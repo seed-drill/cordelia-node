@@ -1660,8 +1660,25 @@ impl DeviceEntries {
         }
         let own = self.state.identity.public_key();
         match cordelia_api::shared::take_out_in_steps(&self.state.db, &own, now) {
-            Ok(0) => {}
-            Ok(steps) => tracing::info!(steps, "shared channels' entries were taken out"),
+            Ok(done) => {
+                // A channel is held again only once its take-out has ended:
+                // what was fetched of each whose take-out ended is
+                // forgotten here, after the steps, so that one held again
+                // is fetched again before its first send there (decision
+                // 2026-10-10 §3.4, `not_fetched`). A fetch that a pass
+                // records after this is of the channel as it is now: a
+                // page asked from a place since forgotten keeps no place
+                // and says no end (`shared_pass::take_page`).
+                for channel in &done.ended {
+                    self.state.own_channels.forget_fetched(channel);
+                }
+                if done.steps > 0 {
+                    tracing::info!(
+                        steps = done.steps,
+                        "shared channels' entries were taken out"
+                    );
+                }
+            }
             Err(e) => tracing::warn!(error = %e, "could not take shared channels' entries out"),
         }
     }
@@ -4243,6 +4260,62 @@ mod tests {
             held: Default::default(),
             history: Default::default(),
         })
+    }
+
+    /// **A shared channel held again is fetched again before its first
+    /// send there** (decision 2026-10-10 §3.4, §6.1, `not_fetched`): the
+    /// device fetched `review` at its relay, and a bound then left its
+    /// filing out. Once the node has ended its take-out, it keeps nothing of
+    /// that fetch: the closure that the send route gives `send_of` says the
+    /// channel is not fetched, which `send --channel` refuses as
+    /// `not_fetched`, until a pass reads the channel to its end again.
+    #[test]
+    fn a_shared_channel_held_again_is_fetched_again_before_it_is_sent_in() {
+        use cordelia_storage::shared::{self as kept, Came, State};
+        use cordelia_storage::shared_pass::{self as pass_rows, ChannelOut};
+        let state = a_node();
+        let channel = [7u8; 32];
+        let relay = [3u8; 32];
+        let mut card = vec![1u8; 32];
+        card.push(1);
+        card.extend_from_slice(&relay);
+        let now = 1_800_000_000;
+        let id = kept::hold(&lock(&state.db), &channel, &card, "review", Came::Made, now).unwrap();
+        state
+            .own_channels
+            .fetched_from(&channel, "relay.example.org:9474", Instant::now());
+        // The route's closure, as `shared_routes::send` builds it.
+        let fetched = |channel: &[u8; 32]| {
+            state
+                .own_channels
+                .shared_fetch_done(channel, 1, Instant::now())
+        };
+        assert!(fetched(&channel));
+        // A bound leaves its filing out: the first step of its take-out.
+        {
+            let conn = lock(&state.db);
+            kept::set_state(&conn, id, State::NotInForce, now).unwrap();
+            pass_rows::begin_channel(&conn, id, ChannelOut::Dropped).unwrap();
+        }
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        device.take_out_in_steps(now);
+        assert!(
+            pass_rows::channel_out(&lock(&state.db), id)
+                .unwrap()
+                .is_none(),
+            "the take-out ended"
+        );
+        // Held again, as the lists bring it back within the bound.
+        kept::hold(
+            &lock(&state.db),
+            &channel,
+            &card,
+            "review",
+            Came::Made,
+            now + 1,
+        )
+        .unwrap();
+        assert!(!fetched(&channel), "sent in before it was fetched again");
     }
 
     /// The hourly task of messages runs on a node whatever the device's

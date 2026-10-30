@@ -77,15 +77,24 @@ cargo test -p cordelia-node --tests --no-fail-fast -- --ignored
 ```
 
 `CORDELIA_TEST_BINARY_BEFORE` names the binary of the release before
-messages between a person's agents, which
+messages between a person's agents (alpha.10), which
 `a_device_of_the_version_before_beside_one_of_this_version` in `msg_e2e.rs`
-runs beside this build. CI downloads it from the release that `ci.yml`
-names in `VERSION_BEFORE`, and checks it against the SHA-256 that
-`ci.yml` names beside it in `VERSION_BEFORE_SHA256`, and not against a
-checksum taken from the same release, which would not catch an asset
-replaced there. The job's checkout keeps no token on disk while it runs.
-Where the variable is not set, the test says so and passes without
-running, but where `CI` is set it fails. To run it here:
+runs beside this build. `CORDELIA_TEST_BINARY_BEFORE_SHARED` names the
+binary of the release before shared channels (alpha.17, at step 20, which
+the relays and devices run now), which `shared_e2e.rs` runs as the relay
+in `a_relay_carries_a_shared_channel_with_no_change`, and as a device in
+`a_device_of_the_version_before_ignores_shared_lists`. CI downloads each
+from the release that `ci.yml` names in `VERSION_BEFORE` and
+`VERSION_BEFORE_SHARED`, and checks each against the SHA-256 that
+`ci.yml` names beside it (`VERSION_BEFORE_SHA256`,
+`VERSION_BEFORE_SHARED_SHA256`), and not against a checksum taken from
+the same release, which would not catch an asset replaced there. The
+job's checkout keeps no token on disk while it runs. Where a variable is
+not set, the test says so and passes without running, but where `CI` is
+`true`, as GitHub sets it, it fails. To run the first here (the second
+likewise, with `v0.2.0-alpha.17`,
+`58fe2242347ecff805ca4528cb8aee65c4af93b1cace3a3c06978cd247d1f611` and
+`CORDELIA_TEST_BINARY_BEFORE_SHARED`):
 
 ```bash
 v=v0.2.0-alpha.10
@@ -98,9 +107,10 @@ CORDELIA_TEST_BINARY_BEFORE=$d/cordelia-linux-amd64 \
   cargo test -p cordelia-node --test msg_e2e a_device_of_the_version_before
 ```
 
-The two values change together, at a release: when the release before
-messages is to be another, set `VERSION_BEFORE` to its tag and
-`VERSION_BEFORE_SHA256` to the SHA-256 of its `cordelia-linux-amd64`,
+Each pair of values changes together, at a release: when the release
+before messages is to be another, set `VERSION_BEFORE` to its tag and
+`VERSION_BEFORE_SHA256` to the SHA-256 of its `cordelia-linux-amd64` (and
+so `VERSION_BEFORE_SHARED` and its SHA-256),
 worked out from the binary downloaded and checked against the release's
 published `.sha256`, in one commit.
 

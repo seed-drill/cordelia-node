@@ -72,6 +72,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-storage/src/relay.rs`: `test_a_proof_is_checked_before_the_channel_is_looked_up_and_no_is_one_answer`
 - `crates/cordelia-node/src/relay_entries.rs`: `a_channel_is_handed_only_to_a_connection_that_proved_it`
 - `crates/cordelia-storage/src/relay.rs`: `test_a_slot_goes_only_where_every_authors_entry_is_an_old_delete`
+- `crates/cordelia-node/tests/shared_e2e.rs`: `a_relay_carries_a_shared_channel_with_no_change`
 
 ### T3
 - `crates/cordelia-node/tests/threat_model.rs`: `t03_a_relay_refuses_an_entry_over_the_size_limit`
@@ -140,6 +141,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-api/src/reader.rs`: `an_entry_whose_number_is_not_in_its_slots_place_is_no_message`
 - `crates/cordelia-crypto/src/message.rs`: `an_entry_whose_number_is_not_in_its_slots_place_is_no_message`
 - `crates/cordelia-node/tests/msg_e2e.rs`: `send_takes_only_a_name_of_yours_or_all`
+- `crates/cordelia-api/src/shared_routes/tests.rs`: `a_name_that_is_both_across_two_devices_goes_nowhere_wrong`
 
 ### T13
 - `crates/cordelia-api/src/adding.rs`: `test_a_hand_over_is_taken_only_from_the_key_typed_within_the_last_hour`
@@ -155,6 +157,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/recover_e2e.rs`: `a_person_who_lost_both_devices_recovers_what_either_had_sent`
 - `crates/cordelia-api/src/look.rs`: `test_a_device_added_since_is_shown_on_every_device_until_cleared_there`
 - `crates/cordelia-node/tests/shared_e2e.rs`: `accept_with_channel_never_moves_the_device_and_accept_without_never_takes_a_share`
+- `crates/cordelia-node/tests/shared_e2e.rs`: `a_device_of_the_version_before_ignores_shared_lists`
 
 ### T16
 - `crates/cordelia-api/tests/entries.rs`: `a_removed_device_can_no_longer_write`
@@ -192,6 +195,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/shared_e2e.rs`: `a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_the_device_that_made_them`
 - `crates/cordelia-api/src/lists/tests.rs`: `a_device_away_brings_nothing_back`
 - `crates/cordelia-node/src/indicator.rs`: `a_removed_device_that_holds_a_shared_channel_makes_the_line_amber_for_seven_days`
+- `crates/cordelia-api/src/lists/tests.rs`: `an_act_made_with_no_relay_survives_coming_back`
 
 ### T18
 - `crates/cordelia-network/src/item_sync.rs`: `test_verify_item_signature`
@@ -321,6 +325,9 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-api/src/lists/tests.rs`: `an_undo_of_nothing_never_pushes_out_what_is_in_force`
 - `crates/cordelia-api/src/lists/tests.rs`: `the_items_in_force_are_a_function_of_the_lists`
 - `crates/cordelia-api/src/lists/tests.rs`: `three_reviews_of_slice_3_converge`
+- `crates/cordelia-api/src/shared_routes/tests.rs`: `a_device_never_has_more_than_its_room_in_a_shared_channel`
+- `crates/cordelia-api/src/lists/tests.rs`: `a_channel_not_written_keeps_no_entries`
+- `crates/cordelia-api/src/lists/tests.rs`: `a_channel_shared_again_while_its_drop_is_written_shows_nothing_old_as_new`
 
 ## How CI checks this
 

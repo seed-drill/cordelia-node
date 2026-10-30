@@ -2669,11 +2669,6 @@ fn a_removed_device_reads_what_was_sent_in_its_generation_and_nothing_after_its_
 
 // ── The upgrade ──────────────────────────────────────────────────────
 
-/// The variable that names the binary of the version before this one: the
-/// release that CI downloads and checks against its published checksum
-/// (`.github/workflows/ci.yml`).
-const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
-
 /// Desktop runs the version before, beside laptop on this version, through
 /// the test's own relay; desktop alone maps the name `only`. It derives
 /// nothing of the messages channel and holds nothing of it, and its
@@ -2682,20 +2677,13 @@ const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
 /// (decision 2026-10-09 §9.2, C21).
 ///
 /// Where no binary of the version before is given, the test says so and
-/// passes without running; but where `CI` is set, which it is on every CI
-/// runner, it fails, so that CI never passes it by.
+/// passes without running; but in CI it fails, so that CI never passes it
+/// by (`common::binary_given`).
 #[test]
 fn a_device_of_the_version_before_beside_one_of_this_version() {
-    let Some(before) = std::env::var_os(BINARY_BEFORE) else {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "{BINARY_BEFORE} is not set: CI gives this test the binary of the version before"
-        );
-        eprintln!("{BINARY_BEFORE} is not set: this test did not run");
+    let Some(before) = binary_before() else {
         return;
     };
-    let before = PathBuf::from(before);
-    assert!(before.is_file(), "{}", before.display());
     let relay = relay_started();
     let laptop = device_started("laptop", &relay);
     let mut desktop = node_run_by(before, "desktop", relay.p2p);

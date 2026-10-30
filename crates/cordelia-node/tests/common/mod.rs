@@ -775,6 +775,61 @@ pub fn node_run_by(bin: PathBuf, name: &'static str, relay_p2p: u16) -> Node {
     node_made(name, "personal", &relays, Some(bin))
 }
 
+/// A relay of the test's own, made, run and asked by the binary at `bin`:
+/// a version before this one ([`node_run_by`]), started.
+pub fn relay_run_by(bin: PathBuf) -> Node {
+    let mut relay = node_made("relay", "relay", &[], Some(bin));
+    relay.start();
+    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
+    relay
+}
+
+/// The variable that names the binary of the release before messages
+/// between a person's agents (alpha.10): what the messages upgrade test
+/// runs (`.github/workflows/ci.yml`, `VERSION_BEFORE`; TESTING.md).
+pub const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
+
+/// The variable that names the binary of the release before shared
+/// channels (alpha.17, at step 20, with messages): the version before of
+/// the shared channel's record, which the relays and devices run now, and
+/// which `shared_e2e.rs` runs as the relay and as a device (`ci.yml`,
+/// `VERSION_BEFORE_SHARED`; decision 2026-10-10 §14).
+pub const BINARY_BEFORE_SHARED: &str = "CORDELIA_TEST_BINARY_BEFORE_SHARED";
+
+/// Whether the tests run in CI, as GitHub says it: `CI` is `true`. A `CI`
+/// set to anything else (`false`, `0`, empty) is not CI.
+pub fn in_ci() -> bool {
+    std::env::var("CI").is_ok_and(|ci| ci.eq_ignore_ascii_case("true") || ci == "1")
+}
+
+/// The binary that the variable `var` names. Where it is not given,
+/// `None`, and the test that asks says so and passes without running; but
+/// in CI ([`in_ci`]) it fails, so that CI never passes it by.
+pub fn binary_given(var: &str) -> Option<PathBuf> {
+    let Some(before) = std::env::var_os(var) else {
+        assert!(
+            !in_ci(),
+            "{var} is not set: CI gives this test the binary of the version before"
+        );
+        eprintln!("{var} is not set: this test did not run");
+        return None;
+    };
+    let before = PathBuf::from(before);
+    assert!(before.is_file(), "{}", before.display());
+    Some(before)
+}
+
+/// The binary of the release before messages ([`BINARY_BEFORE`]).
+pub fn binary_before() -> Option<PathBuf> {
+    binary_given(BINARY_BEFORE)
+}
+
+/// The binary of the release before shared channels
+/// ([`BINARY_BEFORE_SHARED`]).
+pub fn binary_before_shared() -> Option<PathBuf> {
+    binary_given(BINARY_BEFORE_SHARED)
+}
+
 fn node_made(
     name: &'static str,
     role: &str,

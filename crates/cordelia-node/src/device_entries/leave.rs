@@ -1402,7 +1402,7 @@ impl Leave {
                     entries: entries.len(),
                     handed,
                     got_somewhere: taken.got_somewhere,
-                    end: entries.is_empty(),
+                    end: entries.is_empty() && !taken.stale,
                 })
             }
             (SharedAsk::Push { .. }, WireMessage::EntryPushed(pushed)) => {

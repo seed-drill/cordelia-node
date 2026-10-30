@@ -456,10 +456,11 @@ pub fn keep(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), PersonErr
 }
 
 /// Hold each channel filed in force; begin taking every entry of a channel
-/// dropped or moved from out of the store, with every row of a drop and
-/// every row but the index of a move, and of a channel the lists hold no
-/// valid act on, which is forgotten at the end (decision 2026-10-10 §3.4,
-/// §6.3). What is in force, and
+/// dropped, moved from or left out by a bound out of the store, with the
+/// index rows of a drop and of a channel left out, its other rows kept
+/// while the device writes an act on it; and every entry and every row of
+/// a channel the lists hold no valid act on, which is forgotten at the end
+/// (decision 2026-10-10 §3.4, §6.3). What is in force, and
 /// what a bound leaves out, is worked out from the lists the device reads
 /// (`lists::holds_worked_out`). Of the channels moved from, the index
 /// stays for the 16 moved from last.
@@ -535,8 +536,14 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
                 }
             }
         } else if anywhere.contains(&row.channel) {
+            // A channel a bound leaves out is not written: its entries and
+            // index rows are taken out, in steps, and its rows stay while
+            // the lists carry an act on it (§3.4, "A channel that is not
+            // written keeps no entries"). The take-out is told apart from a
+            // drop's by the channel's state at its end.
             if row.state == State::Held {
                 kept::set_state(conn, row.id, State::NotInForce, now)?;
+                pass_rows::begin_channel(conn, row.id, ChannelOut::Dropped)?;
             }
         } else {
             if matches!(row.state, State::Held | State::NotInForce) {
@@ -551,7 +558,7 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
         .collect();
     moved.sort_by_key(|row| std::cmp::Reverse((row.left_at, row.id)));
     for older in moved.iter().skip(SHARED_MAX_CHANNELS) {
-        kept::drop_index(conn, older.id)?;
+        kept::drop_index_rows(conn, older.id)?;
     }
     Ok(())
 }
@@ -710,8 +717,10 @@ pub enum Stepped {
     /// one that stopped being known.
     Key,
     /// One key's entries, or one signer's index rows, went from a channel
-    /// dropped, moved from or forgotten; or such a take-out ended.
+    /// dropped, moved from, forgotten or left out by a bound.
     OfAChannel,
+    /// The take-out of every entry of this channel ended.
+    Ended([u8; 32]),
 }
 
 /// One step of the take-outs begun and not ended, at `now` (decision
@@ -725,9 +734,13 @@ pub enum Stepped {
 pub fn take_out_step(conn: &Connection, now: i64) -> Result<Stepped, PersonError> {
     in_one(conn, || {
         if let Some((id, key, as_refused)) = pass_rows::next_key_out(conn)? {
+            // A key's take-out ends as begun, with the revisions its row
+            // keeps, also where the whole channel goes after it: the row
+            // stays while the device writes an act on the channel (§3.4),
+            // and its revisions with it. Only a channel forgotten loses it.
             let row = kept::channel_of_row(conn, id)?;
-            let going_whole = pass_rows::channel_out(conn, id)?.is_some();
-            if let Some(row) = row.filter(|_| !going_whole) {
+            let forgotten = pass_rows::channel_out(conn, id)? == Some(ChannelOut::Forgotten);
+            if let Some(row) = row.filter(|_| !forgotten) {
                 // A key the person came to know since its take-out was
                 // begun is taken out no more: its take-out ends here.
                 let known = match held(conn)? {
@@ -760,35 +773,86 @@ pub fn take_out_step(conn: &Connection, now: i64) -> Result<Stepped, PersonError
             pass_rows::channel_ended(conn, id)?;
             return Ok(Stepped::OfAChannel);
         };
-        let index_too = how != ChannelOut::Moved;
+        let anew = |e| PersonError::Storage(e);
+        // A channel the device writes an act on keeps its rows (§3.4, the
+        // person's ruling of 30 October): a filing a bound left out, a
+        // drop, or a move. Its entries go, and but for a move its index
+        // rows; its table of keys, with the revisions a let-go key keeps,
+        // and its rows of first holding and of H stay. Only a channel no
+        // list carries an act on is forgotten, every row of it.
+        if how != ChannelOut::Forgotten {
+            let index_too = how != ChannelOut::Moved;
+            let step = kept::take_out_whole_step(
+                conn,
+                id,
+                &row.channel,
+                index_too,
+                SHARED_TAKE_OUT_STEP_ENTRIES,
+            )?;
+            if step != ChannelStep::Done {
+                return Ok(Stepped::OfAChannel);
+            }
+            if row.state == State::NotInForce {
+                // Back within the bound, it is read again from its start.
+                pass_rows::channel_ended(conn, id)?;
+                pass_rows::forget_places(conn, id)?;
+            } else {
+                // What step 26 keeps of the channel: of one dropped,
+                // nothing; of one moved from, the offers read there, which
+                // say who has not moved yet (§7).
+                cordelia_storage::shared_anew::clean(conn, &row.channel).map_err(anew)?;
+                if how == ChannelOut::Dropped {
+                    cordelia_storage::shared_anew::forget_offers_in(conn, &row.channel)
+                        .map_err(anew)?;
+                    cordelia_storage::shared_anew::forget_made(conn, &row.channel).map_err(anew)?;
+                    // A drop forgets the seed; a filing made later carries
+                    // the card again (§3.4). A channel moved from keeps it
+                    // while its offer goes to each relay of its card (§7).
+                    kept::forget_seed(conn, id)?;
+                }
+                pass_rows::forget(conn, id)?;
+            }
+            return Ok(Stepped::Ended(row.channel));
+        }
         let step = kept::take_out_channel_step(
             conn,
             id,
             &row.channel,
-            index_too,
+            true,
             SHARED_TAKE_OUT_STEP_ENTRIES,
         )?;
-        if step == ChannelStep::Done {
-            // What step 26 keeps of the channel: of one dropped or
-            // forgotten, everything; of one moved from, the offers read
-            // there, which say who has not moved yet (§7).
-            let anew = |e| PersonError::Storage(e);
-            cordelia_storage::shared_anew::clean(conn, &row.channel).map_err(anew)?;
-            if how != ChannelOut::Moved {
-                cordelia_storage::shared_anew::forget_offers_in(conn, &row.channel)
-                    .map_err(anew)?;
-                cordelia_storage::shared_anew::forget_made(conn, &row.channel).map_err(anew)?;
-            }
-            match how {
-                ChannelOut::Forgotten => kept::forget(conn, id)?,
-                ChannelOut::Dropped | ChannelOut::Moved => {
-                    kept::drop_rows(conn, id, how == ChannelOut::Moved)?;
-                    pass_rows::forget(conn, id)?;
-                }
-            }
+        if step != ChannelStep::Done {
+            return Ok(Stepped::OfAChannel);
         }
-        Ok(Stepped::OfAChannel)
+        cordelia_storage::shared_anew::clean(conn, &row.channel).map_err(anew)?;
+        cordelia_storage::shared_anew::forget_offers_in(conn, &row.channel).map_err(anew)?;
+        cordelia_storage::shared_anew::forget_made(conn, &row.channel).map_err(anew)?;
+        kept::forget(conn, id)?;
+        Ok(Stepped::Ended(row.channel))
     })
+}
+
+/// What [`take_out_in_steps`] did: how many steps, and the channels whose
+/// whole take-out ended, each dropped, moved from, forgotten, or left out
+/// by a bound. The node forgets what it fetched of each (decision
+/// 2026-10-10 §3.4: "for sending, a channel held again is as after a
+/// start"), after the steps: one held again is fetched again before its
+/// first send there (`not_fetched`, §6.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TakenOut {
+    pub steps: usize,
+    pub ended: Vec<[u8; 32]>,
+}
+
+impl TakenOut {
+    fn add(&mut self, stepped: Stepped) {
+        self.steps += 1;
+        if let Stepped::Ended(channel) = stepped
+            && !self.ended.contains(&channel)
+        {
+            self.ended.push(channel);
+        }
+    }
 }
 
 /// Every take-out begun and not ended, ended in steps, each under a hold of
@@ -803,18 +867,21 @@ pub fn take_out_in_steps(
     db: &cordelia_core::lock::TimedLock<Connection>,
     own: &[u8; 32],
     now: i64,
-) -> Result<usize, PersonError> {
+) -> Result<TakenOut, PersonError> {
     use cordelia_core::lock::LockWhole;
-    let mut steps = 0;
+    let mut done = TakenOut::default();
     // A keeping that begins another take-out is followed by its steps: a
     // few rounds at most, since each keeping begins only what brings the
     // room within its bound.
     for _ in 0..4 {
-        let before = steps;
-        while take_out_step(&db.lock_whole(), now)? != Stepped::Nothing {
-            steps += 1;
+        let before = done.steps;
+        loop {
+            match take_out_step(&db.lock_whole(), now)? {
+                Stepped::Nothing => break,
+                stepped => done.add(stepped),
+            }
         }
-        if steps == before {
+        if done.steps == before {
             break;
         }
         let conn = db.lock_whole();
@@ -823,20 +890,23 @@ pub fn take_out_in_steps(
             break;
         }
     }
-    Ok(steps)
+    Ok(done)
 }
 
 /// [`take_out_in_steps`], on a connection the caller holds: every step,
 /// one after another. For a caller that holds the store whole, and for
 /// tests.
-pub fn take_out_all(conn: &Connection, own: &[u8; 32], now: i64) -> Result<usize, PersonError> {
-    let mut steps = 0;
+pub fn take_out_all(conn: &Connection, own: &[u8; 32], now: i64) -> Result<TakenOut, PersonError> {
+    let mut done = TakenOut::default();
     for _ in 0..4 {
-        let before = steps;
-        while take_out_step(conn, now)? != Stepped::Nothing {
-            steps += 1;
+        let before = done.steps;
+        loop {
+            match take_out_step(conn, now)? {
+                Stepped::Nothing => break,
+                stepped => done.add(stepped),
+            }
         }
-        if steps == before {
+        if done.steps == before {
             break;
         }
         keep(conn, own, now)?;
@@ -844,7 +914,7 @@ pub fn take_out_all(conn: &Connection, own: &[u8; 32], now: i64) -> Result<usize
             break;
         }
     }
-    Ok(steps)
+    Ok(done)
 }
 
 /// The shared channels to read again from their start at `now`: each
@@ -1336,8 +1406,8 @@ pub(crate) mod tests {
     /// 2026-10-10 §3.4): a channel filed on the laptop is held on the
     /// desktop once it takes the laptop's list at a whole fetch, by its
     /// card, its name and how it came; renamed, it is held under the new
-    /// name; dropped, it is held no more, and its seed is kept until the
-    /// drop is freed.
+    /// name; dropped, it is held no more, and its seed is forgotten
+    /// (§3.4).
     #[test]
     fn the_table_of_shared_channels_follows_the_lists() {
         let s = bob(2);
@@ -1383,7 +1453,9 @@ pub(crate) mod tests {
             (dropped.state, dropped.left_at),
             (State::Dropped, Some(now + 2))
         );
-        assert_eq!(dropped.card, on_laptop.card);
+        // Its seed is forgotten, and its relays kept.
+        assert_eq!(&dropped.card[..32], &[0; 32]);
+        assert_eq!(&dropped.card[32..], &on_laptop.card[32..]);
     }
 
     /// A member writes in the slots of another key: `msg/<another>/0` and
@@ -1980,11 +2052,13 @@ pub(crate) mod tests {
     }
 
     /// A drop or a move takes its entries (decision 2026-10-10 §6.3): at a
-    /// drop the device holds no entry and no row of that channel; at a move
-    /// it holds no entry of the old channel, and shows its index rows until
-    /// they expire, for the 16 channels moved from last. Neither's entries
-    /// are taken any more, ninety days on or a year on: a drop is never let
-    /// go for its age.
+    /// drop the device holds no entry and no index row of that channel,
+    /// and forgets its seed, its table of keys and its rows of first
+    /// holding and of H kept while the drop is written (§3.4, the person's
+    /// ruling of 30 October); at a move it holds no entry of the old
+    /// channel, and shows its index rows until they expire, for the 16
+    /// channels moved from last. Neither's entries are taken any more,
+    /// ninety days on or a year on: a drop is never let go for its age.
     #[test]
     fn a_drop_or_a_move_takes_its_entries() {
         let s = bob(1);
@@ -2008,23 +2082,27 @@ pub(crate) mod tests {
         assert!(s[0].stored_in(&dropped.secret).is_empty());
         let row_of = row(&s, 0, &dropped);
         assert_eq!(row_of.state, State::Dropped);
-        assert!(key_rows(&s, 0, &dropped).is_empty());
         assert_eq!(indexed(&s, 0, &dropped), 0);
-        for table in [
-            "shared_first_held",
-            "shared_signers",
-            "shared_places",
-            "shared_unopened",
-        ] {
-            let rows: i64 = s[0]
-                .conn
+        assert_eq!(&row_of.card[..32], &[0; 32], "the seed is forgotten");
+        let count = |table: &str| -> i64 {
+            s[0].conn
                 .query_row(
                     &format!("SELECT COUNT(*) FROM {table} WHERE channel = ?1"),
                     [row_of.id],
                     |row| row.get(0),
                 )
-                .unwrap();
-            assert_eq!(rows, 0, "{table}");
+                .unwrap()
+        };
+        for table in ["shared_index", "shared_numbers", "shared_unopened"] {
+            assert_eq!(count(table), 0, "{table}");
+        }
+        // Kept while the drop is written: the table of keys, the rows of
+        // first holding and of H.
+        assert_eq!(key_rows(&s, 0, &dropped).len(), 1);
+        assert_eq!(key_rows(&s, 0, &dropped)[0].bytes_stored, 0);
+        assert_eq!(row_of.room, 0);
+        for table in ["shared_first_held", "shared_signers"] {
+            assert!(count(table) > 0, "{table}");
         }
 
         let mut to = filing(3, "b");
@@ -2032,7 +2110,7 @@ pub(crate) mod tests {
         acts(&s, 0, Do::Move { from: moved.id, to }, now + 2);
         assert!(s[0].stored_in(&moved.secret).is_empty());
         assert_eq!(row(&s, 0, &moved).state, State::Moved);
-        assert!(key_rows(&s, 0, &moved).is_empty());
+        assert_eq!(key_rows(&s, 0, &moved).len(), 1);
         assert_eq!(bodies(&s, 0, &moved, now + 2), ["one"]);
         assert_eq!(row(&s, 0, &Shared::of(3)).state, State::Held);
         assert!(read_again_due(&s[0].conn, now + 2).unwrap().is_empty());
@@ -2978,6 +3056,38 @@ pub(crate) mod tests {
         let later = now + 2 + 30 * DAY;
         assert_eq!(super::hourly(conn, &s.key(0), later).unwrap().let_go, 0);
         assert!(!pass_rows::key_going(conn, id, &carol.public_key()).unwrap());
+    }
+
+    /// A quiet key's take-out that the take-out of its whole channel comes
+    /// after ends as begun, with its revisions (§6.3, §3.4): the hourly
+    /// task chooses a member's quiet key, and before its step the channel
+    /// is dropped. The key's row keeps the revisions it held, beside the
+    /// rows the drop keeps while it is written; the channel filed again,
+    /// that key's old entry is refused.
+    #[test]
+    fn a_quiet_keys_take_out_keeps_its_revisions_when_its_channel_goes() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let quiet = member(2);
+        let old = message(&quiet, &channel, 1, "quiet", now);
+        stores(&s, 0, &old, now);
+        let later = now + 31 * DAY;
+        let conn = &s[0].conn;
+        let id = row(&s, 0, &channel).id;
+        assert_eq!(super::hourly(conn, &s.key(0), later).unwrap().let_go, 1);
+        assert!(pass_rows::key_going(conn, id, &quiet.public_key()).unwrap());
+        let done = act(conn, &s[0].identity, Do::Drop(channel.id), later + 1).unwrap();
+        assert!(matches!(done, Done::Made(_)), "{done:?}");
+        out(&s, 0, later + 1);
+        assert_eq!(row(&s, 0, &channel).state, State::Dropped);
+        let kept_row = key_row(&s, 0, &channel, &quiet.public_key()).unwrap();
+        assert!(kept_row.kept_message_rev.is_some(), "{kept_row:?}");
+        acts(&s, 0, Do::File(filing(1, "review")), later + 2);
+        assert_eq!(
+            given(&s, 0, &old, later + 3),
+            Taken::Refused(NotTaken::SharedFull)
+        );
     }
 
     /// A step of a channel's take-out takes out at most
