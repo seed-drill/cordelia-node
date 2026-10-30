@@ -1838,30 +1838,73 @@ impl RelayEntries {
         if (taken.is_empty() && offers.is_empty()) || relays.is_empty() {
             return Vec::new();
         }
-        // The two times of each channel, and each head that is offered as
-        // it is kept. An entry of a channel that was dropped since is
-        // passed on to nobody.
-        let (times, kept): (ChannelTimes, HashMap<[u8; 32], Vec<u8>>) = {
+        // Each head that is offered, as it is kept: at most a page of them
+        // to each relay at an offer (ENTRY_PAGE_MAX_BYTES), the ones that
+        // waited longest first, read MAX_CHANGE_HEADS at a time with the
+        // lock taken for each (the review of the whole build, its M1).
+        // What is not offered now waits for the next offer, in its place.
+        // So an offer holds no more than a page for each relay, however
+        // many heads wait, and no read of them holds the lock for long.
+        let mut kept: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let mut gone: Vec<[u8; 32]> = Vec::new();
+        let mut paged: Vec<(NodeId, Vec<HeadAt>)> = Vec::new();
+        for (relay, heads) in offers {
+            let mut page: Vec<HeadAt> = Vec::new();
+            let mut bytes = 0usize;
+            let mut full = false;
+            for batch in heads.chunks(MAX_CHANGE_HEADS) {
+                {
+                    let Ok(db) = db.lock() else {
+                        return Vec::new();
+                    };
+                    for (place, id) in batch {
+                        if kept.contains_key(id) || gone.contains(id) {
+                            continue;
+                        }
+                        match relay::kept_entry(&db, (&place[0], &place[1], &place[2]), id) {
+                            Ok(Some(entry)) => {
+                                kept.insert(*id, entry.to_wire());
+                            }
+                            Ok(None) => gone.push(*id),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "could not read a head to offer");
+                            }
+                        }
+                    }
+                }
+                for head in batch {
+                    let Some(entry) = kept.get(&head.1) else {
+                        continue;
+                    };
+                    if !page.is_empty() && bytes + entry.len() > ENTRY_PAGE_MAX_BYTES {
+                        full = true;
+                        break;
+                    }
+                    bytes += entry.len();
+                    page.push(*head);
+                }
+                if full {
+                    break;
+                }
+            }
+            if !page.is_empty() {
+                paged.push((relay, page));
+            }
+        }
+        lock(&*self.heads).gone(&gone);
+        // A head read and not offered to any relay now is not held.
+        kept.retain(|id, _| {
+            paged
+                .iter()
+                .any(|(_, page)| page.iter().any(|head| head.1 == *id))
+        });
+        let offers = paged;
+        // The two times of each channel. An entry of a channel that was
+        // dropped since is passed on to nobody.
+        let times: ChannelTimes = {
             let Ok(db) = db.lock() else {
                 return Vec::new();
             };
-            let mut kept = HashMap::new();
-            let mut gone = Vec::new();
-            for (place, id) in offers.iter().flat_map(|(_, heads)| heads) {
-                if kept.contains_key(id) || gone.contains(id) {
-                    continue;
-                }
-                match relay::kept_entry(&db, (&place[0], &place[1], &place[2]), id) {
-                    Ok(Some(entry)) => {
-                        kept.insert(*id, entry.to_wire());
-                    }
-                    Ok(None) => gone.push(*id),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "could not read a head to offer");
-                    }
-                }
-            }
-            lock(&*self.heads).gone(&gone);
             let channels: HashSet<[u8; 32]> = taken
                 .iter()
                 .map(|taken| taken.channel)
@@ -1871,14 +1914,13 @@ impl RelayEntries {
                         .flat_map(|(_, heads)| heads.iter().map(|(place, _)| place[0])),
                 )
                 .collect();
-            let times = channels
+            channels
                 .into_iter()
                 .filter_map(|channel| {
                     let held = relay::held_channel(&db, &channel).ok()??;
                     Some((channel, (held.held_since, held.used_at)))
                 })
-                .collect();
-            (times, kept)
+                .collect()
         };
         let passed: Vec<(NodeId, Vec<RelayPush>)> = relays
             .iter()
@@ -7715,6 +7757,59 @@ mod tests {
                 .is_empty()
         );
         assert!(lock(&*at.entries.heads).heads.is_empty());
+    }
+
+    /// An offer of heads holds at most a page for each relay (the review
+    /// of the whole build, its M1): of 40 heads that wait, each a change
+    /// entry of 32 KB, an offer carries no more than ENTRY_PAGE_MAX_BYTES
+    /// of them, those that waited longest first, and the rest are offered
+    /// at the offers after, in order, until each is answered.
+    ///
+    /// Taken out: the page (all 40 go in one offer: the first fails).
+    #[test]
+    fn an_offer_of_heads_holds_at_most_a_page_for_each_relay() {
+        let at = relay_of(u64::MAX, &[9]);
+        let heads: Vec<CheckedEntry> = (0..40u16)
+            .map(|n| change(100 + n, 1, 3, 0x13, &[0x01, 0x02]))
+            .collect();
+        for head in &heads {
+            assert_eq!(
+                pushed(at.push(1, vec![head.to_wire()])),
+                [PushAnswer::Stored]
+            );
+        }
+        let mut offered: Vec<[u8; 32]> = Vec::new();
+        for _ in 0..heads.len() {
+            let passed = at.entries.to_pass_on(&at.db, &[peer(9)]);
+            if passed.is_empty() {
+                break;
+            }
+            let messages = waiting_for(&passed, 9);
+            let bytes: usize = messages
+                .iter()
+                .flatten()
+                .map(|passed| passed.entry.len())
+                .sum();
+            assert!(
+                bytes <= ENTRY_PAGE_MAX_BYTES,
+                "an offer of {bytes} bytes of heads to one relay"
+            );
+            for message in &passed[0].1 {
+                offered.extend(
+                    message
+                        .entries
+                        .iter()
+                        .map(|passed| Entry::from_wire(&passed.entry).unwrap().id()),
+                );
+                RelayEntries::heads_answered(&at.entries.heads, &peer(9), message);
+            }
+            RelayEntries::offer_ended(&at.entries.heads, &peer(9));
+        }
+        let ids: Vec<[u8; 32]> = heads.iter().map(|head| head.id()).collect();
+        assert_eq!(
+            offered, ids,
+            "every head is offered once, in the order it waited"
+        );
     }
 
     /// Rule 17, where the asker is over its allowance (the review of slice
