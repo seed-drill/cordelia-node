@@ -235,6 +235,9 @@ pub struct PageOf {
     /// Whether the pull got somewhere by it: the place moved on, the
     /// holding is another, or the store took an entry it did not hold.
     pub got_somewhere: bool,
+    /// The page was asked from a place the device keeps no more: it kept
+    /// no place, and is no end of the channel at that relay.
+    pub stale: bool,
 }
 
 /// Take a page that the relay `relay` handed of the channel of `usable`
@@ -263,6 +266,22 @@ pub fn take_page(
     let own = identity.public_key();
     in_one(conn, || {
         let kept_place = rows::place(conn, usable.id, relay)?;
+        // A page asked from a place the device keeps no more (a read again
+        // began, or the channel was left out and came back, while it was
+        // asked): its entries go through the door, and it keeps no place
+        // and says no end, so that the next page is asked from the place
+        // kept now, and nothing before the old place is passed over.
+        if kept_place.unwrap_or((NO_MARK, 0)) != asked {
+            let mut each = Vec::with_capacity(entries.len());
+            for entry in entries {
+                each.push(take(conn, identity, entry, now)?);
+            }
+            return Ok(PageOf {
+                each,
+                got_somewhere: true,
+                stale: true,
+            });
+        }
         let another_holding = mark != NO_MARK && kept_place.is_some_and(|(kept, _)| kept != mark);
         let no_holding = mark == NO_MARK && entries.is_empty() && kept_place.is_some();
         if another_holding || no_holding {
@@ -302,6 +321,7 @@ pub fn take_page(
         Ok(PageOf {
             each,
             got_somewhere,
+            stale: false,
         })
     })
     .map(Some)
@@ -541,6 +561,54 @@ mod tests {
         let none = crate::several::Several::new(1);
         assert_eq!(may_open(&none[0].conn).unwrap(), Err(NotUsable::NotApplied));
         assert!(at_relay(&none[0].conn, &AT).unwrap().is_empty());
+    }
+
+    /// A page asked from a place the device keeps no more keeps no place
+    /// (§6.3, §3.4): the device keeps a place at its relay and asks a page
+    /// from it; before the page is taken, a read again forgets its places.
+    /// The page's entry goes through the door, the place is not written
+    /// back, and the page says it is stale, so that it is no end of the
+    /// channel there; the next page, asked from the start, keeps its place.
+    #[test]
+    fn a_page_asked_from_a_place_forgotten_keeps_no_place() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+        rows::keep_place(conn, here.id, &AT, &[5; 8], 9).unwrap();
+        let asked = place(conn, &here, &AT).unwrap();
+        assert_eq!(asked, ([5; 8], 9));
+        rows::forget_places(conn, here.id).unwrap();
+        let dave = message(&member(7), &channel, 1, "dave", now);
+        let page = [dave];
+        let taken = take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            asked,
+            (&page, [5; 8], 12),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(taken.stale);
+        assert!(matches!(taken.each[..], [Taken::Shared { .. }]));
+        assert_eq!(place(conn, &here, &AT).unwrap(), (NO_MARK, 0));
+        let from_start = take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            (NO_MARK, 0),
+            (&[], [5; 8], 12),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!from_start.stale);
+        assert_eq!(place(conn, &here, &AT).unwrap(), ([5; 8], 12));
     }
 
     /// A page moves the device's place at a relay past every entry it
