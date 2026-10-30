@@ -2166,6 +2166,122 @@ mod tests {
         );
     }
 
+    /// Message `number` of device `from`, saying `body`, sent at `sent`, in
+    /// the messages channel of the generation device `on` follows.
+    fn message(s: &Several, on: usize, from: usize, number: u64, body: &str) -> CheckedEntry {
+        use cordelia_core::protocol::AGENT_MESSAGE_ID_BYTES;
+        use cordelia_crypto::message::{Message, To, message_name, message_rev};
+        let said = Message {
+            asks: false,
+            sent: u64::try_from(s.now).unwrap(),
+            nonce: [0; 16],
+            thread: [0; AGENT_MESSAGE_ID_BYTES],
+            answers: [0; AGENT_MESSAGE_ID_BYTES],
+            from: "~".into(),
+            to: To::Name("notes".into()),
+            link: None,
+            body: body.into(),
+        };
+        let messages = cordelia_crypto::derive::messages_secret(&s[on].secret()).unwrap();
+        crate::several::entry_by(
+            &s[from].identity,
+            &messages,
+            message_rev(number).unwrap(),
+            &message_name(&s.key(from), number).unwrap(),
+            Value::Other(said.to_value(crate::names::is_a_name).unwrap()),
+            &[],
+        )
+    }
+
+    /// Rule 27, a late message (the review of rule 27, its messages): the
+    /// tablet (2) sent one message long before its removal, and one after
+    /// it; the laptop (1) took both before it knew. The second opens the
+    /// window though no file of the tablet's came late: `notes.md`, which
+    /// the laptop wrote after it, is set aside. `before.md`, written after
+    /// the first message and after the cut time, but before the late one,
+    /// is kept.
+    #[test]
+    fn a_late_message_opens_the_window() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        let early = message(&s, 1, 2, 1, "an honest message");
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &early, now).unwrap();
+        s.now += 2 * MARGIN;
+        let removal = s.change(0, &[0, 1], &[2]);
+        s.write(
+            1,
+            "notes",
+            "before.md",
+            "after the cut time, before the message",
+        );
+        let late = message(&s, 1, 2, 2, "the tablet's late message");
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &late, now).unwrap();
+        let held = cordelia_storage::messages::held_of(&s[1].conn, &s.key(2)).unwrap();
+        assert_eq!(held.held.len(), 2, "{held:?}");
+        s.write(
+            1,
+            "notes",
+            "notes.md",
+            "the late message, as the agent wrote it down",
+        );
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+        assert_eq!(
+            s[1].text("notes", "before.md").as_deref(),
+            Some("after the cut time, before the message")
+        );
+    }
+
+    /// Rule 27, a late message whose record went past the ring before the
+    /// carry (the removed device sent more than `AGENT_MESSAGE_RING`, or
+    /// cleared it): its time is not kept, and the window opens at the
+    /// earliest it could have been cut, so `notes.md`, written after it, is
+    /// set aside.
+    #[test]
+    fn a_late_message_that_went_past_the_ring_still_opens_the_window() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        let late = message(&s, 1, 2, 1, "the tablet's late message");
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &late, now).unwrap();
+        // As the ring drops a number that is no longer live.
+        s[1].conn
+            .execute(
+                "DELETE FROM message_first_held WHERE signer = ?1",
+                [&s.key(2)[..]],
+            )
+            .unwrap();
+        let held = cordelia_storage::messages::held_of(&s[1].conn, &s.key(2)).unwrap();
+        assert!(held.held.is_empty(), "{held:?}");
+        assert_eq!(held.went.len(), 1, "{held:?}");
+        s.write(
+            1,
+            "notes",
+            "notes.md",
+            "the late message, as the agent wrote it down",
+        );
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+    }
+
     /// Rule 27, after the device knew: the laptop follows a change made
     /// apart from the removal that never listed the tablet (its change 3
     /// lists the desktop, the laptop and the phone), so it stays clear and
