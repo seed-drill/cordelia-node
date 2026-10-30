@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 26;
+pub const SCHEMA_VERSION: u32 = 27;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1397,6 +1397,19 @@ CREATE TABLE file_own_set_aside (
 );
 "#;
 
+/// Step 27: why a carry left out what a folder holds of a file (the review
+/// of the whole build, its M4).
+///
+/// - `file_put_back.own`: 1 where the device wrote what is left out itself,
+///   after it took a removed device's late writing and before it knew of
+///   the removal (decision 2026-10-24 (removal), rule 27); 0 where a
+///   removed device wrote it, or it was written over what one wrote (rule
+///   7). Every row kept before the step is 0: the two were not told apart.
+const MIGRATION_V27: &str = r#"
+ALTER TABLE file_put_back ADD COLUMN own INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(own) = 'integer' AND own IN (0, 1));
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1642,6 +1655,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 26 {
         tracing::info!("applying migration v26 (what a device wrote itself)");
         migrate_in_one(conn, MIGRATION_V26, 26)?;
+    }
+
+    if current < 27 {
+        tracing::info!("applying migration v27 (why a file was put back)");
+        migrate_in_one(conn, MIGRATION_V27, 27)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -5885,7 +5903,7 @@ mod tests {
         let failing = format!("{MIGRATION_V26} SELECT no_such_function();");
         assert!(migrate_in_one(&conn, &failing, 26).is_err());
         assert_eq!(version(&conn), 25);
-        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V26, 26).unwrap();
         assert_eq!(version(&conn), 26);
         migrate_in_one(&conn, MIGRATION_V26, 26).unwrap();
         let own: i64 = conn
@@ -5925,6 +5943,52 @@ mod tests {
         ] {
             conn.execute_batch("SAVEPOINT one").unwrap();
             assert_eq!(conn.execute_batch(sql).is_ok(), taken, "{sql}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
+    /// Step 27 (the review of the whole build, its M4): each file a carry
+    /// left out before it is one that a removed device wrote, or that was
+    /// written over what one wrote (`own` 0); `own` takes no value but 0 or
+    /// 1; it is made in one step with its version, and asked for twice it
+    /// is run once.
+    #[test]
+    fn step_27_takes_every_file_put_back_before_it_as_not_the_devices_own() {
+        let conn = at_v21();
+        for (sql, version) in [
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+            (MIGRATION_V25, 25),
+            (MIGRATION_V26, 26),
+        ] {
+            migrate_in_one(&conn, sql, version).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO file_put_back (folder, channel_id, key) VALUES ('f', 'c', 'a.md');",
+        )
+        .unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let failing = format!("{MIGRATION_V27} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 27).is_err());
+        assert_eq!(version(&conn), 26);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 27);
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
+        let own: i64 = conn
+            .query_row("SELECT own FROM file_put_back", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(own, 0);
+        for (value, taken) in [("0", true), ("1", true), ("2", false), ("'one'", false)] {
+            let sql = format!(
+                "INSERT INTO file_put_back (folder, channel_id, key, own)
+                 VALUES ('f', 'c', 'b.md', {value})"
+            );
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
             conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
         }
     }

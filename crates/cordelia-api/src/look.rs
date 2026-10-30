@@ -444,8 +444,12 @@ pub struct Look {
     pub not_carried: Vec<NotCarried>,
     /// How many edits a carry set aside (decision 2026-10-24 (removal),
     /// rule 7), said for seven days from the last: each is in local
-    /// history alone.
+    /// history alone, where it was on.
     pub edits_set_aside: u64,
+    /// How many edits that this device wrote itself a carry set aside
+    /// (rule 27), said for seven days from the last, apart from the others
+    /// (the review of the whole build, its M4).
+    pub own_edits_set_aside: u64,
     /// Why the device cannot go on, where it cannot.
     pub cannot_go_on: Option<String>,
     /// A few words for a line of status, where there is something to
@@ -601,6 +605,7 @@ pub fn look(
             names_not_shown: 0,
             not_carried: Vec::new(),
             edits_set_aside: 0,
+            own_edits_set_aside: 0,
             cannot_go_on: None,
             short: None,
             says: Vec::new(),
@@ -983,22 +988,21 @@ fn of_its_names(
         ));
     }
     // What a carry left out of the folders (decision 2026-10-24 (removal),
-    // rule 7): said for as long as a removal not yet applied is.
-    if let Some((edits, at)) = edits_set_aside(conn)?
-        && now.saturating_sub(at) < i64::from(REMOVAL_NOT_APPLIED_SHOWN_DAYS) * 24 * 60 * 60
+    // rules 7 and 27): said for as long as a removal not yet applied is,
+    // each in its own words. `cordelia restore` puts none of it back (the
+    // review of the whole build, its H1).
+    let shown_for = i64::from(REMOVAL_NOT_APPLIED_SHOWN_DAYS) * 24 * 60 * 60;
+    if let Some(noted) = edits_set_aside(conn, false)?
+        && now.saturating_sub(noted.at) < shown_for
     {
-        look.edits_set_aside = edits;
-        let edits_were = match edits {
-            1 => "1 edit was".to_string(),
-            n => format!("{n} edits were"),
-        };
-        look.says.push(format!(
-            "{edits_were} set aside at a change: a removed device wrote {}, or {} written over \
-             what one wrote. `cordelia history` lists {}, and `cordelia restore` puts one back",
-            if edits == 1 { "it" } else { "them" },
-            if edits == 1 { "it was" } else { "they were" },
-            if edits == 1 { "it" } else { "them" },
-        ));
+        look.edits_set_aside = noted.edits;
+        look.says.push(set_aside_line(&noted, false));
+    }
+    if let Some(noted) = edits_set_aside(conn, true)?
+        && now.saturating_sub(noted.at) < shown_for
+    {
+        look.own_edits_set_aside = noted.edits;
+        look.says.push(set_aside_line(&noted, true));
     }
     if !look.not_carried.is_empty() {
         let each: Vec<String> = look
@@ -1038,28 +1042,110 @@ fn counted(n: usize, noun: &str) -> String {
     }
 }
 
-/// How many edits a carry set aside, and when the last was
-/// ([`note_set_aside`]).
-fn edits_set_aside(conn: &Connection) -> Result<Option<(u64, i64)>, PersonError> {
-    Ok(
-        meta::get(conn, meta::PERSON_EDITS_SET_ASIDE)?.and_then(|noted| {
-            let (edits, at) = noted.split_once(' ')?;
-            Some((edits.parse().ok()?, at.parse().ok()?))
-        }),
-    )
+/// What is noted of the edits a carry set aside ([`note_set_aside`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SetAsideNoted {
+    /// How many.
+    edits: u64,
+    /// When the last was, in seconds.
+    at: i64,
+    /// How many of them were not kept: local history was off.
+    gone: u64,
+}
+
+/// The meta key of the edits a carry set aside: of the device's own
+/// writing (rule 27), or of the others (rule 7).
+fn set_aside_key(own: bool) -> &'static str {
+    match own {
+        true => meta::PERSON_OWN_EDITS_SET_ASIDE,
+        false => meta::PERSON_EDITS_SET_ASIDE,
+    }
+}
+
+/// How many edits a carry set aside, when the last was, and how many were
+/// not kept ([`note_set_aside`]): of the device's own writing (rule 27)
+/// where `own`, or of the others (rule 7).
+fn edits_set_aside(conn: &Connection, own: bool) -> Result<Option<SetAsideNoted>, PersonError> {
+    Ok(meta::get(conn, set_aside_key(own))?.and_then(|noted| {
+        let mut parts = noted.split(' ');
+        let edits = parts.next()?.parse().ok()?;
+        let at = parts.next()?.parse().ok()?;
+        let gone = parts.next().and_then(|gone| gone.parse().ok()).unwrap_or(0);
+        Some(SetAsideNoted { edits, at, gone })
+    }))
 }
 
 /// Count `edits` more that a carry set aside, the last at `now` (decision
-/// 2026-10-24 (removal), rule 7): the sync adapter counts each file whose
-/// text it put in local history alone.
-pub fn note_set_aside(conn: &Connection, edits: u64, now: i64) -> Result<(), PersonError> {
-    let had = edits_set_aside(conn)?.map_or(0, |(edits, _)| edits);
+/// 2026-10-24 (removal), rules 7 and 27): the sync adapter counts each file
+/// whose text it put in local history alone, apart where the device wrote
+/// what was set aside itself (`own`, rule 27). `kept` says whether local
+/// history kept the text: where it is off, nothing is kept, and the status
+/// says so (the review of the whole build, its L1).
+pub fn note_set_aside(
+    conn: &Connection,
+    edits: u64,
+    now: i64,
+    own: bool,
+    kept: bool,
+) -> Result<(), PersonError> {
+    let had = edits_set_aside(conn, own)?.unwrap_or(SetAsideNoted {
+        edits: 0,
+        at: now,
+        gone: 0,
+    });
+    let gone = match kept {
+        true => had.gone,
+        false => had.gone.saturating_add(edits),
+    };
     meta::set(
         conn,
-        meta::PERSON_EDITS_SET_ASIDE,
-        &format!("{} {now}", had.saturating_add(edits)),
+        set_aside_key(own),
+        &format!("{} {now} {gone}", had.edits.saturating_add(edits)),
     )?;
     Ok(())
+}
+
+/// What the status says of the edits a carry set aside: of the device's
+/// own writing (rule 27) where `own`, or of what a removed device wrote or
+/// what was written over it (rule 7). No word says that `cordelia restore`
+/// puts one back: it does not (the review of the whole build, its H1). Of
+/// rule 7's, `--from` brings in what the removed device wrote, at a
+/// terminal with the recovery phrase; of rule 27's, no command brings
+/// anything back (M4).
+fn set_aside_line(noted: &SetAsideNoted, own: bool) -> String {
+    let one = noted.edits == 1;
+    let them = if one { "it" } else { "them" };
+    let edits_were = match noted.edits {
+        1 => "1 edit was".to_string(),
+        n => format!("{n} edits were"),
+    };
+    let what = match own {
+        true => format!(
+            "{edits_were} set aside at a change: this device wrote {them} after it took a \
+             removed device's late writing, and before it knew of the removal"
+        ),
+        false => format!(
+            "{edits_were} set aside at a change: a removed device wrote {them}, or {} \
+             written over what one wrote",
+            if one { "it was" } else { "they were" },
+        ),
+    };
+    let kept = noted.edits.saturating_sub(noted.gone);
+    let history = match (kept, noted.gone) {
+        (_, 0) => format!("`cordelia history` lists {them}"),
+        (0, _) => "local history was off, so none of the text was kept".to_string(),
+        (kept, gone) => format!(
+            "`cordelia history` lists {kept}; {gone} {} not kept, as local history was off",
+            if gone == 1 { "was" } else { "were" }
+        ),
+    };
+    let back = match own {
+        true => format!("no command puts {them} back"),
+        false => "what a removed device wrote comes back only at a terminal, with the recovery \
+                  phrase: `cordelia sync carry <name> --from <its label>`"
+            .to_string(),
+    };
+    format!("{what}. {history}; {back}")
 }
 
 /// The files whose record could not be carried when this device applied
@@ -2105,6 +2191,69 @@ mod tests {
 
     fn kinds(look: &Look) -> Vec<&'static str> {
         look.notices.iter().map(|notice| notice.kind).collect()
+    }
+
+    /// What a carry set aside is said in two lines, each in its own words
+    /// (the review of the whole build, its H1, M4 and L1): rule 7's points
+    /// to `--from`, and rule 27's to no command; neither says that
+    /// `cordelia restore` puts one back; and where local history was off,
+    /// neither says that `cordelia history` lists what it never kept.
+    ///
+    /// Taken out: rule 27's count apart (its edits are said as a removed
+    /// device's: the second fails).
+    #[test]
+    fn what_a_carry_set_aside_is_said_by_its_rule() {
+        let s = Several::of_one_person(1);
+        let conn = &s[0].conn;
+        note_set_aside(conn, 2, s.now, false, true).unwrap();
+        note_set_aside(conn, 1, s.now, true, true).unwrap();
+        let look = seen(&s, 0);
+        assert_eq!((look.edits_set_aside, look.own_edits_set_aside), (2, 1));
+        let of = |words: &str| -> Vec<&String> {
+            look.says
+                .iter()
+                .filter(|said| said.contains(words))
+                .collect()
+        };
+        let removed = of("a removed device wrote them");
+        assert_eq!(removed.len(), 1, "{:?}", look.says);
+        assert!(removed[0].contains("`cordelia history` lists them"));
+        assert!(removed[0].contains("--from <its label>"));
+        let own = of("this device wrote it after it took a removed device's late writing");
+        assert_eq!(own.len(), 1, "{:?}", look.says);
+        assert!(own[0].contains("no command puts it back"));
+        assert!(!own[0].contains("--from"));
+        assert!(
+            look.says
+                .iter()
+                .all(|said| !said.contains("cordelia restore")),
+            "{:?}",
+            look.says
+        );
+
+        // With local history off, what was not kept is said so.
+        let conn = &s[0].conn;
+        note_set_aside(conn, 1, s.now, true, false).unwrap();
+        let look = seen(&s, 0);
+        assert_eq!(look.own_edits_set_aside, 2);
+        let own: Vec<&String> = look
+            .says
+            .iter()
+            .filter(|said| said.contains("this device wrote them"))
+            .collect();
+        assert!(
+            own[0].contains("`cordelia history` lists 1; 1 was not kept, as local history was off"),
+            "{own:?}"
+        );
+        note_set_aside(conn, 2, s.now, false, false).unwrap();
+        note_set_aside(conn, 0, s.now, false, true).unwrap();
+        let look = seen(&s, 0);
+        let removed: Vec<&String> = look
+            .says
+            .iter()
+            .filter(|said| said.contains("a removed device wrote them"))
+            .collect();
+        assert!(removed[0].contains("`cordelia history` lists 2; 2 were not kept"));
     }
 
     /// A device is named by the words of its key's fingerprint first, and

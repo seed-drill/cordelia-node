@@ -2920,7 +2920,7 @@ fn move_records(
     // or none, and the folder takes that version back, whatever its file
     // holds, with that kept in local history alone. The record is written
     // once the others have moved.
-    let mut put_back: Vec<(String, String, sync_state::Agreed)> = Vec::new();
+    let mut put_back: Vec<(String, String, sync_state::Agreed, bool)> = Vec::new();
     for (folder, file, rev) in sync_state::files_at(conn, &old)? {
         if let Some(cut) = cut.get(&slot_id(&slot_key, &file)) {
             let back = cut.target.as_ref().and_then(|version| {
@@ -2946,7 +2946,7 @@ fn move_records(
                 )?;
             }
             sync_state::forget_file(conn, &folder, &old, &file)?;
-            put_back.push((folder, file, agreed));
+            put_back.push((folder, file, agreed, cut.own));
             continue;
         }
         let held = entries::slot_entries(conn, &channel, &slot_id(&slot_key, &file))?;
@@ -2963,8 +2963,8 @@ fn move_records(
     dropped.dedup();
     // Each record left has a revision that the renumbering carries.
     sync_state::move_channel(conn, &old, &new, |rev| carry.renumbered(rev).unwrap_or(rev))?;
-    for (folder, file, agreed) in put_back {
-        sync_state::save_put_back(conn, &folder, &new, &file, &agreed)?;
+    for (folder, file, agreed, own) in put_back {
+        sync_state::save_put_back(conn, &folder, &new, &file, &agreed, own)?;
     }
     // A conflict copy that a folder made and has not yet published holds
     // no entry, and is in no record: it is judged by the arrivals it was
@@ -2975,18 +2975,25 @@ fn move_records(
     let to_channel = derive::channel_id(to)?;
     let to_slot_key = derive::slot_key(to)?;
     for copy in cordelia_storage::arrivals::copies_of_channel(conn, &channel)? {
-        match cut.contains_key(&copy.slot) {
-            true => {
+        match cut.get(&copy.slot) {
+            Some(copy_cut) => {
                 let none = sync_state::Agreed {
                     hash: None,
                     rev: 0,
                     signer: None,
                     chain: None,
                 };
-                sync_state::save_put_back(conn, &copy.folder, &new, &copy.key, &none)?;
+                sync_state::save_put_back(
+                    conn,
+                    &copy.folder,
+                    &new,
+                    &copy.key,
+                    &none,
+                    copy_cut.own,
+                )?;
                 cordelia_storage::arrivals::copy_done(conn, &channel, &copy.slot)?;
             }
-            false => cordelia_storage::arrivals::move_copy(
+            None => cordelia_storage::arrivals::move_copy(
                 conn,
                 &channel,
                 &copy.slot,

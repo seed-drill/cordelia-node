@@ -461,6 +461,85 @@ fn text_now(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Why the record `id`, which says `about`, is not put back, where a carry
+/// set its text aside (decision 2026-10-24 (removal), rules 7 and 27; the
+/// review of the whole build, its H1). `cordelia restore` is open to any
+/// local process, an agent included, through the local API, so it brings
+/// back none of:
+///
+/// - a version that a carry set aside: what a removed device wrote, or
+///   what was written over it (rule 7), or what this device wrote itself
+///   in its window (rule 27);
+/// - any version of the same file in the same folder kept before a set
+///   aside of it: what the file held from the removed device's first late
+///   writing to the carry is among them (an edit made here keeps the
+///   channel's version, which may be the removed device's), and history
+///   does not say from when;
+/// - any version that holds the very text of one set aside, under any
+///   name: a conflict copy keeps the text of its file.
+///
+/// That fails safe. **What the person gives up:** `cordelia restore` of
+/// every version of a file that was set aside kept before it was, for as
+/// long as history keeps them (`HISTORY_DAYS`); the file holds the version
+/// the carry went back to, and `cordelia history show` still prints each.
+/// What a removed device wrote comes back only by `cordelia sync carry
+/// --from`, at a terminal, with the recovery phrase; what this device wrote
+/// in its window comes back by no command. Where history cannot be read,
+/// nothing is put back.
+fn set_aside_refusal(store: &Store, id: &Id, about: &About) -> Option<String> {
+    let from = "What a removed device wrote comes back only at a terminal, with the recovery \
+                phrase: `cordelia sync carry <name> --from <its label>`";
+    match about.change {
+        Change::SetAside => {
+            return Some(format!(
+                "this version was set aside at a change: a removed device wrote it, or it was \
+                 written over what one wrote. `cordelia restore` does not put it back. {from}"
+            ));
+        }
+        Change::SetAsideOwn => {
+            return Some(
+                "this version was set aside at a change: this device wrote it after it took a \
+                 removed device's late writing, and before it knew of the removal. `cordelia \
+                 restore` does not put it back, and no command does"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    let listing = match store.list() {
+        Ok(listing) => listing,
+        Err(e) => {
+            return Some(format!(
+                "history cannot be read to say whether a change set this version aside ({e}): \
+                 nothing was put back"
+            ));
+        }
+    };
+    let sha = about.kept.as_ref().map(|kept| kept.sha256.as_str());
+    for record in listing
+        .records
+        .iter()
+        .filter(|r| r.about.change.is_set_aside())
+    {
+        let set = &record.about;
+        if set.folder == about.folder && set.file == about.file && record.id.as_str() > id.as_str()
+        {
+            return Some(format!(
+                "{} was set aside at a change after this version was kept, so it may hold what a \
+                 removed device wrote: `cordelia restore` does not put it back. {from}",
+                about.file
+            ));
+        }
+        if sha.is_some() && set.kept.as_ref().map(|kept| kept.sha256.as_str()) == sha {
+            return Some(format!(
+                "this version holds a text that was set aside at a change: `cordelia restore` \
+                 does not put it back. {from}"
+            ));
+        }
+    }
+    None
+}
+
 /// Put one kept text back. `Err` is the reason nothing was done.
 /// `flushed` is run once the text is flushed and before the last look at
 /// the file: nothing, except in a test.
@@ -480,6 +559,12 @@ fn restore_one(
         })?
         .ok_or_else(|| "no such record in history".to_string())?;
     let about = &record.about;
+    // What a carry set aside, and every version that may hold it, stays
+    // out: no local process, an agent included, brings it back unasked
+    // (the review of the whole build, its H1).
+    if let Some(why) = set_aside_refusal(store, &id, about) {
+        return Err(why);
+    }
     let text = text.ok_or_else(|| {
         format!(
             "this record keeps no text: {} was not here before the change",

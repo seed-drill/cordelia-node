@@ -112,6 +112,11 @@ pub struct FolderReport {
     /// it held is in local history alone.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub set_aside: usize,
+    /// Files whose text a carry left out in this cycle because this device
+    /// wrote it itself, after it took a removed device's late writing and
+    /// before it knew of the removal (rule 27): counted apart.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub set_aside_own: usize,
     /// Conflict files in the folder now, full paths: each holds a version of
     /// a memory that lost to a concurrent edit, until someone merges it
     /// and deletes the file.
@@ -1594,8 +1599,8 @@ fn sync_folder_with(
         let actions = match agreed.get(key) {
             // A file that a carry left out goes back, whatever it holds
             // (decision 2026-10-24 (removal), rule 7).
-            Some(record) if put_back.contains(key) => {
-                plan::put_back(local.get(key), remote.get(key), record)
+            Some(record) if let Some(own) = put_back.get(key) => {
+                plan::put_back(local.get(key), remote.get(key), record, *own)
             }
             _ => (hooks.plan)(
                 key,
@@ -2714,7 +2719,7 @@ fn apply(
             record(made.agreed(Some(Content::new(text).hash), me))?;
         }
         Action::Record(agreed) => record(agreed)?,
-        Action::PutBack { text, agreed } => {
+        Action::PutBack { text, agreed, own } => {
             // What the file holds was left out by a carry (decision
             // 2026-10-24 (removal), rule 7): it is kept in local history
             // alone, never beside the file, and the file takes the version
@@ -2723,7 +2728,16 @@ fn apply(
                 (Some(version), Some(_)) => history::Replacement::Entry(written_by(ctx, version)),
                 _ => history::Replacement::Nothing,
             };
-            let ahead = match keep_here(ctx, key, seen, history::Change::SetAside, replaced_by)? {
+            // What this device wrote itself in a window of rule 27 is kept
+            // apart from what a removed device wrote: what is said of it,
+            // and how it may come back, differ (the review of the whole
+            // build, its M4).
+            let change = match own {
+                true => history::Change::SetAsideOwn,
+                false => history::Change::SetAside,
+            };
+            let kept = ctx.state.history.store().is_some();
+            let ahead = match keep_here(ctx, key, seen, change, replaced_by)? {
                 KeptHere::Ahead(ahead) => ahead,
                 KeptHere::Changed => {
                     deferred();
@@ -2744,10 +2758,13 @@ fn apply(
                 },
             }
             settle(ctx, ahead);
-            if seen.is_some() {
-                report.set_aside += 1;
-                note_set_aside(state);
+            // Every put-back sets an edit aside: a delete of the file here
+            // that went back too (the review of the whole build, its L2).
+            match own {
+                true => report.set_aside_own += 1,
+                false => report.set_aside += 1,
             }
+            note_set_aside(state, own, kept);
             forget_kept(ctx, key);
             record(agreed)?;
         }
@@ -2792,11 +2809,13 @@ fn kept_after(agreed: Option<&Agreed>, text: &str, me: &[u8; 32]) -> Option<Vec<
 }
 
 /// Count an edit that a carry set aside (decision 2026-10-24 (removal),
-/// rule 7), for the status to say. A count that cannot be written is said
-/// in the log: the text is in local history either way.
-fn note_set_aside(state: &AppState) {
+/// rule 7, or rule 27 where `own`), for the status to say, with whether
+/// local history kept its text (`kept`). A count that cannot be written is
+/// said in the log: the text is in local history either way, where it is
+/// on.
+fn note_set_aside(state: &AppState, own: bool, kept: bool) {
     let noted = lock(state).and_then(|db| {
-        cordelia_api::look::note_set_aside(&db, 1, chrono::Utc::now().timestamp())
+        cordelia_api::look::note_set_aside(&db, 1, chrono::Utc::now().timestamp(), own, kept)
             .map_err(of_person)
     });
     if let Err(error) = noted {
@@ -3301,6 +3320,139 @@ mod tests {
                 "{inside:?}"
             );
         }
+    }
+
+    /// `cordelia restore` brings back nothing that a carry set aside (the
+    /// review of the whole build, its H1), in the review's sequence: the
+    /// desktop removes the tablet; the laptop took the tablet's late
+    /// `notes.md` before it knew; it applies the removal, and the file is
+    /// set aside to local history. A restore of the record set aside is
+    /// refused, and so is a restore of every version of that file kept
+    /// before it, which may hold the tablet's text (the edit made here kept
+    /// the channel's version, the tablet's). The folder keeps the version
+    /// gone back to, the next cycle publishes nothing, and the desktop is
+    /// never given the text. A file never set aside is still restored.
+    ///
+    /// Taken out: the refusal (the restore writes the tablet's text back,
+    /// and the next cycle publishes it: the first fails).
+    #[test]
+    fn a_restore_brings_back_nothing_a_carry_set_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let (channel, phrase) = person_of(&st, NAME);
+        let desktop = another_device(&st, &tmp.path().join("desktop"), NAME);
+        let tablet = another_device(&st, &tmp.path().join("tablet"), NAME);
+        deliver(&st, &desktop, NAME);
+        deliver(&st, &tablet, NAME);
+        let store = history::Store::new(&st.home_dir, 30, 1 << 24).unwrap();
+        st.history.open(Some(store.clone()));
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let cycle = |channel: &str| {
+            let generation = st.sync_control.generation();
+            sync_folder(&st, &mem, channel, NAME, "abcd", generation).unwrap()
+        };
+        std::fs::write(mem.join("notes.md"), "mine\n").unwrap();
+        std::fs::write(mem.join("other.md"), "one\n").unwrap();
+        assert_eq!(cycle(&channel).published, 2);
+        std::fs::write(mem.join("other.md"), "two\n").unwrap();
+        assert_eq!(cycle(&channel).published, 1);
+
+        // The tablet's late text, taken before the laptop knew, and a line
+        // its agent appended over it.
+        deliver(&st, &tablet, NAME);
+        write(&tablet, NAME, "notes.md", text("mine\nthe tablet's\n"));
+        deliver(&tablet, &st, NAME);
+        assert_eq!(cycle(&channel).pulled, 1);
+        std::fs::write(mem.join("notes.md"), "mine\nthe tablet's\nmy line\n").unwrap();
+        assert_eq!(cycle(&channel).published, 1);
+
+        let removal = removes_at(&desktop, &phrase, &tablet.identity.public_key(), now());
+        {
+            let db = st.db.lock().unwrap();
+            take::take(&db, &st.identity, &removal, now()).unwrap();
+        }
+        let channel = {
+            let db = st.db.lock().unwrap();
+            let id = held_rows::channel_of_name(&db, NAME).unwrap().unwrap();
+            encode_channel_id(&id).unwrap()
+        };
+        assert_eq!(cycle(&channel).set_aside, 1);
+        assert_eq!(
+            std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+            "mine\n"
+        );
+
+        // `cordelia history notes.md`, then `cordelia restore <id>` of each
+        // version kept of it: none is put back.
+        let listing = store.list().unwrap();
+        let of_notes: Vec<&history::Record> = listing
+            .records
+            .iter()
+            .filter(|record| record.about.file == "notes.md")
+            .collect();
+        assert!(
+            of_notes
+                .iter()
+                .any(|record| record.about.change == history::Change::SetAside)
+        );
+        assert!(of_notes.len() >= 2, "{of_notes:?}");
+        let restore = |id: &history::Id| {
+            let request = cordelia_api::history::RestoreRequest {
+                ids: vec![id.to_string()],
+            };
+            let answer =
+                cordelia_api::history::restore(&st, &request, std::time::Duration::from_secs(5))
+                    .unwrap();
+            answer.results.into_iter().next().unwrap()
+        };
+        for record in &of_notes {
+            let restored = restore(&record.id);
+            assert!(
+                !restored.done,
+                "a version of a file set aside was restored: {:?} {restored:?}",
+                record.about.change
+            );
+            assert_eq!(
+                std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+                "mine\n"
+            );
+        }
+        let set_aside = of_notes
+            .iter()
+            .find(|record| record.about.change == history::Change::SetAside)
+            .unwrap();
+        let said = restore(&set_aside.id).message;
+        assert!(
+            said.contains("set aside at a change: a removed device wrote it")
+                && said.contains("--from <its label>"),
+            "{said}"
+        );
+        // The next cycle publishes nothing, and the desktop is never given
+        // the text.
+        let again = cycle(&channel);
+        assert_eq!((again.published, again.set_aside), (0, 0), "{again:?}");
+        deliver(&st, &desktop, NAME);
+        let secret = name_secret(&desktop, NAME);
+        for entry in held(&desktop, NAME) {
+            let inside = entry.open(&secret).unwrap();
+            assert!(
+                !matches!(&inside.value, Value::Text(t) if t.contains("tablet")),
+                "{inside:?}"
+            );
+        }
+
+        // A file never set aside is restored as before.
+        let of_other = listing
+            .records
+            .iter()
+            .find(|record| record.about.file == "other.md")
+            .unwrap();
+        assert!(restore(&of_other.id).done);
+        assert_eq!(
+            std::fs::read_to_string(mem.join("other.md")).unwrap(),
+            "one\n"
+        );
     }
 
     /// `st` renews with `phrase`, removing nobody, and applies it: a carry

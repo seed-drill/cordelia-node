@@ -502,6 +502,7 @@ impl Carried {
             "above": self.tally.above,
             "deletes": self.tally.deletes,
             "cut": self.tally.cut,
+            "cut_own": self.tally.cut_own,
             "by_other_keys": self.by_other_keys,
             "read_all": self.read_all,
             "nothing": self.nothing,
@@ -1058,6 +1059,8 @@ pub async fn look_from(
         // Left out by the cut: another removed key wrote them, or what
         // they were written over.
         "cut": tally.cut,
+        // Left out because this device wrote them in its window (rule 27).
+        "cut_own": tally.cut_own,
         "has_folder": has_folder,
         "generations": read.iter().map(|g| g.says(0)).collect::<Vec<_>>(),
         "read_all": read.iter().all(Generation::read_all),

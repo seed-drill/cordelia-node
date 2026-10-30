@@ -211,6 +211,12 @@ pub enum Brought {
     /// cut leaves that key out where it was read ([`Rule::Counts`]).
     /// Nothing was written.
     Cut,
+    /// This device signed it, or its chain names this device, or may have
+    /// dropped links, in a generation where a carry set aside what this
+    /// device wrote itself (decision 2026-10-24 (removal), rule 27): it is
+    /// at the relays, and left out. No command brings it in. Nothing was
+    /// written.
+    CutOwn,
 }
 
 /// Judge one version for a carry, and bring it in where it may come
@@ -444,7 +450,7 @@ fn judged(
             read_in.as_ref(),
             version,
         )? {
-            return Ok(Some(Brought::Cut));
+            return Ok(Some(Brought::CutOwn));
         }
     }
     let slot = standing.slot(conn, secret, &version.name)?;
@@ -495,6 +501,10 @@ pub struct Tally {
     /// Left out by the cut: a removed key signed them, or wrote what they
     /// were written over ([`Brought::Cut`]).
     pub cut: usize,
+    /// Left out because this device wrote them in its window (rule 27;
+    /// [`Brought::CutOwn`]): counted apart, since no command brings them
+    /// in (the review of the whole build, its M4).
+    pub cut_own: usize,
 }
 
 impl Tally {
@@ -508,6 +518,7 @@ impl Tally {
             Brought::Above => self.above.push(file.to_string()),
             Brought::Delete => self.deletes += 1,
             Brought::Cut => self.cut += 1,
+            Brought::CutOwn => self.cut_own += 1,
         }
     }
 }
