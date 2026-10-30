@@ -1289,72 +1289,113 @@ fn bar_1(read: &Read) -> Line {
     )
 }
 
+/// Bar 2's figures over a set of edits.
+#[derive(Debug, Default)]
+struct Latencies {
+    /// Each edit's time to arrive, from when it is timed ([`timed_from`]),
+    /// where its device ran from then to its arrival.
+    of: Vec<f64>,
+    /// Those that did not arrive within 120 s of when they are timed while
+    /// their device ran.
+    late: usize,
+    /// Of those judged (in `of` or `late`), the ones written while their
+    /// writer was off, timed from its return.
+    from_return: usize,
+    /// Written while their writer was off, and their writer never ran
+    /// again: bar 2 does not judge them, bar 3 does.
+    not_judged: usize,
+}
+
+/// When bar 2 times an edit from (amended after stage 100): its writing,
+/// where its writer was running then; where its writer was off (stopped or
+/// frozen), as when the person goes on editing in a device's folder while
+/// its sync is off, the moment its writer runs again, since nothing could
+/// read the file and send it before that. `None` where the writer never
+/// ran again: bar 2 does not judge the edit, and bar 3 does. An edit
+/// written while its writer ran is timed from the write, whatever its
+/// writer did after, so that a slow relay or reader is never hidden.
+fn timed_from(read: &Read, p: &Pair) -> Option<f64> {
+    let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+    match read.lives.at(writer, p.edit.at) {
+        Is::Running => Some(p.edit.at),
+        _ => read.lives.ran_again_after(writer, p.edit.at, p.edit.at),
+    }
+}
+
 /// Bar 2's figures over `pairs`: p50, p95, the most, and those that did
-/// not arrive within 120 s while their device ran.
-fn latencies<'a>(read: &Read, pairs: impl Iterator<Item = &'a Pair>) -> (Vec<f64>, usize) {
-    let mut l = Vec::new();
-    let mut late = 0;
+/// not arrive within 120 s while their device ran, each timed from
+/// [`timed_from`].
+fn latencies<'a>(read: &Read, pairs: impl Iterator<Item = &'a Pair>) -> Latencies {
+    let mut out = Latencies::default();
     for p in pairs {
         if p.edit.at < read.start {
             continue;
         }
+        let Some(from) = timed_from(read, p) else {
+            out.not_judged += 1;
+            continue;
+        };
+        let returned = usize::from(from > p.edit.at);
         // A device removed later was still owed what it ran 120 s through
         // before its removal's line.
         if p.gone {
             let owed = p.arrived.is_none()
                 && !p.replaced
-                && p.gone_at.is_some_and(|line| p.edit.at + 120.0 <= line)
-                && read.lives.ran_through(p.node, p.edit.at, p.edit.at + 120.0);
-            late += usize::from(owed);
+                && p.gone_at.is_some_and(|line| from + 120.0 <= line)
+                && read.lives.ran_through(p.node, from, from + 120.0);
+            out.late += usize::from(owed);
+            out.from_return += returned * usize::from(owed);
             continue;
         }
-        match Edits::latency(p) {
-            Some(latency)
-                if read
-                    .lives
-                    .ran_through(p.node, p.edit.at, p.edit.at + latency) =>
-            {
-                l.push(latency);
+        match p.arrived.map(|a| a.at - from) {
+            Some(latency) if read.lives.ran_through(p.node, from, from + latency) => {
+                out.of.push(latency);
+                out.from_return += returned;
             }
             Some(_) => {}
-            None if !p.replaced && read.lives.ran_through(p.node, p.edit.at, p.edit.at + 120.0) => {
-                late += 1;
+            None if !p.replaced && read.lives.ran_through(p.node, from, from + 120.0) => {
+                out.late += 1;
+                out.from_return += returned;
             }
             None => {}
         }
     }
-    (l, late)
+    out
 }
 
 /// When an edit's way to a device ends: its arrival there, or 120 s after
-/// it was written where it did not arrive.
-fn journey_end(p: &Pair) -> f64 {
-    p.arrived.map_or(p.edit.at + 120.0, |a| a.at)
+/// it is timed from ([`timed_from`]) where it did not arrive.
+fn journey_end(read: &Read, p: &Pair) -> f64 {
+    p.arrived.map_or_else(
+        || timed_from(read, p).unwrap_or(p.edit.at) + 120.0,
+        |a| a.at,
+    )
 }
 
 fn bar_2(read: &Read, edits: &Edits) -> Line {
     let people = &read.run.plan.population.people;
     // An edit whose way from its writing to its arrival (or to 120 s, where
     // it did not arrive) crosses a part treated apart is treated apart.
-    let outside = |p: &&Pair| !read.is_apart(p.edit.at, journey_end(p));
-    let (both, late_both) = latencies(
+    let outside = |p: &&Pair| !read.is_apart(p.edit.at, journey_end(read, p));
+    let b = latencies(
         read,
         edits
             .of_person(read, false)
             .filter(|p| !people[p.edit.person].split)
             .filter(outside),
     );
-    let (split, late_split) = latencies(
+    let s = latencies(
         read,
         edits
             .of_person(read, false)
             .filter(|p| people[p.edit.person].split)
             .filter(outside),
     );
-    let p50 = quantile(&both, 0.5).unwrap_or(0.0);
-    let p95 = quantile(&both, 0.95).unwrap_or(0.0);
+    let (both, late_both, split, late_split) = (&b.of, b.late, &s.of, s.late);
+    let p50 = quantile(both, 0.5).unwrap_or(0.0);
+    let p95 = quantile(both, 0.95).unwrap_or(0.0);
     let most = both.iter().copied().fold(0.0, f64::max);
-    let sp95 = quantile(&split, 0.95).unwrap_or(0.0);
+    let sp95 = quantile(split, 0.95).unwrap_or(0.0);
     let smost = split.iter().copied().fold(0.0, f64::max);
     let holds = !both.is_empty()
         && p50 <= 12.0
@@ -1368,10 +1409,16 @@ fn bar_2(read: &Read, edits: &Edits) -> Line {
         "Sync latency",
         format!(
             "set up with both relays: {} arrivals, p50 {p50:.1} s, p95 {p95:.1} s, the most \
-             {most:.1} s, {late_both} not arrived within 120 s; split between the relays: {} \
-             arrivals, p95 {sp95:.1} s, the most {smost:.1} s, {late_split} not arrived within 120 s",
+             {most:.1} s, {late_both} not arrived within 120 s, {} timed from their writer's \
+             return, {} left to bar 3; split between the relays: {} arrivals, p95 {sp95:.1} s, \
+             the most {smost:.1} s, {late_split} not arrived within 120 s, {} timed from their \
+             writer's return, {} left to bar 3",
             both.len(),
-            split.len()
+            b.from_return,
+            b.not_judged,
+            split.len(),
+            s.from_return,
+            s.not_judged,
         ),
         "p50 at most 12 s, p95 at most 25 s, every edit within 120 s; split: p95 at most 40 s, \
          every edit within 120 s",
@@ -2765,11 +2812,14 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
             }
         ));
     }
-    let (office, late) = latencies(read, edits.of_person(read, true));
+    let office = latencies(read, edits.of_person(read, true));
     said.push(format!(
-        "the office's people: {} arrivals, {}, {late} not arrived within 120 s",
-        office.len(),
-        mm(&office, "s")
+        "the office's people: {} arrivals, {}, {} not arrived within 120 s, {} timed from \
+         their writer's return",
+        office.of.len(),
+        mm(&office.of, "s"),
+        office.late,
+        office.from_return
     ));
     line(
         "The office is as expected",
@@ -2855,8 +2905,12 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
     let people = &read.run.plan.population.people;
     // Held up by the outage: its way from its writing to its arrival
     // crosses the outage.
-    let during = |p: &&Pair| p.edit.at <= started && journey_end(p) >= stopped;
-    let (both, late_both) = latencies(
+    let during = |p: &&Pair| p.edit.at <= started && journey_end(read, p) >= stopped;
+    let Latencies {
+        of: both,
+        late: late_both,
+        ..
+    } = latencies(
         read,
         edits
             .of_person(read, false)
@@ -3501,7 +3555,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
             .iter()
             .filter(|p| nodes.contains(&p.node))
             .collect();
-        let (l, late) = latencies(read, of.iter().copied());
+        let Latencies { of: l, late, .. } = latencies(read, of.iter().copied());
         let _ = writeln!(
             s,
             "- sync latency: {} arrivals, p50 {}, p95 {}, the most {}; {late} not within 120 s",
@@ -3751,7 +3805,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
             &all,
         ) / minutes;
         let people = &read.run.plan.population.people;
-        let (split, _) = latencies(
+        let Latencies { of: split, .. } = latencies(
             read,
             edits
                 .of_person(read, false)

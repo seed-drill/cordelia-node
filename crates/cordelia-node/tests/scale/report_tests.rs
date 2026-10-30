@@ -779,7 +779,8 @@ fn an_edit_a_running_device_missed_for_two_minutes_is_late_though_replaced_later
     n_then_m(&run, 200.0, 1200.0);
     let read = read_of(&run);
     let edits = edits_of(&read);
-    let (_, late) = latencies(&read, edits.pairs.iter().filter(|p| p.edit.number == 10));
+    let Latencies { late, .. } =
+        latencies(&read, edits.pairs.iter().filter(|p| p.edit.number == 10));
     assert_eq!(late, 1);
     // Where the device ran no minute between the two, `m` replaced `n` by
     // intent there, and nothing is late.
@@ -799,7 +800,8 @@ fn an_edit_a_running_device_missed_for_two_minutes_is_late_though_replaced_later
             .unwrap()
             .replaced
     );
-    let (_, late) = latencies(&read, edits.pairs.iter().filter(|p| p.edit.number == 10));
+    let Latencies { late, .. } =
+        latencies(&read, edits.pairs.iter().filter(|p| p.edit.number == 10));
     assert_eq!(late, 0);
 }
 
@@ -849,7 +851,7 @@ fn a_device_removed_while_off_still_owed_what_it_ran_through() {
     let edits = edits_of(&read);
     let bar = bar_3(&read, &edits);
     assert_eq!(bar.verdict, Verdict::Fail, "{}", bar.figure);
-    let (_, late) = latencies(&read, edits.pairs.iter());
+    let Latencies { late, .. } = latencies(&read, edits.pairs.iter());
     assert_eq!(late, 1);
     // Back less than a minute before the line: the time down before counts.
     let back = [(0.0, true), (500.0, false), (2060.0, true)];
