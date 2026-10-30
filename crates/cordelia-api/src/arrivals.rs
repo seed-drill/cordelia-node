@@ -384,6 +384,35 @@ pub(crate) fn windows(
             }
         }
     }
+    // A message of a removed key's that the device held where it is cut
+    // opens the window too (the review of rule 27, its messages): an agent
+    // reads it, and may write it down. Its generation is known by its
+    // statement's number alone, and is judged as each noted change of that
+    // number, and as one made apart where none is noted (fails safe).
+    for key in cuts.keys() {
+        let held = cordelia_storage::messages::held_of(conn, &key.key).map_err(|e| {
+            PersonError::Storage(cordelia_core::CordeliaError::Storage(e.to_string()))
+        })?;
+        for (number, at) in held.held {
+            if cuts.cuts_numbered(key, number, at) {
+                windows.open_from(key.key, at);
+            }
+        }
+        // Where a message of the key's went past the ring, its time is not
+        // kept: it was held after the generation was first held, and is
+        // judged as held at the latest. Where that is cut, the window opens
+        // at the earliest it could have been cut.
+        for (number, first_held) in held.went {
+            if !cuts.cuts_numbered(key, number, i64::MAX) {
+                continue;
+            }
+            let opens = match cuts.cuts_numbered(key, number, first_held) {
+                true => first_held,
+                false => key.at.unwrap_or(first_held).max(first_held),
+            };
+            windows.open_from(key.key, opens);
+        }
+    }
     Ok(windows)
 }
 
