@@ -1473,7 +1473,7 @@ fn edit_times(
 fn median(mut times: Vec<std::time::Duration>) -> std::time::Duration {
     times.sort();
     let middle = times.len() / 2;
-    if times.len() % 2 == 0 {
+    if times.len().is_multiple_of(2) {
         (times[middle - 1] + times[middle]) / 2
     } else {
         times[middle]
