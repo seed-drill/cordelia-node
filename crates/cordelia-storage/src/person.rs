@@ -859,7 +859,11 @@ pub fn clear_additions(conn: &Connection) -> Result<usize, CordeliaError> {
 // ── What it knows of removals ────────────────────────────────────────
 
 /// Keep `keys` as removed (decision 2026-10-24 (removal), rule 2): each
-/// that the device does not keep already, with `now`, its own clock. A key
+/// that the device does not keep already, with `now`, its own clock, or
+/// the newest time an event of a file was stamped where that is later
+/// ([`crate::arrivals::newest_stamp`]): the close of a window of rule 27,
+/// which a clock once ahead cannot then put before what was stored in it
+/// (the review of rule 27, its clock). A key
 /// is never taken out here. Where keeping them would pass
 /// `MAX_KNOWN_REMOVED`, those beyond it are not kept and the device is
 /// marked past the bound (`meta::PERSON_REMOVED_PAST_BOUND`): it is then
@@ -871,6 +875,7 @@ pub fn keep_removed(
     now: i64,
 ) -> Result<usize, CordeliaError> {
     let mut kept = 0;
+    let now = crate::arrivals::newest_stamp(conn)?.map_or(now, |newest| now.max(newest));
     for key in keys {
         let held: bool = conn
             .query_row(
@@ -957,6 +962,18 @@ pub fn removed_with_adders(conn: &Connection) -> Result<Vec<RemovedBy>, Cordelia
             "SELECT k.key, b.added_by FROM person_removed_keys k
              LEFT JOIN person_removed_keys_by b ON b.key = k.key ORDER BY k.key ASC",
         )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// Every key the device keeps as removed, with when it first kept it: the
+/// moment it knew (decision 2026-10-24 (removal), rules 2, 5 and 27).
+pub fn removed_seen(conn: &Connection) -> Result<Vec<([u8; 32], i64)>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT key, seen_at FROM person_removed_keys ORDER BY key ASC")
         .map_err(storage)?;
     let rows = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))

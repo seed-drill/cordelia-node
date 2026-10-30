@@ -95,6 +95,48 @@ pub fn generation(
     )?)
 }
 
+/// What this device held of the messages that `signer` signed, for the
+/// windows of rule 27 (decision 2026-10-24 (removal)): each message's
+/// generation, by its statement's number, and when the device first held
+/// it (`held`); and each generation where a number of the signer's that
+/// the device held went past the ring before now, with when the device
+/// first held that generation (`went`). What went was held at or after
+/// that time, and its own time is not kept.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldOf {
+    pub held: Vec<(u64, i64)>,
+    pub went: Vec<(u64, i64)>,
+}
+
+/// [`HeldOf`] for `signer`.
+pub fn held_of(conn: &Connection, signer: &[u8; 32]) -> Result<HeldOf, StorageError> {
+    let pairs = |sql: &str| -> Result<Vec<(u64, i64)>, StorageError> {
+        Ok(conn
+            .prepare(sql)?
+            .query_map([&signer[..]], |row| {
+                Ok((row.get::<_, i64>(0)?.max(0) as u64, row.get(1)?))
+            })?
+            .collect::<Result<_, _>>()?)
+    };
+    Ok(HeldOf {
+        held: pairs(
+            "SELECT g.statement, f.first_held FROM message_first_held f
+             JOIN message_generations g ON g.id = f.generation
+             WHERE f.signer = ?1 AND f.id IS NOT NULL
+             ORDER BY f.first_held",
+        )?,
+        went: pairs(
+            "SELECT g.statement, g.first_held FROM message_signers s
+             JOIN message_generations g ON g.id = s.generation
+             WHERE s.signer = ?1 AND s.counted_from IS NOT NULL
+               AND s.counted_from < COALESCE(
+                   (SELECT MIN(f.number) FROM message_first_held f
+                    WHERE f.signer = s.signer AND f.generation = s.generation),
+                   s.highest + 1)",
+        )?,
+    })
+}
+
 /// The generation of the messages channel whose ID is `channel`, where
 /// the device has held it.
 pub fn generation_of(conn: &Connection, channel: &[u8; 32]) -> Result<Option<i64>, StorageError> {
