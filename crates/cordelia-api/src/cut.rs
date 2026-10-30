@@ -324,7 +324,9 @@ impl Cuts {
 ///   (`cordelia_crypto::chain::merged`). A text written back makes such a
 ///   hash stand twice, and a removed key's link behind it goes from a
 ///   chain far from full (the fourth read's round, its look for other
-///   paths). A device cannot tell a merge from an edit by its chain.
+///   paths). Only the door tells a merge from an edit, by the versions the
+///   file holds (`arrivals::written_over_held`); every other reader takes
+///   each chain of the index as one that may have dropped links.
 pub fn may_have_dropped_links(name: Option<&str>, chain: Option<&[EntryLink]>) -> bool {
     match chain {
         None => true,
