@@ -2274,9 +2274,9 @@ fn a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look() {
             let said = new.post("/api/v1/carry/sessions", json!({}));
             let sessions = said["sessions"].as_array()?;
             let reached = |at: &Value| at["relay"] == named && at["session"].is_string();
-            let connected = relays_of(&new)
-                .iter()
-                .all(|relay| relay["state"] == "connected");
+            let relays = relays_of(&new);
+            let connected =
+                !relays.is_empty() && relays.iter().all(|relay| relay["state"] == "connected");
             (connected && sessions.iter().any(reached)).then_some(())
         },
     );

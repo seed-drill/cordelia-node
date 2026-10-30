@@ -69,7 +69,7 @@ pub fn is_copy_of(name: &str, file: &str) -> bool {
 }
 
 /// An edit the harness wrote.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Written {
     pub number: u64,
     pub person: usize,
@@ -88,7 +88,7 @@ pub struct Written {
 }
 
 /// Where an edit arrived on a device, and when.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Arrival {
     pub at: f64,
     /// Found in a copy kept beside the file, and not in the file.
@@ -153,6 +153,12 @@ impl Observer {
 
     pub fn pending(&self) -> usize {
         self.pending.len()
+    }
+
+    /// Each (edit, device) still waited for, in the order the waits
+    /// began.
+    pub fn still_waited(&self) -> Vec<(u64, usize)> {
+        self.pending.iter().map(|w| (w.edit, w.device)).collect()
     }
 
     /// Device `device` of `person` is removed: what was written from

@@ -253,6 +253,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR` | 256 | parameter-rationale.md §12.7 |
 | `ENTRY_CHANNEL_UNUSED_DAYS`, `ENTRY_CHANNEL_USED_STEP_SECS`, `ENTRY_CHANNEL_SWEEP_INTERVAL_SECS` | 90, 3600s, 3600s (derived) | parameter-rationale.md §12.7 |
 | `RELAY_USES_WRITE_INTERVAL_SECS` | 60s (a relay writes the uses of channels it keeps in memory: a proof and a show are reads; also at the sweep and a clean stop) | parameter-rationale.md §12.7 |
+| `RELAY_CHECKPOINT_INTERVAL_SECS`, `RELAY_CHECKPOINT_LOG_PAGES`, `RELAY_LOG_KEPT_BYTES` | 1s (a relay's connection has SQLite's automatic checkpoint off; a tick of this timer, as kind Checkpoint, checkpoints passively once the log holds the pages, and a clean stop truncates), 1000 (SQLite's own threshold, so that a push pays for no more syncs than it did), 64 MiB (a longer log's file is cut to this when the log starts again; above a second's log at the most a relay takes in) | parameter-rationale.md §12.7 |
 | `ENTRY_OFFER_INTERVAL_SECS`, `RELAY_ENTRY_PULL_INTERVAL_SECS` | 5s, 10s (derived) | parameter-rationale.md §12.7 |
 | `RELAY_ENTRY_PULL_PAGES`, `RELAY_CHANNEL_PAGES_PER_PASS` | 10, 10 | parameter-rationale.md §12.7 |
 | `ENTRY_REQUESTS_PER_PEER_PER_MINUTE`, `OWN_ENTRY_REQUESTS_PER_MINUTE` | 3000, 2250 (derived) | parameter-rationale.md §12.8 |
@@ -339,7 +340,7 @@ The constants of the counters of the scale test (decision 2026-10-22 §1,
 | Parameter | Value | Spec Section |
 |-----------|-------|-------------|
 | `LOAD_HISTOGRAM_BUCKETS` | 25 (powers of two of µs from 1 µs to 16 s, and one more) | parameter-rationale.md §14 |
-| `LOCK_COUNTED_OVER_MS` | 5, 50, 100, 250 (waits and holds counted apart, for bars 4 and 5) | parameter-rationale.md §14 |
+| `LOCK_COUNTED_OVER_MS` | 5, 10, 50, 100, 250 (waits and holds counted apart, for bars 4 and 5; 10 ms settles bar 4 (a): a kind's wait p99 is at most 10 ms where at most 1% of its waits are over 10 ms) | parameter-rationale.md §14 |
 | `LOAD_RELAYS_COUNTED` | 16 (derived: the relays counted apart by key) | parameter-rationale.md §14 |
 | `LOCK_HOLD_MEDIAN_NANOS`, `LOCK_TIMING_COST_MAX_NANOS` | 12,000, 120 (derived: what timing a take may cost) | parameter-rationale.md §14 |
 

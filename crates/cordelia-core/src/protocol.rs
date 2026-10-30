@@ -1827,6 +1827,43 @@ pub const ENTRY_CHANNEL_SWEEP_INTERVAL_SECS: u64 = TOMBSTONE_GC_INTERVAL_SECS;
 /// most this much of its uses, against ENTRY_CHANNEL_UNUSED_DAYS.
 pub const RELAY_USES_WRITE_INTERVAL_SECS: u64 = 60;
 
+/// How often a relay looks at its store's write-ahead log, in a take of
+/// its lock of its own, of kind Checkpoint (issue #224): every second,
+/// from when it starts. Where the relay has written
+/// RELAY_CHECKPOINT_LOG_PAGES to the log since its last whole checkpoint,
+/// it checkpoints then; otherwise it lets go at once. At a clean stop the
+/// log is written back and truncated. A relay's connection has SQLite's
+/// automatic checkpoint off, which would otherwise run inside whichever
+/// commit crossed those pages, and hold that push for two syncs more. The
+/// checkpoint is passive: it waits for no reader. Chosen from a
+/// measurement (parameter-rationale.md §12.7): a second keeps the log
+/// short between two checkpoints at the most a relay can take in, and a
+/// look that finds the log short costs a take of the lock and some µs.
+pub const RELAY_CHECKPOINT_INTERVAL_SECS: u64 = 1;
+
+/// The pages a relay writes to its store's log before its timer
+/// checkpoints it (issue #224): SQLite's own threshold for its automatic
+/// checkpoint, kept, so that at the scale test's rates (a write every few
+/// seconds) a relay checkpoints as often as SQLite did, and a push pays
+/// for no more syncs than it did; only the checkpoint's own two are moved
+/// out of the push, into a take of their own. A checkpoint each second
+/// whatever was written would cost about four syncs a push at those rates
+/// (parameter-rationale.md §12.7).
+pub const RELAY_CHECKPOINT_LOG_PAGES: u64 = 1000;
+
+/// The bytes of its write-ahead log's file that a relay's store keeps once
+/// a checkpoint has written the log back whole, and the next commit starts
+/// it again (issue #224; SQLite's `journal_size_limit`): a longer file is
+/// cut to this. Chosen above the longest log a second can make: at a
+/// thousand pushes a second, more than a relay's limits let it take for
+/// long, the log reached 27 MiB between two checkpoints; 64 MiB is that
+/// with room, rounded up to a power of two. Below it the log is written
+/// over in place; a file cut below a second's log must grow again under
+/// the next second's commits, which cost every push (parameter-rationale.md
+/// §12.7). Above it, as after a reader held the log for long, the file is
+/// cut back.
+pub const RELAY_LOG_KEPT_BYTES: i64 = 64 * 1024 * 1024;
+
 /// How often a device sweeps from its own store the deletes that it has
 /// held for KEYED_TOMBSTONE_RETENTION_DAYS: once a day (decision
 /// 2026-10-04 §16). A channel that a sweep took a delete of is read
@@ -2636,10 +2673,12 @@ const _: () = assert!(2 * AGENT_MESSAGE_NUMBER_MAX + 1 < REV_BAND_HALF);
 pub const LOAD_HISTOGRAM_BUCKETS: usize = 25;
 
 /// The lengths, in milliseconds, past which a wait or a hold of the lock
-/// is counted apart (decision 2026-10-22 §1.2): 5 and 50 ms, the counts
-/// of §1.2 and bar 4 (c); 100 ms, a device's waits of bar 5; and 250 ms,
-/// which bar 4 (c) holds every write under.
-pub const LOCK_COUNTED_OVER_MS: [u64; 4] = [5, 50, 100, 250];
+/// is counted apart (decision 2026-10-22 §1.2, §7.3): 5 and 50 ms, the
+/// counts of §1.2 and bar 4 (c); 10 ms, bar 4 (a)'s wait at p99, which a
+/// kind meets where at most 1% of its waits are over 10 ms; 100 ms, a
+/// device's waits of bar 5; and 250 ms, which bar 4 (c) holds every write
+/// under.
+pub const LOCK_COUNTED_OVER_MS: [u64; 5] = [5, 10, 50, 100, 250];
 
 /// The relays that a node counts apart, each by its key (decision
 /// 2026-10-22 §1.2): a device's requests to each relay, and the closures
@@ -2661,6 +2700,28 @@ pub const LOCK_TIMING_COST_MAX_NANOS: u64 = LOCK_HOLD_MEDIAN_NANOS / 100;
 // is over 16 s, and 2^23 µs is not.
 const _: () = assert!(1u64 << (LOAD_HISTOGRAM_BUCKETS - 1) >= 16_000_000);
 const _: () = assert!(1u64 << (LOAD_HISTOGRAM_BUCKETS - 2) < 16_000_000);
+
+// The lengths counted apart rise, and each is within the histogram's last
+// bound (decision 2026-10-22 §1.2).
+const _: () = {
+    let mut i = 0;
+    while i < LOCK_COUNTED_OVER_MS.len() {
+        assert!(LOCK_COUNTED_OVER_MS[i] * 1000 < 1u64 << (LOAD_HISTOGRAM_BUCKETS - 1));
+        assert!(i == 0 || LOCK_COUNTED_OVER_MS[i - 1] < LOCK_COUNTED_OVER_MS[i]);
+        i += 1;
+    }
+};
+// Bar 4 (a)'s 10 ms is counted: it falls inside the bucket of 8,193 to
+// 16,384 µs, which the histogram cannot read against it (decision
+// 2026-10-22 §3, bar 4).
+const _: () = {
+    let mut i = 0;
+    while LOCK_COUNTED_OVER_MS[i] != 10 {
+        i += 1;
+    }
+    assert!(LOCK_COUNTED_OVER_MS[i] * 1000 > 1 << 13);
+    assert!(LOCK_COUNTED_OVER_MS[i] * 1000 < 1 << 14);
+};
 
 /// Every label above, for the tests that set one against another.
 pub const LABELS: [&[u8]; 29] = [
@@ -4175,12 +4236,12 @@ mod tests {
 
     /// The counters of the scale test (decision 2026-10-22 §1.1, §1.2):
     /// histograms from 1 µs to 16 s by powers of two; the waits and holds
-    /// counted past 5, 50, 100 and 250 ms; the relays counted apart; and
+    /// counted past 5, 10, 50, 100 and 250 ms; the relays counted apart; and
     /// the bar on what timing a take costs, 1% of the median hold.
     #[test]
     fn test_the_counters_of_the_scale_test_decision_2026_10_22_1_2() {
         assert_eq!(LOAD_HISTOGRAM_BUCKETS, 25);
-        assert_eq!(LOCK_COUNTED_OVER_MS, [5, 50, 100, 250]);
+        assert_eq!(LOCK_COUNTED_OVER_MS, [5, 10, 50, 100, 250]);
         assert_eq!(LOAD_RELAYS_COUNTED, 16);
         assert_eq!(LOCK_HOLD_MEDIAN_NANOS, 12_000);
         assert_eq!(LOCK_TIMING_COST_MAX_NANOS, 120);
@@ -4190,6 +4251,10 @@ mod tests {
             assert!(ms * 1000 < 1 << (LOAD_HISTOGRAM_BUCKETS - 1));
         }
         assert!(LOCK_COUNTED_OVER_MS.windows(2).all(|w| w[0] < w[1]));
+        // Bar 4 (a)'s 10 ms is counted, and lies inside a bucket (from
+        // 8,193 to 16,384 µs) that cannot be read against it.
+        assert!(LOCK_COUNTED_OVER_MS.contains(&10));
+        assert!(!(10_000u64).is_power_of_two());
         // A device's relays by default, and those a word names, are
         // counted apart.
         const { assert!(REACHED_WORD_MAX_RELAYS < LOAD_RELAYS_COUNTED) };

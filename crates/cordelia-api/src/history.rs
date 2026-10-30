@@ -379,7 +379,7 @@ pub fn show(state: &AppState, request: &ShowRequest) -> Result<ShowResponse, Api
 const TURN_WAIT: Duration = Duration::from_secs(HISTORY_TURN_WAIT_SECS);
 
 /// The turn, or the answer that the node is busy.
-fn turn(state: &AppState, wait: Duration) -> Result<std::sync::MutexGuard<'_, ()>, ApiError> {
+fn turn(state: &AppState, wait: Duration) -> Result<crate::state::Turn<'_>, ApiError> {
     state.history.turn_within(wait).ok_or_else(|| {
         ApiError::Conflict(
             "the node is busy syncing and did not come free. Nothing was done; try again".into(),
@@ -1649,6 +1649,51 @@ mod tests {
         let dropped = drop_with(&n.state, &request, NO_WAIT, &removing).unwrap();
         assert_eq!((dropped.removed, dropped.left), (0, 1));
         assert!(dropped.dropped.is_empty());
+    }
+
+    /// **A restore and a drop get their turn while cycles run back to
+    /// back**, as they do while passes keep storing entries of names and
+    /// each wakes the next cycle: a cycle takes the turn again at once
+    /// after it lets it go, and a command that waits goes before it. (A
+    /// command that tried the turn now and then would find it free
+    /// almost never, and say after its wait that the node is busy.)
+    #[test]
+    fn test_a_restore_and_a_drop_get_their_turn_while_cycles_run_back_to_back() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        let n = node();
+        n.write("notes.md", "now\n");
+        let before = n.kept("notes.md", Change::Pulled, Some("before\n"), 0);
+        let request = RestoreRequest { ids: vec![before] };
+        let dropping = DropRequest {
+            all: true,
+            ..Default::default()
+        };
+        let wait = Duration::from_secs(2);
+        let (stop, cycles) = (AtomicBool::new(false), AtomicU64::new(0));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _cycle = n.state.history.turn();
+                    std::thread::sleep(Duration::from_millis(5));
+                    cycles.fetch_add(1, Ordering::Relaxed);
+                }
+            });
+            while cycles.load(Ordering::Relaxed) < 3 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let restored = restore(&n.state, &request, wait);
+            let dropped = drop_records(&n.state, &dropping, wait);
+            // The cycles go on after each.
+            let seen = cycles.load(Ordering::Relaxed);
+            while cycles.load(Ordering::Relaxed) < seen + 3 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert!(restored.unwrap().results[0].done);
+            assert!(dropped.unwrap().removed > 0);
+        });
+        assert_eq!(n.read("notes.md").as_deref(), Some("before\n"));
+        assert!(n.ids().is_empty());
     }
 
     /// A drop holds the turn at the moment it comes to remove, whichever

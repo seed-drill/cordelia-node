@@ -4468,9 +4468,7 @@ async fn one_relay_under_two_names_is_counted_and_paced_once() {
     let counted = wait_for("the relay holds the latest change", &all, 60, || {
         let seen = person_of(&laptop);
         let relays = seen["relays"].as_array()?.clone();
-        relays
-            .iter()
-            .all(|relay| relay["holds_latest"] == true)
+        (!relays.is_empty() && relays.iter().all(|relay| relay["holds_latest"] == true))
             .then_some(relays)
     });
     let names: Vec<&str> = counted.iter().filter_map(|r| r["relay"].as_str()).collect();

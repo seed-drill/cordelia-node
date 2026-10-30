@@ -101,6 +101,15 @@ impl Histogram {
     }
 }
 
+impl HistogramRead {
+    /// How many were longer than `ms` milliseconds, where `ms` is one of
+    /// LOCK_COUNTED_OVER_MS.
+    pub fn over_ms(&self, ms: u64) -> Option<u64> {
+        let i = LOCK_COUNTED_OVER_MS.iter().position(|m| *m == ms)?;
+        Some(self.over[i])
+    }
+}
+
 // ── The kinds ────────────────────────────────────────────────────────
 
 /// A kind of take of the node's lock, by the request or task it is in
@@ -1115,7 +1124,7 @@ mod tests {
     }
 
     /// A histogram counts each length in its bucket, sums them, keeps the
-    /// longest, and counts those over 5, 50, 100 and 250 ms.
+    /// longest, and counts those over 5, 10, 50, 100 and 250 ms.
     #[test]
     fn a_histogram_counts_sums_and_keeps_the_longest_and_those_over_each_length() {
         let h = Histogram::default();
@@ -1136,7 +1145,27 @@ mod tests {
         assert_eq!(read.sum_nanos, 12_500 + 371_000_000);
         assert_eq!(read.max_micros, 300_000);
         // 5 ms is not over 5 ms.
-        assert_eq!(read.over, [3, 2, 1, 1]);
+        assert_eq!(read.over, [3, 2, 2, 1, 1]);
+        assert_eq!(read.over_ms(10), Some(2), "60 and 300 ms");
+        assert_eq!(read.over_ms(7), None, "7 ms is not counted apart");
+    }
+
+    /// A length is counted over 10 ms only where it is longer than
+    /// 10,000 µs (decision 2026-10-22 §3, bar 4 (a)): 9,999 and 10,000 µs
+    /// are not, 10,001 µs is; all three are in the bucket of 8,193 to
+    /// 16,384 µs, which cannot tell them apart.
+    #[test]
+    fn a_length_is_counted_over_10_ms_only_where_it_is_longer() {
+        let h = Histogram::default();
+        h.record(Duration::from_micros(9_999));
+        h.record(Duration::from_micros(10_000));
+        h.record(Duration::from_nanos(10_000_999));
+        h.record(Duration::from_micros(10_001));
+        let read = h.read();
+        assert_eq!(read.buckets[14], 4);
+        assert_eq!(read.over_ms(5), Some(4));
+        assert_eq!(read.over_ms(10), Some(1));
+        assert_eq!(read.over_ms(50), Some(0));
     }
 
     /// The route's text says each histogram's buckets summed, with their
@@ -1157,6 +1186,10 @@ mod tests {
         assert_eq!(said["h_count{kind=\"pull\"}"], "2");
         assert_eq!(said["h_max{kind=\"pull\"}"], "20000000");
         assert_eq!(said["h_over{kind=\"pull\",ms=\"250\"}"], "1");
+        for ms in LOCK_COUNTED_OVER_MS {
+            assert_eq!(said[&format!("h_over{{kind=\"pull\",ms=\"{ms}\"}}")], "1");
+        }
+        assert_eq!(said["h_over{kind=\"pull\",ms=\"10\"}"], "1");
     }
 
     /// Each count of a relay's streams moves for what it counts and for

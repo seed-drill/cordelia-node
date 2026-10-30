@@ -861,7 +861,10 @@ fn open_database(
 /// (the second of what is returned); a node of any other role does not
 /// start without its database, and says why. The connection is set as a
 /// node of the role that `config` gives keeps it, before the schema's
-/// steps run ([`keeps_secure_delete`]).
+/// steps run ([`keeps_secure_delete`]); a relay's has the automatic
+/// checkpoint off, for it checkpoints on a timer of its own in a take of
+/// its lock of kind Checkpoint (issue #224; [`relay_entries::kept_by`],
+/// the same test that gives the node the relay's part that runs it).
 fn open_the_nodes_database(
     db_path: &std::path::Path,
     config: &Config,
@@ -869,7 +872,18 @@ fn open_the_nodes_database(
     let role = config.network.role.as_str();
     let secure_delete = keeps_secure_delete(role);
     match cordelia_storage::db::open_as(db_path, secure_delete) {
-        Ok(conn) => Ok((conn, None)),
+        Ok(conn) => {
+            if relay_entries::kept_by(role) {
+                cordelia_storage::db::automatic_checkpoint_off(&conn)?;
+                // What a stop that was not clean left in the log is written
+                // back now: the timer counts only the pages this connection
+                // writes, and would leave it until as many are written again.
+                if let Err(e) = cordelia_storage::db::checkpoint_passive(&conn) {
+                    tracing::warn!(error = %e, "could not write the log back at the start");
+                }
+            }
+            Ok((conn, None))
+        }
         Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
             let why = from_a_later_version(db_path, found, own);
             if role != "personal" {
@@ -2753,8 +2767,9 @@ fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
     }
 }
 
-/// Every `CYCLE_SECS`, and as soon as a sync setting changes, run one
-/// adapter cycle (if sync is on) off the async runtime, and store its
+/// Every `CYCLE_SECS`, as soon as a sync setting changes, and as soon as
+/// a pass has stored an entry of a name that the store did not hold, run
+/// one adapter cycle (if sync is on) off the async runtime, and store its
 /// report for `cordelia sync status`. Once in every
 /// `HISTORY_SWEEP_INTERVAL_SECS` it sweeps local history first.
 ///
@@ -2765,20 +2780,16 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
 
     let adapter: std::sync::Arc<Mutex<Option<ClaudeAdapter>>> =
         std::sync::Arc::new(Mutex::new(None));
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+    let mut timer = CycleTimer::every(std::time::Duration::from_secs(
         cordelia_sync::claude::CYCLE_SECS,
     ));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut sweep = Every::from(
         std::time::Instant::now(),
         std::time::Duration::from_secs(cordelia_core::protocol::HISTORY_SWEEP_INTERVAL_SECS),
     );
 
     loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            _ = state.sync_control.woken() => {}
-        }
+        timer.next_turn(&state.sync_control).await;
         let state = state.clone();
         let adapter = adapter.clone();
         let sweep = sweep.is_due(std::time::Instant::now());
@@ -2876,6 +2887,38 @@ async fn run_sync_loop(state: web::Data<cordelia_api::state::AppState>) {
             counted.sync_control.cycle_was_cut_short(cycle);
         }
         counted.sync_control.cycle_ended(cycle);
+        timer.turn_ended();
+    }
+}
+
+/// When the sync loop takes its next turn: once its timer has run a
+/// cycle's time, or as soon as it is woken. The timer runs from the end
+/// of the last turn, whatever began it, so that a turn that a wake began
+/// just before a tick is not followed at the tick by one more with
+/// nothing to do.
+struct CycleTimer {
+    interval: tokio::time::Interval,
+}
+
+impl CycleTimer {
+    /// A timer of `period`, whose first turn is at once.
+    fn every(period: std::time::Duration) -> Self {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self { interval }
+    }
+
+    /// Wait for the next turn: a tick, or a wake of `control`.
+    async fn next_turn(&mut self, control: &cordelia_api::state::SyncControl) {
+        tokio::select! {
+            _ = self.interval.tick() => {}
+            _ = control.woken() => {}
+        }
+    }
+
+    /// A turn has ended: the next tick is a whole period from now.
+    fn turn_ended(&mut self) {
+        self.interval.reset();
     }
 }
 
@@ -9366,6 +9409,79 @@ mod tests {
         assert!(open_database(&later, &as_a("personal")).is_err());
     }
 
+    /// The connection a relay's node runs on has SQLite's automatic
+    /// checkpoint off (issue #224), and keeps RELAY_LOG_KEPT_BYTES of its
+    /// log's file: it checkpoints on its own timer, which runs on a node
+    /// that keeps the relay's part. A personal node's, a
+    /// bootnode's and a command's keep SQLite's 1,000 pages, and no limit.
+    #[test]
+    fn a_relays_store_has_the_automatic_checkpoint_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let every = |conn: &rusqlite::Connection| -> (i64, i64) {
+            let pragma = |name: &str| -> i64 {
+                conn.pragma_query_value(None, name, |row| row.get(0))
+                    .unwrap()
+            };
+            (pragma("wal_autocheckpoint"), pragma("journal_size_limit"))
+        };
+        let kept = cordelia_core::protocol::RELAY_LOG_KEPT_BYTES;
+        let as_a = |role: &str| {
+            let mut config = Config::default();
+            config.network.role = role.into();
+            config
+        };
+        for (role, pages) in [
+            ("relay", (0, kept)),
+            ("personal", (1000, -1)),
+            ("bootnode", (1000, -1)),
+        ] {
+            let db_path = dir.path().join(format!("{role}.db"));
+            let (started, _) = open_the_nodes_database(&db_path, &as_a(role)).unwrap();
+            assert_eq!(every(&started), pages, "{role}");
+            // A node whose store has it off is one that keeps the relay's
+            // part, whose timer checkpoints it.
+            assert_eq!(
+                every(&started).0 == 0,
+                relay_entries::kept_by(role),
+                "{role}"
+            );
+            drop(started);
+            let command = open_database(&db_path, &as_a(role)).unwrap();
+            assert_eq!(every(&command), (1000, -1), "{role}");
+        }
+    }
+
+    /// A relay that starts over a log a stop that was not clean left writes
+    /// it back at once (issue #224): its timer counts only the pages its
+    /// own connection writes, and would leave the log until as many were
+    /// written again.
+    #[test]
+    fn a_relay_writes_back_at_its_start_a_log_left_from_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("relay.db");
+        let mut config = Config::default();
+        config.network.role = "relay".into();
+        let (before, _) = open_the_nodes_database(&db_path, &config).unwrap();
+        before
+            .execute_batch(
+                "CREATE TABLE left (n INTEGER, v BLOB);
+                 WITH RECURSIVE k(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM k WHERE n < 500)
+                 INSERT INTO left SELECT n, zeroblob(4096) FROM k;",
+            )
+            .unwrap();
+        // As a process that is killed: the connection is never closed, so
+        // nothing writes its log back.
+        std::mem::forget(before);
+        let file = || std::fs::metadata(&db_path).unwrap().len();
+        let left = file();
+        let (_started, _) = open_the_nodes_database(&db_path, &config).unwrap();
+        assert!(
+            file() >= left + 500 * 4096,
+            "the log was not written back: {left} then {} bytes",
+            file()
+        );
+    }
+
     /// The node sets `secure_delete` on a personal node's store before
     /// the schema's steps run (decision 2026-10-09 §7.1, D10), where it
     /// starts and where a command opens the store itself: a store of an
@@ -9416,5 +9532,34 @@ mod tests {
         assert_eq!(format_uptime(40), "40s");
         assert_eq!(format_uptime(245), "4m 05s");
         assert_eq!(format_uptime(3 * 3600 + 12 * 60 + 9), "3h 12m");
+    }
+
+    /// **The sync loop's timer runs from the end of each turn**: a turn
+    /// that a wake began just before a tick is not followed at the tick
+    /// by another with nothing to do. The next is a whole cycle's time
+    /// after it.
+    #[tokio::test(start_paused = true)]
+    async fn the_cycle_timer_runs_from_the_end_of_each_turn() {
+        use std::time::Duration;
+        let control = cordelia_api::state::SyncControl::default();
+        let mut timer = CycleTimer::every(Duration::from_secs(5));
+        let began = tokio::time::Instant::now();
+        let at = || began.elapsed();
+        // The first turn is at once.
+        timer.next_turn(&control).await;
+        assert_eq!(at(), Duration::ZERO);
+        timer.turn_ended();
+        // A wake just before the tick begins a turn then.
+        tokio::time::sleep(Duration::from_millis(4_900)).await;
+        control.ask_cycle();
+        timer.next_turn(&control).await;
+        assert_eq!(at(), Duration::from_millis(4_900));
+        timer.turn_ended();
+        // The next is a cycle's time after that turn, and not at the tick.
+        timer.next_turn(&control).await;
+        assert_eq!(at(), Duration::from_millis(9_900));
+        timer.turn_ended();
+        timer.next_turn(&control).await;
+        assert_eq!(at(), Duration::from_millis(14_900));
     }
 }

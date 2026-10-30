@@ -19,7 +19,7 @@ pub const RELAY_GOVERNOR: [(&str, u32); 5] = [
 /// The relays listen here, and on nothing else (rule 5 of §2.2).
 pub const RELAY_ADDRESS: Ipv4Addr = Ipv4Addr::LOCALHOST;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     Relay,
     Device,
@@ -35,7 +35,7 @@ impl Role {
 }
 
 /// What one node is given.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Settings {
     pub name: String,
     pub role: Role,

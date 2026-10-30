@@ -54,3 +54,7 @@ rustix = { version = "1", features = ["pty"] }
 tokio = { workspace = true, features = ["test-util"] }
 # To build a wire entry (a ByteBuf) in a test of the streams of entries.
 serde_bytes = { workspace = true }
+# What the scale test's report reads, kept in a run's folder so that the
+# report can be made again from it; its floats read back exactly.
+serde = { workspace = true }
+serde_json = { workspace = true, features = ["float_roundtrip"] }

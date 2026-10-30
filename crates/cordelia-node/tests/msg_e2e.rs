@@ -206,6 +206,7 @@ fn printed_and_told(all: &[&Node], n: &Node, name: &str, id: &str) -> String {
         120,
         || {
             assert!(!told(), "the node was told before it printed the line");
+            let crossed_before = through.answered(ANNOUNCED).len();
             let said = msg_in(
                 n,
                 &folder(n, name),
@@ -215,15 +216,16 @@ fn printed_and_told(all: &[&Node], n: &Node, name: &str, id: &str) -> String {
             );
             assert!(said.status.success(), "{}", err(&said));
             let said = out(&said);
-            // A word that crossed to the node is answered once it is marked.
+            let printed = said.contains(id);
+            // A word that crossed to the node is answered once it is marked;
+            // where the line was printed, its word crosses after `summary`
+            // ends, so wait for it to cross too.
             wait_for("each word that crossed is answered", all, 30, || {
                 let answered = through.answered(ANNOUNCED);
-                answered
-                    .iter()
-                    .all(|(_, status)| status.is_some())
-                    .then_some(())
+                let crossed = !printed || answered.len() > crossed_before;
+                (crossed && answered.iter().all(|(_, status)| status.is_some())).then_some(())
             });
-            if !said.contains(id) {
+            if !printed {
                 return None;
             }
             assert!(said.contains(&format!("\n  {id}  ")), "{said}");

@@ -210,6 +210,69 @@ impl Relay {
     }
 }
 
+/// One relay's turn: one pass at a time holds it, and whether a whole
+/// pass holds it or waits for it is known.
+#[derive(Debug, Default)]
+struct Turn {
+    held: tokio::sync::Mutex<()>,
+    whole: AtomicBool,
+}
+
+/// A whole pass's claim on a relay's [`Turn`], from before it waits until
+/// it lets the turn go: the flag is cleared when the claim is dropped,
+/// whether the pass held the turn or was dropped while it waited.
+struct WholeClaim<'a>(&'a AtomicBool);
+
+impl Drop for WholeClaim<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// A hold of a relay's [`Turn`], for as long as it is not dropped. The
+/// turn is let go before a whole pass's claim, so that no second whole
+/// pass finds the claim gone while the first still holds the turn.
+struct TurnHeld<'a> {
+    _held: tokio::sync::MutexGuard<'a, ()>,
+    _whole: Option<WholeClaim<'a>>,
+}
+
+impl Turn {
+    /// Take the turn for a pass of `kind`, or `None` where the pass does
+    /// nothing at this relay. A pass that sends does nothing where another
+    /// pass holds the turn. A whole pass does nothing where another whole
+    /// pass holds it or waits for it: that one will show and pull, and a
+    /// second would only do it again. Otherwise a whole pass claims the
+    /// turn first and then waits for the turn of a pass that sends, which
+    /// is short: the node's two timers fire in step, the send's every 2 s
+    /// and the fetch's every 10 s, a few milliseconds apart, and a whole
+    /// pass that gave way to a send once gave way at every fetch after
+    /// it, and never showed or pulled again.
+    async fn take(&self, kind: Pass) -> Option<TurnHeld<'_>> {
+        if kind != Pass::Whole {
+            let held = self.held.try_lock().ok()?;
+            return Some(TurnHeld {
+                _held: held,
+                _whole: None,
+            });
+        }
+        if self.whole.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        // Built before the wait, so that a pass dropped while it waits
+        // leaves the turn unclaimed.
+        let claim = WholeClaim(&self.whole);
+        let held = match self.held.try_lock() {
+            Ok(held) => held,
+            Err(_) => self.held.lock().await,
+        };
+        Some(TurnHeld {
+            _held: held,
+            _whole: Some(claim),
+        })
+    }
+}
+
 /// Which pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Pass {
@@ -476,7 +539,7 @@ pub struct DeviceEntries {
     /// While the device wakes, one pass at a time asks every relay first.
     waking: tokio::sync::Mutex<()>,
     /// One turn at a time at each relay, by the relay's name.
-    turns: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    turns: Mutex<HashMap<String, Arc<Turn>>>,
     /// One asking at a time at each relay for what the device of a typed
     /// key hands over, by the relay's name.
     asking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -496,6 +559,12 @@ pub struct DeviceEntries {
     /// ([`Leave::watch_commits`]): from the first pass, which is the first
     /// that can push.
     watching: AtomicBool,
+    /// What the passes found last of what decides whether the lists of a
+    /// person's reads and of bounds are due (issue #221).
+    lists_seen: Mutex<marks::ListsSeen>,
+    /// Whether the lists that the store held from before step 20 are known
+    /// to have been read: once they are, a pass asks no more.
+    held_lists_read: AtomicBool,
 }
 
 impl DeviceEntries {
@@ -535,6 +604,8 @@ impl DeviceEntries {
             reach,
             set_up: Mutex::default(),
             started: AtomicBool::new(false),
+            lists_seen: Mutex::default(),
+            held_lists_read: AtomicBool::new(false),
         })
     }
 
@@ -564,7 +635,8 @@ impl DeviceEntries {
     /// Each relay has its turn, and the turns run beside one another: it
     /// comes back when each has ended. A relay at which a turn of an
     /// earlier pass is still running is left out of this one, and no
-    /// other relay waits for it.
+    /// other relay waits for it, except that a whole pass behind a pass
+    /// that sends waits for its turn ([`Turn::take`]).
     ///
     /// The whole pass also asks each relay for what the device of a key
     /// typed at `cordelia accept` hands over, beside everything else and
@@ -1347,7 +1419,9 @@ impl DeviceEntries {
     ///
     /// One turn runs at a time at a relay. A turn that finds another
     /// running there does nothing: that one is waiting for the relay,
-    /// and a second would wait with it.
+    /// and a second would wait with it. But a whole pass waits for the
+    /// turn of a pass that sends, where no other whole pass holds the
+    /// turn or waits for it ([`Turn::take`]).
     ///
     /// The whole pass shows on every connection. Where the answer to
     /// this turn's show gave no leave, the relay is left for the next
@@ -1363,7 +1437,7 @@ impl DeviceEntries {
             let mut turns = lock(&self.turns);
             Arc::clone(turns.entry(link.name().to_string()).or_default())
         };
-        let Ok(_turn) = turn.try_lock() else {
+        let Some(_turn) = turn.take(kind).await else {
             return false;
         };
         let whole = kind == Pass::Whole;
@@ -1579,11 +1653,20 @@ impl DeviceEntries {
     /// [`cordelia_api::marks::write_person_list`]): only once the messages
     /// channel was fetched since the node started. Says whether it wrote
     /// one.
+    ///
+    /// What decides it is read without opening or checking anything, and
+    /// where it is what it was at a pass that changed nothing, nothing more
+    /// is done ([`marks::ListsSeen`], issue #221).
     fn write_person_list(&self) -> bool {
         let db = lock(&self.state.db);
-        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
         let identity = &self.state.identity;
-        match marks::write_person_list(&db, identity, self.unix(), fetched.unwrap_or(false)) {
+        match marks::write_person_list_where_changed(&db, identity, self.unix(), fetched, &mut seen)
+        {
             Ok(written) => written.is_some(),
             Err(e) => {
                 tracing::debug!(error = %e, "could not write the list of what a person read here");
@@ -1598,15 +1681,23 @@ impl DeviceEntries {
     /// list 7 days and 10 minutes after it was set, or that another
     /// device's later bound overrode, goes. Only once the messages channel
     /// was fetched since the node started. Says whether it wrote one.
+    ///
+    /// As [`Self::write_person_list`], what decides it is read without
+    /// opening or checking anything first (issue #221).
     fn write_bounds_list(&self) -> bool {
         let db = lock(&self.state.db);
-        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
         let identity = &self.state.identity;
-        let written = cordelia_api::bounds::write_bounds_list(
+        let written = cordelia_api::bounds::write_bounds_list_where_changed(
             &db,
             identity,
             self.unix(),
-            fetched.unwrap_or(false),
+            fetched,
+            &mut seen,
         );
         match written {
             Ok(written) => written.is_some(),
@@ -1621,12 +1712,20 @@ impl DeviceEntries {
     /// held from before step 20 (decision 2026-10-25, rule 1;
     /// [`cordelia_api::reader::read_held_lists`]): at the first pass at
     /// which the device stands applied, where the start did not.
+    /// Once they are known to be read, a pass does nothing here, and takes
+    /// no lock (issue #221).
     fn read_held_lists(&self) {
+        if self.held_lists_read.load(Ordering::Relaxed) {
+            return;
+        }
         let db = lock(&self.state.db);
         match cordelia_api::reader::read_held_lists(&db, &self.state.identity, self.unix()) {
             Ok(true) => tracing::info!("read the lists of messages held from before this version"),
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "could not read the lists of messages held"),
+        }
+        if cordelia_api::reader::held_lists_were_read(&db) {
+            self.held_lists_read.store(true, Ordering::Relaxed);
         }
     }
 
@@ -3026,6 +3125,7 @@ impl DeviceEntries {
                                 read_again,
                                 kept_changed: kept_before.is_none()
                                     || kept_before != at_relays::what_it_keeps(db),
+                                stored: stored_one(&each),
                                 // A page asked from a place forgotten
                                 // since is no end of the channel: the pull
                                 // goes on, from the start.
@@ -3054,6 +3154,17 @@ impl DeviceEntries {
                     // (decision 2026-10-24 (removal), rule 19).
                     if page.kept_changed {
                         self.state.own_channels.ask_whole();
+                    }
+                    // What the store took of a name is written to its
+                    // folder at once: the sync cycle is woken, and not
+                    // waited for. Its timer and the pass's run in step,
+                    // so a page taken just after the cycle's tick waited
+                    // for the whole of the next one, a cycle's time
+                    // added to every edit (decision 2026-10-22, bars 2
+                    // and 15). A publish wakes the pass that sends in the
+                    // same way.
+                    if page.stored && matches!(channel.kind, Kind::Name(_)) {
+                        self.state.sync_control.ask_cycle();
                     }
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
@@ -3518,6 +3629,22 @@ struct PageSeen {
     /// it: a record that hands a removed key the secret it follows closes
     /// it (decision 2026-10-24 (removal), rules 3, 8 and 19).
     kept_changed: bool,
+    /// Whether the store took an entry of it that it did not hold.
+    stored: bool,
+}
+
+/// Whether the store took one of `each`, the entries of a page, that it
+/// did not hold: a new entry, or a later revision of one it held.
+fn stored_one(each: &[Taken]) -> bool {
+    each.iter().any(|taken| {
+        matches!(
+            taken,
+            Taken::Own {
+                stored: Outcome::Stored,
+                ..
+            }
+        )
+    })
 }
 
 /// What the answer `done` to a push of a channel of `kind` says of what of
@@ -3628,6 +3755,75 @@ fn refused_wait(refusals: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Whether a pass of `kind` does nothing at `turn` at once: `false`
+    /// where it takes the turn or waits for it. The take is polled once,
+    /// so that a take that waits fails the test instead of hanging it.
+    async fn gives_way(turn: &Turn, kind: Pass) -> bool {
+        matches!(
+            tokio::time::timeout(Duration::ZERO, turn.take(kind)).await,
+            Ok(None)
+        )
+    }
+
+    /// **A whole pass waits for the turn of a pass that sends**, and no
+    /// other pass waits for a turn held: a pass that sends does nothing
+    /// where any pass holds the turn, and a whole pass does nothing where
+    /// a whole pass holds it or waits for it.
+    #[tokio::test]
+    async fn a_whole_pass_waits_only_for_the_turn_of_a_pass_that_sends() {
+        let turn = Arc::new(Turn::default());
+        // A whole pass holds it: no other pass takes it, and none waits.
+        let held = turn.take(Pass::Whole).await.unwrap();
+        assert!(gives_way(&turn, Pass::Send).await);
+        assert!(gives_way(&turn, Pass::Whole).await);
+        drop(held);
+        // A pass that sends holds it: another that sends does nothing, and
+        // a whole pass waits until it is let go, and then holds it.
+        let sending = turn.take(Pass::Send).await.unwrap();
+        assert!(gives_way(&turn, Pass::Send).await);
+        let waiting = {
+            let turn = Arc::clone(&turn);
+            tokio::spawn(async move { turn.take(Pass::Whole).await.is_some() })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        // A second whole pass behind the send does nothing: the first
+        // will show and pull, and the second would only do it again.
+        assert!(gives_way(&turn, Pass::Whole).await);
+        drop(sending);
+        assert!(waiting.await.unwrap());
+        // Let go, it is free for either.
+        drop(turn.take(Pass::Send).await.unwrap());
+        drop(turn.take(Pass::Whole).await.unwrap());
+    }
+
+    /// **A whole pass dropped while it waits leaves the turn unclaimed**:
+    /// the next whole pass behind the same send waits for it, and holds it
+    /// once it is let go.
+    #[tokio::test]
+    async fn a_whole_pass_dropped_while_it_waits_leaves_the_turn_unclaimed() {
+        let turn = Arc::new(Turn::default());
+        let sending = turn.take(Pass::Send).await.unwrap();
+        let waiting = {
+            let turn = Arc::clone(&turn);
+            tokio::spawn(async move { turn.take(Pass::Whole).await.is_some() })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert!(!turn.whole.load(Ordering::Acquire));
+        let next = {
+            let turn = Arc::clone(&turn);
+            tokio::spawn(async move { turn.take(Pass::Whole).await.is_some() })
+        };
+        tokio::task::yield_now().await;
+        assert!(!next.is_finished());
+        drop(sending);
+        assert!(next.await.unwrap());
+        assert!(!turn.whole.load(Ordering::Acquire));
+    }
 
     /// The state of a node over a store of its own in memory, which
     /// follows no phrase.
@@ -3962,6 +4158,14 @@ mod tests {
             256 + 1024
         );
         assert_eq!(counted_as_handed(3), entry_cost(0));
+        // A page wakes the sync cycle only where the store took something
+        // it did not hold.
+        assert!(stored_one(&stored));
+        assert!(stored_one(&held_and_stored));
+        assert!(!stored_one(&held));
+        assert!(!stored_one(&held_and_refused));
+        assert!(!stored_one(&[own(Outcome::OlderThanHeld)]));
+        assert!(!stored_one(&[]));
     }
 
     /// What a push's answer says of what waits at a relay (decision
@@ -4018,5 +4222,32 @@ mod tests {
             pushed_as(&PushAnswer::Refused(EntryRefused::OverLimit)),
             Pushed::OverAllowance
         );
+    }
+
+    /// Once the lists that the store held from before step 20 are known to
+    /// have been read, a pass asks no more, and takes no lock for them
+    /// (issue #221). Before, each pass asks.
+    #[test]
+    fn a_pass_takes_no_lock_for_the_held_lists_once_they_were_read() {
+        let state = a_node();
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        let takes = || state.db.times().hold(TakeKind::Other).count;
+        let before = takes();
+        device.read_held_lists();
+        device.read_held_lists();
+        assert_eq!(takes(), before + 2);
+        cordelia_storage::meta::set(
+            &lock(&state.db),
+            cordelia_storage::meta::MESSAGES_LISTS_READ,
+            "1",
+        )
+        .unwrap();
+        let before = takes();
+        device.read_held_lists();
+        assert_eq!(takes(), before + 1);
+        for _ in 0..10 {
+            device.read_held_lists();
+        }
+        assert_eq!(takes(), before + 1);
     }
 }

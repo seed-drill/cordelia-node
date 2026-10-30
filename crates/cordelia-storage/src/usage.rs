@@ -14,6 +14,32 @@ fn storage(e: rusqlite::Error) -> CordeliaError {
     CordeliaError::Storage(e.to_string())
 }
 
+/// Note that each peer of `seen`, by its hash and whether it is a relay,
+/// is connected at `now` (unix seconds), and, with `prune_before`, forget
+/// those not seen since then: all of it in one transaction, so one write
+/// to disk however many peers there are (issue #221). Each note on its own
+/// was a write of its own, and a relay that noted every peer it holds at
+/// once held its lock for as many writes. What one call notes is bounded
+/// by the peers the node holds connections to.
+pub fn record_sightings(
+    conn: &Connection,
+    seen: &[([u8; 32], bool)],
+    now: i64,
+    prune_before: Option<i64>,
+) -> Result<(), CordeliaError> {
+    if seen.is_empty() && prune_before.is_none() {
+        return Ok(());
+    }
+    let batch = conn.unchecked_transaction().map_err(storage)?;
+    for (hash, is_relay) in seen {
+        record_sighting(conn, hash, *is_relay, now)?;
+    }
+    if let Some(before) = prune_before {
+        prune_sightings(conn, before)?;
+    }
+    batch.commit().map_err(storage)
+}
+
 /// Note that the peer with this hash is connected at `now` (unix seconds).
 pub fn record_sighting(
     conn: &Connection,
@@ -260,5 +286,29 @@ mod tests {
         assert_eq!(peers_seen(&conn, 0).unwrap(), (0, 0));
         assert_eq!(channels_active(&conn, 7).unwrap(), 0);
         assert_eq!(stored(&conn).unwrap(), (0, 0));
+    }
+
+    /// The peers due at one note are written in one transaction, with the
+    /// prune (issue #221): the log holds a few frames for a hundred peers,
+    /// and not one for each. Each note on its own was a write to disk of
+    /// its own, under the node's lock.
+    #[test]
+    fn the_peers_of_one_note_are_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = db::open(&dir.path().join("cordelia.db")).unwrap();
+        let now = 1_800_000_000;
+        record_sighting(&conn, &[200; 32], false, now - 9 * DAY).unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let seen: Vec<([u8; 32], bool)> = (0..100u8).map(|i| ([i; 32], i < 2)).collect();
+        record_sightings(&conn, &seen, now, Some(now - 8 * DAY)).unwrap();
+        let frames: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| row.get(1))
+            .unwrap();
+        assert!(frames < 10, "{frames} frames for one note of 100 peers");
+        assert_eq!(peers_seen(&conn, now).unwrap(), (2, 98));
+        assert_eq!(peers_seen(&conn, now - 10 * DAY).unwrap(), (2, 98));
+        // Nothing due and no prune: nothing is begun.
+        record_sightings(&conn, &[], now, None).unwrap();
     }
 }
