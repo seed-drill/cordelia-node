@@ -2083,3 +2083,251 @@ fn a_folder_without_the_inputs_of_this_version_is_refused() {
     let why = again(dir.path(), None).unwrap_err();
     assert!(why.contains("the run did not start"), "{why}");
 }
+
+// ── After stage 190, seed 2: bars 3 and 9 read what the record means ──
+
+/// A change of a node: when, to what, and how a stop ended (its seconds
+/// and its status; none where it is not known).
+type Became<'a> = (f64, Is, Option<(f64, &'a str)>);
+
+/// The high end of bar 9's band for relay 1 at 1000 s, where person 0's
+/// first device (node 2) changes as `changes` says.
+fn bar_9_ceiling(changes: &[Became]) -> f64 {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 150.0, 1500.0);
+    for (t, is, ended) in changes {
+        run.fleet.changes.lock().unwrap().push(Change {
+            t: *t,
+            node: 2,
+            is: *is,
+            ended: ended.map(|(took, said)| (took, said.to_string())),
+        });
+    }
+    relay_at(&run, 0, 1000.0, Some(&[("cordelia_connections_open", 0.0)]));
+    let read = read_of(&run);
+    let bar = bar_9(&read);
+    let said = "0 at 1000 s (band ";
+    let from = bar.figure.find(said).expect(&bar.figure);
+    let rest = &bar.figure[from + said.len()..];
+    let hi = rest.split(" to ").nth(1).unwrap();
+    hi.split(')').next().unwrap().parse().unwrap()
+}
+
+/// Bar 9's high end counts a device stopped cleanly only until the relay's
+/// governor has had its tick after the exit (10 s, and 2 s for the tick's
+/// turn): one stopped 0.5 s and 0.2 s before the sample counts, as at
+/// stage 190, seed 2, where relay 2 held 178 against a band of 174 to 177;
+/// one that exited exactly 12 s before counts, one 12.5 s before or 50 s
+/// before does not. A device frozen, or stopped without a clean exit
+/// (killed, an exit with failure, a stop slower than
+/// `NODE_STOP_TIMEOUT_SECS`, or how it ended not known), counts for 90 s:
+/// at 89.5 s, and not at exactly 90 s.
+#[test]
+fn bar_9_counts_a_device_stopped_cleanly_only_until_the_relays_tick() {
+    let running = bar_9_ceiling(&[]);
+    let clean = Some((0.3, "exit status: 0"));
+    let stop = |t: f64, ended: Option<(f64, &'static str)>| (t, Is::Stopped, ended);
+    for (case, changes, counted) in [
+        (
+            "stopped cleanly 0.5 s before",
+            vec![stop(999.5, clean)],
+            true,
+        ),
+        (
+            "stopped cleanly 0.2 s before",
+            vec![stop(999.8, clean)],
+            true,
+        ),
+        (
+            "exited cleanly exactly 12 s before",
+            vec![stop(987.5, Some((0.5, "exit status: 0")))],
+            true,
+        ),
+        (
+            "exited cleanly 12.5 s before",
+            vec![stop(987.0, Some((0.5, "exit status: 0")))],
+            false,
+        ),
+        (
+            "stopped cleanly 50 s before",
+            vec![stop(950.0, clean)],
+            false,
+        ),
+        (
+            "killed 89.5 s before",
+            vec![stop(910.5, Some((45.0, "killed: it did not stop")))],
+            true,
+        ),
+        (
+            "killed exactly 90 s before",
+            vec![stop(910.0, Some((45.0, "killed: it did not stop")))],
+            false,
+        ),
+        (
+            "exited with failure 89.5 s before",
+            vec![stop(910.5, Some((0.3, "exit status: 1")))],
+            true,
+        ),
+        (
+            "exited with success, but slower than its 30 s, 60 s before",
+            vec![stop(940.0, Some((31.0, "exit status: 0")))],
+            true,
+        ),
+        (
+            "how it ended not known, 89.5 s before",
+            vec![stop(910.5, None)],
+            true,
+        ),
+        (
+            "frozen, then stopped cleanly 89 s before",
+            vec![(900.0, Is::Frozen, None), stop(911.0, clean)],
+            true,
+        ),
+        (
+            "frozen, then stopped cleanly exactly 90 s before",
+            vec![(900.0, Is::Frozen, None), stop(910.0, clean)],
+            false,
+        ),
+        ("stopped 100 s before", vec![stop(900.0, None)], false),
+    ] {
+        let want = match counted {
+            true => running,
+            false => running - 1.0,
+        };
+        assert_eq!(bar_9_ceiling(&changes), want, "{case}");
+    }
+}
+
+/// Edit 10 of person 0, written at 1000 s by its first device (node 2),
+/// which then `lives` as the case says; it never reaches the second device
+/// (node 3), which runs all through. The window is 0 to 2000 s. Bar 3, as
+/// the case reads it. With `reader_off`, the second device is off from
+/// 990 s to 1100 s, so the edit is one of its catch-up too.
+fn bar_3_of_a_writer(lives: &[(f64, Is)], reader_off: bool) -> Line {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 2000.0);
+    for (t, is) in lives {
+        becomes(&run, 2, *t, *is);
+    }
+    if reader_off {
+        becomes(&run, 3, 990.0, Is::Stopped);
+        becomes(&run, 3, 1100.0, Is::Running);
+    }
+    run.observer.lock().unwrap().wrote(
+        Written {
+            number: 10,
+            person: 0,
+            writer: 0,
+            name: 0,
+            file: "f001.md".into(),
+            size: 600,
+            at: 1000.0,
+            burst: false,
+            new: false,
+            replaced: None,
+        },
+        vec![(1, run.out.clone())],
+    );
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    bar_3(&read, &edits)
+}
+
+/// An edit not found by the end is passed over only where its writer was
+/// told to stop within a cycle (5 s) of writing it, so that its cycle had
+/// at most that turn to read it, and did not run 60 s again 120 s or more
+/// before the end. Its writer stopped 36 ms after writing and off to the
+/// end (as at stage 190, seed 2, where the writer was removed), or back
+/// only for 30 s, or back too late: passed over, and counted. Its writer
+/// ran on, ran 5.5 s or 10 s and then stopped, froze, or ran again in
+/// time: lost. Either way with the reader off when it was written, as the
+/// catch-up reads it.
+#[test]
+fn bar_3_passes_over_an_edit_only_where_its_writer_stopped_within_a_cycle() {
+    let stopped = (1000.036, Is::Stopped);
+    for (case, lives, lost) in [
+        ("stopped 36 ms after, off to the end", vec![stopped], false),
+        (
+            "back for 30 s only",
+            vec![stopped, (1300.0, Is::Running), (1330.0, Is::Stopped)],
+            false,
+        ),
+        (
+            "back too late to send before the end",
+            vec![stopped, (1850.0, Is::Running)],
+            false,
+        ),
+        ("ran on", vec![], true),
+        ("ran 20 s, then stopped", vec![(1020.5, Is::Stopped)], true),
+        (
+            "ran again in time",
+            vec![stopped, (1300.0, Is::Running)],
+            true,
+        ),
+        (
+            "frozen, then went on in time",
+            vec![(1000.036, Is::Frozen), (1300.0, Is::Running)],
+            true,
+        ),
+        // Its cycle had the time to read it and push it: owed, wherever
+        // it went after.
+        (
+            "ran 10 s, then stopped for good",
+            vec![(1010.0, Is::Stopped)],
+            true,
+        ),
+        (
+            "ran 5.5 s, then stopped for good",
+            vec![(1005.5, Is::Stopped)],
+            true,
+        ),
+        (
+            "frozen 36 ms after, then stopped for good",
+            vec![(1000.036, Is::Frozen), (1060.0, Is::Stopped)],
+            true,
+        ),
+        // The edges: a stop told exactly a cycle (5 s) after the edit; a
+        // writer back at 1820 s, whose 60 s end exactly 120 s before the
+        // end, and one back half a second later.
+        (
+            "stopped exactly 5 s after",
+            vec![(1005.0, Is::Stopped)],
+            false,
+        ),
+        (
+            "back with exactly 120 s left after its catch-up",
+            vec![stopped, (1820.0, Is::Running)],
+            true,
+        ),
+        (
+            "back with 119.5 s left after its catch-up",
+            vec![stopped, (1820.5, Is::Running)],
+            false,
+        ),
+    ] {
+        for reader_off in [false, true] {
+            let bar = bar_3_of_a_writer(&lives, reader_off);
+            let want = match lost {
+                true => Verdict::Fail,
+                false => Verdict::Pass,
+            };
+            let case = format!("{case}, the reader off: {reader_off}");
+            assert_eq!(bar.verdict, want, "{case}: {}", bar.figure);
+            let (found, passed) = match lost {
+                true => ("1 not found by the end", "0 not found and passed over"),
+                false => ("0 not found by the end", "1 not found and passed over"),
+            };
+            assert!(bar.figure.contains(found), "{case}: {}", bar.figure);
+            assert!(bar.figure.contains(passed), "{case}: {}", bar.figure);
+            // An edit passed over is not one the reader failed to catch up
+            // on; one lost is.
+            let slow = match lost && reader_off {
+                true => "1 edits not held within 60 s",
+                false => "0 edits not held within 60 s",
+            };
+            assert!(bar.figure.contains(slow), "{case}: {}", bar.figure);
+        }
+    }
+}

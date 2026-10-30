@@ -98,18 +98,28 @@ fn reported(title: &str, figure: String, bar: &str) -> Line {
 
 struct Lives {
     of: Vec<Vec<(f64, Is)>>,
+    /// Each stop of each node: when it was told, and when its process
+    /// exited where it stopped cleanly (with success, within `allowed`);
+    /// `None` where it did not, or where how it ended is not known.
+    stops: Vec<Vec<(f64, Option<f64>)>>,
 }
 
 impl Lives {
-    fn new(changes: &[Change], nodes: usize) -> Lives {
+    /// `allowed` is `NODE_STOP_TIMEOUT_SECS` of the run's build.
+    fn new(changes: &[Change], nodes: usize, allowed: f64) -> Lives {
         let mut of = vec![Vec::new(); nodes];
+        let mut stops = vec![Vec::new(); nodes];
         for c in changes {
             of[c.node].push((c.t, c.is));
+            if c.is == Is::Stopped {
+                let exited = stopped_cleanly(c.ended.as_ref(), allowed).map(|took| c.t + took);
+                stops[c.node].push((c.t, exited));
+            }
         }
         for each in &mut of {
             each.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
-        Lives { of }
+        Lives { of, stops }
     }
 
     fn at(&self, node: usize, t: f64) -> Is {
@@ -195,11 +205,23 @@ impl Lives {
         longest
     }
 
-    fn frozen_within(&self, node: usize, t: f64, secs: f64) -> bool {
-        self.at(node, t - secs) == Is::Frozen
+    /// Whether a relay may still hold its connection at `t`, where it is
+    /// not running then: it was frozen at any moment of the last
+    /// [`HELD_AFTER_A_FREEZE_SECS`]; or it was stopped in that time and its
+    /// process did not exit cleanly; or it exited cleanly within the last
+    /// [`HELD_AFTER_A_CLEAN_STOP_SECS`]. A device stopped cleanly before
+    /// that is not counted.
+    fn may_be_held(&self, node: usize, t: f64) -> bool {
+        let from = t - HELD_AFTER_A_FREEZE_SECS;
+        let frozen = self.at(node, from) == Is::Frozen
             || self.of[node]
                 .iter()
-                .any(|(at, is)| *at > t - secs && *at <= t && *is == Is::Frozen)
+                .any(|(at, is)| *at > from && *at <= t && *is == Is::Frozen);
+        frozen
+            || self.stops[node]
+                .iter()
+                .filter(|(told, _)| *told > from && *told <= t)
+                .any(|(_, exited)| exited.is_none_or(|e| t <= e + HELD_AFTER_A_CLEAN_STOP_SECS))
     }
 
     /// Each time it was not running within [a, b]: from when, to when it
@@ -519,7 +541,11 @@ fn read_of_kept(mut run: Kept) -> Read {
     };
     Read {
         told: Told::default(),
-        lives: Lives::new(&run.fleet.changes, run.fleet.made.len()),
+        lives: Lives::new(
+            &run.fleet.changes,
+            run.fleet.made.len(),
+            run.constants.node_stop_timeout_secs as f64,
+        ),
         samples: std::mem::take(&mut run.samples),
         machine: std::mem::take(&mut run.machine),
         start,
@@ -1353,11 +1379,42 @@ fn bar_2(read: &Read, edits: &Edits) -> Line {
     )
 }
 
+/// The time an edit sent has to arrive: `CHANGE_FETCH_MAX_SECS`, the 120 s
+/// within which bar 2 and bar 15 hold every edit.
+const ARRIVES_WITHIN_SECS: f64 = cordelia_core::protocol::CHANGE_FETCH_MAX_SECS as f64;
+
+/// Whether an edit not found by the end is passed over, not lost: its
+/// writer was told to stop within `CYCLE_SECS` of writing it, so its cycle
+/// had at most that one turn to read the file, and it never ran again in
+/// time to send it, [`CATCH_UP_SECS`] without a stop or a freeze (bar 3's
+/// catch-up) ending [`ARRIVES_WITHIN_SECS`] or more before the run's end.
+/// Every other edit not found is lost: one whose writer ran on, froze, or
+/// stopped later, its cycle having had the time to read it and push it.
+fn passed_over(read: &Read, p: &Pair) -> bool {
+    let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+    let read_by = p.edit.at + read.run.constants.cycle_secs as f64;
+    let stopped = read.lives.stops[writer]
+        .iter()
+        .any(|(told, _)| *told > p.edit.at && *told <= read_by);
+    if !stopped {
+        return false;
+    }
+    let end = read.end.max(read.run.kept_at);
+    let sent_again = read
+        .lives
+        .ran_again_after(writer, p.edit.at, read_by)
+        .and_then(|again| read.lives.ran_for_after(writer, again, CATCH_UP_SECS))
+        .is_some_and(|t| t + ARRIVES_WITHIN_SECS <= end);
+    !sent_again
+}
+
 fn bar_3(read: &Read, edits: &Edits) -> Line {
-    let lost: Vec<&Pair> = edits
+    let missing: Vec<&Pair> = edits
         .of_person(read, false)
         .filter(|p| p.edit.at >= read.start && p.arrived.is_none() && !p.gone && !p.replaced)
         .collect();
+    let (passed, lost): (Vec<&Pair>, Vec<&Pair>) =
+        missing.into_iter().partition(|p| passed_over(read, p));
     // Catching up: each time a device was off in the window, the edits its
     // person made meanwhile, within 60 s of its running again.
     let mut worst: f64 = 0.0;
@@ -1383,7 +1440,8 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
                             slow += 1;
                         }
                     }
-                    None => slow += 1,
+                    None if !passed_over(read, p) => slow += 1,
+                    None => {}
                 }
             }
         }
@@ -1401,8 +1459,10 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
     line(
         "No edit is lost, and a device catches up",
         format!(
-            "{} edits of the window on other devices; {} not found by the end{}; after {} times \
-             off, the slowest catch-up {:.1} s, {} edits not held within 60 s",
+            "{} edits of the window on other devices; {} not found by the end{}; {} not found \
+             and passed over, their writer told to stop within a cycle of writing them and not \
+             run long enough again; after {} times off, the slowest catch-up {:.1} s, {} edits \
+             not held within 60 s",
             edits
                 .of_person(read, false)
                 .filter(|p| p.edit.at >= read.start && !p.gone)
@@ -1412,12 +1472,15 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
                 true => String::new(),
                 false => format!(" ({})", examples.join(", ")),
             },
+            passed.len(),
             times_off,
             worst,
             slow
         ),
-        "every edit's own line on every other device by the end; a device that was off holds \
-         its person's edits within 60 s of running again",
+        "every edit's own line on every other device by the end, but one whose writer was told \
+         to stop within a cycle (5 s) of writing it and did not run 60 s again 120 s or more \
+         before the end; a device that was off holds its person's edits within 60 s of running \
+         again",
         lost.is_empty() && slow == 0,
     )
 }
@@ -1924,6 +1987,32 @@ fn bar_8(read: &Read) -> Line {
     )
 }
 
+/// How long a relay may hold the connection of a device that is frozen, or
+/// that stopped without a clean exit: until QUIC's idle time (60 s) and the
+/// governor's next tick (10 s) close it, with 20 s to spare (bar 9).
+const HELD_AFTER_A_FREEZE_SECS: f64 = 90.0;
+
+/// How long after a device's process exits cleanly a relay may still count
+/// its connection open (bar 9). The device closes its connections on the
+/// way out and the relay's QUIC reads the close at once, but the relay
+/// drops a closed connection from those it keeps, and from the gauge, only
+/// at its governor's next tick (`reap_closed`): within
+/// `TICK_INTERVAL_SECS`, 10 s, and 2 s more for the tick's turn in the
+/// node's loop. At stage 190, seed 2, the two seen were 0.2 s and 0.5 s
+/// after the stop was told.
+const HELD_AFTER_A_CLEAN_STOP_SECS: f64 = cordelia_core::protocol::TICK_INTERVAL_SECS as f64 + 2.0;
+
+/// Whether a stop that ended as `ended` says (its seconds, and its status)
+/// was clean: the process exited with success within `allowed`. Its
+/// seconds from when it was told; `None` where it did not, or where how it
+/// ended is not known.
+fn stopped_cleanly(ended: Option<&(f64, String)>, allowed: f64) -> Option<f64> {
+    // `ExitStatus`'s own words for an exit with success on Unix.
+    ended
+        .filter(|(took, said)| said == "exit status: 0" && *took <= allowed)
+        .map(|(took, _)| *took)
+}
+
 fn bar_9(read: &Read) -> Line {
     let plan = &read.run.plan;
     let people = &plan.population.people;
@@ -1975,7 +2064,9 @@ fn bar_9(read: &Read) -> Line {
                             lo += 1.0;
                         }
                     }
-                    _ if read.lives.frozen_within(node, s.t, 90.0) => hi += 1.0,
+                    // Frozen, or stopped since: the relay may still hold
+                    // its connection.
+                    _ if read.lives.may_be_held(node, s.t) => hi += 1.0,
                     _ => {}
                 }
             }

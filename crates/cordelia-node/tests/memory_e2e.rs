@@ -1268,3 +1268,136 @@ fn an_edit_made_while_sync_was_off_is_sent_when_it_comes_back_with_no_conflict_f
     });
     assert_eq!(conflict_files(&b_mem), Vec::<String>::new());
 }
+
+/// **An edit written just before a clean stop is sent when the device runs
+/// again** (the property bar 3 of the scale test leaves to this test,
+/// decision 2026-10-22 §3, bar 3). A device writes a file of a name, a
+/// new one and one over an earlier file, and is told to stop cleanly soon
+/// after; started again, it sends both, and the other device takes each,
+/// with nothing kept beside it. Two ways:
+///
+/// - stopped at once, 0, 25 and 50 ms after the writes, as at stage 190,
+///   seed 2: its cycle has most likely not read the files yet (each round
+///   says whether it had), so the files are read after the start;
+/// - stopped once its store holds the edits and before it can have pushed
+///   them: the relay is stopped first, the files written, the store
+///   watched until it holds the new file, the device stopped, the relay
+///   started, and the device started. This round asserts that the store
+///   held the edit before the stop: what the device sends after its start
+///   is what it stored, not what it reads again.
+#[test]
+fn an_edit_written_just_before_a_clean_stop_is_sent_when_the_device_runs_again() {
+    let mut relay = relay_started();
+    let mut a = device_started("a", &relay);
+    let b = device_started("b", &relay);
+    let (a_notes, a_mem) = notes_of(&a);
+    let (b_notes, b_mem) = notes_of(&b);
+    std::fs::write(a_mem.join("notes.md"), "as both had it\n").unwrap();
+    syncs_notes_as_lab(&a, &a_notes);
+    syncs_notes_as_lab(&b, &b_notes);
+    makes_a_phrase(&a, "desktop");
+    adds(&a, &b, "laptop");
+    has_applied(&b, 1, &[&relay, &a, &b]);
+    wait_for(
+        "the file reaches the laptop",
+        &[&relay, &a, &b],
+        120,
+        || (read(&b_mem.join("notes.md")).as_deref() == Some("as both had it\n")).then_some(()),
+    );
+    wait_for(
+        "the desktop has sent what it holds",
+        &[&relay, &a, &b],
+        90,
+        || has_sent_everything(&a),
+    );
+
+    // The slots `n` holds entries in under `lab`, read from its store.
+    let slots_of = |n: &Node| {
+        let conn = rusqlite::Connection::open_with_flags(
+            n.data_dir().join("cordelia.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let lab = cordelia_storage::person::channel_of_name(&conn, "lab")
+            .unwrap()
+            .unwrap();
+        cordelia_storage::entries::channel_slots(&conn, &lab)
+            .unwrap()
+            .len()
+    };
+    for (round, wait_ms) in [0u64, 25, 50].into_iter().enumerate() {
+        let before = slots_of(&a);
+        let edited = format!("edited just before a stop, round {round}\n");
+        let new = format!("new.{round}.md");
+        let made = format!("made just before a stop, round {round}\n");
+        std::fs::write(a_mem.join("notes.md"), &edited).unwrap();
+        std::fs::write(a_mem.join(&new), &made).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+        // Told to stop with SIGTERM: `stop` fails the test where the node
+        // does not exit with success.
+        a.stop();
+        // Whether its cycle had read the new file before the stop: its slot
+        // is then in the store. Said, not asserted: a cycle every 5 s may
+        // fall within the 50 ms; the edits must arrive either way.
+        eprintln!(
+            "round {round}: stopped {wait_ms} ms after the writes; the new file {} in the store",
+            match slots_of(&a) > before {
+                true => "was already",
+                false => "was not yet",
+            }
+        );
+        // Off for a few seconds, as a device turned off is.
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        a.start();
+        let all = [&relay, &a, &b];
+        wait_for("the desktop is healthy again", &all, 30, || healthy(&a));
+        wait_for("both edits reach the laptop", &all, 120, || {
+            (read(&b_mem.join("notes.md")).as_ref() == Some(&edited)
+                && read(&b_mem.join(&new)).as_ref() == Some(&made))
+            .then_some(())
+        });
+        assert!(conflict_files(&a_mem).is_empty(), "{:?}", files(&a_mem));
+        assert!(conflict_files(&b_mem).is_empty(), "{:?}", files(&b_mem));
+        assert_eq!(files(&a_mem), files(&b_mem));
+        wait_for("the desktop has sent what it holds", &all, 90, || {
+            has_sent_everything(&a)
+        });
+    }
+    // In the store, not yet pushed: the relay is stopped, so nothing the
+    // device stores can leave it.
+    let round = 3;
+    let before = slots_of(&a);
+    relay.stop();
+    let edited = format!("edited just before a stop, round {round}\n");
+    let new = format!("new.{round}.md");
+    let made = format!("made just before a stop, round {round}\n");
+    std::fs::write(a_mem.join("notes.md"), &edited).unwrap();
+    std::fs::write(a_mem.join(&new), &made).unwrap();
+    wait_for("the desktop stores the new file", &[&a, &b], 60, || {
+        (slots_of(&a) > before).then_some(())
+    });
+    a.stop();
+    let stored = slots_of(&a);
+    assert!(
+        stored > before,
+        "round {round}: the store held {stored} slots at the stop, {before} before the writes"
+    );
+    eprintln!("round {round}: the new file was in the store at the stop, and not yet pushed");
+    relay.start();
+    wait_for("the relay is healthy again", &[&relay], 30, || {
+        healthy(&relay)
+    });
+    a.start();
+    let all = [&relay, &a, &b];
+    wait_for("the desktop is healthy again", &all, 30, || healthy(&a));
+    wait_for("both edits reach the laptop", &all, 120, || {
+        (read(&b_mem.join("notes.md")).as_ref() == Some(&edited)
+            && read(&b_mem.join(&new)).as_ref() == Some(&made))
+        .then_some(())
+    });
+    assert!(conflict_files(&a_mem).is_empty(), "{:?}", files(&a_mem));
+    assert!(conflict_files(&b_mem).is_empty(), "{:?}", files(&b_mem));
+    assert_eq!(files(&a_mem), files(&b_mem));
+}
