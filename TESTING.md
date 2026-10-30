@@ -83,7 +83,9 @@ runs beside this build. `CORDELIA_TEST_BINARY_BEFORE_SHARED` names the
 binary of the release before shared channels (alpha.17, at step 20, which
 the relays and devices run now), which `shared_e2e.rs` runs as the relay
 in `a_relay_carries_a_shared_channel_with_no_change`, and as a device in
-`a_device_of_the_version_before_ignores_shared_lists`. CI downloads each
+`a_device_of_the_version_before_ignores_shared_lists`. Main's workspace
+is at alpha.17 too until its next release, so the relay's test tells the
+binary from this build by its bytes, not by the version it prints. CI downloads each
 from the release that `ci.yml` names in `VERSION_BEFORE` and
 `VERSION_BEFORE_SHARED`, and checks each against the SHA-256 that
 `ci.yml` names beside it (`VERSION_BEFORE_SHA256`,
