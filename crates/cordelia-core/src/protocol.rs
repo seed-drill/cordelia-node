@@ -1073,8 +1073,8 @@ const _: () = assert!(CHANGE_ENTRY_BYTES <= MAX_ITEM_BYTES);
 /// How much of a change entry's content is the part for the devices,
 /// sealed: the first 28 KB (decision 2026-10-04 §4.6). **Fixed, and never
 /// derived** (decision 2026-10-24 rule 13): a device of the version before
-/// (0.2.0-alpha.16) opens this part at this place and of this size, so it
-/// does not move or grow when the parts after it change.
+/// (v0.2.0-alpha.17 and earlier) opens this part at this place and of
+/// this size, so it does not move or grow when the parts after it change.
 pub const CHANGE_ENTRY_DEVICES_PART_BYTES: usize = 28_672;
 
 /// How much of a change entry's content is the part for the phrase, sealed:
@@ -1089,8 +1089,8 @@ pub const CHANGE_ENTRY_LINEAGE_BYTES: usize =
     CHANGE_ENTRY_BYTES - CHANGE_ENTRY_DEVICES_PART_BYTES - CHANGE_ENTRY_PHRASE_PART_BYTES;
 
 /// How much of a change entry's content was the part for the phrase in the
-/// layout of the version before (0.2.0-alpha.16), which had no lineage: the
-/// last 4 KB (decision 2026-10-04 §4.6). A change entry made there is
+/// layout of the version before (v0.2.0-alpha.17 and earlier), which had
+/// no lineage: the last 4 KB (decision 2026-10-04 §4.6). A change entry made there is
 /// opened for the phrase with it (decision 2026-10-24 rule 13).
 /// Derived: what the part for the devices leaves of CHANGE_ENTRY_BYTES.
 pub const CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES: usize =
