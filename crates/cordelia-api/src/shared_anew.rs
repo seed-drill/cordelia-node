@@ -832,6 +832,16 @@ fn write_offer(
             crate::take::take(conn, identity, &entry, now)?;
         }
         _ => {
+            // A take-out that the bound began and that has not ended ends
+            // here: it would take the offer out with the rest, and end as a
+            // drop's. What is left of the channel's entries goes once the
+            // offer is at each relay (§3.5, §7).
+            if row.state == State::NotInForce
+                && st(pass_rows::channel_out(conn, row.id))? == Some(ChannelOut::Dropped)
+            {
+                st(pass_rows::channel_ended(conn, row.id))?;
+                st(pass_rows::forget_places(conn, row.id))?;
+            }
             entries::store(conn, &entry, now)?;
         }
     }
