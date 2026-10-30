@@ -17,6 +17,14 @@
 //! went is kept as the newest time of each generation's, with the version
 //! before the first event of it that went ([`Dropped`]).
 //!
+//! **The device's own versions** make no arrivals, and are kept as events
+//! of their own ([`note_own`]; decision 2026-10-24 (removal), rule 27):
+//! each version it writes in the channel of a name, with its generation,
+//! when it was stored and the version current before it. They go with the
+//! file as arrivals do, and are counted apart: at most `MAX_FILE_ARRIVALS`
+//! a file, the newest time of each generation's that went kept
+//! ([`OwnDropped`]).
+//!
 //! Nothing here decides what is cut: that is the carry's.
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -67,8 +75,27 @@ pub struct Stored {
     /// that entry. A version gone back to counts as brought where it is
     /// one of these (decision 2026-10-24 (removal), rule 7).
     pub stored_id: Option<[u8; 32]>,
+    /// Whether it is a version this device wrote itself ([`note_own`]),
+    /// with no arrivals (rule 27).
+    pub own: bool,
     pub arrivals: Vec<Arrival>,
 }
+
+/// What went past the bound of the device's own versions of a file, for
+/// one generation (rule 27).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OwnDropped {
+    pub number: u64,
+    pub hash: [u8; 16],
+    /// The newest time a version of the device's own that went was stored.
+    pub newest_at: i64,
+}
+
+/// The slot of a channel that keeps the events of files a carry did not
+/// carry (rule 27): what came in them still says when a device first took
+/// a removed key's late writing. No file's slot is it: a slot is a keyed
+/// hash of a name.
+pub const LEFT_SLOT: [u8; 32] = [0; 32];
 
 /// What went past the bound, for one generation of a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,36 +177,17 @@ pub fn note(
     conn.execute_batch("SAVEPOINT file_arrivals")
         .map_err(storage)?;
     let noted = (|| {
-        let newest: Option<i64> = conn.query_row(
-            "SELECT MAX(at) FROM (SELECT MAX(stored_at) AS at FROM file_arrivals_stored
-                                  UNION ALL SELECT MAX(newest_at) FROM file_arrivals_dropped)",
-            [],
-            |row| row.get(0),
+        let place = insert(
+            conn,
+            channel,
+            slot,
+            (number, hash),
+            stored_at,
+            full_signers,
+            before,
+            stored_id,
+            false,
         )?;
-        let stored_at = newest.map_or(stored_at, |newest| stored_at.max(newest));
-        let full = (!full_signers.is_empty()).then(|| full_signers.concat());
-        conn.execute(
-            "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
-                 full_signers, before_author, before_rev, before_delete, before_content,
-                 before_author_sig, before_channel_sig, stored_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                channel.as_slice(),
-                slot.as_slice(),
-                i64::try_from(number).unwrap_or(i64::MAX),
-                hash.as_slice(),
-                stored_at,
-                full,
-                before.map(|entry| entry.author.to_vec()),
-                before.map(|entry| i64::try_from(entry.rev).unwrap_or(i64::MAX)),
-                before.map(|entry| entry.delete),
-                before.map(|entry| entry.content.clone()),
-                before.map(|entry| entry.author_signature.to_vec()),
-                before.map(|entry| entry.channel_signature.to_vec()),
-                stored_id.map(|id| id.to_vec()),
-            ],
-        )?;
-        let place = conn.last_insert_rowid();
         for arrival in arrivals {
             conn.execute(
                 "INSERT INTO file_arrivals (stored, signer, link_hash, times)
@@ -203,6 +211,94 @@ pub fn note(
     noted.map_err(storage)
 }
 
+/// Keep a version that this device wrote itself in the file `slot` of
+/// `channel` (rule 27): an event with no arrivals, in the generation
+/// `number` and `hash`, at `stored_at` (stamped no earlier than the newest
+/// event kept, as [`note`] stamps one), with the version current before it
+/// and the ID of the entry it stored. The file is kept to the bound of its
+/// own versions, apart from its arrivals. Returns its place.
+#[allow(clippy::too_many_arguments)]
+pub fn note_own(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    number: u64,
+    hash: &[u8; 16],
+    stored_at: i64,
+    before: Option<&Entry>,
+    stored_id: &[u8; 32],
+) -> Result<i64, CordeliaError> {
+    conn.execute_batch("SAVEPOINT file_own").map_err(storage)?;
+    let noted = (|| {
+        let place = insert(
+            conn,
+            channel,
+            slot,
+            (number, hash),
+            stored_at,
+            &[],
+            before,
+            Some(stored_id),
+            true,
+        )?;
+        keep_own_to_the_bound(conn, channel, slot)?;
+        Ok(place)
+    })();
+    let end = match noted {
+        Ok(_) => "RELEASE file_own",
+        Err(_) => "ROLLBACK TO file_own; RELEASE file_own",
+    };
+    conn.execute_batch(end).map_err(storage)?;
+    noted.map_err(storage)
+}
+
+/// Insert one event, stamped no earlier than the newest kept, and return
+/// its place.
+#[allow(clippy::too_many_arguments)]
+fn insert(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    (number, hash): (u64, &[u8; 16]),
+    stored_at: i64,
+    full_signers: &[[u8; 16]],
+    before: Option<&Entry>,
+    stored_id: Option<&[u8; 32]>,
+    own: bool,
+) -> rusqlite::Result<i64> {
+    let newest: Option<i64> = conn.query_row(
+        "SELECT MAX(at) FROM (SELECT MAX(stored_at) AS at FROM file_arrivals_stored
+                              UNION ALL SELECT MAX(newest_at) FROM file_arrivals_dropped)",
+        [],
+        |row| row.get(0),
+    )?;
+    let stored_at = newest.map_or(stored_at, |newest| stored_at.max(newest));
+    let full = (!full_signers.is_empty()).then(|| full_signers.concat());
+    conn.execute(
+        "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+             full_signers, before_author, before_rev, before_delete, before_content,
+             before_author_sig, before_channel_sig, stored_id, own)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        params![
+            channel.as_slice(),
+            slot.as_slice(),
+            i64::try_from(number).unwrap_or(i64::MAX),
+            hash.as_slice(),
+            stored_at,
+            full,
+            before.map(|entry| entry.author.to_vec()),
+            before.map(|entry| i64::try_from(entry.rev).unwrap_or(i64::MAX)),
+            before.map(|entry| entry.delete),
+            before.map(|entry| entry.content.clone()),
+            before.map(|entry| entry.author_signature.to_vec()),
+            before.map(|entry| entry.channel_signature.to_vec()),
+            stored_id.map(|id| id.to_vec()),
+            own,
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
 /// The event at `place` ([`note`]) stored an entry whose chain may have
 /// dropped what it was written after (decision 2026-10-24 (removal), rule
 /// 7): it was missing, or full, or the index's (the fourth read of slice
@@ -224,7 +320,7 @@ fn counted(conn: &Connection, channel: &[u8; 32], slot: &[u8; 32]) -> rusqlite::
     conn.query_row(
         "SELECT COALESCE(SUM(MAX(1, (SELECT COUNT(*) FROM file_arrivals a
                                      WHERE a.stored = s.place))), 0)
-         FROM file_arrivals_stored s WHERE s.channel_id = ?1 AND s.slot = ?2",
+         FROM file_arrivals_stored s WHERE s.channel_id = ?1 AND s.slot = ?2 AND s.own = 0",
         params![channel.as_slice(), slot.as_slice()],
         |row| row.get(0),
     )
@@ -241,7 +337,7 @@ fn keep_to_the_bound(
         let oldest: Option<i64> = conn
             .query_row(
                 "SELECT place FROM file_arrivals_stored
-                 WHERE channel_id = ?1 AND slot = ?2 ORDER BY place LIMIT 1",
+                 WHERE channel_id = ?1 AND slot = ?2 AND own = 0 ORDER BY place LIMIT 1",
                 params![channel.as_slice(), slot.as_slice()],
                 |row| row.get(0),
             )
@@ -268,6 +364,42 @@ fn keep_to_the_bound(
     Ok(())
 }
 
+/// Past `MAX_FILE_ARRIVALS` versions of the device's own in a file, the
+/// oldest go, and the newest time of what went is kept for each generation
+/// (rule 27).
+fn keep_own_to_the_bound(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> rusqlite::Result<()> {
+    loop {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM file_arrivals_stored
+             WHERE channel_id = ?1 AND slot = ?2 AND own = 1",
+            params![channel.as_slice(), slot.as_slice()],
+            |row| row.get(0),
+        )?;
+        if count <= MAX_FILE_ARRIVALS as i64 {
+            return Ok(());
+        }
+        let place: i64 = conn.query_row(
+            "SELECT place FROM file_arrivals_stored
+             WHERE channel_id = ?1 AND slot = ?2 AND own = 1 ORDER BY place LIMIT 1",
+            params![channel.as_slice(), slot.as_slice()],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
+             SELECT channel_id, slot, number, hash, stored_at
+             FROM file_arrivals_stored WHERE place = ?1
+             ON CONFLICT(channel_id, slot, number, hash)
+             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
+            params![place],
+        )?;
+        drop_event(conn, place)?;
+    }
+}
+
 fn drop_event(conn: &Connection, place: i64) -> rusqlite::Result<()> {
     conn.execute(
         "DELETE FROM file_arrivals WHERE stored = ?1",
@@ -291,7 +423,7 @@ pub fn of_file(
         .prepare(
             "SELECT place, number, hash, stored_at, full_signers, before_author, before_rev,
                     before_delete, before_content, before_author_sig, before_channel_sig,
-                    stored_id, unknown
+                    stored_id, unknown, own
              FROM file_arrivals_stored WHERE channel_id = ?1 AND slot = ?2 ORDER BY place",
         )
         .map_err(storage)?;
@@ -310,6 +442,7 @@ pub fn of_file(
                 before,
                 stored_id: id_of(row.get(11)?),
                 unknown: row.get(12)?,
+                own: row.get(13)?,
                 arrivals: Vec::new(),
             })
         })
@@ -356,6 +489,31 @@ pub fn of_file(
         .collect::<Result<Vec<_>, _>>()
         .map_err(storage)?;
     Ok((events, dropped))
+}
+
+/// What went past the bound of the device's own versions of the file
+/// `slot` in `channel`, a row for each generation (rule 27).
+pub fn own_dropped_of_file(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<Vec<OwnDropped>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT number, hash, newest_at FROM file_own_dropped
+             WHERE channel_id = ?1 AND slot = ?2 ORDER BY newest_at",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel.as_slice(), slot.as_slice()], |row| {
+            Ok(OwnDropped {
+                number: row.get::<_, i64>(0)?.max(0) as u64,
+                hash: row.get::<_, Vec<u8>>(1)?.try_into().unwrap_or_default(),
+                newest_at: row.get(2)?,
+            })
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
 /// The most times the link `hash` of `signer` stood in an arrival of the
@@ -417,12 +575,14 @@ pub fn forget_dropped(
     channel: &[u8; 32],
     slot: &[u8; 32],
 ) -> Result<(), CordeliaError> {
-    conn.execute(
-        "DELETE FROM file_arrivals_dropped WHERE channel_id = ?1 AND slot = ?2",
-        params![channel.as_slice(), slot.as_slice()],
-    )
-    .map(|_| ())
-    .map_err(storage)
+    for table in ["file_arrivals_dropped", "file_own_dropped"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE channel_id = ?1 AND slot = ?2"),
+            params![channel.as_slice(), slot.as_slice()],
+        )
+        .map_err(storage)?;
+    }
+    Ok(())
 }
 
 /// The version to go back to before the event at `place`, sealed again
@@ -533,7 +693,11 @@ pub fn move_file(
     to: &[u8; 32],
     to_slot: &[u8; 32],
 ) -> Result<(), CordeliaError> {
-    for table in ["file_arrivals_stored", "file_arrivals_dropped"] {
+    for table in [
+        "file_arrivals_stored",
+        "file_arrivals_dropped",
+        "file_own_dropped",
+    ] {
         conn.execute(
             &format!(
                 "UPDATE {table} SET channel_id = ?3, slot = ?4
@@ -600,8 +764,8 @@ pub fn copy_file(
         for place in places {
             conn.execute(
                 "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
-                     full_signers, unknown)
-                 SELECT channel_id, ?2, number, hash, stored_at, full_signers, unknown
+                     full_signers, unknown, own)
+                 SELECT channel_id, ?2, number, hash, stored_at, full_signers, unknown, own
                  FROM file_arrivals_stored WHERE place = ?1",
                 params![place, to_slot.as_slice()],
             )?;
@@ -625,7 +789,16 @@ pub fn copy_file(
                            before_channel_sig = NULL, first_stored_id = NULL",
             params![channel.as_slice(), from_slot.as_slice(), to_slot.as_slice()],
         )?;
+        conn.execute(
+            "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
+             SELECT channel_id, ?3, number, hash, newest_at
+             FROM file_own_dropped WHERE channel_id = ?1 AND slot = ?2
+             ON CONFLICT(channel_id, slot, number, hash)
+             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
+            params![channel.as_slice(), from_slot.as_slice(), to_slot.as_slice()],
+        )?;
         keep_to_the_bound(conn, channel, to_slot)?;
+        keep_own_to_the_bound(conn, channel, to_slot)?;
         conn.execute(
             "INSERT INTO file_copies (channel_id, slot, folder, key, chain, held)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)
@@ -777,6 +950,93 @@ pub fn files_of_channel(
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
+/// Keep the events of every file of `from` that a carry did not move, and
+/// what went past their bounds, in [`LEFT_SLOT`] of `to`, with no version
+/// to go back to and no entry stored (rule 27): a file whose current
+/// version a carry made before the device knew did not carry (a delete,
+/// say) still says when a removed key's late writing first came. Called
+/// before the carry drops what it holds of `from`.
+pub fn keep_left(conn: &Connection, from: &[u8; 32], to: &[u8; 32]) -> Result<(), CordeliaError> {
+    conn.execute_batch("SAVEPOINT file_left").map_err(storage)?;
+    let kept = (|| -> rusqlite::Result<()> {
+        conn.execute(
+            "UPDATE file_arrivals_stored SET channel_id = ?2, slot = ?3, before_author = NULL,
+                 before_rev = NULL, before_delete = NULL, before_content = NULL,
+                 before_author_sig = NULL, before_channel_sig = NULL, stored_id = NULL
+             WHERE channel_id = ?1",
+            params![from.as_slice(), to.as_slice(), LEFT_SLOT.as_slice()],
+        )?;
+        conn.execute(
+            "INSERT INTO file_arrivals_dropped (channel_id, slot, number, hash, newest_at,
+                 first_place)
+             SELECT ?2, ?3, number, hash, MAX(newest_at), MIN(first_place)
+             FROM file_arrivals_dropped WHERE channel_id = ?1 GROUP BY number, hash
+             ON CONFLICT(channel_id, slot, number, hash)
+             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at),
+                           first_place = MIN(first_place, excluded.first_place),
+                           before_author = NULL, before_rev = NULL, before_delete = NULL,
+                           before_content = NULL, before_author_sig = NULL,
+                           before_channel_sig = NULL, first_stored_id = NULL",
+            params![from.as_slice(), to.as_slice(), LEFT_SLOT.as_slice()],
+        )?;
+        conn.execute(
+            "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
+             SELECT ?2, ?3, number, hash, MAX(newest_at)
+             FROM file_own_dropped WHERE channel_id = ?1 GROUP BY number, hash
+             ON CONFLICT(channel_id, slot, number, hash)
+             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
+            params![from.as_slice(), to.as_slice(), LEFT_SLOT.as_slice()],
+        )?;
+        for table in ["file_arrivals_dropped", "file_own_dropped"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE channel_id = ?1"),
+                params![from.as_slice()],
+            )?;
+        }
+        keep_to_the_bound(conn, to, &LEFT_SLOT)?;
+        keep_own_to_the_bound(conn, to, &LEFT_SLOT)
+    })();
+    let end = match kept {
+        Ok(()) => "RELEASE file_left",
+        Err(_) => "ROLLBACK TO file_left; RELEASE file_left",
+    };
+    conn.execute_batch(end).map_err(storage)?;
+    kept.map_err(storage)
+}
+
+/// Keep the generation `number` and `hash` as one in which a carry set
+/// aside what the device wrote itself (rule 27).
+pub fn own_set_aside_in(
+    conn: &Connection,
+    number: u64,
+    hash: &[u8; 16],
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO file_own_set_aside (number, hash) VALUES (?1, ?2)
+         ON CONFLICT(number, hash) DO NOTHING",
+        params![i64::try_from(number).unwrap_or(i64::MAX), hash.as_slice()],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
+/// Every generation in which a carry set aside what the device wrote
+/// itself (rule 27).
+pub fn own_set_aside(conn: &Connection) -> Result<Vec<(u64, [u8; 16])>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT number, hash FROM file_own_set_aside ORDER BY number, hash")
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?.max(0) as u64,
+                row.get::<_, Vec<u8>>(1)?.try_into().unwrap_or_default(),
+            ))
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// Keep nothing of the files of `channel`: it was left, or dropped.
 pub fn forget_channel(conn: &Connection, channel: &[u8; 32]) -> Result<(), CordeliaError> {
     conn.execute(
@@ -788,6 +1048,7 @@ pub fn forget_channel(conn: &Connection, channel: &[u8; 32]) -> Result<(), Corde
     for table in [
         "file_arrivals_stored",
         "file_arrivals_dropped",
+        "file_own_dropped",
         "file_copies",
     ] {
         conn.execute(
@@ -805,6 +1066,8 @@ pub fn forget_all(conn: &Connection) -> Result<(), CordeliaError> {
         "file_arrivals",
         "file_arrivals_stored",
         "file_arrivals_dropped",
+        "file_own_dropped",
+        "file_own_set_aside",
         "file_copies",
     ] {
         conn.execute(&format!("DELETE FROM {table}"), [])

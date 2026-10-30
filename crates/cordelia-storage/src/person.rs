@@ -964,6 +964,18 @@ pub fn removed_with_adders(conn: &Connection) -> Result<Vec<RemovedBy>, Cordelia
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
+/// Every key the device keeps as removed, with when it first kept it: the
+/// moment it knew (decision 2026-10-24 (removal), rules 2, 5 and 27).
+pub fn removed_seen(conn: &Connection) -> Result<Vec<([u8; 32], i64)>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT key, seen_at FROM person_removed_keys ORDER BY key ASC")
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// How many keys the device keeps as removed.
 fn removed_count(conn: &Connection) -> Result<usize, CordeliaError> {
     conn.query_row("SELECT COUNT(*) FROM person_removed_keys", [], |row| {

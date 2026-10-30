@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 25;
+pub const SCHEMA_VERSION: u32 = 26;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1356,6 +1356,44 @@ ALTER TABLE file_arrivals_stored ADD COLUMN unknown INTEGER NOT NULL DEFAULT 0
 UPDATE file_arrivals_stored SET unknown = 1 WHERE full_signers IS NOT NULL;
 "#;
 
+/// Migration v26: what a device wrote itself, beside the arrivals (decision
+/// 2026-10-24 (removal), rule 27, the person's ruling of 30 October).
+///
+/// - `file_arrivals_stored.own`: 1 on an event that is a version this device
+///   wrote itself in the channel of a name (a publish, a conflict copy's
+///   first version, a version a carry by command brought), with no
+///   arrivals: its generation, when it was stored and the version current
+///   before it. At a carry, every one stored from the first arrival that
+///   rule 7 leaves out in its generation, in any name, to the device's
+///   knowing of the removal is set aside, and the file goes back to before
+///   it. Counted apart from the arrivals, so that the device's own writing
+///   pushes no arrival past the bound; every event kept before the step is
+///   an arrival, 0.
+/// - `file_own_dropped`: for each file and generation, the newest time of
+///   a version of the device's own whose event went past its bound
+///   (`MAX_FILE_ARRIVALS` of them a file): where that is inside a window,
+///   the file goes back to none.
+/// - `file_own_set_aside`: each generation in which a carry set aside what
+///   the device wrote itself: a carry by command on this device leaves out
+///   what it wrote there, which is at the relays.
+const MIGRATION_V26: &str = r#"
+ALTER TABLE file_arrivals_stored ADD COLUMN own INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(own) = 'integer' AND own IN (0, 1));
+CREATE TABLE file_own_dropped (
+    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot        BLOB NOT NULL CHECK(length(slot) = 32),
+    number      INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash        BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    newest_at   INTEGER NOT NULL CHECK(typeof(newest_at) = 'integer'),
+    PRIMARY KEY (channel_id, slot, number, hash)
+);
+CREATE TABLE file_own_set_aside (
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    PRIMARY KEY (number, hash)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1596,6 +1634,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 25 {
         tracing::info!("applying migration v25 (a conflict copy kept on this device)");
         migrate_in_one(conn, MIGRATION_V25, 25)?;
+    }
+
+    if current < 26 {
+        tracing::info!("applying migration v26 (what a device wrote itself)");
+        migrate_in_one(conn, MIGRATION_V26, 26)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -5780,7 +5823,7 @@ mod tests {
         assert!(migrate_in_one(&conn, &failing, 25).is_err());
         assert_eq!(version(&conn), 24);
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 25);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
         migrate_in_one(&conn, MIGRATION_V25, 25).unwrap();
         let held: i64 = conn
             .query_row("SELECT held FROM file_copies", [], |row| row.get(0))
@@ -5804,6 +5847,77 @@ mod tests {
             );
             conn.execute_batch("SAVEPOINT one").unwrap();
             assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
+    /// The step to version 26 adds `file_arrivals_stored.own`, 0 on every
+    /// event kept before it (each was an arrival), and the tables of what
+    /// went past the bound of the device's own versions and of the
+    /// generations where a carry set them aside (decision 2026-10-24
+    /// (removal), rule 27); `own` takes no value but 0 or 1; it is made in
+    /// one step with its version, and asked for twice it is run once.
+    #[test]
+    fn step_26_marks_no_event_kept_before_it_as_the_devices_own() {
+        let conn = at_v21();
+        for (sql, version) in [
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+            (MIGRATION_V25, 25),
+        ] {
+            migrate_in_one(&conn, sql, version).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
+             VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9);",
+        )
+        .unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let failing = format!("{MIGRATION_V26} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 26).is_err());
+        assert_eq!(version(&conn), 25);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 26);
+        migrate_in_one(&conn, MIGRATION_V26, 26).unwrap();
+        let own: i64 = conn
+            .query_row("SELECT own FROM file_arrivals_stored", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(own, 0);
+        for (value, taken) in [("0", true), ("1", true), ("2", false), ("'one'", false)] {
+            let sql = format!(
+                "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at, own)
+                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 10, {value})"
+            );
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+        for (sql, taken) in [
+            (
+                "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
+                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9)",
+                true,
+            ),
+            (
+                "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
+                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(15), 9)",
+                false,
+            ),
+            (
+                "INSERT INTO file_own_set_aside (number, hash) VALUES (1, zeroblob(16))",
+                true,
+            ),
+            (
+                "INSERT INTO file_own_set_aside (number, hash) VALUES (0, zeroblob(16))",
+                false,
+            ),
+        ] {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert_eq!(conn.execute_batch(sql).is_ok(), taken, "{sql}");
             conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
         }
     }
