@@ -241,6 +241,28 @@ pub fn write_bounds_list(
     in_one(conn, || list_written(conn, identity, now, fetched, None))
 }
 
+/// [`write_bounds_list`], as each pass asks it: where what decides it is
+/// what it was at a pass that wrote and dropped nothing, and none of the
+/// device's own bounds has reached the time it leaves the list, nothing is
+/// opened or checked ([`crate::marks::ListsSeen`]). `fetched` says, of the
+/// messages channel's ID, whether it was fetched since the node started.
+pub fn write_bounds_list_where_changed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+    fetched: impl FnOnce(&[u8; 32]) -> bool,
+    seen: &mut crate::marks::ListsSeen,
+) -> Result<Option<u64>, PersonError> {
+    seen.where_changed(
+        conn,
+        &identity.public_key(),
+        PersonList::Bounds,
+        now,
+        fetched,
+        |fetched| write_bounds_list(conn, identity, now, fetched),
+    )
+}
+
 /// [`write_bounds_list`], in the caller's write; with `above`, a relay
 /// answered that it holds another list of the device's at that revision.
 fn list_written(
@@ -1229,5 +1251,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(stops_on(&s, 0, t + 1), None);
+    }
+
+    /// A pass asks in full whether the list of bounds is due only where
+    /// what decides it changed since a pass that changed nothing, or once
+    /// one of the device's own bounds reaches the time it leaves the list
+    /// (issue #221): ten passes ask nothing; a second bound set here, and
+    /// another device's list taken, are each asked once; and at the second
+    /// a bound leaves the list it is asked, and the list written without it.
+    #[test]
+    fn the_list_of_bounds_is_asked_again_only_where_what_decides_it_changed() {
+        let s = devices(2);
+        let t = s.now;
+        allows(&s, 0, Some(20), 2 * HOUR as u32, t);
+        let asked = std::cell::Cell::new(0);
+        let pass = |seen: &mut crate::marks::ListsSeen, now: i64| {
+            let write = |fetched: bool| {
+                asked.set(asked.get() + 1);
+                write_bounds_list(&s[0].conn, &s[0].identity, now, fetched)
+            };
+            seen.where_changed(
+                &s[0].conn,
+                &s.key(0),
+                PersonList::Bounds,
+                now,
+                |_| true,
+                write,
+            )
+            .unwrap()
+        };
+        let mut seen = crate::marks::ListsSeen::default();
+        pass(&mut seen, t + 1);
+        pass(&mut seen, t + 2);
+        let warm = asked.get();
+        assert!(warm <= 2);
+        let changes = s[0].conn.total_changes();
+        for i in 0..10 {
+            assert_eq!(pass(&mut seen, t + 3 + i), None);
+        }
+        assert_eq!(asked.get(), warm, "nothing changed: nothing is asked");
+        assert_eq!(s[0].conn.total_changes(), changes);
+
+        // A bound set here for another pair.
+        allows_pair(
+            &s,
+            0,
+            &Pair::of("plans", None),
+            Some(30),
+            HOUR as u32,
+            t + 20,
+        );
+        assert_eq!(pass(&mut seen, t + 21), None);
+        assert_eq!(asked.get(), warm + 1);
+        assert_eq!(pass(&mut seen, t + 22), None);
+        assert_eq!(asked.get(), warm + 1);
+
+        // Another device's list, for a pair this device has no bound of.
+        allows_pair(&s, 1, &Pair::of("work", None), Some(5), HOUR as u32, t + 30);
+        hears(&s, 1, 0, t + 31);
+        assert_eq!(pass(&mut seen, t + 32), None);
+        assert_eq!(asked.get(), warm + 2);
+
+        // The first of its own bounds to leave the list: asked once that
+        // time comes, and written without it.
+        let own = s.key(0);
+        let leaves = kept(held::bounds(&s[0].conn))
+            .unwrap()
+            .iter()
+            .filter(|row| row.key == own)
+            .map(listed_until)
+            .min()
+            .unwrap();
+        assert_eq!(pass(&mut seen, leaves - 1), None);
+        assert_eq!(asked.get(), warm + 2);
+        assert_eq!(listed(&s, 0).len(), 2);
+        assert!(pass(&mut seen, leaves).is_some());
+        assert_eq!(asked.get(), warm + 3);
+        assert_eq!(listed(&s, 0).len(), 1);
     }
 }

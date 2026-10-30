@@ -728,6 +728,220 @@ impl PersonRead {
     }
 }
 
+// ── What a pass found last (issue #221) ──────────────────────────────
+
+/// What a device's passes found last of what decides whether its list of
+/// a person's reads, its list of bounds (decision 2026-10-25, rules 1 and
+/// 2), and its list of shared marks (decision 2026-10-10 §6.1), is due,
+/// kept in memory between passes. Each pass asks whether
+/// either list is due, at each relay; asked in full, that opens the list
+/// the store holds and checks the statement, under the lock, each time.
+/// What decides it is read here with a few reads of the store and nothing
+/// checked or opened: where it is what it was at a pass that wrote and
+/// changed nothing, the list is not due, and nothing more is done. A
+/// change to any of it, and a bound reaching the time it leaves the list,
+/// asks in full again, once.
+#[derive(Debug, Default)]
+pub struct ListsSeen {
+    /// The statement the device stands applied under, and the messages
+    /// channel and the two lists' slots under it.
+    under: Option<Under>,
+    reads: Option<Inputs>,
+    bounds: Option<Inputs>,
+    shared_reads: Option<Inputs>,
+}
+
+#[derive(Debug)]
+struct Under {
+    statement: Vec<u8>,
+    channel: [u8; 32],
+    reads_slot: [u8; 32],
+    bounds_slot: [u8; 32],
+    shared_reads_slot: [u8; 32],
+}
+
+/// What decides whether one of the lists is due, but the time.
+#[derive(Debug, PartialEq, Eq)]
+struct Inputs {
+    /// The statement applied, as the store holds it: the generation, the
+    /// secret and the keys of the statement.
+    statement: Vec<u8>,
+    sync: Option<String>,
+    fetched: bool,
+    /// The revision of the device's own list in its slot, where the store
+    /// holds one: it replaces a list only with a higher one.
+    rev: Option<u64>,
+    /// The rows that the list is made from, as the store reads them.
+    rows: Rows,
+    /// The time at which a pass asks in full again whatever else holds:
+    /// the first at which one of the device's own bounds leaves the list.
+    until: i64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Rows {
+    Reads(Vec<held::Id>),
+    Bounds {
+        rows: Vec<held::BoundRow>,
+        additions: Vec<cordelia_storage::person::KeptAddition>,
+    },
+    /// The marks of the device's table of shared marks that a list holds.
+    SharedReads(Vec<Mark>),
+}
+
+impl ListsSeen {
+    /// The messages channel and the lists' slots under `statement`: worked
+    /// out once for each statement applied.
+    fn under(
+        &mut self,
+        conn: &Connection,
+        own: &[u8; 32],
+        statement: &[u8],
+    ) -> Result<&Under, PersonError> {
+        if self
+            .under
+            .as_ref()
+            .is_none_or(|under| under.statement != statement)
+        {
+            let standing = Standing::to_write(conn)?;
+            let secret = derive::messages_secret(&standing.secret)?;
+            let slot_key = derive::slot_key(&secret)?;
+            self.under = Some(Under {
+                statement: statement.to_vec(),
+                channel: derive::channel_id(&secret)?,
+                reads_slot: slot_id(&slot_key, &person_name(own)?),
+                bounds_slot: slot_id(&slot_key, &hold_name(own)?),
+                shared_reads_slot: slot_id(&slot_key, &sread_name(own)?),
+            });
+        }
+        match &self.under {
+            Some(under) => Ok(under),
+            None => unreachable!("set just above"),
+        }
+    }
+
+    /// What decides whether `list` is due now, read from the store, with
+    /// whether the messages channel was fetched since the node started by
+    /// `fetched` of its ID. `None` where the device does not stand applied:
+    /// then nothing is due, and the caller asks in full, which says so at
+    /// no cost.
+    fn inputs(
+        &mut self,
+        conn: &Connection,
+        own: &[u8; 32],
+        list: PersonList,
+        fetched: impl FnOnce(&[u8; 32]) -> bool,
+    ) -> Result<Option<Inputs>, PersonError> {
+        let Some(person) = cordelia_storage::person::person(conn)? else {
+            return Ok(None);
+        };
+        if person.state != cordelia_storage::person::State::Applied {
+            return Ok(None);
+        }
+        let under = self.under(conn, own, &person.statement)?;
+        let (channel, slot) = match list {
+            PersonList::Reads => (under.channel, under.reads_slot),
+            PersonList::Bounds => (under.channel, under.bounds_slot),
+            PersonList::SharedReads => (under.channel, under.shared_reads_slot),
+        };
+        let rev = entries::author_cost(conn, &channel, &slot, own)?.map(|(rev, _)| rev);
+        let (rows, until) = match list {
+            PersonList::Reads => (Rows::Reads(kept(held::person_ids_to_list(conn))?), i64::MAX),
+            PersonList::Bounds => {
+                let rows = kept(held::bounds(conn))?;
+                let until = rows
+                    .iter()
+                    .filter(|row| row.key == *own)
+                    .map(crate::bounds::listed_until)
+                    .min()
+                    .unwrap_or(i64::MAX);
+                let additions = cordelia_storage::person::additions(conn)?;
+                (Rows::Bounds { rows, additions }, until)
+            }
+            PersonList::SharedReads => (
+                Rows::SharedReads(
+                    cordelia_storage::shared_messages::marks_to_list(conn)
+                        .map_err(PersonError::Storage)?,
+                ),
+                i64::MAX,
+            ),
+        };
+        Ok(Some(Inputs {
+            statement: person.statement,
+            sync: meta::get(conn, meta::SYNC_CLAUDE_DIR)?,
+            fetched: fetched(&channel),
+            rev,
+            rows,
+            until,
+        }))
+    }
+
+    fn seen(&mut self, list: PersonList) -> &mut Option<Inputs> {
+        match list {
+            PersonList::Reads => &mut self.reads,
+            PersonList::Bounds => &mut self.bounds,
+            PersonList::SharedReads => &mut self.shared_reads,
+        }
+    }
+
+    /// Ask whether `list` is due by `write`, given `fetched` of the
+    /// messages channel's ID, where what decides it is not what it was at
+    /// a pass that changed nothing, and before the time it is asked again
+    /// at. Returns what `write` returned, or `None` where it was not
+    /// asked. Its answer is kept where `write` changed nothing in the
+    /// store; anything else is asked in full at the next pass.
+    pub(crate) fn where_changed(
+        &mut self,
+        conn: &Connection,
+        own: &[u8; 32],
+        list: PersonList,
+        now: i64,
+        fetched: impl FnOnce(&[u8; 32]) -> bool,
+        write: impl FnOnce(bool) -> Result<Option<u64>, PersonError>,
+    ) -> Result<Option<u64>, PersonError> {
+        let inputs = match self.inputs(conn, own, list, fetched) {
+            Ok(inputs) => inputs,
+            Err(e) => {
+                *self.seen(list) = None;
+                return Err(e);
+            }
+        };
+        let Some(inputs) = inputs else {
+            *self.seen(list) = None;
+            return write(false);
+        };
+        if now < inputs.until && self.seen(list).as_ref() == Some(&inputs) {
+            return Ok(None);
+        }
+        let before = conn.total_changes();
+        let written = write(inputs.fetched);
+        let unchanged = matches!(written, Ok(None)) && conn.total_changes() == before;
+        *self.seen(list) = unchanged.then_some(inputs);
+        written
+    }
+}
+
+/// [`write_person_list`], as each pass asks it: where what decides it is
+/// what it was at a pass that wrote nothing, nothing is opened or checked
+/// ([`ListsSeen`]). `fetched` says, of the messages channel's ID, whether
+/// it was fetched since the node started.
+pub fn write_person_list_where_changed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+    fetched: impl FnOnce(&[u8; 32]) -> bool,
+    seen: &mut ListsSeen,
+) -> Result<Option<u64>, PersonError> {
+    seen.where_changed(
+        conn,
+        &identity.public_key(),
+        PersonList::Reads,
+        now,
+        fetched,
+        |fetched| write_person_list(conn, identity, now, fetched),
+    )
+}
+
 /// What the store answered, with its error as the device's.
 fn kept<T>(answer: Result<T, StorageError>) -> Result<T, PersonError> {
     answer.map_err(|e| PersonError::Storage(CordeliaError::Storage(e.to_string())))
@@ -1894,5 +2108,71 @@ mod tests {
             true,
         );
         assert_eq!(again.unwrap(), Some(2));
+    }
+
+    /// A pass asks in full whether the list of a person's reads is due only
+    /// where what decides it changed since a pass that changed nothing
+    /// (issue #221): ten passes after the list is written ask nothing and
+    /// change nothing in the store; a person's new read, the first fetch
+    /// and a list of the device's own at a higher revision are each asked
+    /// once, and what is written is what the pass would write asked in
+    /// full.
+    #[test]
+    fn the_persons_list_is_asked_again_only_where_what_decides_it_changed() {
+        let s = devices(2);
+        let t = s.now;
+        let asked = std::cell::Cell::new(0);
+        let pass = |seen: &mut ListsSeen, fetched: bool| {
+            let write = |fetched: bool| {
+                asked.set(asked.get() + 1);
+                write_person_list(&s[0].conn, &s[0].identity, t, fetched)
+            };
+            seen.where_changed(
+                &s[0].conn,
+                &s.key(0),
+                PersonList::Reads,
+                t,
+                |_| fetched,
+                write,
+            )
+            .unwrap()
+        };
+        let mut seen = ListsSeen::default();
+        let first = sends(&s, 0, "~", "notes", "first", t);
+        assert_eq!(pass(&mut seen, true), Some(1));
+        // The pass after a write asks again, once.
+        assert_eq!(pass(&mut seen, true), None);
+        assert_eq!(asked.get(), 2);
+        let changes = s[0].conn.total_changes();
+        for _ in 0..10 {
+            assert_eq!(pass(&mut seen, true), None);
+        }
+        assert_eq!(asked.get(), 2, "nothing changed: nothing is asked");
+        assert_eq!(s[0].conn.total_changes(), changes);
+
+        // A person's new read.
+        let second = sends(&s, 0, "~", "work", "second", t);
+        assert_eq!(pass(&mut seen, true), Some(2));
+        assert_eq!(person_listed(&s, 0), Some((2, vec![second, first])));
+        assert_eq!(pass(&mut seen, true), None);
+        assert_eq!(asked.get(), 4);
+
+        // The channel not fetched since a start, then fetched.
+        assert_eq!(pass(&mut seen, false), None);
+        assert_eq!(pass(&mut seen, false), None);
+        assert_eq!(asked.get(), 5);
+        assert_eq!(pass(&mut seen, true), None);
+        assert_eq!(asked.get(), 6);
+
+        // A list of its own at a higher revision, as a relay's answer of
+        // another has the device write.
+        assert_eq!(
+            person_list_written(&s[0].conn, &s[0].identity, t, true, Some(2)).unwrap(),
+            Some(3)
+        );
+        assert_eq!(pass(&mut seen, true), None);
+        assert_eq!(asked.get(), 7);
+        assert_eq!(pass(&mut seen, true), None);
+        assert_eq!(asked.get(), 7);
     }
 }

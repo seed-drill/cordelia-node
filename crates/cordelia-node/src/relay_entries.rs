@@ -46,6 +46,20 @@
 //! - **Push** (§2.4 items 1 and 2). Each entry is checked and taken by the
 //!   store's rule, and each is answered for.
 //!
+//! ## When a channel was used
+//!
+//! A proof that holds for a channel the relay holds, and an entry shown,
+//! whole or in short, that the relay holds, are use of the channel
+//! (decision 2026-10-04 §2.5). None of them writes: each is answered by
+//! reading, and the use is kept in memory ([`Uses`]), with the database's
+//! lock held, so that a sweep that holds it sees every use before it. The
+//! uses are written in one transaction once a minute
+//! (RELAY_USES_WRITE_INTERVAL_SECS), at the hourly sweep, before it reads
+//! them, and at a clean stop ([`RelayEntries::write_uses`]), by the rule
+//! of §16: a time more than an hour later than the one kept, never an
+//! earlier one (issue #214). The same is done with when a listed relay
+//! says a channel was last used.
+//!
 //! ## Who asks
 //!
 //! A peer is its address, for the room's allowance of new channels, or it
@@ -110,21 +124,21 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cordelia_core::NodeId;
 use cordelia_core::load::{Answered, Kind, Refusal, Stream, StreamCounts};
-use cordelia_core::lock::{LockWhole, Nested, TimedLock, take_as, taking};
+use cordelia_core::lock::{LockWhole, Nested, TimedGuard, TimedLock, take_as, taking};
 use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
     FRAME_LENGTH_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES,
     MAX_SLOTS_SHOWN_ON_A_CONNECTION, MIN_ENTRY_CONTENT_BYTES, RELAY_CHANNEL_PAGES_PER_PASS,
-    RELAY_CHANNELS_PAGE_MAX, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SMALL_PAGE_BYTES,
-    SMALL_WINDOWS_PULL_ENTRIES, entry_cost,
+    RELAY_CHANNELS_PAGE_MAX, RELAY_CHECKPOINT_LOG_PAGES, RELAY_ENTRY_PULL_PAGES,
+    SESSION_VALUE_BYTES, SMALL_PAGE_BYTES, SMALL_WINDOWS_PULL_ENTRIES, entry_cost,
 };
 use cordelia_crypto::entry::CheckedEntry;
-use cordelia_crypto::proof;
 use cordelia_network::codec;
 use cordelia_network::messages::{
     ChannelProve, ChannelProved, EntryPull, EntryPulled, EntryPush, EntryPushed, EntryRefused,
@@ -132,7 +146,9 @@ use cordelia_network::messages::{
     RelayChannelsHeld, RelayEntry, RelayPull, RelayPush, ShowAnswer, WireMessage,
 };
 use cordelia_network::transport;
-use cordelia_storage::relay::{self, Asker, Mark, Refused, Room, Shown, Taken};
+use cordelia_storage::relay::{
+    self, Asker, Mark, Proof, Refused, Room, Shown, ShownShort, Taken, Uses,
+};
 use rusqlite::Connection;
 
 use crate::p2p::{OverLimit, Rates, RelayAddrs};
@@ -531,6 +547,10 @@ pub struct RelayEntries {
     /// of more channels than one pass reads: the next goes on after that
     /// ID. A relay whose list was read to its end has none.
     stopped_at: Mutex<HashMap<NodeId, [u8; 32]>>,
+    /// When the channels it holds were used, as it saw them, until they
+    /// are written: once a minute, at the hourly sweep, and at a clean
+    /// stop. Taken with the database's lock held.
+    uses: Mutex<Uses>,
     /// How long a channel that found no room here is left before it is
     /// pulled again from a listed relay.
     ask_again: Duration,
@@ -540,6 +560,52 @@ pub struct RelayEntries {
     /// each request: counted, and read by nothing it does (decision
     /// 2026-10-22 §1.2, §7.3).
     counts: Arc<StreamCounts>,
+    /// Whether a checkpoint of the store is running (issue #224): a tick
+    /// that finds one running does nothing, so that ticks do not queue on
+    /// the lock behind a long hold.
+    checkpointing: AtomicBool,
+}
+
+/// What a tick of a relay's checkpoint did (issue #224).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Checkpointed {
+    /// Another was still running: this one took no lock.
+    Running,
+    /// The relay had written fewer than RELAY_CHECKPOINT_LOG_PAGES to its
+    /// log since its last whole checkpoint: nothing was written back.
+    Short,
+    /// The log was written back whole; the next commit starts it again.
+    Whole,
+    /// A reader in another process holds a part of the log (or the
+    /// checkpoint failed): the rest was written back, and the next tick
+    /// tries again.
+    Part,
+}
+
+/// While a checkpoint runs: its relay's flag set, cleared when dropped.
+struct Running<'a>(&'a AtomicBool);
+
+impl<'a> Running<'a> {
+    fn start(flag: &'a AtomicBool) -> Option<Self> {
+        flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(flag))
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Whether a node of `role` holds the entries of channels from their
+/// secrets as a relay (decision 2026-10-04 §2.4): it then keeps a
+/// [`RelayEntries`], and its store has SQLite's automatic checkpoint off,
+/// for the relay checkpoints it on its timer (issue #224). One test for
+/// both, so that no node has the one without the other.
+pub fn kept_by(role: &str) -> bool {
+    role == "relay"
 }
 
 impl RelayEntries {
@@ -553,9 +619,11 @@ impl RelayEntries {
             places: Mutex::default(),
             pulling: Mutex::default(),
             stopped_at: Mutex::default(),
+            uses: Mutex::default(),
             ask_again,
             most_proved: MAX_CHANNELS_PROVED_ON_A_CONNECTION,
             counts: Arc::default(),
+            checkpointing: AtomicBool::new(false),
         }
     }
 
@@ -623,15 +691,137 @@ impl RelayEntries {
         self.sweep_at(db, unix_now());
     }
 
-    /// [`Self::sweep`], at `now`, this relay's time in seconds.
+    /// [`Self::sweep`], at `now`, this relay's time in seconds. The uses
+    /// that the relay kept are written first, in the same hold of the
+    /// lock: the sweep reads every use there was before it.
     fn sweep_at(&self, db: &TimedLock<Connection>, now: i64) {
         let _sweep = taking(Kind::Sweep);
         lock(&self.room).forget_old(now);
         let Ok(db) = db.lock() else { return };
+        // A use that could not be written is in memory alone: a sweep now
+        // could drop a channel in use. It waits for the next hour.
+        if !self.uses_written(&db) {
+            return;
+        }
         match relay::sweep_unused(&db, now) {
             Ok(dropped) => self.dropped(&dropped, "unused"),
             Err(e) => tracing::warn!(error = %e, "could not sweep the channels nobody uses"),
         }
+    }
+
+    /// Write the uses of channels that the relay kept, in one transaction
+    /// (issue #214): once a minute, RELAY_USES_WRITE_INTERVAL_SECS, and at
+    /// a clean stop. The hourly sweep writes them as well, before it reads
+    /// them.
+    ///
+    /// A relay that stops uncleanly loses the uses of one interval at
+    /// most. That is harmless: a channel that is in use is proved again on
+    /// its devices' next passes, and one that is not was last used at most
+    /// an hour and a minute after the time kept (the step and the
+    /// interval), which brings its drop at most that much nearer at the
+    /// end of 90 days.
+    pub fn write_uses(&self, db: &TimedLock<Connection>) {
+        let _sweep = taking(Kind::Sweep);
+        let Ok(db) = db.lock() else { return };
+        self.uses_written(&db);
+    }
+
+    /// A tick of the store's checkpoint, every
+    /// RELAY_CHECKPOINT_INTERVAL_SECS from when the relay starts, in a take
+    /// of the lock of its own, of kind Checkpoint (issue #224). Where the
+    /// relay has written RELAY_CHECKPOINT_LOG_PAGES to its log since its
+    /// last whole checkpoint, the log is written back; otherwise the tick
+    /// lets go at once. A relay's connection has SQLite's automatic
+    /// checkpoint off, so that no push or show pays for one, and this
+    /// keeps SQLite's threshold, so that a push pays for no more syncs than
+    /// it did. The checkpoint is passive: where a reader in another process
+    /// holds a part of the log, the rest is written back at once, and the
+    /// next tick writes back what is left. A tick that finds another still
+    /// running does nothing.
+    pub fn checkpoint(&self, db: &TimedLock<Connection>) -> Checkpointed {
+        self.checkpoint_over(db, RELAY_CHECKPOINT_LOG_PAGES)
+    }
+
+    /// [`Self::checkpoint`], once `pages` have been written to the log.
+    fn checkpoint_over(&self, db: &TimedLock<Connection>, pages: u64) -> Checkpointed {
+        let Some(_running) = Running::start(&self.checkpointing) else {
+            return Checkpointed::Running;
+        };
+        let _checkpoint = taking(Kind::Checkpoint);
+        let Ok(db) = db.lock() else {
+            return Checkpointed::Part;
+        };
+        match cordelia_storage::db::log_pages_written(&db, false) {
+            Ok(written) if written < pages => return Checkpointed::Short,
+            Ok(_) => {}
+            // Not known: the log is written back, as where it is long.
+            Err(e) => tracing::warn!(error = %e, "could not read the pages written to the log"),
+        }
+        if Self::checkpointed_with(&db, cordelia_storage::db::checkpoint_passive) {
+            Checkpointed::Whole
+        } else {
+            Checkpointed::Part
+        }
+    }
+
+    /// At a clean stop, once no stream asks: the log is written back whole
+    /// and its file truncated, waiting for a reader up to the connection's
+    /// busy timeout, as kind Checkpoint (issue #224). It waits for a tick
+    /// that is running, on the lock.
+    pub fn checkpoint_at_stop(&self, db: &TimedLock<Connection>) -> bool {
+        let _checkpoint = taking(Kind::Checkpoint);
+        let Ok(db) = db.lock() else { return false };
+        Self::checkpointed_with(&db, cordelia_storage::db::checkpoint_truncating)
+    }
+
+    /// Whether `checkpoint` wrote the log back whole; where it did, the
+    /// count of the pages written to it starts again.
+    fn checkpointed_with(
+        db: &Connection,
+        checkpoint: fn(&Connection) -> Result<bool, cordelia_storage::StorageError>,
+    ) -> bool {
+        match checkpoint(db) {
+            Ok(true) => {
+                if let Err(e) = cordelia_storage::db::log_pages_written(db, true) {
+                    tracing::warn!(error = %e, "could not clear the pages written to the log");
+                }
+                true
+            }
+            Ok(false) => {
+                tracing::debug!("a reader holds a part of the log: the next checkpoint writes it");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "could not checkpoint the store's log");
+                false
+            }
+        }
+    }
+
+    /// [`Self::write_uses`], with the database's lock held: whether every
+    /// use kept was written. What could not be written is kept, for the
+    /// next time.
+    fn uses_written(&self, db: &TimedGuard<'_, Connection>) -> bool {
+        let mut uses = db.nested(Nested::Uses, &self.uses);
+        let kept = uses.len();
+        match relay::write_uses(db, &mut uses) {
+            Ok(written) => {
+                if kept > 0 {
+                    tracing::debug!(kept, written, "wrote when channels of entries were used");
+                }
+                true
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, kept, "could not write when channels were used");
+                false
+            }
+        }
+    }
+
+    /// The relay saw `channel` used at `at` (decision 2026-10-04 §2.5): it
+    /// is kept, with the database's lock held, until it is written.
+    fn used(&self, db: &TimedGuard<'_, Connection>, channel: &[u8; 32], at: i64) {
+        db.nested(Nested::Uses, &self.uses).used(channel, at);
     }
 
     /// Drop each slot in which every entry is a delete that the relay has
@@ -779,6 +969,10 @@ impl RelayEntries {
                     return Answer::Nothing;
                 }
             };
+            // An entry held: use of its channel, kept and not written.
+            if found == Shown::Held {
+                self.used(&db, &entry.channel, now);
+            }
             // The entry that goes back counts against the asker's limits
             // as anything fetched does. It goes back while neither
             // allowance is over already, also where it takes the asker
@@ -845,15 +1039,19 @@ impl RelayEntries {
             let Ok(db) = db.lock() else {
                 return Answer::Nothing;
             };
-            relay::show_short(
+            let found = relay::show_short(
                 &db,
                 &show.channel,
                 &show.slot,
                 &show.author,
                 show.rev,
                 &show.id,
-                now,
-            )
+            );
+            // An entry held: use of its channel, kept and not written.
+            if matches!(found, Ok(ShownShort::Held)) {
+                self.used(&db, &show.channel, now);
+            }
+            found
         };
         match found {
             Ok(found) => Answer::of(WireMessage::EntryShown(EntryShown {
@@ -892,27 +1090,26 @@ impl RelayEntries {
             return no;
         }
         // The signature, before the channel is looked up and before the
-        // database is held.
-        if !proof::check(
+        // database is held, and only here: what the store is given is a
+        // proof that was checked, and it does not check it again.
+        let Some(checked) = relay::check_proof(
             &prove.channel,
             &session.value,
             &session.prover,
             &prove.proof,
-        ) {
+        ) else {
             return no;
-        }
+        };
+        // A read: the use of a channel held is kept, and not written.
         let found = {
             let Ok(db) = db.lock() else {
                 return Answer::Nothing;
             };
-            relay::prove(
-                &db,
-                &prove.channel,
-                &session.value,
-                &session.prover,
-                &prove.proof,
-                now,
-            )
+            let found = relay::prove(&db, &checked);
+            if matches!(found, Ok(Proof::Holds { channel_held: true })) {
+                self.used(&db, checked.channel(), now);
+            }
+            found
         };
         let found = match found {
             Ok(found) => found,
@@ -1247,8 +1444,10 @@ impl RelayEntries {
             if told.held_since > 0 && told.held_since < held.held_since {
                 let _ = relay::listed_relay_says(&db, &told.channel, told.held_since);
             }
+            // When it was last used is kept with this relay's own uses,
+            // and written with them: never later than this relay's clock.
             if told.used_at > held.used_at {
-                let _ = relay::listed_relay_used(&db, &told.channel, told.used_at, now);
+                self.used(&db, &told.channel, told.used_at.min(now));
             }
         }
         let kept = lock(&self.places).get(relay, &told.channel);
@@ -1988,6 +2187,7 @@ mod tests {
     use cordelia_crypto::derive;
     use cordelia_crypto::entry::{Entry, Inside, Value};
     use cordelia_crypto::identity::NodeIdentity;
+    use cordelia_crypto::proof;
     use cordelia_network::bootstrap::RelayAddr;
     use cordelia_network::messages::EntryRefused;
 
@@ -2338,6 +2538,12 @@ mod tests {
         /// The channel numbered `c` as the relay holds it.
         fn held(&self, c: u16) -> Option<relay::HeldChannel> {
             relay::held_channel(&lock(&self.db), &channel(c)).unwrap()
+        }
+
+        /// The use of the channel numbered `c` that the relay keeps, not
+        /// yet written.
+        fn kept(&self, c: u16) -> Option<i64> {
+            lock(&self.entries.uses).of(&channel(c))
         }
 
         /// What the relay holds of this kind, as entries are counted.
@@ -3024,6 +3230,756 @@ mod tests {
         assert_eq!(breaches(&at, 5), (1, 1));
     }
 
+    // ── When a channel was used ──────────────────────────────────────
+
+    /// The rows the relay's database has changed since it was opened.
+    fn changes(at: &Relay) -> i64 {
+        lock(&at.db)
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// A proof, a show of an entry held, whole and in short, and a pull
+    /// write nothing with the lock held (issue #214), where the time kept
+    /// is two hours old and each would have been written: the database's
+    /// count of changes is as it was. The use of the channel is kept in
+    /// memory, at the time of the request. What is no use (a proof that
+    /// fails, an earlier entry shown, a pull) keeps nothing.
+    #[test]
+    fn a_proof_a_show_and_a_pull_write_nothing_and_keep_the_use() {
+        let at = relay();
+        let held_entry = small(1, 1, 5);
+        at.hold(&held_entry, NOW - 2 * HOUR);
+        at.hold(&small(2, 1, 5), NOW - 2 * HOUR);
+        let session = Session {
+            value: [0x51; 32],
+            prover: peer(1).0,
+        };
+        let before = changes(&at);
+        let prove = |c: u16, proof: [u8; 64], proved: &mut Proved| {
+            proved_said(at.answer(
+                1,
+                Protocol::ChannelProve,
+                WireMessage::ChannelProve(ChannelProve {
+                    channel: channel(c),
+                    proof,
+                }),
+                Some(&session),
+                proved,
+            ))
+        };
+
+        // What is no use: a proof that fails, an earlier entry of channel
+        // 2 shown, and a pull of it.
+        let mut proved = Proved::default();
+        assert!(!prove(2, [7; 64], &mut proved));
+        assert!(matches!(
+            at.show(1, small(2, 1, 4).to_wire()),
+            Answer::Message(..)
+        ));
+        let none = Proved::default();
+        page(at.pull(1, 2, &none, relay::NO_MARK, 0));
+        assert_eq!(at.kept(2), None);
+
+        // A proof that holds.
+        let good = proof::make(&secret(1), &session.value, &session.prover).unwrap();
+        assert!(prove(1, good, &mut proved));
+        assert_eq!(changes(&at), before, "a proof wrote");
+        assert_eq!(at.kept(1), Some(NOW));
+        *lock(&at.entries.uses) = Uses::default();
+        // An entry held, shown whole, and then in short.
+        let mut whole = ShownWhole::default();
+        let show = WireMessage::EntryShow(EntryShow {
+            entry: held_entry.to_wire(),
+        });
+        assert_eq!(at.show_on(1, &mut whole, show), ShowAnswer::Held);
+        assert_eq!(changes(&at), before, "a show wrote");
+        assert_eq!(at.kept(1), Some(NOW));
+        *lock(&at.entries.uses) = Uses::default();
+        assert_eq!(
+            at.show_on(1, &mut whole, short_of(&held_entry)),
+            ShowAnswer::Held
+        );
+        assert_eq!(changes(&at), before, "a short show wrote");
+        assert_eq!(at.kept(1), Some(NOW));
+        // A pull of the channel proved.
+        assert_eq!(
+            page(at.pull(1, 1, &proved, relay::NO_MARK, 0))
+                .entries
+                .len(),
+            1
+        );
+        assert_eq!(changes(&at), before, "a pull wrote");
+        assert_eq!(at.held(1).unwrap().used_at, NOW - 2 * HOUR);
+
+        // The control: the uses kept are written, as one.
+        at.entries.write_uses(&at.db);
+        assert_eq!(at.held(1).unwrap().used_at, NOW);
+        assert_eq!(at.held(2).unwrap().used_at, NOW - 2 * HOUR);
+        assert_eq!(changes(&at), before + 1);
+    }
+
+    /// The uses that a relay keeps are written at its hourly sweep, before
+    /// the sweep reads them, and at a clean stop ([`RelayEntries::write_uses`]),
+    /// by the rule of decision 2026-10-04 §16: a time is written only where
+    /// it is more than an hour later than the time kept, and an earlier one
+    /// never. From made-up times.
+    #[test]
+    fn the_uses_kept_are_written_at_the_sweep_and_at_a_stop_more_than_an_hour_later_only() {
+        let at = relay();
+        let t = NOW;
+        for c in 1..=3 {
+            at.hold(&small(c, 1, 5), t);
+        }
+        let session = Session {
+            value: [0x51; 32],
+            prover: peer(1).0,
+        };
+        // Channel `c` proved at `when`, by the stream.
+        let prove_at = |c: u16, when: i64| {
+            let proof = proof::make(&secret(c), &session.value, &session.prover).unwrap();
+            let answer = at.entries.proving(
+                &at.db,
+                Some(&session),
+                &mut Proved::default(),
+                &ChannelProve {
+                    channel: channel(c),
+                    proof,
+                },
+                when,
+            );
+            assert!(proved_said(answer));
+        };
+        let used_at = |c: u16| at.held(c).unwrap().used_at;
+
+        // Channel 1 past the hour, channel 2 within it, and channel 1
+        // again earlier: the latest is kept, and nothing is written.
+        prove_at(1, t + HOUR + 1);
+        prove_at(2, t + 600);
+        prove_at(1, t + 60);
+        assert_eq!(
+            (at.kept(1), at.kept(2)),
+            (Some(t + HOUR + 1), Some(t + 600))
+        );
+        assert_eq!((used_at(1), used_at(2)), (t, t));
+
+        // The sweep writes them: channel 1, more than an hour later, and
+        // not channel 2. Nothing is kept after.
+        at.entries.sweep_at(&at.db, t + 2 * HOUR);
+        assert_eq!((used_at(1), used_at(2)), (t + HOUR + 1, t));
+        assert_eq!((at.kept(1), at.kept(2)), (None, None));
+
+        // A clock that was set back: an earlier time is never written.
+        for earlier in [t + HOUR, t, 1] {
+            prove_at(1, earlier);
+            at.entries.write_uses(&at.db);
+            assert_eq!(used_at(1), t + HOUR + 1, "{earlier}");
+        }
+        // An hour later to the second is not more than an hour later;
+        // a second past it is.
+        prove_at(1, t + 2 * HOUR + 1);
+        at.entries.write_uses(&at.db);
+        assert_eq!(used_at(1), t + HOUR + 1);
+        prove_at(1, t + 2 * HOUR + 2);
+        at.entries.write_uses(&at.db);
+        assert_eq!(used_at(1), t + 2 * HOUR + 2);
+
+        // The sweep reads every use there was before it: channel 3 is
+        // proved ten seconds before its 90 days are up, and the sweep at
+        // 90 days keeps it. Channel 2, used last at `t`, goes.
+        prove_at(3, t + 90 * DAY - 10);
+        assert_eq!(used_at(3), t);
+        at.entries.sweep_at(&at.db, t + 90 * DAY);
+        assert_eq!(at.held(2), None);
+        assert_eq!(used_at(3), t + 90 * DAY - 10);
+        assert_eq!(used_at(1), t + 2 * HOUR + 2);
+    }
+
+    /// A sweep whose uses could not be written drops nothing (the review
+    /// of #217): a use in memory alone may be of a channel in use. Channel
+    /// 1 is proved ten seconds before its 90 days are up, the database
+    /// refuses the uses' write at the sweep, and the channel stays; once writes are
+    /// taken again, the next sweep writes the use first.
+    #[test]
+    fn a_sweep_whose_uses_could_not_be_written_drops_nothing() {
+        let at = relay();
+        let t = NOW;
+        at.hold(&small(1, 1, 5), t);
+        let session = Session {
+            value: [0x52; 32],
+            prover: peer(1).0,
+        };
+        let proof = proof::make(&secret(1), &session.value, &session.prover).unwrap();
+        let answer = at.entries.proving(
+            &at.db,
+            Some(&session),
+            &mut Proved::default(),
+            &ChannelProve {
+                channel: channel(1),
+                proof,
+            },
+            t + 90 * DAY - 10,
+        );
+        assert!(proved_said(answer));
+        // The uses' write (an update) is refused; the sweep's (a delete)
+        // is not.
+        let updates_refused = |on: bool| {
+            let db = at.db.lock().unwrap();
+            let sql = match on {
+                true => {
+                    "CREATE TEMP TRIGGER no_update BEFORE UPDATE ON relay_channels \
+                         BEGIN SELECT RAISE(ABORT, 'refused'); END"
+                }
+                false => "DROP TRIGGER no_update",
+            };
+            db.execute_batch(sql).unwrap();
+        };
+        updates_refused(true);
+        at.entries.sweep_at(&at.db, t + 90 * DAY);
+        updates_refused(false);
+        assert!(at.held(1).is_some(), "a channel in use was dropped");
+        assert_eq!(at.kept(1), Some(t + 90 * DAY - 10));
+        at.entries.sweep_at(&at.db, t + 90 * DAY + HOUR);
+        assert_eq!(at.held(1).unwrap().used_at, t + 90 * DAY - 10);
+    }
+
+    /// The lock's hold for a proof, from the node's counters (issue #214):
+    /// many proofs on one relay with a database on disk, each of a channel
+    /// whose time kept is two hours old, as after churn or a restart.
+    /// Printed, not asserted: run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn bench_the_locks_hold_for_many_proofs() {
+        const N: u16 = 2000;
+        let dir = tempfile::tempdir().unwrap();
+        let mut at = relay();
+        at.db = TimedLock::new(cordelia_storage::db::open(&dir.path().join("relay.db")).unwrap());
+        for c in 1..=N {
+            at.hold(&small(c, 1, 5), NOW - 2 * HOUR);
+        }
+        let session = Session {
+            value: [0x51; 32],
+            prover: peer(1).0,
+        };
+        let proofs: Vec<[u8; 64]> = (1..=N)
+            .map(|c| proof::make(&secret(c), &session.value, &session.prover).unwrap())
+            .collect();
+        let read = |what: &str| {
+            let hold = at.db.times().hold(Kind::Proof);
+            // The upper bound of the bucket that holds the quantile.
+            let upper = |q: f64| {
+                let target = (q * hold.count as f64).ceil() as u64;
+                let mut seen = 0;
+                for (i, n) in hold.buckets.iter().enumerate() {
+                    seen += n;
+                    if seen >= target {
+                        return 1u64 << i;
+                    }
+                }
+                u64::MAX
+            };
+            println!(
+                "{what}: {} holds, mean {:.1} us, p50 <= {} us, p99 <= {} us, max {} us, over 5/50/100/250 ms {:?}",
+                hold.count,
+                hold.sum_nanos as f64 / hold.count.max(1) as f64 / 1000.0,
+                upper(0.50),
+                upper(0.99),
+                hold.max_micros,
+                hold.over,
+            );
+        };
+        let round = || {
+            let started = Instant::now();
+            for (i, proof) in proofs.iter().enumerate() {
+                // A connection remembers so many proofs: one for each.
+                let mut proved = Proved::default();
+                let c = i as u16 + 1;
+                assert!(proved_said(at.answer(
+                    1,
+                    Protocol::ChannelProve,
+                    WireMessage::ChannelProve(ChannelProve {
+                        channel: channel(c),
+                        proof: *proof,
+                    }),
+                    Some(&session),
+                    &mut proved,
+                )));
+            }
+            started.elapsed()
+        };
+        let took = round();
+        read(&format!(
+            "first round, every time kept 2 h old ({took:?} in all)"
+        ));
+        let sweep = Instant::now();
+        at.entries.write_uses(&at.db);
+        let sweep_hold = at.db.times().hold(Kind::Sweep);
+        println!(
+            "the {N} uses written in one transaction: hold {} us ({:?} in all)",
+            sweep_hold.max_micros,
+            sweep.elapsed()
+        );
+        let took = round();
+        read(&format!(
+            "both rounds, the second with every time kept new ({took:?} in all)"
+        ));
+    }
+
+    // ── The checkpoint (issue #224) ──────────────────────────────────
+
+    /// A relay with room for everything, whose store is a file in `dir`,
+    /// opened as a relay's node opens it: with SQLite's automatic
+    /// checkpoint off where `off`.
+    fn relay_on_disk(dir: &std::path::Path, off: bool) -> (Relay, std::path::PathBuf) {
+        let path = dir.join("relay.db");
+        let conn = cordelia_storage::db::open(&path).unwrap();
+        if off {
+            cordelia_storage::db::automatic_checkpoint_off(&conn).unwrap();
+        }
+        let mut at = relay();
+        at.db = TimedLock::new(conn);
+        (at, path)
+    }
+
+    /// The bytes of the store's write-ahead log.
+    fn wal_bytes(path: &std::path::Path) -> u64 {
+        std::fs::metadata(path.with_extension("db-wal")).map_or(0, |file| file.len())
+    }
+
+    /// The kinds of take of the lock that held it at least once.
+    fn kinds_held(db: &TimedLock<Connection>) -> Vec<Kind> {
+        Kind::ALL
+            .into_iter()
+            .filter(|kind| db.times().hold(*kind).count > 0)
+            .collect()
+    }
+
+    /// The peer numbered `n` pushes one entry of its own channel, `n`,
+    /// in slot `slot`, at `rev`: stored.
+    fn pushes_one(at: &Relay, n: u8, slot: u64, rev: u64) {
+        let entry = made(n.into(), n, rev, &format!("note-{slot}.md"), "a small text");
+        assert_eq!(
+            pushed(at.push(n, vec![entry.to_wire()])),
+            [PushAnswer::Stored]
+        );
+    }
+
+    /// No push checkpoints the log (issue #224): on a relay's store, a
+    /// thousand pushes from ten devices grow its log past twice the 1,000
+    /// pages at which SQLite's automatic checkpoint would have run inside
+    /// one of them, and it never shrinks; every take of the lock is of a
+    /// push.
+    #[test]
+    fn a_push_never_runs_a_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (at, path) = relay_on_disk(dir.path(), true);
+        let page: u64 = Connection::open(&path)
+            .unwrap()
+            .pragma_query_value(None, "page_size", |row| row.get(0))
+            .unwrap();
+        let mut log = wal_bytes(&path);
+        for i in 0..100u64 {
+            for n in 1..=10u8 {
+                pushes_one(&at, n, i, 5 + i);
+                let now = wal_bytes(&path);
+                assert!(now >= log, "a push shrank the log: {log} to {now}");
+                log = now;
+            }
+        }
+        assert!(log / page > 2_000, "the log is {} pages", log / page);
+        assert_eq!(kinds_held(&at.db), [Kind::Push]);
+    }
+
+    /// The pages the relay has written to its log since its last whole
+    /// checkpoint.
+    fn log_written(at: &Relay) -> u64 {
+        cordelia_storage::db::log_pages_written(&lock_db(&at.db), false).unwrap()
+    }
+
+    fn lock_db(db: &TimedLock<Connection>) -> TimedGuard<'_, Connection> {
+        db.lock().unwrap()
+    }
+
+    /// The relay's checkpoint takes the lock as a checkpoint, and as no
+    /// other kind (issue #224). A tick lets go while the relay has written
+    /// fewer than RELAY_CHECKPOINT_LOG_PAGES to its log, and the log grows;
+    /// the first tick once it has written them writes the log back whole,
+    /// and the next pushes start the log again over its file, which does
+    /// not grow. The checkpoint at a stop truncates it.
+    #[test]
+    fn the_checkpoint_takes_the_lock_as_a_checkpoint_and_starts_the_log_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (at, path) = relay_on_disk(dir.path(), true);
+        let mut rev = 5;
+        while log_written(&at) < RELAY_CHECKPOINT_LOG_PAGES {
+            assert!(rev < 500, "the log stays at {} pages", log_written(&at));
+            assert_eq!(at.entries.checkpoint(&at.db), Checkpointed::Short);
+            for n in 1..=10u8 {
+                pushes_one(&at, n, rev, rev);
+            }
+            rev += 1;
+        }
+        assert_eq!(at.db.times().hold(Kind::Checkpoint).count, rev - 5);
+        let grown = wal_bytes(&path);
+        assert_eq!(at.entries.checkpoint(&at.db), Checkpointed::Whole);
+        assert_eq!(log_written(&at), 0);
+        assert_eq!(at.entries.checkpoint(&at.db), Checkpointed::Short);
+        for n in 1..=10u8 {
+            pushes_one(&at, n, rev, rev);
+        }
+        assert_eq!(wal_bytes(&path), grown, "the log starts again in place");
+        assert!(log_written(&at) > 0);
+        assert_eq!(
+            kinds_held(&at.db),
+            [Kind::Push, Kind::Checkpoint, Kind::Other]
+        );
+        assert!(at.entries.checkpoint_at_stop(&at.db));
+        assert_eq!(wal_bytes(&path), 0);
+        assert_eq!(log_written(&at), 0);
+        // What was pushed is held after it.
+        assert!(at.held(10).is_some());
+    }
+
+    /// At the scale test's rates a relay sees a write every few seconds,
+    /// and so a tick after each push (issue #224, the review's sequence: a
+    /// push, then a tick, hundreds of times). A tick checkpoints only once
+    /// the relay has written RELAY_CHECKPOINT_LOG_PAGES to its log since
+    /// the last, as SQLite's automatic checkpoint did inside a commit; a
+    /// checkpoint at each tick would cost each push the checkpoint's two
+    /// syncs, and the next push one more to start the log again.
+    #[test]
+    fn a_tick_after_each_push_checkpoints_only_once_the_log_holds_its_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let (at, _path) = relay_on_disk(dir.path(), true);
+        let (mut whole, pushes) = (0, 600u64);
+        for i in 0..pushes {
+            pushes_one(&at, 1 + (i % 10) as u8, i, 5 + i);
+            let written = log_written(&at);
+            let tick = at.entries.checkpoint(&at.db);
+            assert_eq!(
+                tick == Checkpointed::Whole,
+                written >= RELAY_CHECKPOINT_LOG_PAGES,
+                "push {i}: {written} pages written, {tick:?}"
+            );
+            assert!(matches!(tick, Checkpointed::Whole | Checkpointed::Short));
+            whole += u64::from(tick == Checkpointed::Whole);
+        }
+        // A push writes a few pages: one checkpoint for each hundred pushes
+        // or more, never one for each.
+        assert!((1..=pushes / 100).contains(&whole), "{whole} checkpoints");
+    }
+
+    /// While something holds the lock for long, the ticks that come do not
+    /// queue behind it (issue #224): one tick waits for the lock, and each
+    /// other finds it running and answers at once, taking no lock. Once the
+    /// lock is let go, the waiting tick runs.
+    #[test]
+    fn ticks_do_not_queue_on_the_lock_behind_a_long_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let (at, _path) = relay_on_disk(dir.path(), true);
+        pushes_one(&at, 1, 1, 5);
+        let at = &at;
+        let held = lock_db(&at.db);
+        std::thread::scope(|s| {
+            let waiting = s.spawn(|| at.entries.checkpoint_over(&at.db, 0));
+            // Until it has started, or a second.
+            let started = Instant::now();
+            while !at.entries.checkpointing.load(Ordering::Acquire)
+                && started.elapsed() < Duration::from_secs(1)
+            {
+                std::thread::yield_now();
+            }
+            // A slow start is said as one, not taken for a tick that queued;
+            // the lock is let go first, or the waiting tick would never end.
+            if !at.entries.checkpointing.load(Ordering::Acquire) {
+                drop(held);
+                panic!("the waiting tick did not start within a second");
+            }
+            // The other ticks from a thread of their own, so that a tick
+            // that queued on the lock fails the test rather than hang it.
+            let (said, answers) = std::sync::mpsc::channel();
+            s.spawn(move || {
+                for _ in 0..5 {
+                    said.send(at.entries.checkpoint(&at.db)).unwrap();
+                }
+            });
+            let mut ticks = Vec::new();
+            for _ in 0..5 {
+                match answers.recv_timeout(Duration::from_millis(500)) {
+                    Ok(tick) => ticks.push(tick),
+                    Err(_) => break,
+                }
+            }
+            drop(held);
+            assert_eq!(
+                ticks,
+                [Checkpointed::Running; 5],
+                "a tick queued on the lock"
+            );
+            assert_eq!(waiting.join().unwrap(), Checkpointed::Whole);
+        });
+        assert_eq!(at.db.times().wait(Kind::Checkpoint).count, 1);
+        assert_eq!(at.entries.checkpoint(&at.db), Checkpointed::Short);
+    }
+
+    /// A checkpoint that a reader in another process holds back answers at
+    /// once, and the next, once the reader is gone, writes the log back
+    /// whole (issue #224). The count of pages written starts again only
+    /// then.
+    #[test]
+    fn a_checkpoint_that_a_reader_holds_back_is_made_again_at_the_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let (at, path) = relay_on_disk(dir.path(), true);
+        pushes_one(&at, 1, 1, 5);
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let _: i64 = reader
+            .query_row("SELECT count(*) FROM node_meta", [], |row| row.get(0))
+            .unwrap();
+        pushes_one(&at, 2, 1, 5);
+        let written = log_written(&at);
+        let started = Instant::now();
+        assert_eq!(at.entries.checkpoint_over(&at.db, 0), Checkpointed::Part);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(log_written(&at), written);
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+        assert_eq!(at.entries.checkpoint_over(&at.db, 0), Checkpointed::Whole);
+        assert_eq!(log_written(&at), 0);
+    }
+
+    /// A push's hold of the lock, and a checkpoint's, from the node's own
+    /// counters, on a relay whose store is a file on disk, in three ways:
+    /// `on`, SQLite's automatic checkpoint, as before issue #224; `every`,
+    /// that off and a checkpoint at each tick whatever was written; `pages`,
+    /// that off and a checkpoint at the first tick once
+    /// RELAY_CHECKPOINT_LOG_PAGES have been written, as the relay does.
+    /// `CORDELIA_BENCH_ONLY` names one of them (all three otherwise).
+    ///
+    /// `CORDELIA_BENCH_RATE=fast` (the default): many devices push from
+    /// four threads as fast as they can, about a thousand pushes a second,
+    /// and a thread ticks every `CORDELIA_BENCH_CHECKPOINT_MS`
+    /// (RELAY_CHECKPOINT_INTERVAL_SECS otherwise); `CORDELIA_BENCH_DEVICES`
+    /// and `CORDELIA_BENCH_ROUNDS` say how many devices push, and how many
+    /// entries each (100 and 200). `CORDELIA_BENCH_RATE=stage`: the scale
+    /// test's rates, a push every few seconds, with
+    /// `CORDELIA_BENCH_TICKS_PER_PUSH` ticks after each push (3: a push
+    /// every three seconds, stage 190's 21 writes a minute; 5 for stage
+    /// 100's 11; 1 for stage 500's 55), `CORDELIA_BENCH_PUSHES` of them
+    /// (2,000), one after another; the time between is not slept, since
+    /// SQLite sees only the order of the commits and the ticks.
+    ///
+    /// `CORDELIA_BENCH_DIR` names where the store goes (a temporary
+    /// directory otherwise), and `CORDELIA_BENCH_LOG_KEPT_BYTES` the bytes
+    /// of the log's file kept where the automatic checkpoint is off
+    /// (RELAY_LOG_KEPT_BYTES otherwise; -1 for no limit). Printed, not
+    /// asserted: run with `--ignored --nocapture`. A disk whose sync is
+    /// slow is had by running the test binary under `strace -f
+    /// --seccomp-bpf -o FILE -e trace=fsync,fdatasync -e
+    /// inject=fsync,fdatasync:delay_exit=10000`, which makes each sync take
+    /// 10 ms more, and whose FILE has a line for each sync: run one way at
+    /// a time to count the syncs for each push.
+    #[test]
+    #[ignore = "a measurement, not a check"]
+    fn bench_a_pushs_hold_with_and_without_the_automatic_checkpoint() {
+        use cordelia_core::protocol::RELAY_CHECKPOINT_INTERVAL_SECS;
+        use std::sync::atomic::AtomicU64;
+        let number = |name: &str, or: i64| -> i64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(or)
+        };
+        let stage = std::env::var("CORDELIA_BENCH_RATE").is_ok_and(|rate| rate == "stage");
+        let only = std::env::var("CORDELIA_BENCH_ONLY").ok();
+        let devices = number("CORDELIA_BENCH_DEVICES", 100).clamp(1, 199) as u8;
+        let rounds = number("CORDELIA_BENCH_ROUNDS", 200) as u64;
+        let ticks_per_push = number("CORDELIA_BENCH_TICKS_PER_PUSH", 3) as u64;
+        let stage_pushes = number("CORDELIA_BENCH_PUSHES", 2_000) as u64;
+        let kept = number(
+            "CORDELIA_BENCH_LOG_KEPT_BYTES",
+            cordelia_core::protocol::RELAY_LOG_KEPT_BYTES,
+        );
+        let base = std::env::var("CORDELIA_BENCH_DIR").ok();
+        let every_ms = number(
+            "CORDELIA_BENCH_CHECKPOINT_MS",
+            RELAY_CHECKPOINT_INTERVAL_SECS as i64 * 1000,
+        ) as u64;
+        let upper = |hold: &cordelia_core::load::HistogramRead, q: f64| -> u64 {
+            let target = (q * hold.count as f64).ceil() as u64;
+            let mut seen = 0;
+            for (i, n) in hold.buckets.iter().enumerate() {
+                seen += n;
+                if seen >= target {
+                    return 1u64 << i;
+                }
+            }
+            u64::MAX
+        };
+        // Each way: its name, whether the automatic checkpoint is off, and
+        // the pages written at which a tick checkpoints.
+        let ways = [
+            ("on", false, 0),
+            ("every", true, 0),
+            ("pages", true, RELAY_CHECKPOINT_LOG_PAGES),
+        ];
+        for (name, off, pages) in ways {
+            if only.as_deref().is_some_and(|only| only != name) {
+                continue;
+            }
+            let dir = match &base {
+                Some(base) => tempfile::tempdir_in(base).unwrap(),
+                None => tempfile::tempdir().unwrap(),
+            };
+            let (at, path) = relay_on_disk(dir.path(), off);
+            if off {
+                lock_db(&at.db)
+                    .pragma_update(None, "journal_size_limit", kept)
+                    .unwrap();
+            }
+            // The counts start after the store is opened.
+            let at = Relay {
+                db: TimedLock::new(at.db.into_inner().unwrap()),
+                ..at
+            };
+            // Each push's own time, around the call, for exact quantiles
+            // beside the counters' buckets.
+            let took = Mutex::new(Vec::new());
+            let most_log = AtomicU64::new(0);
+            let whole = AtomicU64::new(0);
+            let tick = || {
+                most_log.fetch_max(wal_bytes(&path), std::sync::atomic::Ordering::Relaxed);
+                if at.entries.checkpoint_over(&at.db, pages) == Checkpointed::Whole {
+                    whole.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            };
+            let started = Instant::now();
+            if stage {
+                for i in 0..stage_pushes {
+                    let one = Instant::now();
+                    pushes_one(&at, 1 + (i % 10) as u8, i % 8, 5 + i);
+                    lock(&took).push(one.elapsed());
+                    if off {
+                        (0..ticks_per_push).for_each(|_| tick());
+                    }
+                }
+            } else {
+                let done = std::sync::atomic::AtomicBool::new(false);
+                std::thread::scope(|s| {
+                    if off {
+                        s.spawn(|| {
+                            let every = Duration::from_millis(every_ms);
+                            let mut next = Instant::now();
+                            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                                if Instant::now() >= next {
+                                    tick();
+                                    next += every;
+                                }
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                        });
+                    }
+                    let pushers: Vec<_> = (0..4u8)
+                        .map(|t| {
+                            let (at, took) = (&at, &took);
+                            s.spawn(move || {
+                                for i in 0..rounds {
+                                    for n in (1..=devices).filter(|n| n % 4 == t) {
+                                        let one = Instant::now();
+                                        pushes_one(at, n, i % 8, 5 + i);
+                                        lock(took).push(one.elapsed());
+                                    }
+                                }
+                            })
+                        })
+                        .collect();
+                    for pusher in pushers {
+                        pusher.join().unwrap();
+                    }
+                    done.store(true, std::sync::atomic::Ordering::Relaxed);
+                });
+            }
+            most_log.fetch_max(wal_bytes(&path), std::sync::atomic::Ordering::Relaxed);
+            let elapsed = started.elapsed();
+            let mut took = took.into_inner().unwrap();
+            took.sort();
+            let at_q =
+                |q: f64| took[((q * took.len() as f64).ceil() as usize).clamp(1, took.len()) - 1];
+            let times = at.db.times();
+            let (push, checkpoint) = (times.hold(Kind::Push), times.hold(Kind::Checkpoint));
+            println!(
+                "{name} ({}): {} pushes in {elapsed:?}, {} whole checkpoints, the log's file at most {} KiB; the lock held {:.1} ms for pushes and {:.1} ms for checkpoints, {:.3} ms a push in all",
+                if stage {
+                    format!("stage rate, {ticks_per_push} ticks a push")
+                } else {
+                    format!("fast, a tick every {every_ms} ms")
+                },
+                took.len(),
+                whole.into_inner(),
+                most_log.into_inner() / 1024,
+                push.sum_nanos as f64 / 1e6,
+                checkpoint.sum_nanos as f64 / 1e6,
+                (push.sum_nanos + checkpoint.sum_nanos) as f64 / 1e6 / took.len() as f64,
+            );
+            for kind in [Kind::Push, Kind::Checkpoint] {
+                let hold = times.hold(kind);
+                let wait = times.wait(kind);
+                println!(
+                    "  {}: {} holds, mean {:.0} us, p50 <= {} us, p99 <= {} us, max {} us, over 5/50/100/250 ms {:?}; wait p99 <= {} us, max {} us",
+                    kind.name(),
+                    hold.count,
+                    hold.sum_nanos as f64 / hold.count.max(1) as f64 / 1000.0,
+                    upper(&hold, 0.50),
+                    upper(&hold, 0.99),
+                    hold.max_micros,
+                    hold.over,
+                    upper(&wait, 0.99),
+                    wait.max_micros,
+                );
+                // The holds over 8 ms, by bucket: up to 16, 32, 64 and
+                // 128 ms, and over.
+                println!(
+                    "    holds over 8 ms, in buckets to 16/32/64/128 ms and over: {:?}",
+                    [
+                        hold.buckets[14],
+                        hold.buckets[15],
+                        hold.buckets[16],
+                        hold.buckets[17],
+                        hold.buckets[18..].iter().sum::<u64>(),
+                    ]
+                );
+            }
+            println!(
+                "  a push's call, timed around it: p50 {:?}, p99 {:?}, p99.9 {:?}, max {:?}",
+                at_q(0.50),
+                at_q(0.99),
+                at_q(0.999),
+                took[took.len() - 1]
+            );
+        }
+    }
+
+    /// A listed relay whose clock runs ahead says a channel was used later
+    /// than this relay's time: the use is kept at this relay's time, and
+    /// written so (decision 2026-10-04 §2.4 item 6).
+    #[test]
+    fn a_listed_relays_word_of_use_is_kept_no_later_than_this_relays_clock() {
+        let at = relay_of(u64::MAX, &[8]);
+        at.hold(&small(1, 1, 5), NOW - 2 * HOUR);
+        let held = at.held(1).unwrap();
+        let told = RelayChannel {
+            channel: channel(1),
+            mark: held.mark,
+            held_since: held.held_since,
+            used_at: NOW + 10 * DAY,
+            places: 1,
+        };
+        at.entries.wants(&at.db, &peer(8), &told, NOW);
+        assert_eq!(at.kept(1), Some(NOW));
+        at.entries.write_uses(&at.db);
+        assert_eq!(at.held(1).unwrap().used_at, NOW);
+    }
+
     // ── Prove ────────────────────────────────────────────────────────
 
     /// A proof holds where the channel's key signed this connection's
@@ -3074,13 +4030,19 @@ mod tests {
         // None of it was use of the channel, and nothing is remembered of
         // a proof that failed.
         assert_eq!(at.held(1).unwrap().used_at, NOW - 2 * HOUR);
+        assert_eq!(at.kept(1), None);
         assert_eq!(proved.len(), 0);
         assert!(!proved.holds(&channel(1)));
 
-        // The proof: yes, and the channel was used.
+        // The proof: yes, and the channel was used. The use is kept, and
+        // written with the others: the proof wrote nothing.
         let good = proof::make(&secret(1), &session.value, &session.prover).unwrap();
         assert!(prove(1, good, Some(&session), &mut proved));
+        assert_eq!(at.held(1).unwrap().used_at, NOW - 2 * HOUR);
+        assert_eq!(at.kept(1), Some(NOW));
+        at.entries.write_uses(&at.db);
         assert_eq!(at.held(1).unwrap().used_at, NOW);
+        assert_eq!(at.kept(1), None);
         // The same proof on a connection with another value, or from
         // another peer, is none: the connection is what it is checked
         // against, and nothing in the message says who proves.
@@ -3214,6 +4176,7 @@ mod tests {
         // Nothing is remembered for it, and it was no use of the channel.
         assert!(!prove(2000, &mut proved));
         assert_eq!(at.held(2000).unwrap().used_at, NOW - 2 * HOUR);
+        assert_eq!(at.kept(2000), None);
         assert!(!proved.holds(&channel(2000)));
         // Nor any after it.
         assert!(!prove(2001, &mut proved));
@@ -3224,6 +4187,8 @@ mod tests {
             .execute("UPDATE relay_channels SET used_at = ?1", [NOW - 2 * HOUR])
             .unwrap();
         assert!(prove(7, &mut proved));
+        assert_eq!(at.kept(7), Some(NOW));
+        at.entries.write_uses(&at.db);
         assert_eq!(at.held(7).unwrap().used_at, NOW);
         assert_eq!(proved.len(), 1024);
 
@@ -4646,15 +5611,13 @@ mod tests {
         // One of them was used since: its key was proved there.
         let session = [0x51; 32];
         let proof = proof::make(&secret(3), &session, &peer(1).0).unwrap();
-        relay::prove(
-            &lock(&other.db),
-            &channel(3),
-            &session,
-            &peer(1).0,
-            &proof,
-            then + 2 * HOUR,
-        )
-        .unwrap();
+        let checked = relay::check_proof(&channel(3), &session, &peer(1).0, &proof).unwrap();
+        {
+            let db = other.db.lock().unwrap();
+            assert!(relay::prove(&db, &checked).unwrap().answer());
+            other.entries.used(&db, &channel(3), then + 2 * HOUR);
+        }
+        other.entries.write_uses(&other.db);
 
         let link = Link::to(&other);
         this.entries.pull_from(&link, peer(8), &this.db).await;
@@ -4882,6 +5845,11 @@ mod tests {
             .unwrap();
         this.entries.pull_from(&link, peer(8), &this.db).await;
         assert!(link.pulls().is_empty());
+        // When it was last used is kept with this relay's uses, and
+        // written with them.
+        assert_eq!(this.held(1).unwrap().used_at, now - 3 * HOUR);
+        assert_eq!(this.kept(1), Some(now - 5));
+        this.entries.write_uses(&this.db);
         let first = this.held(1).unwrap();
         assert_eq!(
             (first.held_since, first.used_at),
