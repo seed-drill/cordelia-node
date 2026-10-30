@@ -379,7 +379,7 @@ pub fn show(state: &AppState, request: &ShowRequest) -> Result<ShowResponse, Api
 const TURN_WAIT: Duration = Duration::from_secs(HISTORY_TURN_WAIT_SECS);
 
 /// The turn, or the answer that the node is busy.
-fn turn(state: &AppState, wait: Duration) -> Result<std::sync::MutexGuard<'_, ()>, ApiError> {
+fn turn(state: &AppState, wait: Duration) -> Result<crate::state::Turn<'_>, ApiError> {
     state.history.turn_within(wait).ok_or_else(|| {
         ApiError::Conflict(
             "the node is busy syncing and did not come free. Nothing was done; try again".into(),
