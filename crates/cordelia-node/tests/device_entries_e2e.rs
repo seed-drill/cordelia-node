@@ -11691,3 +11691,166 @@ async fn a_closed_device_sends_the_delete_over_a_hand_over_and_nothing_else() {
     assert!(sent[0].delete && sent[0].channel == pair && sent[0].author == laptop.key());
     assert_eq!(laptop.has_leave("relay"), Err(NoLeave::Closed));
 }
+
+// ── A change in what a device keeps wakes its pass (rule 19) ─────────
+
+/// Whatever asked the device for a whole pass before now is let go, so
+/// that [`woken`] says what happened after.
+async fn drained(device: &Device) {
+    while tokio::time::timeout(
+        Duration::from_millis(20),
+        device.state.own_channels.wait_asked(),
+    )
+    .await
+    .is_ok()
+    {}
+}
+
+/// Whether something asked the device for a whole pass since it was
+/// [`drained`]: the wake of decision 2026-10-24 (removal), rule 19.
+async fn woken(device: &Device) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        device.state.own_channels.wait_asked(),
+    )
+    .await
+    .is_ok()
+}
+
+/// Rule 19 where a device applies a change a relay hands it (the review of
+/// the whole build, its M5): it shows at every relay at once.
+///
+/// Taken out: the wake after an apply (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_apply_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let [maker, other, third] = three_in_step(&relay).await;
+    let change = maker.changes(&phrase(), &[&maker, &other, &third], &[]);
+    maker.passes().await;
+    drained(&other).await;
+    other.passes().await;
+    assert_eq!(other.latest().id(), change.id());
+    assert!(woken(&other).await, "an apply did not wake the pass");
+}
+
+/// Rule 19 where a device sets a head aside: a change made apart from the
+/// one it follows, both clear.
+///
+/// Taken out: the wake after a head set aside (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_head_set_aside_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let (mut one, mut other) = (Device::new("desktop"), Device::new("laptop"));
+    one.makes_the_phrase(&phrase());
+    one.adds(&other);
+    for device in [&mut one, &mut other] {
+        device.holds("notes");
+        device.connects("relay", &relay).await;
+    }
+    all_pass(&[&one, &other], 2).await;
+    let by_one = one.changes(&phrase(), &[&one, &other], &[]);
+    other.changes(&phrase(), &[&one, &other], &[]);
+    one.passes().await;
+    drained(&other).await;
+    other.passes().await;
+    let shows = at_relays::to_show(&other.db()).unwrap().unwrap();
+    assert_eq!(shows.set_aside, vec![by_one.id()]);
+    assert!(
+        woken(&other).await,
+        "a head set aside did not wake the pass"
+    );
+}
+
+/// Rule 19 where a device closes: two removals made apart, each of a
+/// device the other lists.
+///
+/// Taken out: both wakes of a close, the one where what the change removes
+/// commits and the one where it is kept closed (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let mut devices = [
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+        Device::new("phone"),
+    ];
+    devices[0].makes_the_phrase(&phrase());
+    for n in 1..4 {
+        devices[0].adds(&devices[n]);
+    }
+    for device in &mut devices {
+        device.holds("notes");
+        device.connects("relay", &relay).await;
+    }
+    let [desktop, laptop, tablet, phone] = &devices;
+    all_pass(&[desktop, laptop, tablet, phone], 3).await;
+    desktop.changes(&phrase(), &[desktop, laptop, phone], &[tablet]);
+    laptop.changes(&phrase(), &[desktop, laptop, tablet], &[phone]);
+    desktop.passes().await;
+    drained(laptop).await;
+    laptop.passes().await;
+    assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+    assert!(woken(laptop).await, "a close did not wake the pass");
+}
+
+/// Rule 19 where a device moves at the start of a pass: closed by what it
+/// knows of removals growing, it keeps a clear head that counts it.
+///
+/// Taken out: the wake after a move (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let [desktop, laptop, tablet] = three_in_step(&relay).await;
+    // The desktop's change lists the tablet no more; the laptop's, made
+    // apart, still does. Both are clear: the laptop sets the desktop's
+    // aside and goes on.
+    let by_desktop = desktop.changes(&phrase(), &[&desktop, &laptop], &[]);
+    laptop.changes(&phrase(), &[&desktop, &laptop, &tablet], &[]);
+    desktop.passes().await;
+    laptop.passes().await;
+    assert_eq!(laptop.stands(), Stands::Applied);
+    // It comes to know the tablet removed: the change it follows lists
+    // it, and is not clear. Its next pass moves it to the desktop's.
+    cordelia_storage::person::keep_removed(&laptop.db(), &[tablet.key()], laptop.now()).unwrap();
+    assert_eq!(laptop.stands(), Stands::Closed);
+    drained(&laptop).await;
+    laptop.passes().await;
+    assert_eq!(laptop.latest().id(), by_desktop.id());
+    assert!(woken(&laptop).await, "a move did not wake the pass");
+}
+
+/// Rule 19 where what a pull takes changes what the device keeps: an
+/// entry of a removed key's that opens under the secret it follows closes
+/// it at the door (the review of the whole build, its M3 and M5).
+///
+/// Taken out: the wake after the pull (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_that_closes_the_device_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let [desktop, laptop, _tablet] = three_in_step(&relay).await;
+    // A key the laptop knows to be removed, which holds the secret it
+    // follows: a branch that never heard of its removal added it again.
+    let stolen = NodeIdentity::generate().unwrap();
+    cordelia_storage::person::keep_removed(&laptop.db(), &[stolen.public_key()], laptop.now())
+        .unwrap();
+    assert_eq!(laptop.stands(), Stands::Applied);
+    let by_stolen = sealed(
+        &stolen,
+        &laptop.name_secret("notes"),
+        1,
+        "s.md",
+        Value::Text("written with a secret it was handed again".into()),
+    );
+    assert_eq!(
+        pushed_by_hand(&desktop, "relay", &[&by_stolen]).await,
+        [PushAnswer::Stored]
+    );
+    drained(&laptop).await;
+    laptop.passes().await;
+    assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+    assert!(
+        woken(&laptop).await,
+        "a pull that closed the device did not wake the pass"
+    );
+}
