@@ -30,6 +30,19 @@ pub(crate) fn filing(seed: u8, name: &str) -> Filing {
     }
 }
 
+/// A filing as [`filing`] makes it, of a card at the relay of `relay`.
+fn filing_at(seed: u8, name: &str, relay: [u8; 32]) -> Filing {
+    let mut bytes = vec![seed; 32];
+    bytes.extend_from_slice(&Relays::new(&[relay]).unwrap().to_bytes());
+    let card = Card::from_bytes(&bytes).unwrap();
+    Filing {
+        channel: card.channel_id().unwrap(),
+        card,
+        name: name.into(),
+        came: Came::Made,
+    }
+}
+
 /// The ID of the channel of the card made from `seed`.
 fn channel(seed: u8) -> [u8; 32] {
     filing(seed, "x").channel
@@ -3503,7 +3516,8 @@ struct PastABound {
 /// each, apart, and `review`, the oldest of 17, is past the bound. The
 /// table lets go the row of the member that wrote first (by hand: see
 /// below), and Dave writes there after the bound, of which the door takes
-/// nothing.
+/// nothing. The desktop's last channel, `d7`, is at a relay of its own,
+/// which the laptop does not reach.
 fn past_a_bound(
     s: &Several,
     while_held: &dyn Fn(&Several, &crate::shared::tests::Shared, &NodeIdentity),
@@ -3529,7 +3543,11 @@ fn past_a_bound(
     for k in 0..8u8 {
         let at = t1 + i64::from(k);
         on(s, laptop, Do::File(filing(10 + k, &format!("l{k}"))), at);
-        on(s, desktop, Do::File(filing(20 + k, &format!("d{k}"))), at);
+        let d = match k {
+            7 => filing_at(20 + k, "d7", [4; 32]),
+            _ => filing(20 + k, &format!("d{k}")),
+        };
+        on(s, desktop, Do::File(d), at);
     }
     for round in 0..3 {
         let now = t1 + 10 + round;
@@ -3804,9 +3822,12 @@ fn shared_move_past_a_bound_judges_the_offers_read_before() {
 /// goes at revision 2, above the empty anew record the relays hold at 1;
 /// and the line says how many keys it could not list, in the words of
 /// `shared anew`. The new channel takes the old one's place past the bound:
-/// the 16 channels held are made anew and filed, and none goes past the
-/// bound. The old channel is moved from, the pass sends its offer there
-/// alone, and the look and the status say the line.
+/// the 15 channels held that the laptop reaches are made anew and filed,
+/// `d7`, which it does not reach, stays as it was, and none goes past the
+/// bound. A take-out that the bound began and that has not ended when the
+/// removal comes ends there: the old channel is moved from, keeps its
+/// offer, and the pass sends it there alone; the look and the status say
+/// the line.
 #[test]
 fn a_removal_makes_a_channel_past_its_bound_anew() {
     use crate::shared::tests::row;
@@ -3823,6 +3844,14 @@ fn a_removal_makes_a_channel_past_its_bound_anew() {
         dave,
         t2,
     } = past_a_bound(&s, &|_, _, _| {});
+    // The take-out that the bound began has not ended yet.
+    let id = row(&s, laptop, &review).id;
+    cordelia_storage::shared_pass::begin_channel(
+        &s[laptop].conn,
+        id,
+        cordelia_storage::shared_pass::ChannelOut::Dropped,
+    )
+    .unwrap();
     s.now = t2 + 10;
     s.change(laptop, &[laptop, desktop], &[phone]);
     let now = s.now + 1;
@@ -3837,7 +3866,7 @@ fn a_removal_makes_a_channel_past_its_bound_anew() {
     // Before its yes, the removal names it among the channels past a bound.
     let (made_anew, _, past, _) = crate::shared_anew::at_a_removal(conn, &own_relays).unwrap();
     assert_eq!(past, ["review"]);
-    assert_eq!(made_anew.len(), 16);
+    assert_eq!(made_anew.len(), 15, "d7 is not reached");
     // Channels held come before it and after it among those not clean.
     let order: Vec<[u8; 32]> = cordelia_storage::shared_anew::not_clean_all(conn)
         .unwrap()
@@ -3854,6 +3883,10 @@ fn a_removal_makes_a_channel_past_its_bound_anew() {
         !said
             .iter()
             .any(|line| line.contains("could not be made anew")),
+        "{said:?}"
+    );
+    assert!(
+        said.contains(&crate::shared_anew::unreached_line("d7")),
         "{said:?}"
     );
 
@@ -3904,7 +3937,10 @@ fn a_removal_makes_a_channel_past_its_bound_anew() {
         .collect();
     expected.sort();
     assert_eq!(names, expected);
-    assert!(filings.iter().all(|filing| filing.came != Came::Made));
+    // Each but d7 is made anew; d7 keeps its filing.
+    for filing in &filings {
+        assert_eq!(filing.came == Came::Made, filing.name == "d7", "{filing:?}");
+    }
     let worked = holds_worked_out(conn, &s.key(laptop), now).unwrap();
     assert!(
         !worked
@@ -3951,7 +3987,11 @@ fn a_removal_makes_a_channel_past_its_bound_anew() {
     assert_eq!(made.len(), 1, "{status}");
     assert_eq!(made[0]["name"], "review");
     assert_eq!(made[0]["said"], line.as_str());
-    assert_eq!(status["removed_device_holds"], serde_json::json!([]));
+    // Only d7, which it did not reach, is still held by the removed device.
+    assert_eq!(
+        status["removed_device_holds"][0]["channels"],
+        serde_json::json!(["d7"])
+    );
 }
 
 /// A recovery does not make a channel past its bound anew, and names it
