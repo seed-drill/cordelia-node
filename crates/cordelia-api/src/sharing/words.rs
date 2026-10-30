@@ -573,6 +573,15 @@ fn the_shared_commands_say_what_this_record_says() {
             &["review-with-alice", "review-with-alice"]
         )
     );
+    // `shared anew` on a channel past a bound (§3.4, §7).
+    assert_eq!(
+        crate::shared_anew::past_a_bound_line("review-with-alice", 3),
+        says(
+            "You could not list <n> keys of \"<name>\", nor anyone who wrote there after it went \
+             past a bound: share the new channel with them again.",
+            &["3", "review-with-alice"]
+        )
+    );
     // With sync off, every command is refused so.
     meta::remove(conn, meta::SYNC_CLAUDE_DIR).unwrap();
     assert_eq!(line_of(new_plan(conn, &relays(), "x", &[])).0, "sync_off");
