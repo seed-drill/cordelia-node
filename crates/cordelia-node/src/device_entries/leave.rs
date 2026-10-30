@@ -326,6 +326,22 @@ impl Link {
     pub fn is_open(&self) -> bool {
         self.conn.close_reason().is_none()
     }
+
+    /// A show on this connection failed: it was not answered, or not as a
+    /// show is. At a relay that names the role RELAY_ROLE_HEADS the
+    /// connection is dropped, and the node makes another (the review of
+    /// the whole build, its H2). The relay remembers, for a connection,
+    /// each head it handed there, and hands none of them again on it: an
+    /// answer that handed a removal and was lost on the way, after the
+    /// relay wrote it, would leave the device to be told "held" at its next
+    /// show there, and to have leave without the removal. A new connection
+    /// is handed every head again. At a relay that does not name the role,
+    /// nothing is remembered of what it handed, and the connection stays.
+    pub fn drop_after_a_failed_show(&self) {
+        if self.heads {
+            self.conn.close(0u32.into(), b"a show failed");
+        }
+    }
 }
 
 impl std::fmt::Debug for Link {
@@ -792,12 +808,18 @@ impl Leave {
             })
         };
         let bytes = codec::encode_message(&request).map_or(0, |bytes| bytes.len());
-        let answer = match self
-            .ask_counted(link, Protocol::EntryShow, &request)
-            .await?
-        {
-            WireMessage::EntryShown(shown) => shown.answer,
-            _ => return Err("a show was not answered as one".into()),
+        // A show that fails at a relay that keeps every head drops the
+        // connection ([`Link::drop_after_a_failed_show`]).
+        let answer = match self.ask_counted(link, Protocol::EntryShow, &request).await {
+            Ok(WireMessage::EntryShown(shown)) => shown.answer,
+            Ok(_) => {
+                link.drop_after_a_failed_show();
+                return Err("a show was not answered as one".into());
+            }
+            Err(e) => {
+                link.drop_after_a_failed_show();
+                return Err(e);
+            }
         };
         if followed {
             match gives_leave(&answer) {

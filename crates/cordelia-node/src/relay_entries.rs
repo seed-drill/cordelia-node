@@ -282,10 +282,24 @@ const ENTRIES_SHOWN_IN_A_SLOT: usize = 2 * MAX_CHANGE_HEADS;
 /// its person's channel, one slot. In a slot, at most
 /// [`ENTRIES_SHOWN_IN_A_SLOT`]: one more puts out the one remembered
 /// longest.
+///
+/// **An entry handed is remembered only once its answer is written
+/// whole** (the review of the whole build, its H2): one whose answer could
+/// not be written, or was dropped, is handed again at the next show on the
+/// connection. Remembered before, a lost answer would have the relay say
+/// "held" to the change followed with a removal never handed, and the
+/// device would have leave without it.
 #[derive(Debug, Default)]
 pub struct ShownWhole {
     slots: Vec<ShownSlot>,
+    /// The entry handed whole in the answer being made, by its slot, its
+    /// revision and its ID: remembered once that answer is written.
+    handing: Option<Handing>,
 }
+
+/// An entry handed whole in an answer: its slot (its channel, its slot and
+/// its author), its revision and its ID.
+type Handing = ([[u8; 32]; 3], (u64, [u8; 32]));
 
 /// An author's slot in a channel, and the entries that a connection showed
 /// whole there or was handed whole there.
@@ -318,11 +332,40 @@ impl ShownWhole {
             .unwrap_or_default()
     }
 
-    /// The connection showed `entry` whole, and both its signatures held,
-    /// or the relay handed it whole.
+    /// The connection showed `entry` whole, and both its signatures held.
     fn remember(&mut self, entry: &CheckedEntry) {
-        let place = [entry.channel, entry.slot, entry.author];
-        let shown = (entry.rev, entry.id());
+        self.remember_at(
+            [entry.channel, entry.slot, entry.author],
+            (entry.rev, entry.id()),
+        );
+    }
+
+    /// The answer being made hands `entry` whole: it is remembered once
+    /// that answer is written whole ([`Self::written`]).
+    fn handing(&mut self, entry: &CheckedEntry) {
+        self.handing = Some((
+            [entry.channel, entry.slot, entry.author],
+            (entry.rev, entry.id()),
+        ));
+    }
+
+    /// What the answer just made hands, taken out: nothing is remembered
+    /// of it unless it is given back to [`Self::written`].
+    fn take_handing(&mut self) -> Option<Handing> {
+        self.handing.take()
+    }
+
+    /// The answer that handed `handed` was written whole: the entry is
+    /// remembered as handed on the connection.
+    fn written(&mut self, handed: Option<Handing>) {
+        if let Some((place, shown)) = handed {
+            self.remember_at(place, shown);
+        }
+    }
+
+    /// The connection showed the entry `shown` whole in the slot `place`,
+    /// or was handed it whole there.
+    fn remember_at(&mut self, place: [[u8; 32]; 3], shown: (u64, [u8; 32])) {
         if let Some(kept) = self.slots.iter_mut().find(|kept| kept.place == place) {
             if !kept.entries.contains(&shown) {
                 if kept.entries.len() >= ENTRIES_SHOWN_IN_A_SLOT {
@@ -1163,9 +1206,10 @@ impl RelayEntries {
             return Answer::NotNow;
         }
         // An entry handed whole is not handed again on this connection
-        // (decision 2026-10-24 (removal), rule 16).
+        // (decision 2026-10-24 (removal), rule 16), once the answer that
+        // hands it is written whole ([`ShownWhole::written`]).
         if let Shown::Another { entry, .. } = &showing.answer {
-            whole.remember(entry);
+            whole.handing(entry);
         }
         Answer::of(WireMessage::EntryShown(EntryShown {
             answer: (&showing.answer).into(),
@@ -2102,6 +2146,9 @@ impl RelayEntries {
             serving.rates,
             unix_now(),
         );
+        // What the answer hands is remembered only once it is written
+        // whole: an answer not made, or not written, hands nothing.
+        let handed = whole.take_handing();
         // The answer is made, and needs nothing more of the request, which
         // is large where its answer is small (a push of a page of
         // entries), nor of its frame, which a pull may pad to a message
@@ -2154,6 +2201,9 @@ impl RelayEntries {
                 .then_some(written.len()),
             Err(_) => None,
         };
+        if wrote.is_some() {
+            whole.written(handed);
+        }
         match (wrote, stream) {
             (Some(bytes), Some(stream)) => {
                 self.counts.wrote(stream, FRAME_LENGTH_BYTES + bytes);
@@ -2758,8 +2808,23 @@ mod tests {
         /// connection that has shown `whole` so far: of the entry whole,
         /// or in short.
         fn show_on(&self, n: u8, whole: &mut ShownWhole, request: WireMessage) -> ShowAnswer {
+            let answer = self.show_unwritten(n, whole, request);
+            // The answer is written whole: what it hands is remembered.
+            let handed = whole.take_handing();
+            whole.written(handed);
+            answer
+        }
+
+        /// As [`Self::show_on`], where the answer is made and never
+        /// written: what it hands is not remembered as handed.
+        fn show_unwritten(
+            &self,
+            n: u8,
+            whole: &mut ShownWhole,
+            request: WireMessage,
+        ) -> ShowAnswer {
             let peer = peer(n);
-            shown(self.entries.answer(
+            let answer = shown(self.entries.answer(
                 Protocol::EntryShow,
                 &request,
                 &self.who(&peer, n),
@@ -2769,7 +2834,8 @@ mod tests {
                 &self.db,
                 &self.rates,
                 NOW,
-            ))
+            ));
+            answer
         }
 
         /// The peer numbered `n` shows `entry`.
@@ -7492,6 +7558,78 @@ mod tests {
             at.show_on(1, &mut again, whole_of(&laptop)),
             ShowAnswer::Held
         );
+    }
+
+    /// A head is remembered as handed only once the answer that hands it
+    /// is written whole (the review of the whole build, its H2). A show
+    /// whose answer cannot be written, the device gone or its stream reset,
+    /// is handed the head again at the next show on the same connection,
+    /// and the relay says "held" only after that: so a lost answer gives
+    /// the device no leave without the removal.
+    #[tokio::test]
+    async fn a_head_whose_answer_was_not_written_is_handed_again() {
+        let at = relay();
+        let (laptop, desktop) = made_apart(1);
+        // The relay keeps the laptop's change, and then the desktop's
+        // beside it; the second connection was handed the laptop's.
+        let mut first = ShownWhole::default();
+        assert_eq!(
+            at.show_on(1, &mut first, whole_of(&laptop)),
+            ShowAnswer::Taken
+        );
+        let mut second = ShownWhole::default();
+        let answer = at.show_on(2, &mut second, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+
+        // A third connection shows the desktop's change, as a device that
+        // follows it does, on a stream whose answer cannot be written: the
+        // device has gone from it.
+        let peer3 = peer(3);
+        let serving = Serving {
+            conn: None,
+            peer: &peer3,
+            address: address(3),
+            db: &at.db,
+            rates: &at.rates,
+            permits: None,
+        };
+        let mut proved = Proved::default();
+        let mut third = ShownWhole::default();
+        let (mut relay_w, peer_r) = tokio::io::duplex(1 << 20);
+        drop(peer_r);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(1 << 20);
+        let frame = codec::encode_message(&whole_of(&desktop)).unwrap();
+        codec::write_raw_frame(&mut peer_w, &frame).await.unwrap();
+        at.entries
+            .serve(
+                Protocol::EntryShow,
+                &mut relay_w,
+                &mut relay_r,
+                &serving,
+                &mut proved,
+                &mut third,
+            )
+            .await;
+        // The next show on the same connection is handed the laptop's
+        // change, whose first answer was lost, and only then told "held".
+        let answer = at.show_on(3, &mut third, whole_of(&desktop));
+        assert_eq!(
+            handed_whole(&answer),
+            Some(laptop.id()),
+            "a head whose answer was never written counted as handed: {answer:?}"
+        );
+        assert_eq!(
+            at.show_on(3, &mut third, whole_of(&desktop)),
+            ShowAnswer::Held
+        );
+
+        // An answer made and dropped before its write hands nothing either.
+        let mut fourth = ShownWhole::default();
+        let answer = at.show_unwritten(4, &mut fourth, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+        let _ = fourth.take_handing();
+        let answer = at.show_on(4, &mut fourth, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
     }
 
     /// Rule 17: a head that a relay keeps, beside another or alone, is

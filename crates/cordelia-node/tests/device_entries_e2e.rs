@@ -11249,6 +11249,42 @@ async fn at_a_relay_that_keeps_heads_a_head_answered_with_another_is_shown_again
     assert_eq!(laptop.has_leave("relay"), Ok(()));
 }
 
+/// A show that fails at a relay that names the role `heads` drops the
+/// connection, so that a new one is handed every head again (the review of
+/// the whole build, its H2): the relay remembers each head it handed on a
+/// connection, and an answer that handed a removal and was lost after the
+/// relay wrote it would leave the device told "held" at its next show
+/// there. At a relay that names no role `heads` the connection stays.
+///
+/// Taken out: the drop (the connection stays open: the first fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_show_at_a_relay_that_keeps_heads_drops_the_connection() {
+    let (mut laptop, _, _, _) = keeping_heads();
+    let heads = StandIn::naming(&["relay", "heads"]).await;
+    heads.says(Say::Reset, Say::Reset);
+    laptop.connects_to("heads", heads.port, heads.key).await;
+    assert!(laptop.link("heads").keeps_heads());
+    laptop.passes().await;
+    assert!(
+        !shows_in(&heads.requests()).is_empty(),
+        "the device showed nothing"
+    );
+    assert!(
+        !laptop.link("heads").is_open(),
+        "a failed show at a relay that keeps heads left its connection open"
+    );
+    assert_ne!(laptop.has_leave("heads"), Ok(()));
+
+    // At a relay of the version before, the same failure keeps it.
+    let before = StandIn::started().await;
+    before.says(Say::Reset, Say::Reset);
+    laptop.connects_to("before", before.port, before.key).await;
+    assert!(!laptop.link("before").keeps_heads());
+    laptop.passes().await;
+    assert!(!shows_in(&before.requests()).is_empty());
+    assert!(laptop.link("before").is_open());
+}
+
 /// Test 8 of decision 2026-10-24 (removal), section 7: a relay of the
 /// version before (it names no role `heads`) answers each show with a
 /// change that the device keeps as a head set aside, numbered above the
