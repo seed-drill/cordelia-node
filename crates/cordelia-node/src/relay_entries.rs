@@ -2866,7 +2866,7 @@ mod tests {
             request: WireMessage,
         ) -> ShowAnswer {
             let peer = peer(n);
-            let answer = shown(self.entries.answer(
+            shown(self.entries.answer(
                 Protocol::EntryShow,
                 &request,
                 &self.who(&peer, n),
@@ -2876,8 +2876,7 @@ mod tests {
                 &self.db,
                 &self.rates,
                 NOW,
-            ));
-            answer
+            ))
         }
 
         /// The peer numbered `n` shows `entry`.
