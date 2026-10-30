@@ -28,8 +28,17 @@
 //! is judged at the cut's own time, by its signers and the keys its chain
 //! names, and where one is cut the file goes back to none. The arrivals that
 //! are not cut go with the file to the channel it is carried to.
+//!
+//! **What the device wrote itself** (rule 27, the person's ruling of 30
+//! October). Each version it writes in the channel of a name is kept as an
+//! event of its own ([`noted_own`]). At a carry, the window of each
+//! generation and removed key ([`windows`]) opens at the first arrival
+//! there, in any name, that the cut leaves out for that key, and closes
+//! when the device first kept the key as removed. Every version of its own
+//! stored in a window is set aside: the file goes back to the version
+//! current before the first, as for an arrival cut.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use rusqlite::Connection;
 
@@ -218,6 +227,203 @@ pub(crate) fn noted_at_the_door(
     Ok(())
 }
 
+/// When each window of rule 27 opens and closes: for each generation and
+/// removed key, the time of the first arrival there that the cut leaves
+/// out for that key, in any name; and for each removed key, when this
+/// device first kept it as removed.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Windows {
+    opens: BTreeMap<(Change, [u8; 32]), i64>,
+    closes: BTreeMap<[u8; 32], i64>,
+}
+
+impl Windows {
+    /// Whether a version of the device's own, stored at `at` in
+    /// `generation`, is in a window: at or after it opens for some removed
+    /// key, and before the device knew of that key's removal.
+    pub(crate) fn sets_aside(&self, generation: &Change, at: i64) -> bool {
+        self.opens.iter().any(|((change, key), opens)| {
+            change == generation
+                && at >= *opens
+                && self.closes.get(key).is_none_or(|closes| at < *closes)
+        })
+    }
+
+    /// Whether a version of the device's own that went past the bound in
+    /// `generation`, the newest of them stored at `newest_at`, may have been
+    /// in a window: one opened there at or before it. The earliest that
+    /// went is not known, so that fails safe.
+    fn may_have_set_aside(&self, generation: &Change, newest_at: i64) -> bool {
+        self.opens
+            .iter()
+            .any(|((change, _), opens)| change == generation && newest_at >= *opens)
+    }
+
+    /// When the first window opens in `generation`.
+    fn opens_in(&self, generation: &Change) -> Option<i64> {
+        self.opens
+            .iter()
+            .filter(|((change, _), _)| change == generation)
+            .map(|(_, opens)| *opens)
+            .min()
+    }
+
+    fn open(&mut self, generation: Change, key: [u8; 32], at: i64) {
+        let opens = self.opens.entry((generation, key)).or_insert(at);
+        *opens = (*opens).min(at);
+    }
+}
+
+/// The windows of rule 27, from every file of the channels `channels` (the
+/// channels of the names a carry leaves), and the time each removed key was
+/// first kept: worked out before any file is judged, since a late arrival
+/// in one name sets aside what the device wrote in every name.
+pub(crate) fn windows(
+    conn: &Connection,
+    channels: &[[u8; 32]],
+    cuts: &Cuts,
+) -> Result<Windows, PersonError> {
+    let mut windows = Windows {
+        opens: BTreeMap::new(),
+        closes: cordelia_storage::person::removed_seen(conn)?
+            .into_iter()
+            .collect(),
+    };
+    if cuts.keys().is_empty() {
+        return Ok(windows);
+    }
+    for channel in channels {
+        let mut slots = entries::channel_slots(conn, channel)?;
+        slots.extend(kept::files_of_channel(conn, channel)?);
+        slots.sort();
+        slots.dedup();
+        for slot in slots {
+            let (events, dropped) = kept::of_file(conn, channel, &slot)?;
+            for event in events.iter().filter(|event| !event.own) {
+                let generation = (event.number, event.hash);
+                for key in cuts.keys() {
+                    let names_it = event.unknown
+                        || event
+                            .arrivals
+                            .iter()
+                            .map(|arrival| &arrival.signer)
+                            .chain(&event.full_signers)
+                            .any(|signer| *signer == key.signer);
+                    if names_it && cuts.cuts(key, &generation, event.stored_at) {
+                        windows.open(generation, key.key, event.stored_at);
+                    }
+                }
+            }
+            // What went past the bound and is cut opens the window at the
+            // earliest time an arrival of the key could be cut there: its
+            // cut time where it is cut by time, and any time otherwise.
+            for went in &dropped {
+                let generation = (went.number, went.hash);
+                for key in cuts.keys() {
+                    if !cuts.cuts(key, &generation, went.newest_at) {
+                        continue;
+                    }
+                    let opens = match cuts.cuts(key, &generation, i64::MIN) {
+                        true => i64::MIN,
+                        false => key.at.unwrap_or(i64::MIN),
+                    };
+                    windows.open(generation, key.key, opens);
+                }
+            }
+        }
+    }
+    Ok(windows)
+}
+
+/// The version current in `file` of the channel whose secret is `channel`,
+/// before this device writes its own entry over `current` (rule 27), as
+/// one entry: its own where it holds one, and otherwise the first. Read
+/// before the entry is stored, since the store keeps one entry of each
+/// author in a slot.
+pub(crate) fn own_before(
+    conn: &Connection,
+    own: &[u8; 32],
+    channel: &[u8; 32],
+    file: &str,
+    current: Option<&Version>,
+) -> Result<Option<Entry>, PersonError> {
+    let Some(version) = current else {
+        return Ok(None);
+    };
+    let Some(one) = version
+        .entries
+        .iter()
+        .find(|one| one.author == *own)
+        .or(version.entries.first())
+    else {
+        return Ok(None);
+    };
+    let id = cordelia_crypto::derive::channel_id(channel)?;
+    let slot = cordelia_crypto::slots::slot_id(&cordelia_crypto::derive::slot_key(channel)?, file);
+    Ok(entries::slot_entries(conn, &id, &slot)?
+        .into_iter()
+        .find(|entry| entry.id() == one.id)
+        .map(|entry| Entry::clone(&entry)))
+}
+
+/// Keep `entry`, which this device just wrote itself in the channel whose
+/// secret is `channel`, in the generation `generation`, at `now`, over the
+/// version `before` ([`own_before`]): an event of its own (rule 27).
+pub(crate) fn noted_own(
+    conn: &Connection,
+    entry: &CheckedEntry,
+    generation: &Change,
+    before: Option<&Entry>,
+    now: i64,
+) -> Result<(), PersonError> {
+    kept::note_own(
+        conn,
+        &entry.channel,
+        &entry.slot,
+        generation.0,
+        &generation.1,
+        now,
+        before,
+        &entry.id(),
+    )?;
+    Ok(())
+}
+
+/// Whether a carry by command leaves out `version`, read in `generation`
+/// (`None`: a generation not known), as what this device wrote itself in
+/// a window (rule 27): where a carry set aside its own writing in that
+/// generation (or in any, where the generation is not known), a version
+/// that this device signed, or whose chain names its key, or whose chain
+/// may have dropped links. What it sent there in its window is at the
+/// relays.
+pub(crate) fn own_window_leaves_out(
+    conn: &Connection,
+    own: &[u8; 32],
+    generation: Option<&Change>,
+    version: &Version,
+) -> Result<bool, PersonError> {
+    let set_aside = kept::own_set_aside(conn)?;
+    let in_it = match generation {
+        Some(generation) => set_aside.contains(generation),
+        None => !set_aside.is_empty(),
+    };
+    if !in_it {
+        return Ok(false);
+    }
+    let signer = Link::signer_of(own);
+    Ok(version.entries.iter().any(|one| {
+        one.author == *own
+            || match one.chain.as_deref() {
+                Some(links)
+                    if !crate::cut::may_have_dropped_links(Some(&version.name), Some(links)) =>
+                {
+                    links.iter().any(|link| link.signer == signer)
+                }
+                _ => true,
+            }
+    }))
+}
+
 /// The first event of a file that the cut leaves out, or what went past
 /// its bound.
 struct First<'a> {
@@ -250,11 +456,20 @@ pub(crate) struct FileCut {
 /// Each file of the channel whose secret is `from`, under the statement
 /// numbered `statement`, that the cut leaves out from somewhere, by its
 /// slot (rule 7). A file that is not in it is carried as it is.
+///
+/// **And each file where a version of the device's own is in a window of
+/// rule 27** (`windows`): it goes back to the version current before the
+/// first such version, where no event earlier is cut; where one of its own
+/// that went past the bound may have been in a window, it goes back to
+/// none. Each generation where that set anything aside is added to
+/// `set_aside_in`.
 pub(crate) fn cut_of_channel(
     conn: &Connection,
     own: &[u8; 32],
     from: &[u8; 32],
     cuts: &Cuts,
+    windows: &Windows,
+    set_aside_in: &mut BTreeSet<Change>,
 ) -> Result<BTreeMap<[u8; 32], FileCut>, PersonError> {
     let channel = cordelia_crypto::derive::channel_id(from)?;
     let mut cut = BTreeMap::new();
@@ -269,6 +484,7 @@ pub(crate) fn cut_of_channel(
     slots.dedup();
     for slot in slots {
         let (events, dropped) = kept::of_file(conn, &channel, &slot)?;
+        let own_dropped = kept::own_dropped_of_file(conn, &channel, &slot)?;
         let any_key = |generation: &Change, at: i64| {
             cuts.keys().iter().any(|key| cuts.cuts(key, generation, at))
         };
@@ -286,8 +502,32 @@ pub(crate) fn cut_of_channel(
         let went = dropped
             .iter()
             .position(|went| any_key(&(went.number, went.hash), went.newest_at));
-        let first = match went {
-            Some(at) => {
+        // A version of the device's own that went past its bound in a
+        // generation where a window opened at or before it: the version
+        // before it is not kept, so the file goes back to none (rule 27).
+        let own_went = own_dropped
+            .iter()
+            .find(|went| windows.may_have_set_aside(&(went.number, went.hash), went.newest_at));
+        // The first version of the device's own in a window (rule 27).
+        let own_first = events.iter().position(|event| {
+            event.own && windows.sets_aside(&(event.number, event.hash), event.stored_at)
+        });
+        if let Some(index) = own_first {
+            set_aside_in.insert((events[index].number, events[index].hash));
+        }
+        let first = match (own_went, went) {
+            (Some(own_went), _) => {
+                let generation = (own_went.number, own_went.hash);
+                set_aside_in.insert(generation);
+                Some(First {
+                    place: None,
+                    generation,
+                    at: windows.opens_in(&generation).unwrap_or(own_went.newest_at),
+                    before: None,
+                    stored_before: Vec::new(),
+                })
+            }
+            (None, Some(at)) => {
                 let went = &dropped[at];
                 Some(First {
                     place: None,
@@ -300,7 +540,7 @@ pub(crate) fn cut_of_channel(
                         .collect(),
                 })
             }
-            None => events
+            (None, None) => events
                 .iter()
                 .position(|event| {
                     let generation = (event.number, event.hash);
@@ -314,6 +554,9 @@ pub(crate) fn cut_of_channel(
                         // removed key.
                         || (event.unknown && any_key(&generation, event.stored_at))
                 })
+                .into_iter()
+                .chain(own_first)
+                .min()
                 .map(|index| {
                     let event = &events[index];
                     let stored = events[..index].iter().map(|event| event.stored_id);
@@ -590,7 +833,10 @@ mod tests {
                     .unwrap();
                 }
                 let (events, dropped) = kept::of_file(&on.conn, &channel, &slot).unwrap();
-                assert_eq!((events.len(), dropped.len()), (MAX_FILE_ARRIVALS, 1));
+                // The laptop's own version is an event of its own, counted
+                // apart (rule 27).
+                let arrivals = events.iter().filter(|event| !event.own).count();
+                assert_eq!((arrivals, dropped.len()), (MAX_FILE_ARRIVALS, 1));
             }
             s.now = made - 1;
             let removal = s.change(0, &[0, 1], &[2]);
@@ -856,7 +1102,8 @@ mod tests {
             assert!(!dropped.is_empty());
             // The oldest event kept goes back to a late version of the
             // tablet's (sealed again as the laptop's own, after a carry).
-            let oldest = version_of(events[0].before.as_ref().unwrap(), &s[1].own("notes"))
+            let oldest = events.iter().find(|event| !event.own).unwrap();
+            let oldest = version_of(oldest.before.as_ref().unwrap(), &s[1].own("notes"))
                 .unwrap()
                 .unwrap();
             assert!(matches!(&oldest.value, Value::Text(text) if text.starts_with("tablet late")));
@@ -1409,6 +1656,320 @@ mod tests {
         assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
         assert_eq!(s[1].text("notes", INDEX), before);
         assert!(texts(&s, 1).iter().all(|text| !text.contains("late")));
+    }
+
+    /// The generation device `n` follows, by its statement's number and
+    /// hash.
+    fn generation_of(s: &Several, n: usize) -> Change {
+        let link = s[n].held().statement.statement.link().unwrap();
+        (link.number, link.hash)
+    }
+
+    /// Rule 27, the sequence of section 8's limit (the person's ruling of 30
+    /// October): the desktop (0) removes the tablet (2). Before the laptop
+    /// (1) knows, it takes the tablet's late `w.md`, and then writes
+    /// `notes.md`, a new file, as its agent would that read the late text,
+    /// and edits `keep.md`, which it wrote long before. When it applies the
+    /// removal, neither is carried: `notes.md` goes back to none and
+    /// `keep.md` to its earlier text, with `w.md` by rule 7. What it wrote
+    /// before the late text came (`early.md`, after the cut time) is kept.
+    #[test]
+    fn what_a_device_wrote_after_it_took_late_writing_is_set_aside() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.write(1, "notes", "keep.md", "keep, long before");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        s.write(1, "notes", "early.md", "written before the late text came");
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        s.write(
+            1,
+            "notes",
+            "notes.md",
+            "the late text, as the agent wrote it down",
+        );
+        s.write(1, "notes", "keep.md", "keep, edited after the late text");
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(s[1].text("notes", "w.md"), None);
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+        assert_eq!(
+            s[1].text("notes", "keep.md").as_deref(),
+            Some("keep, long before")
+        );
+        assert_eq!(
+            s[1].text("notes", "early.md").as_deref(),
+            Some("written before the late text came")
+        );
+        assert!(
+            texts(&s, 1)
+                .iter()
+                .all(|text| !text.contains("late text") || text.contains("before")),
+            "{:?}",
+            texts(&s, 1)
+        );
+        // The desktop is given what the laptop carried: none of it.
+        s.pass(1, 0);
+        assert_eq!(s[0].text("notes", "notes.md"), None);
+        assert_eq!(
+            s[0].text("notes", "keep.md").as_deref(),
+            Some("keep, long before")
+        );
+    }
+
+    /// Rule 27: what a device wrote before the first late arrival it took
+    /// is kept, though it came after the cut time; and a late arrival in
+    /// one name sets aside what the device wrote in another name after it.
+    #[test]
+    fn what_a_device_wrote_before_the_first_late_arrival_is_kept() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.hold(&[0, 1, 2], "work");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        s.now += 5;
+        s.write(
+            1,
+            "work",
+            "before.md",
+            "after the cut time, before the late text",
+        );
+        s.write(1, "notes", "before.md", "also before the late text");
+        s.now += 5;
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        s.write(1, "work", "after.md", "in another name, after it");
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(
+            s[1].text("work", "before.md").as_deref(),
+            Some("after the cut time, before the late text")
+        );
+        assert_eq!(
+            s[1].text("notes", "before.md").as_deref(),
+            Some("also before the late text")
+        );
+        assert_eq!(s[1].text("work", "after.md"), None);
+    }
+
+    /// Rule 27, the index: an edit of `MEMORY.md` that the laptop makes
+    /// after it took the tablet's late writing of another file goes back to
+    /// the index it held before, as its other files do.
+    #[test]
+    fn an_index_written_after_late_writing_was_taken_is_set_aside() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.write(1, "notes", INDEX, "- one\n");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        s.write(1, "notes", INDEX, "- one\n- [w](w.md): the late text\n");
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(s[1].text("notes", INDEX).as_deref(), Some("- one\n"));
+    }
+
+    /// Rule 27, across a carry made before the device knew: the tablet's
+    /// late writing is a delete of `w.md`, which the laptop takes, and then
+    /// the laptop writes `notes.md` and renews, apart from the removal. Its
+    /// renewal carries no `w.md` (a delete is no version), but the events of
+    /// that file are kept: when it moves to the desktop's change, the late
+    /// delete still opens the window, and `notes.md` goes back to none.
+    #[test]
+    fn a_late_arrival_in_a_file_not_carried_still_opens_the_window() {
+        use crate::several::entry_by;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.write(1, "notes", "w.md", "w, long before");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        s.change(0, &[0, 1], &[2]);
+        let rev = newest_rev(&s, 1, "w.md");
+        let delete = entry_by(
+            &s[2].identity,
+            &s[1].own("notes"),
+            rev + 1,
+            "w.md",
+            Value::Delete,
+            &[Link::of(&Value::Text("w, long before".into()), s.key(1))],
+        );
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &delete, now).unwrap();
+        assert_eq!(s[1].text("notes", "w.md").as_deref(), Some("Delete"));
+        s.write(1, "notes", "notes.md", "written after the late delete");
+        s.change(1, &[1, 0, 2], &[]);
+        assert_eq!(
+            s[1].text("notes", "notes.md").as_deref(),
+            Some("written after the late delete")
+        );
+        let taken = s.pass(0, 1);
+        assert!(
+            matches!(taken[0], Taken::Shown(Shown::Moved(_))),
+            "{:?}",
+            taken[0]
+        );
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+    }
+
+    /// Rule 27, the window closes when the device knew: a version of its
+    /// own stored then, or after, is not set aside; one stored before it,
+    /// at or after the first late arrival, is.
+    #[test]
+    fn a_window_closes_when_the_device_knew() {
+        let generation = (2, [2; 16]);
+        let mut windows = Windows {
+            opens: BTreeMap::new(),
+            closes: [([9; 32], 200)].into_iter().collect(),
+        };
+        windows.open(generation, [9; 32], 120);
+        windows.open(generation, [9; 32], 100);
+        assert!(!windows.sets_aside(&generation, 99));
+        assert!(windows.sets_aside(&generation, 100));
+        assert!(windows.sets_aside(&generation, 199));
+        assert!(!windows.sets_aside(&generation, 200));
+        assert!(!windows.sets_aside(&(3, [3; 16]), 150));
+        // What went past the bound may have been in it from when it opens.
+        assert!(windows.may_have_set_aside(&generation, 100));
+        assert!(!windows.may_have_set_aside(&generation, 99));
+    }
+
+    /// Rule 27, after the device knew: the laptop follows a change made
+    /// apart from the removal that never listed the tablet (its change 3
+    /// lists the desktop, the laptop and the phone), so it stays clear and
+    /// the laptop goes on there once it knows (rule 11). The phone (3)
+    /// carried the tablet's late text into it, and the laptop took that:
+    /// a window opens there. What the laptop wrote before it knew is set
+    /// aside at its next carry; what it wrote after it knew is kept.
+    #[test]
+    fn what_a_device_wrote_after_it_knew_is_kept() {
+        let mut s = Several::of_one_person(4);
+        s.hold(&[0, 1, 2, 3], "notes");
+        s.meet(&[0, 1, 2, 3]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1, 3], &[2]);
+        // Late, under change 2: the tablet writes, and the phone takes it.
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 3);
+        // The laptop renews without the tablet, apart from the removal;
+        // the phone applies it, carrying the late text.
+        s.change(1, &[1, 0, 3], &[]);
+        let taken = s.pass(1, 3);
+        assert!(
+            matches!(taken[0], Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        s.pass(3, 1);
+        assert_eq!(
+            s[1].text("notes", "w.md").as_deref(),
+            Some("the tablet's late text")
+        );
+        s.write(1, "notes", "before.md", "before the laptop knew");
+        // The laptop is shown the removal: its change is clear, and it
+        // goes on.
+        let now = s.tick();
+        let on = &s[1];
+        crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(held_rows_removed(&s, 1).contains(&s.key(2)));
+        s.write(1, "notes", "after.md", "after the laptop knew");
+        // A later change of the laptop's carries from its change 3.
+        s.change(1, &[1, 0, 3], &[2]);
+        assert_eq!(s[1].text("notes", "before.md"), None);
+        assert_eq!(
+            s[1].text("notes", "after.md").as_deref(),
+            Some("after the laptop knew")
+        );
+        assert_eq!(s[1].text("notes", "w.md"), None);
+    }
+
+    /// The keys device `n` keeps as removed.
+    fn held_rows_removed(s: &Several, n: usize) -> Vec<[u8; 32]> {
+        cordelia_storage::person::removed_keys(&s[n].conn).unwrap()
+    }
+
+    /// Rule 27, where it does not hold (the limit, shown): the phone (3)
+    /// took the laptop's `notes.md` from the laptop's window before either
+    /// knew. The laptop sets it aside at its carry; the phone, which cannot
+    /// see when the laptop's window opened, carries it as the laptop's
+    /// version, and the laptop takes that carry back in the new generation.
+    /// And a carry by command on the laptop leaves out what it wrote in its
+    /// window, which the relays still hold in the old generation.
+    #[test]
+    fn another_device_that_took_the_window_writing_carries_it() {
+        let mut s = Several::of_one_person(4);
+        s.hold(&[0, 1, 2, 3], "notes");
+        s.meet(&[0, 1, 2, 3]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1, 3], &[2]);
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        let written = s.write(1, "notes", "notes.md", "the late text, written down");
+        let old_secret = s[1].own("notes");
+        let old_generation = generation_of(&s, 1);
+        s.pass(1, 3);
+        assert!(s[3].text("notes", "notes.md").is_some());
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+
+        // A carry by command on the laptop, of what the relays hold of the
+        // old generation, leaves its window writing out.
+        let version = version_of(&written, &old_secret).unwrap().unwrap();
+        let now = s.tick();
+        let on = &s[1];
+        let brought = crate::carry::bring(
+            &on.conn,
+            &on.identity,
+            "notes",
+            &version,
+            crate::carry::Rule::Counts(Some(old_generation)),
+            now,
+        )
+        .unwrap();
+        assert_eq!(brought, crate::carry::Brought::Cut);
+
+        // The phone applies the removal, and carries the laptop's version.
+        let now = s.tick();
+        let on = &s[3];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(
+            s[3].text("notes", "notes.md").as_deref(),
+            Some("the late text, written down")
+        );
+        s.pass(3, 1);
+        assert_eq!(
+            s[1].text("notes", "notes.md").as_deref(),
+            Some("the late text, written down"),
+            "the limit: it comes back from the phone's carry"
+        );
     }
 
     /// After a removal, honest arrivals are not cut again at a later change

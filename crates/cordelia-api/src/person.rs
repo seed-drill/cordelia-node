@@ -2682,6 +2682,19 @@ fn come_to(
         // everything stored over it ([`crate::arrivals::cut_of_channel`]).
         let counting = Counting::of(leaving, &held_rows::additions(conn)?, &[]);
         let cuts = crate::cut::Cuts::read(conn)?;
+        // When the device first took a removed key's late writing, in each
+        // generation, in any name, is worked out before any file is judged
+        // (decision 2026-10-24 (removal), rule 27): what it wrote itself
+        // from then to its knowing is set aside in every name.
+        let mut left_channels = Vec::new();
+        for name in &names {
+            left_channels.push(derive::channel_id(&derive::own_secret(
+                &from.secret,
+                &name.name,
+            )?)?);
+        }
+        let windows = crate::arrivals::windows(conn, &left_channels, &cuts)?;
+        let mut set_aside_in = std::collections::BTreeSet::new();
         applied.left = Some(from.number);
 
         let own = identity.public_key();
@@ -2720,7 +2733,14 @@ fn come_to(
             // first: nothing is carried there.
             // What the cut leaves out of each file (rule 7) is worked out
             // first: the folders' records and the carry both go by it.
-            let cut = crate::arrivals::cut_of_channel(conn, &own, &old, &cuts)?;
+            let cut = crate::arrivals::cut_of_channel(
+                conn,
+                &own,
+                &old,
+                &cuts,
+                &windows,
+                &mut set_aside_in,
+            )?;
             let dropped = move_records(conn, &carry, &counting, &old, &new, &cut)?;
             applied
                 .not_carried
@@ -2737,6 +2757,11 @@ fn come_to(
             if no_version > 0 {
                 applied.no_version.push(name.name.clone());
             }
+        }
+        // A carry by command leaves out what the device wrote itself in a
+        // generation where it was set aside (rule 27): it is at the relays.
+        for (number, hash) in &set_aside_in {
+            cordelia_storage::arrivals::own_set_aside_in(conn, *number, hash)?;
         }
         // Nothing of messages is carried (decision 2026-10-09 §9.1): what
         // the store holds of the messages channel that is left goes, as
@@ -3179,8 +3204,13 @@ impl Carry<'_> {
             }
             carried += 1;
         }
-        // What the store holds of the channel that was left is dropped, and
-        // with it the arrivals of each file that was not carried.
+        // The events of each file that was not carried are kept, with
+        // nothing to go back to: a late arrival there still opens a window
+        // of rule 27 at a later carry (decision 2026-10-24 (removal)).
+        if cut.is_some() {
+            cordelia_storage::arrivals::keep_left(conn, &channel, &derive::channel_id(to)?)?;
+        }
+        // What the store holds of the channel that was left is dropped.
         entries::remove_channel(conn, &channel)?;
         // And with it what the device kept of each relay for it.
         kept_rows::forget_channel(conn, &channel)?;

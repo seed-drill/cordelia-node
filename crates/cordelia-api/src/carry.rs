@@ -258,8 +258,29 @@ fn bring_named(
             return Ok(left);
         }
         let entry = carried_entry(identity, &secret, version)?;
+        // What it brings is a version this device writes itself: it is
+        // kept as an event of its own, over the version current before
+        // (decision 2026-10-24 (removal), rule 27).
+        let current = standing.slot(conn, &secret, &version.name)?.current;
+        let before = crate::arrivals::own_before(
+            conn,
+            &identity.public_key(),
+            &secret,
+            &version.name,
+            current.as_ref(),
+        )?;
         Ok(match entries::store(conn, &entry, now)? {
-            Outcome::Stored => Brought::Carried,
+            Outcome::Stored => {
+                let link = standing.held.statement.statement.link()?;
+                crate::arrivals::noted_own(
+                    conn,
+                    &entry,
+                    &(link.number, link.hash),
+                    before.as_ref(),
+                    now,
+                )?;
+                Brought::Carried
+            }
             Outcome::AlreadyHeld => Brought::Tie,
             Outcome::OlderThanHeld => Brought::Higher,
         })
@@ -413,6 +434,16 @@ fn judged(
             now,
             named,
         ) {
+            return Ok(Some(Brought::Cut));
+        }
+        // What this device wrote itself in a generation where a carry set
+        // it aside (rule 27): it is at the relays, and is left out.
+        if crate::arrivals::own_window_leaves_out(
+            conn,
+            &identity.public_key(),
+            read_in.as_ref(),
+            version,
+        )? {
             return Ok(Some(Brought::Cut));
         }
     }

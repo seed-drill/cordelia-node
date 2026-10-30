@@ -1552,7 +1552,9 @@ mod tests {
     /// the late write arrived after the removal's cut time, and the edit
     /// was stored over it, so the file goes back to the version before
     /// them. The edit of a file the removed device did not touch is carried
-    /// as before.
+    /// as before where device 3 made it before the late write came; one it
+    /// made after is set aside (rule 27, the person's ruling of 30 October,
+    /// which reverses what this test held before it).
     #[test]
     fn test_what_a_removed_device_wrote_late_and_an_edit_over_it_are_not_carried() {
         let mut s = four_with_notes();
@@ -1560,6 +1562,9 @@ mod tests {
         s.change(0, &[0, 1, 3], &[2]);
         s.pass(0, 1);
         assert_eq!((s[1].number(), s[3].number()), (2, 1));
+        // Device 3 edits a file that the removed device has not touched,
+        // before any late write reaches it.
+        s.write(3, "notes", "b.md", "b two, by device 3");
 
         // The removed device writes late, where device 3 still reads.
         let late = s.write(2, "notes", "a.md", "a two, written late");
@@ -1569,11 +1574,11 @@ mod tests {
             s[3].text("notes", "a.md").as_deref(),
             Some("a two, written late")
         );
-        // Device 3 edits it, and edits a file that the removed device has
-        // not touched.
+        // Device 3 edits it, and writes a file that the removed device has
+        // not touched: after the late write came, so it is set aside.
         let edit = s.write(3, "notes", "a.md", "a three, by device 3");
         assert_eq!(edit.rev, 3);
-        s.write(3, "notes", "b.md", "b two, by device 3");
+        s.write(3, "notes", "d.md", "d, by device 3 after the late write");
 
         // It is shown the change, applies it, and carries what it holds:
         // a.md as it was before the late write.
@@ -1588,6 +1593,7 @@ mod tests {
             }))
         ));
         assert_eq!(s[3].text("notes", "a.md").as_deref(), Some("a one"));
+        assert_eq!(s[3].text("notes", "d.md"), None);
         s.pass(3, 0);
         s.pass(3, 1);
 
@@ -1597,12 +1603,13 @@ mod tests {
             for one in s[n].stored() {
                 let said = one.open(&s[n].own("notes")).map(|inside| inside.value);
                 assert!(
-                    !matches!(&said, Ok(Value::Text(t)) if t.starts_with("a two") || t.starts_with("a three")),
+                    !matches!(&said, Ok(Value::Text(t)) if t.starts_with("a two") || t.starts_with("a three") || t.starts_with("d,")),
                     "{n}"
                 );
             }
             // The control: the edit of a file that the removed device did
-            // not touch is carried, and known to follow this device's text.
+            // not touch, made before the late write came, is carried, and
+            // known to follow this device's text.
             let version = s[n].slot("notes", "b.md").current.unwrap();
             assert_eq!(version.value, text("b two, by device 3"));
             assert!(s[n].follows("notes", "b.md", "b one"));
