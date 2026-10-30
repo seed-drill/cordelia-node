@@ -22,7 +22,7 @@ use crate::removal;
 use crate::steps::{Act, Steps, Timing};
 
 /// What a run is to do.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Plan {
     pub stage: Stage,
     pub seed: u64,
@@ -89,7 +89,7 @@ impl Plan {
 }
 
 /// A removal, as it went (bar 10).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Removal {
     pub person: usize,
     pub remover: usize,
@@ -113,7 +113,7 @@ pub struct Removal {
 }
 
 /// The second relay's outage.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Outage {
     pub stopped: Option<f64>,
     pub started: Option<f64>,
@@ -122,7 +122,7 @@ pub struct Outage {
 }
 
 /// The setup, as it went (step 3).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Setup {
     pub started: f64,
     pub ended: f64,

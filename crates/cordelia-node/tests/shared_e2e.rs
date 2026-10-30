@@ -2656,12 +2656,16 @@ fn a_relay_carries_a_shared_channel_with_no_change() {
     let Some(before) = binary_before_shared() else {
         return;
     };
-    let relay = relay_run_by(before);
-    let version = relay.cli(&["--version"]);
-    assert!(
-        !version.contains(env!("CARGO_PKG_VERSION")),
-        "the relay is of this version: {version}"
+    // Not this build, told by its bytes: the release before keeps its
+    // version in the workspace until the next release is cut, so the two
+    // can say the same version.
+    assert_ne!(
+        std::fs::read(&before).unwrap(),
+        std::fs::read(BIN).unwrap(),
+        "the relay is this build: {}",
+        before.display()
     );
+    let relay = relay_run_by(before);
     let two = Shared2::at(relay);
     let all = two.all();
     let channel = id_of(&channel_of(&two.alice, "design-review").unwrap());

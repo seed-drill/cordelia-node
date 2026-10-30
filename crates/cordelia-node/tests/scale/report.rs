@@ -7,22 +7,18 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::Path;
 
-use cordelia_core::protocol::{ENTRY_OVERHEAD_BYTES, MIN_ENTRY_CONTENT_BYTES};
-
 use crate::fleet::{Change, Is, KINDS, Sample, What};
+use crate::kept::Kept;
 use crate::population::Profile;
 use crate::run::{Outcome, Plan, Run};
 
 // ── What is counted ─────────────────────────────────────────────────
 
-/// What an edit of `size` bytes of text in `file` counts as at a relay:
-/// its content, the text with its name and its chain about it (taken as
-/// 96 bytes), sealed in a power of two from 256 bytes, and the overhead
-/// every entry is counted with (`entry_cost`).
+/// What an edit of `size` bytes of text in `file` counts as at a relay,
+/// by this build's constants (`Constants::entry_cost_of`): the report reads
+/// the run's own, as they were kept.
 pub fn entry_cost_of(file: &str, size: usize) -> u64 {
-    let said = size + file.len() + 96 + 28;
-    let content = said.next_power_of_two().max(MIN_ENTRY_CONTENT_BYTES);
-    (content + ENTRY_OVERHEAD_BYTES) as u64
+    crate::kept::Constants::of_this_build().entry_cost_of(file, size)
 }
 
 /// The changes the build has (the first line of the summary). Changes C
@@ -102,18 +98,28 @@ fn reported(title: &str, figure: String, bar: &str) -> Line {
 
 struct Lives {
     of: Vec<Vec<(f64, Is)>>,
+    /// Each stop of each node: when it was told, and when its process
+    /// exited where it stopped cleanly (with success, within `allowed`);
+    /// `None` where it did not, or where how it ended is not known.
+    stops: Vec<Vec<(f64, Option<f64>)>>,
 }
 
 impl Lives {
-    fn new(changes: &[Change], nodes: usize) -> Lives {
+    /// `allowed` is `NODE_STOP_TIMEOUT_SECS` of the run's build.
+    fn new(changes: &[Change], nodes: usize, allowed: f64) -> Lives {
         let mut of = vec![Vec::new(); nodes];
+        let mut stops = vec![Vec::new(); nodes];
         for c in changes {
             of[c.node].push((c.t, c.is));
+            if c.is == Is::Stopped {
+                let exited = stopped_cleanly(c.ended.as_ref(), allowed).map(|took| c.t + took);
+                stops[c.node].push((c.t, exited));
+            }
         }
         for each in &mut of {
             each.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
-        Lives { of }
+        Lives { of, stops }
     }
 
     fn at(&self, node: usize, t: f64) -> Is {
@@ -144,6 +150,40 @@ impl Lives {
                 .any(|(at, is)| *at > a && *at <= b && *is != Is::Running)
     }
 
+    /// When it ran again after the last time it was not running in
+    /// [a, b] (from `a`, where it was not running then); `None` where it
+    /// never ran again. For a device that did not run all through [a, b].
+    fn ran_again_after(&self, node: usize, a: f64, b: f64) -> Option<f64> {
+        let of = &self.of[node];
+        let from = of
+            .iter()
+            .rposition(|(at, is)| *at > a && *at <= b && *is != Is::Running)
+            .map_or_else(|| of.partition_point(|(at, _)| *at <= a), |i| i + 1);
+        of[from..]
+            .iter()
+            .find(|(_, is)| *is == Is::Running)
+            .map(|(at, _)| *at)
+    }
+
+    /// When it had first run `secs` without a stop or a freeze from `from`
+    /// on: the end of that stretch, or `None` where it never did. A device
+    /// still running at its last change runs on.
+    fn ran_for_after(&self, node: usize, from: f64, secs: f64) -> Option<f64> {
+        let mut since = (self.at(node, from) == Is::Running).then_some(from);
+        for (at, is) in self.of[node].iter().filter(|(at, _)| *at > from) {
+            if let Some(s) = since
+                && *at - s >= secs
+            {
+                return Some(s + secs);
+            }
+            match is {
+                Is::Running => since = since.or(Some(*at)),
+                _ => since = None,
+            }
+        }
+        since.map(|s| s + secs)
+    }
+
     /// The longest stretch it ran without a stop or a freeze inside [a, b].
     fn longest_run_within(&self, node: usize, a: f64, b: f64) -> f64 {
         let mut longest: f64 = 0.0;
@@ -165,11 +205,23 @@ impl Lives {
         longest
     }
 
-    fn frozen_within(&self, node: usize, t: f64, secs: f64) -> bool {
-        self.at(node, t - secs) == Is::Frozen
+    /// Whether a relay may still hold its connection at `t`, where it is
+    /// not running then: it was frozen at any moment of the last
+    /// [`HELD_AFTER_A_FREEZE_SECS`]; or it was stopped in that time and its
+    /// process did not exit cleanly; or it exited cleanly within the last
+    /// [`HELD_AFTER_A_CLEAN_STOP_SECS`]. A device stopped cleanly before
+    /// that is not counted.
+    fn may_be_held(&self, node: usize, t: f64) -> bool {
+        let from = t - HELD_AFTER_A_FREEZE_SECS;
+        let frozen = self.at(node, from) == Is::Frozen
             || self.of[node]
                 .iter()
-                .any(|(at, is)| *at > t - secs && *at <= t && *is == Is::Frozen)
+                .any(|(at, is)| *at > from && *at <= t && *is == Is::Frozen);
+        frozen
+            || self.stops[node]
+                .iter()
+                .filter(|(told, _)| *told > from && *told <= t)
+                .any(|(_, exited)| exited.is_none_or(|e| t <= e + HELD_AFTER_A_CLEAN_STOP_SECS))
     }
 
     /// Each time it was not running within [a, b]: from when, to when it
@@ -227,6 +279,8 @@ fn metric(s: &Sample, key: &str) -> Option<f64> {
 pub(crate) struct Series<'a> {
     samples: Vec<&'a Sample>,
     starts: Vec<f64>,
+    /// The buckets of a histogram, in the run's build.
+    buckets: usize,
 }
 
 impl<'a> std::ops::Deref for Series<'a> {
@@ -290,11 +344,9 @@ fn rise(series: &Series, key: &str, a: f64, b: f64, keep: &dyn Fn(f64, f64) -> b
         .sum()
 }
 
-/// The bounds of a histogram's buckets, in µs, as the route names them.
-fn bounds() -> Vec<String> {
-    let mut b: Vec<String> = (0..cordelia_core::protocol::LOAD_HISTOGRAM_BUCKETS)
-        .map(|i| (1u64 << i).to_string())
-        .collect();
+/// The bounds of a histogram's `buckets`, in µs, as the route names them.
+fn bounds(buckets: usize) -> Vec<String> {
+    let mut b: Vec<String> = (0..buckets).map(|i| (1u64 << i).to_string()).collect();
     b.push("+Inf".into());
     b
 }
@@ -311,7 +363,7 @@ fn quantiles(
     keep: &dyn Fn(f64, f64) -> bool,
     qs: &[f64],
 ) -> (f64, Vec<Option<u64>>) {
-    let cumulative: Vec<(String, f64)> = bounds()
+    let cumulative: Vec<(String, f64)> = bounds(series.buckets)
         .into_iter()
         .map(|le| {
             let key = format!("{name}_bucket{{{label},le=\"{le}\"}}");
@@ -372,8 +424,9 @@ fn mm(values: &[f64], unit: &str) -> String {
 
 // ── The run, as the report reads it ─────────────────────────────────
 
-struct Read<'a> {
-    run: &'a Run,
+struct Read {
+    /// The run, as its inputs were kept: every input the report reads.
+    run: Kept,
     lives: Lives,
     samples: Vec<Sample>,
     machine: Vec<crate::fleet::MachineSample>,
@@ -381,15 +434,35 @@ struct Read<'a> {
     end: f64,
     apart: Vec<(f64, f64)>,
     tps: f64,
+    /// What the summary says of how it was made, beyond the run's inputs.
+    told: Told,
 }
 
-impl Read<'_> {
+/// What a summary says of how it was made: by which harness, where not
+/// the run's; with which threshold of bar 6, where not the run's; and
+/// whether its inputs give it again.
+#[derive(Debug, Clone, Default)]
+struct Told {
+    /// The harness that made the report again (its commit and changes),
+    /// where it is not the run's.
+    again_by: Option<String>,
+    /// Where the report made again was given bar 6's threshold
+    /// (`CORDELIA_SCALE_DEVICE_GROWTH`): the run's own, which it was used
+    /// over.
+    growth_over: Option<Option<f64>>,
+    /// Why the run's inputs will not give its summary again: they were not
+    /// kept, or give another.
+    inputs: Option<String>,
+}
+
+impl Read {
     fn series(&self, node: usize) -> Series<'_> {
         let mut s: Vec<&Sample> = self.samples.iter().filter(|s| s.node == node).collect();
         s.sort_by(|a, b| a.t.total_cmp(&b.t));
         Series {
             samples: s,
             starts: self.lives.starts(node),
+            buckets: self.run.constants.load_histogram_buckets,
         }
     }
 
@@ -418,10 +491,11 @@ impl Read<'_> {
 /// The summary of a run that did not start, and why (step 1).
 pub fn refused(plan: &Plan, out: &Path, why: &str) -> Outcome {
     let summary = format!(
-        "INVALID stage {} seed {} commit {} ({CHANGES})\n\nThe run did not start: {why}.\n",
+        "INVALID stage {} seed {} commit {} ({CHANGES}){}{why}.\n",
         plan.stage.name(),
         plan.seed,
-        commit()
+        commit(),
+        crate::kept::DID_NOT_START,
     );
     std::fs::write(out.join("SUMMARY.md"), &summary).unwrap();
     Outcome {
@@ -434,13 +508,13 @@ pub fn refused(plan: &Plan, out: &Path, why: &str) -> Outcome {
 
 /// The parts treated apart: each relay's outage and the five minutes
 /// after it, and each removal's carry window (§3).
-fn parts_apart(run: &Run) -> Vec<(f64, f64)> {
+fn parts_apart(run: &Kept) -> Vec<(f64, f64)> {
     let mut apart = Vec::new();
-    let outage = run.outage.lock().unwrap().clone();
+    let outage = &run.outage;
     if let (Some(a), Some(b)) = (outage.stopped, outage.started) {
         apart.push((a, b + run.plan.timing.after_start));
     }
-    for r in run.removals.lock().unwrap().iter() {
+    for r in &run.removals {
         if let Some(line) = r.line_at {
             apart.push((line, r.carry_end.unwrap_or(line + r.bound)));
         }
@@ -448,62 +522,143 @@ fn parts_apart(run: &Run) -> Vec<(f64, f64)> {
     apart
 }
 
-/// Write what the run leaves, and say what it came to.
-/// What the report reads of a run: its window, where each node was, its
-/// samples, and the parts treated apart.
-fn read_of(run: &Run) -> Read<'_> {
-    let (start, end) = match *run.window.lock().unwrap() {
-        Some((s, e)) => (s, e.unwrap_or_else(|| run.fleet.clock.now())),
-        None => (run.fleet.clock.now(), run.fleet.clock.now()),
-    };
-    let samples = run.samples.lock().unwrap();
-    Read {
+/// What a run keeps for its report, as it is now.
+fn kept_of(run: &Run) -> Kept {
+    Kept::of(
         run,
-        lives: Lives::new(&run.fleet.changes.lock().unwrap(), run.fleet.made.len()),
-        samples: samples.nodes.clone(),
-        machine: samples.machine.clone(),
+        commit(),
+        CHANGES,
+        crate::machine::ticks_a_second() as f64,
+    )
+}
+
+/// What the report reads of a run's inputs: its window, where each node
+/// was, its samples, and the parts treated apart.
+fn read_of_kept(mut run: Kept) -> Read {
+    let (start, end) = match run.window {
+        Some((s, e)) => (s, e.unwrap_or(run.kept_at)),
+        None => (run.kept_at, run.kept_at),
+    };
+    Read {
+        told: Told::default(),
+        lives: Lives::new(
+            &run.fleet.changes,
+            run.fleet.made.len(),
+            run.constants.node_stop_timeout_secs as f64,
+        ),
+        samples: std::mem::take(&mut run.samples),
+        machine: std::mem::take(&mut run.machine),
         start,
         end,
-        apart: parts_apart(run),
-        tps: crate::machine::ticks_a_second() as f64,
+        apart: parts_apart(&run),
+        tps: run.ticks_a_second,
+        run,
     }
+}
+
+/// What the report reads of a run, as it is now.
+fn read_of(run: &Run) -> Read {
+    read_of_kept(kept_of(run))
 }
 
 /// The edits, as the report reads them of `read`'s run.
 fn edits_of(read: &Read) -> Edits {
-    let observer = read.run.observer.lock().unwrap();
-    Edits::of(read, &observer)
+    Edits::of(read, &read.run.observer)
 }
 
-pub fn write(run: &Run) -> Outcome {
-    let read = read_of(run);
+/// The harness this is: its commit and its changes, as a summary's first
+/// line names a run's.
+fn this_harness() -> String {
+    format!("{} ({CHANGES})", commit())
+}
+
+/// The summary of the run whose inputs are in `folder` (`INPUTS_FILE`),
+/// made again by this harness: the same `SUMMARY.md` as the run wrote,
+/// where the report has not changed since and `device_growth` is not
+/// given. Where it is (`CORDELIA_SCALE_DEVICE_GROWTH`), bar 6 is judged by
+/// it over the run's own, and the summary says so. A folder of a run that
+/// did not keep its inputs, or kept another version of them, is refused,
+/// and the error says why.
+pub fn again(folder: &Path, device_growth: Option<f64>) -> Result<Outcome, String> {
+    again_by(folder, device_growth, this_harness())
+}
+
+/// `again`, by the harness `harness` (its commit and changes): where it is
+/// not the run's, the summary names it.
+fn again_by(folder: &Path, device_growth: Option<f64>, harness: String) -> Result<Outcome, String> {
+    let mut kept = Kept::load(folder)?;
+    let run_harness = format!("{} ({})", kept.commit, kept.built_with);
+    let growth_over = device_growth.map(|g| kept.plan.device_growth.replace(g));
+    let mut read = read_of_kept(kept);
+    read.told = Told {
+        again_by: (harness != run_harness).then_some(harness),
+        growth_over,
+        inputs: None,
+    };
     let edits = edits_of(&read);
+    Ok(summary_of(&read, &edits, folder))
+}
+
+/// Write what the run leaves, and say what it came to: its inputs, kept
+/// so that the report can be made again from them, `SUMMARY.md` and
+/// `edits.csv` made from them, and each change of each node in
+/// `samples.jsonl`. Where the inputs were not kept, or do not give the
+/// same summary again, `SUMMARY.md` says so at its end (step 10).
+pub fn write(run: &Run) -> Outcome {
+    let kept = kept_of(run);
+    let saved = kept.save(&run.out);
+    let mut read = read_of_kept(kept);
+    let edits = edits_of(&read);
+    let mut outcome = summary_of(&read, &edits, &run.out);
+    // The inputs give this summary again, or the summary says so.
+    let inputs = match saved.and_then(|()| again(&run.out, None)) {
+        Ok(again) if again.summary == outcome.summary => None,
+        Ok(_) => Some(format!(
+            "the report made again from {} differs from this summary",
+            crate::kept::INPUTS_FILE
+        )),
+        Err(why) => Some(format!("the report's inputs were not kept: {why}")),
+    };
+    if let Some(why) = inputs {
+        eprintln!("{why}: it will not be made again faithfully from them");
+        read.told.inputs = Some(why);
+        outcome = summary_of(&read, &edits, &run.out);
+    }
+    std::fs::write(run.out.join("SUMMARY.md"), &outcome.summary).unwrap();
+    std::fs::write(run.out.join("edits.csv"), edits.csv(&read)).unwrap();
+    changes_written(&read.run, &run.out);
+    outcome
+}
+
+/// The summary of `read`'s run, and what it came to.
+fn summary_of(read: &Read, edits: &Edits, out: &Path) -> Outcome {
+    let run = &read.run;
     let (start, end) = (read.start, read.end);
 
-    let (b6, rises) = bar_6(&read);
-    let (b12, pulls) = bar_12(&read, &edits);
+    let (b6, rises) = bar_6(read);
+    let (b12, pulls) = bar_12(read, edits);
     let b12_holds = b12.verdict != Verdict::Fail;
     let bars = vec![
-        bar_1(&read),
-        bar_2(&read, &edits),
-        bar_3(&read, &edits),
-        bar_4(&read),
-        bar_5(&read),
+        bar_1(read),
+        bar_2(read, edits),
+        bar_3(read, edits),
+        bar_4(read),
+        bar_5(read),
         b6,
-        bar_7(&read),
-        bar_8(&read),
-        bar_9(&read),
-        bar_10(&read, &edits),
-        bar_11(&read),
+        bar_7(read),
+        bar_8(read),
+        bar_9(read),
+        bar_10(read, edits),
+        bar_11(read),
         b12,
-        bar_13(&read, &edits),
-        bar_14(&read, &edits),
-        bar_15(&read, &edits),
+        bar_13(read, edits),
+        bar_14(read, edits),
+        bar_15(read, edits),
     ];
-    let checks = checks(&read, &edits, b12_holds);
+    let checks = checks(read, edits, b12_holds);
 
-    let faults = run.fleet.faults.lock().unwrap().clone();
-    let machine_fault = run.stopped_why.lock().unwrap().clone();
+    let faults = run.fleet.faults.clone();
+    let machine_fault = run.stopped_why.clone();
     let ending = the_end(run);
     let invalid = checks.iter().any(|c| c.verdict == Verdict::Fail) || machine_fault.is_some();
     let failed = bars.iter().any(|b| b.verdict == Verdict::Fail)
@@ -523,12 +678,20 @@ pub fn write(run: &Run) -> Outcome {
     let mut s = String::new();
     let _ = writeln!(
         s,
-        "{verdict} stage {} seed {} commit {} ({CHANGES})\n",
+        "{verdict} stage {} seed {} commit {} ({})\n",
         plan.stage.name(),
         plan.seed,
-        commit()
+        run.commit,
+        run.built_with
     );
-    let setup = run.setup.lock().unwrap().clone();
+    if let Some(harness) = &read.told.again_by {
+        let _ = writeln!(
+            s,
+            "Made again from {} by the harness of commit {harness}.\n",
+            crate::kept::INPUTS_FILE
+        );
+    }
+    let setup = &run.setup;
     let _ = writeln!(
         s,
         "Stage {}, seed {}: {} relays, {} devices of {} people, on {}. The window ran from {:.0} s \
@@ -542,7 +705,7 @@ pub fn write(run: &Run) -> Outcome {
         start,
         end,
         (end - start) / 60.0,
-        if run.cut.load(std::sync::atomic::Ordering::SeqCst) {
+        if run.cut {
             ", and was cut: INVALID"
         } else {
             ""
@@ -550,6 +713,9 @@ pub fn write(run: &Run) -> Outcome {
     );
     if !faults.is_empty() {
         let _ = writeln!(s, "It stopped early: {}.\n", faults.join("; "));
+    }
+    if let Some(why) = &machine_fault {
+        let _ = writeln!(s, "It is INVALID: the harness stopped it, as {why}.\n");
     }
     let _ = writeln!(s, "## The bars (decision 2026-10-22 §3)\n");
     for (n, b) in bars.iter().enumerate() {
@@ -578,7 +744,7 @@ pub fn write(run: &Run) -> Outcome {
             c.bar
         );
     }
-    measures(&mut s, &read, &edits);
+    measures(&mut s, read, edits);
     let _ = writeln!(s, "\n## The end (step 10)\n");
     for (said, well) in &ending {
         let _ = writeln!(
@@ -587,8 +753,14 @@ pub fn write(run: &Run) -> Outcome {
             if *well { "as it should" } else { "FAIL" }
         );
     }
+    if let Some(why) = &read.told.inputs {
+        let _ = writeln!(
+            s,
+            "- {why}: its report will not be made again faithfully from them"
+        );
+    }
     let _ = writeln!(s, "\n## The parts treated apart\n");
-    let outage = run.outage.lock().unwrap().clone();
+    let outage = &run.outage;
     match (outage.stopped, outage.started) {
         (Some(a), Some(b)) => {
             let _ = writeln!(
@@ -602,7 +774,7 @@ pub fn write(run: &Run) -> Outcome {
             let _ = writeln!(s, "- no outage of a relay");
         }
     }
-    for r in run.removals.lock().unwrap().iter() {
+    for r in &run.removals {
         let _ = writeln!(
             s,
             "- the carry window of person {}'s removal: from {} to {}",
@@ -650,17 +822,13 @@ pub fn write(run: &Run) -> Outcome {
     }
     let _ = writeln!(s, "- threads: {}", setup.thread_plan);
     let _ = writeln!(s, "\n## Every setting beyond the defaults\n");
-    let relay = run.fleet.made[run.fleet.relays[0]]
-        .settings
-        .lock()
-        .unwrap()
-        .clone();
+    let relay = &run.fleet.made[run.fleet.relays[0]].settings;
     let device = run
         .fleet
         .made
         .iter()
         .find(|m| matches!(m.what, What::Device { .. }))
-        .map(|m| m.settings.lock().unwrap().clone());
+        .map(|m| &m.settings);
     let _ = writeln!(s, "A relay:");
     for said in relay.beyond_defaults() {
         let _ = writeln!(s, "- {said}");
@@ -688,15 +856,16 @@ pub fn write(run: &Run) -> Outcome {
              holds too few edits for a tenth"
         );
     }
-    let _ = writeln!(s, "- the threshold of bar 6: {}", growth_said(plan));
+    let _ = writeln!(
+        s,
+        "- the threshold of bar 6: {}",
+        growth_said(plan, read.told.growth_over)
+    );
     let _ = writeln!(
         s,
         "- the p99 of the devices' rises in this run, for bar 6 at a later stage: {}",
         quantile(&rises, 0.99).map_or("no value".into(), |r| format!("{r:.2} MiB an hour"))
     );
-    std::fs::write(run.out.join("SUMMARY.md"), &s).unwrap();
-    std::fs::write(run.out.join("edits.csv"), edits.csv(&read)).unwrap();
-    changes_written(run);
     let arrived = edits.pairs.iter().filter(|p| p.arrived.is_some()).count();
     let gone = edits
         .pairs
@@ -706,7 +875,7 @@ pub fn write(run: &Run) -> Outcome {
     Outcome {
         verdict: verdict.into(),
         summary: s,
-        out: run.out.clone(),
+        out: out.to_path_buf(),
         bars: bars
             .iter()
             .map(|b| (b.title.clone(), b.verdict.word().to_string()))
@@ -726,13 +895,13 @@ pub fn write(run: &Run) -> Outcome {
 }
 
 /// How the run ended (step 10): each node told to stop stopped within
-/// NODE_STOP_TIMEOUT_SECS; no pid it started is left; and every key each
-/// relay held a connection from at the end is one of the run's (§4.3,
-/// rule 1).
-fn the_end(run: &Run) -> Vec<(String, bool)> {
-    use cordelia_core::protocol::NODE_STOP_TIMEOUT_SECS;
+/// NODE_STOP_TIMEOUT_SECS of the run's build; no pid it started is left;
+/// and every key each relay held a connection from at the end is one of
+/// the run's (§4.3, rule 1).
+fn the_end(run: &Kept) -> Vec<(String, bool)> {
+    let stop_secs = run.constants.node_stop_timeout_secs;
     let mut said = Vec::new();
-    let stops = run.stops_at_end.lock().unwrap().clone();
+    let stops = &run.stops_at_end;
     let slowest = stops.iter().map(|(_, took, _)| *took).fold(0.0, f64::max);
     let badly: Vec<String> = stops
         .iter()
@@ -741,7 +910,7 @@ fn the_end(run: &Run) -> Vec<(String, bool)> {
         .collect();
     said.push((
         format!(
-            "{} nodes told to stop, the slowest in {slowest:.1} s; {} not stopped as they should within {NODE_STOP_TIMEOUT_SECS} s{}",
+            "{} nodes told to stop, the slowest in {slowest:.1} s; {} not stopped as they should within {stop_secs} s{}",
             stops.len(),
             badly.len(),
             match badly.is_empty() {
@@ -751,13 +920,13 @@ fn the_end(run: &Run) -> Vec<(String, bool)> {
         ),
         badly.is_empty(),
     ));
-    let left = run.pids_left.lock().unwrap().clone();
+    let left = &run.pids_left;
     said.push((
         format!("{} of the pids it started are left", left.len()),
         left.is_empty(),
     ));
     let ours: HashSet<String> = run.fleet.made.iter().map(|m| m.key.clone()).collect();
-    for (r, keys) in run.peers_at_end.lock().unwrap().iter() {
+    for (r, keys) in &run.peers_at_end {
         let strangers = keys.iter().filter(|k| !ours.contains(*k)).count();
         said.push((
             format!(
@@ -774,15 +943,15 @@ fn the_end(run: &Run) -> Vec<(String, bool)> {
 /// Each start, freeze, going on and stop of each node, and how each stop
 /// ended, as lines of `samples.jsonl` (§1.3): what the harness did to each
 /// process, beside what it read of it.
-fn changes_written(run: &Run) {
+fn changes_written(run: &Kept, out: &Path) {
     use std::io::Write as _;
     let Ok(mut file) = std::fs::OpenOptions::new()
         .append(true)
-        .open(run.out.join("samples.jsonl"))
+        .open(out.join("samples.jsonl"))
     else {
         return;
     };
-    for c in run.fleet.changes.lock().unwrap().iter() {
+    for c in &run.fleet.changes {
         let became = match c.is {
             Is::NotStarted => "not started",
             Is::Running => "running",
@@ -802,10 +971,22 @@ fn changes_written(run: &Run) {
     }
 }
 
-fn growth_said(plan: &Plan) -> String {
-    match (plan.stage, plan.device_growth) {
-        (_, Some(g)) => format!("{:.2} MiB an hour (stage 100's p99, given)", g.max(2.0)),
-        (crate::population::Stage::OneNinety, None) => {
+/// Bar 6's threshold, and where it came from: given to the run, or to the
+/// report made again over the run's own (`over`, where it was).
+fn growth_said(plan: &Plan, over: Option<Option<f64>>) -> String {
+    let given = |g: f64| format!("{:.2} MiB an hour", g.max(2.0));
+    match (plan.stage, plan.device_growth, over) {
+        (_, Some(g), Some(run)) => format!(
+            "{} (stage 100's p99, given to the report made again by \
+             CORDELIA_SCALE_DEVICE_GROWTH; the run was given {})",
+            given(g),
+            run.map_or("none".into(), |r| format!("{r:.2} MiB an hour"))
+        ),
+        (_, Some(g), None) => format!(
+            "{} (stage 100's p99, given to the run by CORDELIA_SCALE_DEVICE_GROWTH)",
+            given(g)
+        ),
+        (crate::population::Stage::OneNinety, None, _) => {
             "2 MiB an hour: stage 100's p99 was not given (CORDELIA_SCALE_DEVICE_GROWTH)".into()
         }
         _ => "2 MiB an hour".into(),
@@ -892,7 +1073,7 @@ const CATCH_UP_SECS: f64 = 60.0;
 const HELD_BY_A_RUNNING_DEVICE_SECS: f64 = 20.0;
 
 impl Edits {
-    fn of(read: &Read, observer: &crate::observer::Observer) -> Edits {
+    fn of(read: &Read, observer: &crate::kept::KeptObserver) -> Edits {
         let mut by: HashMap<u64, Vec<&crate::observer::Written>> = HashMap::new();
         for e in &observer.edits {
             if let Some(n) = e.replaced {
@@ -915,8 +1096,6 @@ impl Edits {
             let gone_at = read
                 .run
                 .removals
-                .lock()
-                .unwrap()
                 .iter()
                 .find(|r| r.person == edit.person && r.removed == *device)
                 .and_then(|r| r.line_at);
@@ -930,15 +1109,7 @@ impl Edits {
                 gone: gone.contains(&(*number, *device)),
             });
         }
-        let mut conflict_copies = 0;
-        for folder in read.run.folders.values() {
-            conflict_copies += std::fs::read_dir(folder)
-                .into_iter()
-                .flatten()
-                .filter_map(Result::ok)
-                .filter(|e| e.file_name().to_string_lossy().contains(".conflict-"))
-                .count();
-        }
+        let conflict_copies = read.run.conflict_copies.len();
         Edits {
             written: window.len(),
             window,
@@ -946,11 +1117,7 @@ impl Edits {
             conflict_copies,
             gaps: observer.gaps.clone(),
             counted: Counted {
-                numbered: read
-                    .run
-                    .next_edit
-                    .load(std::sync::atomic::Ordering::SeqCst)
-                    .saturating_sub(1) as usize,
+                numbered: read.run.next_edit.saturating_sub(1) as usize,
                 recorded: observer.edits.len(),
                 waited: observer.waited.len(),
                 arrived: observer.arrivals.len(),
@@ -1020,8 +1187,6 @@ fn relay_series<'a>(read: &'a Read, r: usize) -> Series<'a> {
 fn carry_windows(read: &Read, k: usize) -> Vec<(f64, f64)> {
     read.run
         .removals
-        .lock()
-        .unwrap()
         .iter()
         .filter(|r| r.person == k)
         .filter_map(|r| Some((r.line_at?, r.carry_end.unwrap_or(r.line_at? + r.bound))))
@@ -1124,72 +1289,129 @@ fn bar_1(read: &Read) -> Line {
     )
 }
 
+/// Bar 2's figures over a set of edits.
+#[derive(Debug, Default)]
+struct Latencies {
+    /// Each edit's time to arrive, from when it is timed ([`timed_from`]),
+    /// where its device ran from then to its arrival.
+    of: Vec<f64>,
+    /// Those that did not arrive within 120 s of when they are timed while
+    /// their device ran.
+    late: usize,
+    /// Of those judged (in `of` or `late`), the ones written while their
+    /// writer was off, timed from its return.
+    from_return: usize,
+    /// Written while their writer was off, their writer never ran again,
+    /// and not arrived: bar 2 does not judge them, bar 3 does.
+    not_judged: usize,
+}
+
+/// When bar 2 times an edit from (amended after stage 100): its writing,
+/// where its writer was running then; where its writer was off (stopped or
+/// frozen), as when the person goes on editing in a device's folder while
+/// its sync is off, the moment its writer runs again, since nothing could
+/// read the file and send it before that. `None` where the writer never
+/// ran again: bar 2 does not judge the edit, and bar 3 does. An edit
+/// written while its writer ran is timed from the write, whatever its
+/// writer did after, so that a slow relay or reader is never hidden.
+///
+/// An edit that arrived before its writer ran again (or whose writer never
+/// did) is timed from the write too: its writer plainly sent it. A stop is
+/// recorded when the node is told, and its process may run on for up to
+/// `NODE_STOP_TIMEOUT_SECS` while it shuts down (a frozen one going on
+/// first), so it can read and push an edit written then; timed from the
+/// return, that edit would count a negative latency.
+fn timed_from(read: &Read, p: &Pair) -> Option<f64> {
+    let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+    let back = match read.lives.at(writer, p.edit.at) {
+        Is::Running => return Some(p.edit.at),
+        _ => read.lives.ran_again_after(writer, p.edit.at, p.edit.at),
+    };
+    match p.arrived {
+        Some(a) if back.is_none_or(|b| a.at < b) => Some(p.edit.at),
+        _ => back,
+    }
+}
+
 /// Bar 2's figures over `pairs`: p50, p95, the most, and those that did
-/// not arrive within 120 s while their device ran.
-fn latencies<'a>(read: &Read, pairs: impl Iterator<Item = &'a Pair>) -> (Vec<f64>, usize) {
-    let mut l = Vec::new();
-    let mut late = 0;
+/// not arrive within 120 s while their device ran, each timed from
+/// [`timed_from`].
+fn latencies<'a>(read: &Read, pairs: impl Iterator<Item = &'a Pair>) -> Latencies {
+    let mut out = Latencies::default();
     for p in pairs {
         if p.edit.at < read.start {
             continue;
         }
+        let Some(from) = timed_from(read, p) else {
+            out.not_judged += 1;
+            continue;
+        };
+        let returned = usize::from(from > p.edit.at);
         // A device removed later was still owed what it ran 120 s through
         // before its removal's line.
         if p.gone {
             let owed = p.arrived.is_none()
                 && !p.replaced
-                && p.gone_at.is_some_and(|line| p.edit.at + 120.0 <= line)
-                && read.lives.ran_through(p.node, p.edit.at, p.edit.at + 120.0);
-            late += usize::from(owed);
+                && p.gone_at.is_some_and(|line| from + 120.0 <= line)
+                && read.lives.ran_through(p.node, from, from + 120.0);
+            out.late += usize::from(owed);
+            out.from_return += returned * usize::from(owed);
             continue;
         }
-        match Edits::latency(p) {
-            Some(latency)
-                if read
-                    .lives
-                    .ran_through(p.node, p.edit.at, p.edit.at + latency) =>
-            {
-                l.push(latency);
+        match p.arrived.map(|a| a.at - from) {
+            Some(latency) if read.lives.ran_through(p.node, from, from + latency) => {
+                out.of.push(latency);
+                out.from_return += returned;
             }
             Some(_) => {}
-            None if !p.replaced && read.lives.ran_through(p.node, p.edit.at, p.edit.at + 120.0) => {
-                late += 1;
+            None if !p.replaced && read.lives.ran_through(p.node, from, from + 120.0) => {
+                out.late += 1;
+                out.from_return += returned;
             }
             None => {}
         }
     }
-    (l, late)
+    out
 }
 
 /// When an edit's way to a device ends: its arrival there, or 120 s after
-/// it was written where it did not arrive.
-fn journey_end(p: &Pair) -> f64 {
-    p.arrived.map_or(p.edit.at + 120.0, |a| a.at)
+/// it is timed from ([`timed_from`]) where it did not arrive.
+fn journey_end(read: &Read, p: &Pair) -> f64 {
+    p.arrived.map_or_else(
+        || timed_from(read, p).unwrap_or(p.edit.at) + 120.0,
+        |a| a.at,
+    )
 }
 
 fn bar_2(read: &Read, edits: &Edits) -> Line {
     let people = &read.run.plan.population.people;
-    // An edit whose way from its writing to its arrival (or to 120 s, where
-    // it did not arrive) crosses a part treated apart is treated apart.
-    let outside = |p: &&Pair| !read.is_apart(p.edit.at, journey_end(p));
-    let (both, late_both) = latencies(
+    // An edit whose way from when it is timed (its writing, or its writer's
+    // return) to its arrival (or to 120 s, where it did not arrive) crosses
+    // a part treated apart is treated apart. The time its writer was off is
+    // no part of its latency, and a part apart then holds nothing up.
+    let outside = |p: &&Pair| {
+        let from = timed_from(read, p).unwrap_or(p.edit.at);
+        !read.is_apart(from, journey_end(read, p))
+    };
+    let b = latencies(
         read,
         edits
             .of_person(read, false)
             .filter(|p| !people[p.edit.person].split)
             .filter(outside),
     );
-    let (split, late_split) = latencies(
+    let s = latencies(
         read,
         edits
             .of_person(read, false)
             .filter(|p| people[p.edit.person].split)
             .filter(outside),
     );
-    let p50 = quantile(&both, 0.5).unwrap_or(0.0);
-    let p95 = quantile(&both, 0.95).unwrap_or(0.0);
+    let (both, late_both, split, late_split) = (&b.of, b.late, &s.of, s.late);
+    let p50 = quantile(both, 0.5).unwrap_or(0.0);
+    let p95 = quantile(both, 0.95).unwrap_or(0.0);
     let most = both.iter().copied().fold(0.0, f64::max);
-    let sp95 = quantile(&split, 0.95).unwrap_or(0.0);
+    let sp95 = quantile(split, 0.95).unwrap_or(0.0);
     let smost = split.iter().copied().fold(0.0, f64::max);
     let holds = !both.is_empty()
         && p50 <= 12.0
@@ -1203,10 +1425,16 @@ fn bar_2(read: &Read, edits: &Edits) -> Line {
         "Sync latency",
         format!(
             "set up with both relays: {} arrivals, p50 {p50:.1} s, p95 {p95:.1} s, the most \
-             {most:.1} s, {late_both} not arrived within 120 s; split between the relays: {} \
-             arrivals, p95 {sp95:.1} s, the most {smost:.1} s, {late_split} not arrived within 120 s",
+             {most:.1} s, {late_both} not arrived within 120 s, {} timed from their writer's \
+             return, {} left to bar 3; split between the relays: {} arrivals, p95 {sp95:.1} s, \
+             the most {smost:.1} s, {late_split} not arrived within 120 s, {} timed from their \
+             writer's return, {} left to bar 3",
             both.len(),
-            split.len()
+            b.from_return,
+            b.not_judged,
+            split.len(),
+            s.from_return,
+            s.not_judged,
         ),
         "p50 at most 12 s, p95 at most 25 s, every edit within 120 s; split: p95 at most 40 s, \
          every edit within 120 s",
@@ -1214,13 +1442,61 @@ fn bar_2(read: &Read, edits: &Edits) -> Line {
     )
 }
 
+/// The time an edit sent has to arrive: `CHANGE_FETCH_MAX_SECS`, the 120 s
+/// within which bar 2 and bar 15 hold every edit.
+const ARRIVES_WITHIN_SECS: f64 = cordelia_core::protocol::CHANGE_FETCH_MAX_SECS as f64;
+
+/// Whether an edit not found by the end is passed over, not lost: its
+/// writer was told to stop within `CYCLE_SECS` of writing it, so its cycle
+/// had at most that one turn to read the file, or it was not running when
+/// the edit was written (stopped or frozen: as when a removed device is
+/// left as it is, the person editing on in its folder), so nothing could
+/// read it; and it never ran again in time to send it, [`CATCH_UP_SECS`]
+/// without a stop or a freeze (bar 3's catch-up) ending
+/// [`ARRIVES_WITHIN_SECS`] or more before the run's end. Every other edit
+/// not found is lost: one whose writer ran on, froze, or stopped later, its
+/// cycle having had the time to read it and push it.
+fn passed_over(read: &Read, p: &Pair) -> bool {
+    let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+    let read_by = p.edit.at + read.run.constants.cycle_secs as f64;
+    let off = read.lives.at(writer, p.edit.at) != Is::Running;
+    let stopped = read.lives.stops[writer]
+        .iter()
+        .any(|(told, _)| *told > p.edit.at && *told <= read_by);
+    if !off && !stopped {
+        return false;
+    }
+    let end = read.end.max(read.run.kept_at);
+    let sent_again = read
+        .lives
+        .ran_again_after(writer, p.edit.at, read_by)
+        .and_then(|again| read.lives.ran_for_after(writer, again, CATCH_UP_SECS))
+        .is_some_and(|t| t + ARRIVES_WITHIN_SECS <= end);
+    !sent_again
+}
+
 fn bar_3(read: &Read, edits: &Edits) -> Line {
-    let lost: Vec<&Pair> = edits
+    let missing: Vec<&Pair> = edits
         .of_person(read, false)
         .filter(|p| p.edit.at >= read.start && p.arrived.is_none() && !p.gone && !p.replaced)
         .collect();
+    let (passed, lost): (Vec<&Pair>, Vec<&Pair>) =
+        missing.into_iter().partition(|p| passed_over(read, p));
     // Catching up: each time a device was off in the window, the edits its
-    // person made meanwhile, within 60 s of its running again.
+    // person made meanwhile, within 60 s of its running again; and those
+    // made before the off that had not arrived when it began, where they
+    // could be sent by the time it ran again (timed, as bar 2 times them,
+    // from no later than its return). Bar 2 judges an edit only where its
+    // device ran from when it is timed to its arrival, or the 120 s after;
+    // each it skips for its device's off is one of these, so none is left
+    // to "found by the end" alone.
+    let owed_at = |p: &Pair, off: f64, on: f64| {
+        (p.edit.at >= off && p.edit.at <= on)
+            || (p.edit.at >= read.start
+                && p.edit.at < off
+                && p.arrived.is_none_or(|a| a.at > off)
+                && timed_from(read, p).is_some_and(|from| from <= on))
+    };
     let mut worst: f64 = 0.0;
     let mut slow = 0;
     let mut times_off = 0;
@@ -1234,9 +1510,11 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
         for (off, on) in read.lives.downs(i, read.start, read.end) {
             let Some(on) = on else { continue };
             times_off += 1;
-            for p in edits.pairs.iter().filter(|p| {
-                p.node == i && p.edit.at >= off && p.edit.at <= on && !p.replaced && !p.gone
-            }) {
+            for p in edits
+                .pairs
+                .iter()
+                .filter(|p| p.node == i && owed_at(p, off, on) && !p.replaced && !p.gone)
+            {
                 match p.arrived {
                     Some(a) => {
                         worst = worst.max(a.at - on);
@@ -1244,7 +1522,8 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
                             slow += 1;
                         }
                     }
-                    None => slow += 1,
+                    None if !passed_over(read, p) => slow += 1,
+                    None => {}
                 }
             }
         }
@@ -1262,8 +1541,10 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
     line(
         "No edit is lost, and a device catches up",
         format!(
-            "{} edits of the window on other devices; {} not found by the end{}; after {} times \
-             off, the slowest catch-up {:.1} s, {} edits not held within 60 s",
+            "{} edits of the window on other devices; {} not found by the end{}; {} not found \
+             and passed over, their writer told to stop within a cycle of writing them or off \
+             when they were written, and not run long enough again; after {} times off, the \
+             slowest catch-up {:.1} s, {} edits not held within 60 s",
             edits
                 .of_person(read, false)
                 .filter(|p| p.edit.at >= read.start && !p.gone)
@@ -1273,18 +1554,28 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
                 true => String::new(),
                 false => format!(" ({})", examples.join(", ")),
             },
+            passed.len(),
             times_off,
             worst,
             slow
         ),
-        "every edit's own line on every other device by the end; a device that was off holds \
-         its person's edits within 60 s of running again",
+        "every edit's own line on every other device by the end, but one whose writer was told \
+         to stop within a cycle (5 s) of writing it, or was off when it was written, and did not \
+         run 60 s again 120 s or more before the end; a device that was off holds its person's \
+         edits within 60 s of running again",
         lost.is_empty() && slow == 0,
     )
 }
 
 const LOCK: &str = "cordelia_lock";
 const READS: [&str; 3] = ["pull", "show_short", "proof"];
+/// The kinds of take of the requests a device makes of a relay, on the
+/// streams of entries 0x10 to 0x13: the kinds whose waits bar 4 (a) bars.
+/// A device gives each up after STREAM_TIMEOUT_SECS. The relay's other
+/// kinds (the streams between relays and its own passing on and pulls,
+/// its sweeps and the uses it writes, its checkpoint, its API and any
+/// other) have their waits reported: no device's request waits on them.
+const REQUESTS: [&str; 5] = ["show_whole", "show_short", "proof", "pull", "push"];
 const RELAY_TAKES: [&str; 10] = [
     "show_whole",
     "show_short",
@@ -1330,6 +1621,61 @@ fn against(bound: Option<u64>, bar: u64) -> Verdict {
     }
 }
 
+/// What `key` rose by over the pairs kept, as [`rise`] reads it, where the
+/// node counts it: `None` where no sample of the node carries it (a node
+/// of a version that does not count it), which is no count of nothing.
+fn rise_counted(
+    series: &Series,
+    key: &str,
+    a: f64,
+    b: f64,
+    keep: &dyn Fn(f64, f64) -> bool,
+) -> Option<f64> {
+    series
+        .iter()
+        .any(|s| metric(s, key).is_some())
+        .then(|| rise(series, key, a, b, keep))
+}
+
+/// The most of a histogram, `key` its `_max`, in µs, over every life of
+/// the node up to `b`: the largest that any sample at or before `b`
+/// carries, since each life's most counts from its start. It bounds every
+/// take of the window, and of what came before it. `None` where no sample
+/// carries it.
+fn most_up_to(series: &Series, key: &str, b: f64) -> Option<f64> {
+    series
+        .iter()
+        .filter(|s| s.t <= b)
+        .filter_map(|s| metric(s, key))
+        .reduce(f64::max)
+}
+
+/// How the p99 of `n` takes meets a bar of `bar` µs (decision 2026-10-22
+/// §3, bar 4). Where the takes over the bar are counted (`over_bar`), that
+/// settles it: the p99 is within the bar where at most 1% of the takes are
+/// over it, and over the bar where more are. Otherwise the p99 is read as
+/// its bucket's bound, `bound` ([`against`]); where that bucket holds the
+/// bar, the most held, `most`, settles it where it is within the bar, and
+/// nothing else does.
+fn p99_against(
+    n: f64,
+    bound: Option<u64>,
+    bar: u64,
+    over_bar: Option<f64>,
+    most: Option<f64>,
+) -> Verdict {
+    if let Some(over) = over_bar {
+        return match over <= 0.01 * n {
+            true => Verdict::Pass,
+            false => Verdict::Fail,
+        };
+    }
+    match against(bound, bar) {
+        Verdict::NotResolved if most.is_some_and(|m| m <= bar as f64) => Verdict::Pass,
+        judged => judged,
+    }
+}
+
 /// The worse of two verdicts: a failure, then what is not resolved.
 fn worse(a: Verdict, b: Verdict) -> Verdict {
     match (a, b) {
@@ -1345,7 +1691,11 @@ fn bar_4(read: &Read) -> Line {
     let mut verdict = Verdict::Pass;
     for r in 0..read.run.plan.relays {
         let series = relay_series(read, r);
-        let mut worst_wait = (0u64, "", Verdict::Pass);
+        // The worst wait p99 of a request's kind, which is barred, and of
+        // the relay's own, which is reported: each with its kind, its
+        // verdict and its count over 10 ms of its waits.
+        let mut worst_wait = (0u64, "", Verdict::Pass, None);
+        let mut worst_own = (0u64, "", Verdict::Pass, None);
         let mut worst_read = (0u64, "", Verdict::Pass);
         let (mut over_250, mut over_50) = (0.0, 0.0);
         for kind in RELAY_TAKES {
@@ -1369,18 +1719,42 @@ fn bar_4(read: &Read) -> Line {
                 &[0.99],
             );
             if n > 0.0 {
-                // At most 1% over 5 ms: the p99 is within 10 ms whatever
-                // its bucket; over 1% over 50 ms: it is over.
-                let judged = match (over("wait", "5"), over("wait", "50")) {
-                    (five, _) if five <= 0.01 * n => Verdict::Pass,
-                    (_, fifty) if fifty > 0.01 * n => Verdict::Fail,
-                    _ => against(w[0], 10_000),
+                // The count over 10 ms settles the p99 against 10 ms. A
+                // node that does not count it: at most 1% over 5 ms, the
+                // p99 is within 10 ms whatever its bucket; over 1% over
+                // 50 ms, it is over; else its bucket, or its most.
+                let over_10 = rise_counted(
+                    &series,
+                    &format!("{LOCK}_wait_microseconds_over{{{label},ms=\"10\"}}"),
+                    read.start,
+                    read.end,
+                    &keep,
+                );
+                let most = most_up_to(
+                    &series,
+                    &format!("{LOCK}_wait_microseconds_max{{{label}}}"),
+                    read.end,
+                );
+                let judged = match (over_10, over("wait", "5"), over("wait", "50")) {
+                    (None, five, _) if five <= 0.01 * n => Verdict::Pass,
+                    (None, _, fifty) if fifty > 0.01 * n => Verdict::Fail,
+                    _ => p99_against(n, w[0], 10_000, over_10, most),
                 };
                 let w99 = w[0].unwrap_or(u64::MAX);
-                if w99 > worst_wait.0 {
-                    worst_wait = (w99, kind, judged);
+                let request = REQUESTS.contains(&kind);
+                let worst = match request {
+                    true => &mut worst_wait,
+                    false => &mut worst_own,
+                };
+                if w99 > worst.0 {
+                    *worst = (w99, kind, judged, over_10.map(|ten| (ten, n)));
                 }
-                verdict = worse(verdict, judged);
+                // Only a request's wait is barred (bar 4 (a)): nothing
+                // waits on the relay's own takes, whose holds (c) and (d)
+                // bar for the requests they hold up.
+                if request {
+                    verdict = worse(verdict, judged);
+                }
             }
             if READS.contains(&kind) {
                 let (n, h) = quantiles(
@@ -1393,7 +1767,12 @@ fn bar_4(read: &Read) -> Line {
                     &[0.99],
                 );
                 if n > 0.0 {
-                    let judged = against(h[0], 1_000);
+                    let most = most_up_to(
+                        &series,
+                        &format!("{LOCK}_hold_microseconds_max{{{label}}}"),
+                        read.end,
+                    );
+                    let judged = p99_against(n, h[0], 1_000, None, most);
                     let h99 = h[0].unwrap_or(u64::MAX);
                     if h99 > worst_read.0 {
                         worst_read = (h99, kind, judged);
@@ -1410,30 +1789,42 @@ fn bar_4(read: &Read) -> Line {
         if over_250 > 0.0 || over_50 > 10.0 || most_share > 0.25 {
             verdict = Verdict::Fail;
         }
-        let named = |worst: &(u64, &str, Verdict)| match worst.1.is_empty() {
+        let named = |kind: &str, verdict: Verdict| match kind.is_empty() {
             true => "none".to_string(),
-            false => format!("{}, {}", worst.1, worst.2.word().to_lowercase()),
+            false => format!("{kind}, {}", verdict.word().to_lowercase()),
+        };
+        let counted = |over_10: Option<(f64, f64)>| match over_10 {
+            Some((ten, n)) => format!("; {ten:.0} of {n:.0} over 10 ms"),
+            None => String::new(),
         };
         said.push(format!(
-            "relay {}: wait p99 at most {} ({}), a read's hold p99 at most {} ({}), {over_250:.0} \
-             other holds over 250 ms and {over_50:.0} over 50 ms, the lock held at most {:.1}% of \
-             a minute",
+            "relay {}: a request's wait p99 at most {} ({}{}), the relay's own wait p99 at most {} \
+             ({}{}; reported, not barred), a read's hold p99 at most {} ({}), {over_250:.0} other \
+             holds over 250 ms and {over_50:.0} over 50 ms, the lock held at most {:.1}% of a \
+             minute",
             r + 1,
             us(Some(worst_wait.0)),
-            named(&worst_wait),
+            named(worst_wait.1, worst_wait.2),
+            counted(worst_wait.3),
+            us(Some(worst_own.0)),
+            named(worst_own.1, worst_own.2),
+            counted(worst_own.3),
             us(Some(worst_read.0)),
-            named(&worst_read),
+            named(worst_read.1, worst_read.2),
             most_share * 100.0
         ));
     }
     Line {
         title: "A relay's lock, by kind".into(),
         figure: said.join("; "),
-        bar: "each kind's wait p99 at most 10 ms; a read's hold p99 at most 1 ms; every other \
-              hold under 250 ms and at most 10 over 50 ms; held at most a quarter of any minute \
-              (a p99 is read as its bucket's bound, a power of two of µs, and is NOT RESOLVED \
-              where its bucket holds the bar: from 513 to 1,024 µs for 1 ms, and from 8,193 to \
-              16,384 µs for 10 ms where the waits over 5 ms do not settle it)"
+        bar: "the wait p99 of each kind of a device's request (show_whole, show_short, proof, \
+              pull, push) at most 10 ms, the relay's own kinds' waits reported and not barred; a \
+              read's hold p99 at most 1 ms; every other hold under 250 ms and at most 10 over 50 \
+              ms; held at most a quarter of any minute (a p99 is read as its bucket's bound, a \
+              power of two of µs; where its bucket holds the bar, a wait's p99 is settled by the \
+              count over 10 ms, within the bar where at most 1% are over it, and a read's hold by \
+              its most, where that is at most 1 ms; NOT RESOLVED only where nothing counted \
+              settles it)"
             .into(),
         verdict,
     }
@@ -1474,15 +1865,33 @@ fn bar_5(read: &Read) -> Line {
 }
 
 /// What a series rose by in each half of the window, in MiB an hour, over
-/// its longest stretch in that half with no start; `None` where that
-/// stretch is under a quarter of the half.
-fn halves(series: &[&Sample], read: &Read, node: usize) -> Option<(f64, f64)> {
+/// its longest stretch in that half with no start, and the RSS in MiB it
+/// rose from: the RSS at that stretch's start, or what it held before the
+/// start that began it where that is higher, so that filling again to it
+/// is no growth. `None` where that stretch is under a quarter of the half.
+fn halves(series: &[&Sample], read: &Read, node: usize) -> Option<[(f64, f64); 2]> {
     let mid = (read.start + read.end) / 2.0;
     let half = (mid - read.start).max(1.0);
-    let rise_in = |a: f64, b: f64| -> Option<f64> {
-        let mut best: Option<(f64, f64, f64)> = None;
+    let rss = |s: &Sample| s.proc.map_or(0.0, |p| p.rss_kib as f64);
+    let starts = read.lives.starts(node);
+    let held_before_start = |t: f64| -> f64 {
+        let Some(start) = starts
+            .iter()
+            .copied()
+            .filter(|s| *s <= t)
+            .max_by(f64::total_cmp)
+        else {
+            return 0.0;
+        };
+        series
+            .iter()
+            .filter(|s| s.t < start && s.proc.is_some())
+            .max_by(|x, y| x.t.total_cmp(&y.t))
+            .map_or(0.0, |s| rss(s))
+    };
+    let rise_in = |a: f64, b: f64| -> Option<(f64, f64)> {
+        let mut best: Option<(&Sample, &Sample, f64)> = None;
         let mut first: Option<&Sample> = None;
-        let rss = |s: &Sample| s.proc.map_or(0.0, |p| p.rss_kib as f64);
         // Outside the parts treated apart: a relay that starts again warms
         // up there.
         for s in series
@@ -1499,13 +1908,14 @@ fn halves(series: &[&Sample], read: &Read, node: usize) -> Option<(f64, f64)> {
             let f = *first.get_or_insert(s);
             let long = s.t - f.t;
             if best.is_none_or(|(_, _, b)| long > b) {
-                best = Some((rss(f), rss(s), long));
+                best = Some((f, s, long));
             }
         }
-        let (from, to, long) = best?;
-        (long >= half / 4.0).then(|| (to - from) / 1024.0 / (long / 3600.0))
+        let (f, s, long) = best?;
+        let from = rss(f).max(held_before_start(f.t));
+        (long >= half / 4.0).then(|| ((rss(s) - from) / 1024.0 / (long / 3600.0), from / 1024.0))
     };
-    Some((rise_in(read.start, mid)?, rise_in(mid, read.end)?))
+    Some([rise_in(read.start, mid)?, rise_in(mid, read.end)?])
 }
 
 fn bar_6(read: &Read) -> (Line, Vec<f64>) {
@@ -1522,7 +1932,7 @@ fn bar_6(read: &Read) -> (Line, Vec<f64>) {
                 worst = worst.max(p.rss_kib as f64 / 1024.0);
             }
         }
-        if let Some((a, b)) = halves(&series, read, i) {
+        if let Some([(a, _), (b, _)]) = halves(&series, read, i) {
             tested += 1;
             rises.push(a.max(b));
             if a > threshold && b > threshold {
@@ -1546,8 +1956,9 @@ fn bar_6(read: &Read) -> (Line, Vec<f64>) {
             ),
             &format!(
                 "RSS at most 64 MiB at every sample, and no more than 1% of devices growing by \
-                 over {threshold:.1} MiB an hour in both halves (one device growing in two runs \
-                 of three is read across the stage's summaries)"
+                 over {threshold:.1} MiB an hour in both halves (filling again to what it held \
+                 before a start is no growth; one device growing in two runs of three is read \
+                 across the stage's summaries)"
             ),
             holds,
         ),
@@ -1580,21 +1991,26 @@ fn bar_7(read: &Read) -> Line {
                 over += 1;
             }
         }
-        let grows = halves(&series, read, i).is_some_and(|(a, b)| {
-            let base = series
-                .first()
-                .and_then(|s| s.proc)
-                .map_or(20.0, |p| p.rss_kib as f64 / 1024.0);
-            a > 0.02 * base && b > 0.02 * base
-        });
+        // The 2% an hour is of the RSS it rose from in each half: its first
+        // sample is taken as it starts, at a few MiB, and a start again in
+        // the window lowers its median.
+        let rises = halves(&series, read, i);
+        let grows = rises.is_some_and(|h| h.iter().all(|&(rise, from)| rise > 0.02 * from));
         holds &= over == 0 && !grows;
         said.push(format!(
             "relay {}: the most RSS {worst:.1} MiB, {over} samples over the bar, {}",
             r + 1,
-            if grows {
-                "growing in both halves"
-            } else {
-                "no persistent growth"
+            match rises {
+                None => "growth not tested (a half's longest stretch is under a quarter of it)"
+                    .to_string(),
+                Some([(a, fa), (b, fb)]) => format!(
+                    "{} (rises of {a:.2} and {b:.2} MiB an hour, from {fa:.1} and {fb:.1} MiB)",
+                    if grows {
+                        "growing in both halves"
+                    } else {
+                        "no persistent growth"
+                    }
+                ),
             }
         ));
     }
@@ -1602,7 +2018,8 @@ fn bar_7(read: &Read) -> Line {
         "A relay's memory in ordinary use",
         said.join("; "),
         "RSS at most 64 MiB and 384 KiB for each open connection, and no growth of 2% of its \
-         RSS an hour in both halves",
+         RSS an hour in both halves (from the RSS each half rose from: where a start began the \
+         stretch, what it held before, if higher)",
         holds,
     )
 }
@@ -1650,6 +2067,32 @@ fn bar_8(read: &Read) -> Line {
         "at most half a core on average over the window, and one core in any minute",
         holds,
     )
+}
+
+/// How long a relay may hold the connection of a device that is frozen, or
+/// that stopped without a clean exit: until QUIC's idle time (60 s) and the
+/// governor's next tick (10 s) close it, with 20 s to spare (bar 9).
+const HELD_AFTER_A_FREEZE_SECS: f64 = 90.0;
+
+/// How long after a device's process exits cleanly a relay may still count
+/// its connection open (bar 9). The device closes its connections on the
+/// way out and the relay's QUIC reads the close at once, but the relay
+/// drops a closed connection from those it keeps, and from the gauge, only
+/// at its governor's next tick (`reap_closed`): within
+/// `TICK_INTERVAL_SECS`, 10 s, and 2 s more for the tick's turn in the
+/// node's loop. At stage 190, seed 2, the two seen were 0.2 s and 0.5 s
+/// after the stop was told.
+const HELD_AFTER_A_CLEAN_STOP_SECS: f64 = cordelia_core::protocol::TICK_INTERVAL_SECS as f64 + 2.0;
+
+/// Whether a stop that ended as `ended` says (its seconds, and its status)
+/// was clean: the process exited with success within `allowed`. Its
+/// seconds from when it was told; `None` where it did not, or where how it
+/// ended is not known.
+fn stopped_cleanly(ended: Option<&(f64, String)>, allowed: f64) -> Option<f64> {
+    // `ExitStatus`'s own words for an exit with success on Unix.
+    ended
+        .filter(|(took, said)| said == "exit status: 0" && *took <= allowed)
+        .map(|(took, _)| *took)
 }
 
 fn bar_9(read: &Read) -> Line {
@@ -1703,11 +2146,13 @@ fn bar_9(read: &Read) -> Line {
                             lo += 1.0;
                         }
                     }
-                    _ if read.lives.frozen_within(node, s.t, 90.0) => hi += 1.0,
+                    // Frozen, or stopped since: the relay may still hold
+                    // its connection.
+                    _ if read.lives.may_be_held(node, s.t) => hi += 1.0,
                     _ => {}
                 }
             }
-            if has_office && read.run.setup.lock().unwrap().office_moved.is_some() {
+            if has_office && read.run.setup.office_moved.is_some() {
                 lo += 5.0;
                 hi += 5.0;
             }
@@ -1806,14 +2251,17 @@ fn closed_lately(read: &Read, node: usize, t: f64) -> bool {
 /// device, from its last sample that carries the count before then to its
 /// first at or after `t`.
 fn churned_lately(read: &Read, relay: usize, t: f64) -> bool {
-    let from = t - 150.0;
-    if read
-        .lives
+    read.lives
         .running_since(relay, t)
-        .is_some_and(|since| since > from)
-    {
-        return true;
-    }
+        .is_some_and(|since| since > t - 150.0)
+        || warm_churn_closed_lately(read, relay, t)
+}
+
+/// Whether relay `relay`'s warm churn closed a device's connection in the
+/// 150 s before `t`, read as [`churned_lately`] reads it: from its last
+/// sample that carries the count before then to its first at or after `t`.
+fn warm_churn_closed_lately(read: &Read, relay: usize, t: f64) -> bool {
+    let from = t - 150.0;
     let key = "cordelia_closed_by_warm_churn_total{peer=\"device\"}";
     let series = read.series(relay);
     let carrying = || series.iter().filter(|s| metric(s, key).is_some());
@@ -1823,8 +2271,8 @@ fn churned_lately(read: &Read, relay: usize, t: f64) -> bool {
 }
 
 fn bar_10(read: &Read, edits: &Edits) -> Line {
-    let removals = read.run.removals.lock().unwrap().clone();
-    let planned = *read.run.removals_planned.lock().unwrap();
+    let removals = read.run.removals.clone();
+    let planned = read.run.removals_planned;
     if removals.is_empty() {
         return line(
             "A removal reaches every device, and its carry ends within its bound",
@@ -1915,20 +2363,19 @@ fn reconnects(read: &Read) -> Vec<f64> {
             )
         })
         .collect();
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     let in_outage = |t: f64| {
         outage.stopped.is_some_and(|a| t >= a - 5.0) && outage.started.is_none_or(|b| t <= b + 5.0)
     };
     let mut gaps = Vec::new();
     for i in read.devices() {
-        let log = std::fs::read_to_string(read.run.fleet.made[i].node.log()).unwrap_or_default();
         let mut closed: HashMap<String, f64> = HashMap::new();
-        for raw in log.lines() {
+        for raw in &read.run.fleet.made[i].log {
             let text = strip_ansi(raw);
             let Some(t) = text.split_whitespace().next().and_then(log_time) else {
                 continue;
             };
-            let t = read.run.fleet.clock.of_wall(t);
+            let t = read.run.fleet.of_wall(t);
             let Some(peer) = text
                 .split("peer=")
                 .nth(1)
@@ -1955,7 +2402,7 @@ fn reconnects(read: &Read) -> Vec<f64> {
     gaps
 }
 
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -2172,14 +2619,15 @@ fn bar_12(read: &Read, edits: &Edits) -> (Line, Vec<(f64, f64)>) {
 
 /// The pushes relay `r` is sent at the least for the window's edits in
 /// `spans`: a device publishes what one cycle of its adapter found in one
-/// push to each relay (`CYCLE_SECS`), so edits on a device less than a
-/// cycle apart may share one, and edits further apart cannot. Each group
-/// of a writer's edits that begins at least a cycle after the last began
-/// is one push; a group is counted where it and the cycle after it lie in
-/// one span, so that its push falls in that span too.
+/// push to each relay (`CYCLE_SECS` of the run's build), so edits on a
+/// device less than a cycle apart may share one, and edits further apart
+/// cannot. Each group of a writer's edits that begins at least a cycle
+/// after the last began is one push; a group is counted where it and the
+/// cycle after it lie in one span, so that its push falls in that span
+/// too.
 fn cycles_pushed(read: &Read, edits: &Edits, r: usize, spans: &[(f64, f64)]) -> usize {
     let plan = &read.run.plan;
-    let cycle = cordelia_sync::claude::CYCLE_SECS as f64;
+    let cycle = read.run.constants.cycle_secs as f64;
     let mut by_writer: HashMap<(usize, usize), Vec<f64>> = HashMap::new();
     for e in &edits.window {
         if plan.population.people[e.person]
@@ -2213,14 +2661,14 @@ fn cycles_pushed(read: &Read, edits: &Edits, r: usize, spans: &[(f64, f64)]) -> 
 /// The room's model of one person: what a relay holds of them at the
 /// least and at the most, as entries are counted (bar 13).
 fn room_of(read: &Read, edits: &[&crate::observer::Written], k: usize) -> (f64, f64) {
-    use cordelia_core::protocol::{CHANGE_ENTRY_BYTES, MAX_HAND_OVER_BYTES, entry_cost};
+    let constants = read.run.constants;
+    let entry_cost = |ciphertext: usize| constants.entry_cost(ciphertext);
+    let entry_cost_of = |file: &str, size: usize| constants.entry_cost_of(file, size);
     let plan = &read.run.plan;
     let p = &plan.population.people[k];
     let removal = read
         .run
         .removals
-        .lock()
-        .unwrap()
         .iter()
         .find(|r| r.person == k)
         .and_then(|r| r.line_at.map(|t| (t, r.removed)));
@@ -2264,17 +2712,17 @@ fn room_of(read: &Read, edits: &[&crate::observer::Written], k: usize) -> (f64, 
     // channel's words.
     let changes = 1.0 + f64::from(u8::from(removal.is_some()));
     let generations = changes;
-    least += changes * entry_cost(CHANGE_ENTRY_BYTES) as f64;
-    most += changes * entry_cost(CHANGE_ENTRY_BYTES) as f64;
+    least += changes * entry_cost(constants.change_entry_bytes) as f64;
+    most += changes * entry_cost(constants.change_entry_bytes) as f64;
     least += generations * p.profile.names() as f64 * entry_cost(256) as f64;
-    most += (p.devices - 1) as f64 * entry_cost(MAX_HAND_OVER_BYTES) as f64;
+    most += (p.devices - 1) as f64 * entry_cost(constants.max_hand_over_bytes) as f64;
     most +=
         generations * ((p.profile.names() * 2 + p.devices * 4 + 8) as f64) * entry_cost(512) as f64;
     (least, most)
 }
 
 fn bar_13(read: &Read, edits: &Edits) -> Line {
-    let observer = read.run.observer.lock().unwrap();
+    let observer = &read.run.observer;
     let all: Vec<&crate::observer::Written> = observer.edits.iter().collect();
     let (mut least, mut most) = (0.0, 0.0);
     for k in 0..read.run.plan.population.people.len() {
@@ -2282,7 +2730,6 @@ fn bar_13(read: &Read, edits: &Edits) -> Line {
         least += l;
         most += m;
     }
-    drop(observer);
     // The conflict copies, each once.
     let copies = edits.conflict_copies as f64 * 2048.0;
     least += copies / 2.0;
@@ -2335,11 +2782,11 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
     let keep = |_: f64, _: f64| true;
     let mut said = Vec::new();
     let mut holds = true;
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     for r in 0..read.run.plan.relays {
         let i = read.run.fleet.relays[r];
         let series = read.series(i);
-        let mut off = Vec::new();
+        let (mut off, mut after_churn) = (Vec::new(), 0);
         for s in series
             .iter()
             .filter(|s| s.t >= read.start && s.t <= read.end)
@@ -2358,7 +2805,14 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
                         == Some(std::net::IpAddr::V4(crate::population::OFFICE_ADDRESS))
                 })
                 .count();
-            if n != 5 {
+            // Fewer within 150 s after this relay's warm churn closed a
+            // device's connection, as bar 9 allows: the churn may close
+            // one of the office's, and its next dial takes the place
+            // again 10 s later at the soonest (the record of a relay out
+            // of reach §2). More than 5 is never excused.
+            if n < 5 && warm_churn_closed_lately(read, i, s.t) {
+                after_churn += 1;
+            } else if n != 5 {
                 off.push(format!("{n} at {:.0} s", s.t));
             }
         }
@@ -2378,8 +2832,9 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
         );
         holds &= off.is_empty() && away > 0.0 && for_a_time == 0.0;
         said.push(format!(
-            "relay {}: {} samples not 5 from the office's address{}; {away:.0} dials turned away \
-             for the address, {for_a_time:.0} refusals for a time",
+            "relay {}: {} samples not 5 from the office's address{}, {after_churn} fewer within \
+             150 s after a warm churn closed a device; {away:.0} dials turned away for the \
+             address, {for_a_time:.0} refusals for a time",
             r + 1,
             off.len(),
             if off.is_empty() {
@@ -2392,23 +2847,80 @@ fn bar_14(read: &Read, edits: &Edits) -> Line {
             }
         ));
     }
-    let (office, late) = latencies(read, edits.of_person(read, true));
+    let office = latencies(read, edits.of_person(read, true));
     said.push(format!(
-        "the office's people: {} arrivals, {}, {late} not arrived within 120 s",
-        office.len(),
-        mm(&office, "s")
+        "the office's people: {} arrivals, {}, {} not arrived within 120 s, {} timed from \
+         their writer's return, {} not judged, their writer off and never run again",
+        office.of.len(),
+        mm(&office.of, "s"),
+        office.late,
+        office.from_return,
+        office.not_judged
     ));
     line(
         "The office is as expected",
         said.join("; "),
         "exactly 5 from its address at each relay at every sample but the outage and the 120 s \
-         after; other dials turned away and counted; no refusal for a time",
+         after, and fewer only within 150 s after that relay's warm churn closed a device's \
+         connection; other dials turned away and counted; no refusal for a time",
         holds,
     )
 }
 
+/// Whether an edit of a split person held up by the second relay's
+/// outage (stopped at `stopped`, started at `started`) came late (bar 15).
+/// It is owed within 120 s of the start where the device it waits on ran
+/// through those 120 s and its writer ran until it could push: for
+/// [`HELD_BY_A_RUNNING_DEVICE_SECS`] from the edit where it had a relay
+/// that ran then (the first relay, or the second where it ran those
+/// seconds before its stop), and through the 120 s otherwise, as the edit
+/// waits on it until the relay is back. Where either did not, it is owed
+/// once the later of the two, after it ran again, has run
+/// [`CATCH_UP_SECS`] without a stop or a freeze (bar 3's catch-up), and
+/// never sooner; one that never arrives is late there only where both
+/// devices were running at the end.
+fn split_edit_late(read: &Read, p: &Pair, stopped: f64, started: f64) -> bool {
+    let person = &read.run.plan.population.people[p.edit.person];
+    let writer = read.run.fleet.device(p.edit.person, p.edit.writer);
+    let pushed = p.edit.at + HELD_BY_A_RUNNING_DEVICE_SECS;
+    let up = person
+        .relays_of(p.edit.writer, read.run.plan.relays)
+        .contains(&0)
+        || (pushed <= stopped && read.lives.ran_through(writer, p.edit.at, pushed));
+    let writer_until = if up { pushed } else { started + 120.0 };
+    let mut deadline = started + 120.0;
+    let mut held = false;
+    for (node, a, b) in [
+        (p.node, started, started + 120.0),
+        (writer, p.edit.at, writer_until),
+    ] {
+        if read.lives.ran_through(node, a, b) {
+            continue;
+        }
+        held = true;
+        // One that never ran again holds nothing up: where it is the
+        // writer and the edit arrived, it had pushed before it stopped.
+        // One that ran again is owed its catch-up once it has run that long
+        // without a stop or a freeze.
+        if let Some(t) = read.lives.ran_again_after(node, a, b) {
+            let caught_up = read.lives.ran_for_after(node, t, CATCH_UP_SECS);
+            deadline = deadline.max(caught_up.unwrap_or(f64::INFINITY));
+        }
+    }
+    match p.arrived {
+        Some(a) => a.at > deadline,
+        None => {
+            !held
+                || (deadline <= read.end
+                    && [writer, p.node]
+                        .iter()
+                        .all(|&n| read.lives.at(n, read.end) == Is::Running))
+        }
+    }
+}
+
 fn bar_15(read: &Read, edits: &Edits) -> Line {
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     let (Some(stopped), Some(started)) = (outage.stopped, outage.started) else {
         return line(
             "A relay that stops is come back to",
@@ -2429,8 +2941,13 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
     let people = &read.run.plan.population.people;
     // Held up by the outage: its way from its writing to its arrival
     // crosses the outage.
-    let during = |p: &&Pair| p.edit.at <= started && journey_end(p) >= stopped;
-    let (both, late_both) = latencies(
+    let during = |p: &&Pair| p.edit.at <= started && journey_end(read, p) >= stopped;
+    let Latencies {
+        of: both,
+        late: late_both,
+        from_return,
+        not_judged,
+    } = latencies(
         read,
         edits
             .of_person(read, false)
@@ -2445,7 +2962,7 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
         .filter(|p| people[p.edit.person].split)
         .filter(during)
         .filter(|p| !p.gone && !p.replaced)
-        .filter(|p| p.arrived.is_none_or(|a| a.at - started > 120.0))
+        .filter(|p| split_edit_late(read, p, stopped, started))
         .count();
     let keep = |_: f64, _: f64| true;
     // None refused at a relay, and none held back by a device's own pace
@@ -2470,8 +2987,9 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
         format!(
             "{} devices connected again, the slowest {slowest:.0} s after its start; through the \
              outage, {} arrivals at p50 {p50:.1} s, p95 {p95:.1} s, the most {most:.1} s, \
-             {late_both} not within 120 s; {split_late} split people's edits later than 120 s \
-             after the start; {refused:.0} refused for rate at the relays and {held:.0} held \
+             {late_both} not within 120 s, {from_return} timed from their writer's return, \
+             {not_judged} left to bar 3; {split_late} split people's edits late (past 120 s \
+             after the start, or 60 s after their devices ran again); {refused:.0} refused for rate at the relays and {held:.0} held \
              back by a device outside its own connection's proofs in the five minutes after; in \
              those minutes the relay was asked {:.0} pulls and {:.0} pushes, held its lock {} of a \
              minute, and its memory was {}",
@@ -2489,8 +3007,9 @@ fn bar_15(read: &Read, edits: &Edits) -> Line {
             mm(&rss, "MiB")
         ),
         "each device set up with it connected again within 120 s; bar 2 through the outage for \
-         people with both; held-up split edits within 120 s of its start; none refused for rate \
-         in the five minutes after, and none held back but for what the minute of a \
+         people with both; held-up split edits within 120 s of its start, or within 60 s of \
+         the later of their devices running again where one was held up; none refused for \
+         rate in the five minutes after, and none held back but for what the minute of a \
          connection's proofs holds back",
         holds,
     )
@@ -2626,8 +3145,6 @@ fn checks(read: &Read, edits: &Edits, bar_12: bool) -> Vec<Line> {
         .map(|e| {
             read.run
                 .removals
-                .lock()
-                .unwrap()
                 .iter()
                 .filter(|r| r.person == e.person && r.line_at.is_some_and(|line| line <= e.at))
                 .count()
@@ -2719,9 +3236,9 @@ fn checks(read: &Read, edits: &Edits, bar_12: bool) -> Vec<Line> {
     ));
     // 7. Churn had its chance.
     let keep = |_: f64, _: f64| true;
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     let mut said = Vec::new();
-    let mut had = !read.run.cut.load(std::sync::atomic::Ordering::SeqCst);
+    let mut had = !read.run.cut;
     let mut closed = 0.0;
     for r in 0..read.run.plan.relays {
         let series = relay_series(read, r);
@@ -2910,7 +3427,8 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
             };
             lock.push(format!(
                 "{kind}: {n:.0} takes, wait p50/p99/p99.9 {}/{}/{}, hold p50/p99/p99.9 {}/{}/{}, \
-                 the most held {most:.0} µs, {:.0} over 5 ms and {:.0} over 50 ms",
+                 the most held {most:.0} µs, {:.0} over 5 ms, {:.0} over 10 ms and {:.0} over 50 \
+                 ms; {:.0} waits over 10 ms",
                 us(w[0]),
                 us(w[1]),
                 us(w[2]),
@@ -2918,7 +3436,15 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
                 us(h[1]),
                 us(h[2]),
                 over("5"),
-                over("50")
+                over("10"),
+                over("50"),
+                rise(
+                    &series,
+                    &format!("{LOCK}_wait_microseconds_over{{{label},ms=\"10\"}}"),
+                    read.start,
+                    read.end,
+                    &keep,
+                )
             ));
         }
         let _ = writeln!(
@@ -2930,7 +3456,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
                 lock.join("; ")
             }
         );
-        let nested: Vec<String> = ["rates", "room"]
+        let nested: Vec<String> = ["rates", "room", "uses"]
             .iter()
             .map(|m| {
                 let label = format!("mutex=\"{m}\"");
@@ -3067,10 +3593,17 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
             .iter()
             .filter(|p| nodes.contains(&p.node))
             .collect();
-        let (l, late) = latencies(read, of.iter().copied());
+        let Latencies {
+            of: l,
+            late,
+            from_return,
+            not_judged,
+        } = latencies(read, of.iter().copied());
         let _ = writeln!(
             s,
-            "- sync latency: {} arrivals, p50 {}, p95 {}, the most {}; {late} not within 120 s",
+            "- sync latency: {} arrivals, p50 {}, p95 {}, the most {}; {late} not within 120 s; \
+             {from_return} timed from their writer's return, {not_judged} not judged, their \
+             writer off and never run again",
             l.len(),
             quantile(&l, 0.5).map_or("no value".into(), |v| format!("{v:.1} s")),
             quantile(&l, 0.95).map_or("no value".into(), |v| format!("{v:.1} s")),
@@ -3181,7 +3714,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
         );
     }
     let _ = writeln!(s, "### Across the mesh\n");
-    let removals = read.run.removals.lock().unwrap().clone();
+    let removals = read.run.removals.clone();
     let spread: Vec<String> = removals
         .iter()
         .map(|r| {
@@ -3281,7 +3814,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
         gaps.len(),
         mm(&gaps, "s")
     );
-    let outage = read.run.outage.lock().unwrap().clone();
+    let outage = read.run.outage.clone();
     let back: Vec<f64> = outage
         .back
         .iter()
@@ -3317,7 +3850,7 @@ fn measures(s: &mut String, read: &Read, edits: &Edits) {
             &all,
         ) / minutes;
         let people = &read.run.plan.population.people;
-        let (split, _) = latencies(
+        let Latencies { of: split, .. } = latencies(
             read,
             edits
                 .of_person(read, false)

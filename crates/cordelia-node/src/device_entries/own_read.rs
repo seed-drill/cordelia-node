@@ -88,7 +88,8 @@ use cordelia_network::messages::{EntryPull, WireMessage};
 use cordelia_storage::relay::Mark;
 
 use super::{
-    At, DeviceEntries, LEFT_ROOM_WAIT, Link, Refused, Relay, Step, counted_as_handed, lock,
+    At, DeviceEntries, Kind, LEFT_ROOM_WAIT, Link, Refused, Relay, Step, counted_as_handed, lock,
+    stored_one,
 };
 
 /// The longest that one round of a read lasts.
@@ -102,8 +103,9 @@ pub(super) const A_MINUTE: Duration = Duration::from_secs(60);
 /// What came of one pull of the read.
 enum Pulled {
     /// A page of the channel, which the door took: its entries, the mark
-    /// and the place to ask after next.
-    Page(Vec<CheckedEntry>, Mark, u64),
+    /// and the place to ask after next, and whether the store took an
+    /// entry of it that it did not hold.
+    Page(Vec<CheckedEntry>, Mark, u64, bool),
     /// What came back is no page of the channel.
     NotThePage,
     /// The page could not be taken: the device's database failed. Nothing
@@ -365,7 +367,9 @@ impl DeviceEntries {
                     };
                     let identity = &self.state.identity;
                     let pulled = match at_relays::take_page(db, identity, &page, Places::Own, now) {
-                        Ok(PageTaken::Taken { .. }) => Pulled::Page(entries, mark, next),
+                        Ok(PageTaken::Taken { each, .. }) => {
+                            Pulled::Page(entries, mark, next, stored_one(&each))
+                        }
                         Ok(PageTaken::NotThePage) => Pulled::NotThePage,
                         Err(e) => {
                             tracing::debug!(error = %e, "could not take a page");
@@ -409,8 +413,13 @@ impl DeviceEntries {
                 }
             };
             let page = match &pulled {
-                Pulled::Page(entries, mark, next) => {
+                Pulled::Page(entries, mark, next, stored) => {
                     paged = self.clock.now();
+                    // What the store took of a name is written to its
+                    // folder at once, as for a page of the pass.
+                    if *stored && matches!(channel.kind, Kind::Name(_)) {
+                        self.state.sync_control.ask_cycle();
+                    }
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
                     of.counts.pages += 1;

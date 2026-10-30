@@ -7,7 +7,7 @@
 /// How long each part of a run lasts, in seconds. A stage takes the
 /// record's figures ([`Timing::of_a_stage`]); the small run of test 4
 /// takes shorter ones, which its summary lists.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Timing {
     /// From the office's move to the window's start (step 5).
     pub settle: f64,

@@ -1528,7 +1528,9 @@ impl SyncControl {
     /// Ask for a cycle now, with no setting changed: a command that
     /// prepares a change has the folders made as current as they can be
     /// first (decision 2026-10-04 §7.1, step 1). Whoever asks waits for a
-    /// cycle that began after it asked ([`Self::cycles`]).
+    /// cycle that began after it asked ([`Self::cycles`]). A pass that
+    /// stored an entry of a name asks too, waiting for nothing, so that
+    /// the entry is written to its folder at once.
     pub fn ask_cycle(&self) {
         self.wake.notify_one();
     }
@@ -1597,10 +1599,37 @@ impl SyncControl {
 /// the turn from start to end, so none of them sees a memory folder or the
 /// store half-changed by another. The database lock is taken only inside
 /// a turn, never the other way round.
+///
+/// A command that waits for the turn goes before a cycle that has not
+/// taken it yet: cycles that run back to back, as they do while passes
+/// keep storing entries of names, would otherwise leave it no gap to take
+/// it in.
 #[derive(Default)]
 pub struct History {
     store: std::sync::RwLock<Option<cordelia_storage::history::Store>>,
-    turn: Mutex<()>,
+    turn: Mutex<TurnHeld>,
+    /// Told each time the turn is let go, or a command stops waiting.
+    turn_free: std::sync::Condvar,
+}
+
+/// Whether the turn is held, and how many commands wait for it.
+#[derive(Default)]
+struct TurnHeld {
+    held: bool,
+    commands_waiting: usize,
+}
+
+/// A hold of the turn of local history ([`History::turn`]), let go when
+/// it is dropped, a panic's unwinding included.
+pub struct Turn<'a> {
+    history: &'a History,
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        self.history.turn_held().held = false;
+        self.history.turn_free.notify_all();
+    }
 }
 
 impl History {
@@ -1616,26 +1645,53 @@ impl History {
         self.store.read().ok().and_then(|held| held.clone())
     }
 
-    /// Take the turn, waiting for whoever has it. A sync cycle does: it
-    /// has nobody to answer to.
-    pub fn turn(&self) -> std::sync::MutexGuard<'_, ()> {
+    /// What is held of the turn. The lock is held only for a moment,
+    /// never across work, so a poisoned one is taken as it is.
+    fn turn_held(&self) -> std::sync::MutexGuard<'_, TurnHeld> {
         self.turn.lock().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// Take the turn, waiting for whoever has it, and for every command
+    /// that waits for it. A sync cycle does: it has nobody to answer to.
+    pub fn turn(&self) -> Turn<'_> {
+        let mut turn = self.turn_held();
+        while turn.held || turn.commands_waiting > 0 {
+            turn = self
+                .turn_free
+                .wait(turn)
+                .unwrap_or_else(|held| held.into_inner());
+        }
+        turn.held = true;
+        Turn { history: self }
     }
 
     /// Take the turn if it comes free within `wait`. A command does: it
     /// answers that the node is busy rather than leave something to be
-    /// carried out after it has given up.
-    pub fn turn_within(&self, wait: std::time::Duration) -> Option<std::sync::MutexGuard<'_, ()>> {
+    /// carried out after it has given up. While it waits, no cycle takes
+    /// the turn before it: it has the turn as soon as whoever holds it
+    /// lets go.
+    pub fn turn_within(&self, wait: std::time::Duration) -> Option<Turn<'_>> {
         let until = Instant::now() + wait;
+        let mut turn = self.turn_held();
+        turn.commands_waiting += 1;
         loop {
-            match self.turn.try_lock() {
-                Ok(turn) => return Some(turn),
-                Err(std::sync::TryLockError::Poisoned(held)) => return Some(held.into_inner()),
-                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-                Err(std::sync::TryLockError::WouldBlock) => return None,
+            if !turn.held {
+                turn.held = true;
+                turn.commands_waiting -= 1;
+                return Some(Turn { history: self });
             }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                turn.commands_waiting -= 1;
+                drop(turn);
+                // A cycle that waited behind this command may go on.
+                self.turn_free.notify_all();
+                return None;
+            }
+            turn = match self.turn_free.wait_timeout(turn, left) {
+                Ok((turn, _)) => turn,
+                Err(held) => held.into_inner().0,
+            };
         }
     }
 

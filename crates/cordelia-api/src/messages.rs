@@ -4007,7 +4007,11 @@ mod tests {
         let wait = state.db.times().wait(Kind::Api);
         assert_eq!(wait.count, 1);
         assert!(wait.max_micros >= 100_000, "{wait:?}");
-        assert_eq!(wait.over[2], 1, "a wait over 100 ms, as bar 5 counts");
+        assert_eq!(
+            wait.over_ms(100),
+            Some(1),
+            "a wait over 100 ms, as bar 5 counts"
+        );
         assert_eq!(state.db.times().given_up(Kind::Api), 0);
 
         let holder = held_for(400);
