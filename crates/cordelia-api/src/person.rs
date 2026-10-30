@@ -1950,6 +1950,7 @@ pub(crate) fn note_change(
         Some(&statement.removed),
         Some(&chain),
         Some(&devices),
+        Some(&statement.commitment),
     )?)
 }
 
@@ -2719,7 +2720,7 @@ fn come_to(
             // first: nothing is carried there.
             // What the cut leaves out of each file (rule 7) is worked out
             // first: the folders' records and the carry both go by it.
-            let cut = crate::arrivals::cut_of_channel(conn, &old, &cuts)?;
+            let cut = crate::arrivals::cut_of_channel(conn, &own, &old, &cuts)?;
             let dropped = move_records(conn, &carry, &counting, &old, &new, &cut)?;
             applied
                 .not_carried
@@ -2940,12 +2941,41 @@ fn move_records(
     for (folder, file, agreed) in put_back {
         sync_state::save_put_back(conn, &folder, &new, &file, &agreed)?;
     }
+    // A conflict copy that a folder made and has not yet published holds
+    // no entry, and is in no record: it is judged by the arrivals it was
+    // given from the file it was copied from (the second read of slice 8,
+    // its first finding). Where the cut leaves it out, the folder's file is
+    // put back to none, as a file the carry left out is; otherwise its
+    // arrivals go with it, and it is published in the new channel.
+    let to_channel = derive::channel_id(to)?;
+    let to_slot_key = derive::slot_key(to)?;
+    for copy in cordelia_storage::arrivals::copies_of_channel(conn, &channel)? {
+        match cut.contains_key(&copy.slot) {
+            true => {
+                let none = sync_state::Agreed {
+                    hash: None,
+                    rev: 0,
+                    signer: None,
+                    chain: None,
+                };
+                sync_state::save_put_back(conn, &copy.folder, &new, &copy.key, &none)?;
+                cordelia_storage::arrivals::copy_done(conn, &channel, &copy.slot)?;
+            }
+            false => cordelia_storage::arrivals::move_copy(
+                conn,
+                &channel,
+                &copy.slot,
+                &to_channel,
+                &slot_id(&to_slot_key, &copy.key),
+            )?,
+        }
+    }
     Ok(dropped)
 }
 
 /// The name of a folder's index file (decision 2026-09-30 §4.5): its lines
 /// are put back by a rule of their own.
-const INDEX_FILE: &str = "MEMORY.md";
+pub(crate) const INDEX_FILE: &str = "MEMORY.md";
 
 /// Note each key that this device counted under the statement `leaving`
 /// and that `statement`, which it now applies, has in neither of its
@@ -3119,7 +3149,7 @@ impl Carry<'_> {
                             .into(),
                     ));
                 }
-                self.arrivals_carried(conn, from, to, &slot, &entry.slot)?;
+                self.arrivals_carried(conn, from, to, &slot, (target, &entry))?;
                 carried += 1;
                 continue;
             }
@@ -3145,7 +3175,7 @@ impl Carry<'_> {
                 ));
             }
             if cut.is_some() {
-                self.arrivals_carried(conn, from, to, &slot, &entry.slot)?;
+                self.arrivals_carried(conn, from, to, &slot, (&version, &entry))?;
             }
             carried += 1;
         }
@@ -3160,27 +3190,43 @@ impl Carry<'_> {
 
 impl Carry<'_> {
     /// The arrivals of the file `slot` of the channel whose secret is
-    /// `from` go with it to the file `to_slot` of the channel whose secret
-    /// is `to` (decision 2026-10-24 (removal), rule 7), with the version each
-    /// goes back to sealed again there, as this carry carries a version: one
+    /// `from` go with it to the file of the channel whose secret is `to`
+    /// that `carried` (the version carried, and its entry there) is in
+    /// (decision 2026-10-24 (removal), rule 7), with the version each goes
+    /// back to sealed again there, as this carry carries a version: one
     /// that it does not carry goes back to none, which fails safe.
+    ///
+    /// **The entry that each event stored is named anew** where its version
+    /// is sealed again: the carried version by the entry that carries it,
+    /// and a version gone back to by the one entry that seals it again, for
+    /// every event that goes back to it. Any other names none. So a version
+    /// gone back to counts as brought after a carry where it did before.
     fn arrivals_carried(
         &self,
         conn: &Connection,
         from: &[u8; 32],
         to: &[u8; 32],
         slot: &[u8; 32],
-        to_slot: &[u8; 32],
+        carried: (&Version, &CheckedEntry),
     ) -> Result<(), PersonError> {
         use cordelia_storage::arrivals as kept;
+        use std::collections::HashMap;
         let channel = derive::channel_id(from)?;
         let (events, dropped) = kept::of_file(conn, &channel, slot)?;
-        let sealed_again = |before: Option<&Entry>| -> Result<Option<Entry>, PersonError> {
-            let before = match before {
-                Some(before) => crate::arrivals::version_of(before, from)?,
-                None => None,
+        // What each entry of the old channel is sealed again as: each entry
+        // of the version carried as the entry that carries it.
+        let mut anew: HashMap<[u8; 32], Option<Entry>> = HashMap::new();
+        for one in &carried.0.entries {
+            anew.insert(one.id, Some(Entry::clone(carried.1)));
+        }
+        let mut sealed_again = |before: Option<&Entry>| -> Result<Option<Entry>, PersonError> {
+            let Some(before) = before else {
+                return Ok(None);
             };
-            Ok(match before {
+            if let Some(sealed) = anew.get(&before.id()) {
+                return Ok(sealed.clone());
+            }
+            let sealed = match crate::arrivals::version_of(before, from)? {
                 Some(version) => match self.renumbered(version.rev) {
                     Some(rev) => {
                         let sealed = carried_entry_at(self.identity, to, &version, rev)?;
@@ -3189,7 +3235,9 @@ impl Carry<'_> {
                     None => None,
                 },
                 None => None,
-            })
+            };
+            anew.insert(before.id(), sealed.clone());
+            Ok(sealed)
         };
         for event in &events {
             let sealed = sealed_again(event.before.as_ref())?;
@@ -3207,7 +3255,24 @@ impl Carry<'_> {
                 sealed.as_ref(),
             )?;
         }
-        kept::move_file(conn, &channel, slot, &derive::channel_id(to)?, to_slot)?;
+        let named = |id: Option<[u8; 32]>| -> Option<[u8; 32]> {
+            anew.get(&id?).cloned().flatten().map(|entry| entry.id())
+        };
+        for event in &events {
+            kept::set_stored_id(conn, event.place, named(event.stored_id).as_ref())?;
+        }
+        for went in &dropped {
+            kept::set_dropped_stored_id(
+                conn,
+                &channel,
+                slot,
+                went.number,
+                &went.hash,
+                named(went.first_stored_id).as_ref(),
+            )?;
+        }
+        let to_slot = carried.1.slot;
+        kept::move_file(conn, &channel, slot, &derive::channel_id(to)?, &to_slot)?;
         Ok(())
     }
 }
@@ -9065,6 +9130,80 @@ mod tests {
             keys.sort();
             keys
         });
+    }
+
+    /// Rule 6's spare takes every removal of the adder (the second read of
+    /// slice 8, its third finding). The desktop removes device 2; device 2,
+    /// still holding the old secret, adds device 6, and this device (the
+    /// tablet) takes the record. The person removes device 2 here too, and
+    /// keeps device 6: that removal, made apart, lists it. Noted alone, it
+    /// spares device 6, which existed when it was made. Once the desktop's
+    /// removal is noted, made before device 6 was added and so not listing
+    /// it, device 6 is spared no more: it is removed, and its record counts
+    /// for nothing. And one removal alone never spares a key added after it.
+    #[test]
+    fn test_a_key_is_spared_only_where_every_removal_of_its_adder_lists_it() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let margin = REMOVAL_TAKEN_MARGIN_SECS as i64;
+        let phrase = phrase();
+        let [_, two, _, _] = statements(&phrase);
+        let made = NOW + 50_000;
+        let late = made + 10;
+        let counted = |conn: &Connection| -> Vec<bool> {
+            held_rows::additions(conn)
+                .unwrap()
+                .iter()
+                .map(|record| record.counted)
+                .collect()
+        };
+        let desktops = two
+            .next(key(1), &secret(33), listed(&[0, 1]), &[key(2)])
+            .unwrap();
+        let desktops_entry = change_made_at(&phrase, &desktops, secret(33), made);
+        let tablets = two
+            .next(key(0), &secret(34), listed(&[0, 1, 6]), &[key(2)])
+            .unwrap();
+        let tablets_entry = change_made_at(&phrase, &tablets, secret(34), late + margin / 2);
+
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), late).unwrap();
+        assert_eq!(counted(&conn), [true]);
+        know_removed_if_signed(
+            &conn,
+            &device(0),
+            &sign(&tablets, &phrase),
+            Some(&tablets_entry.content),
+            late + margin,
+        )
+        .unwrap();
+        assert_eq!(counted(&conn), [true], "the removal here lists device 6");
+        assert_eq!(removed(&conn), vec![key(2)]);
+        know_removed_if_signed(
+            &conn,
+            &device(0),
+            &sign(&desktops, &phrase),
+            Some(&desktops_entry.content),
+            late + margin + 1,
+        )
+        .unwrap();
+        assert_eq!(counted(&conn), [false]);
+        let mut both = vec![key(2), key(6)];
+        both.sort();
+        assert_eq!(removed(&conn), both);
+
+        // One removal alone, made before device 6 was added: not spared.
+        let conn = device_at(0, 2);
+        see_addition(&conn, &added(&two, 2, 6), late).unwrap();
+        know_removed_if_signed(
+            &conn,
+            &device(0),
+            &sign(&desktops, &phrase),
+            Some(&desktops_entry.content),
+            late + 1,
+        )
+        .unwrap();
+        assert_eq!(counted(&conn), [false]);
+        assert_eq!(removed(&conn), both);
     }
 
     /// The change followed is noted with its lists when a change is shown

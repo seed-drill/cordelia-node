@@ -2195,3 +2195,100 @@ fn a_put_back_takes_no_line_from_a_removed_devices_version() {
         }
     }
 }
+
+/// A version beside the index's whose chain may have dropped links is
+/// marked so (the extra look of the third read of slice 8): the put-back
+/// takes no line from it where anything of a removed key is cut, since a
+/// removed key's link may have fallen off it. Every chain of the index may
+/// have, since a merge stops one short (the fourth read's round): each is
+/// marked, of any length. Under another name, a chain missing or at the
+/// most a chain keeps is, and one link fewer is not.
+#[test]
+fn a_version_beside_whose_chain_may_have_dropped_links_is_marked() {
+    use cordelia_core::protocol::MAX_ENTRY_LINKS;
+    use cordelia_crypto::entry::Link;
+    use cordelia_crypto::version::{Slot, VersionEntry};
+    let link = Link {
+        hash: [1; 16],
+        signer: [2; 16],
+    };
+    let named = |name: &str| {
+        let of = |chain: Option<Vec<Link>>| Version {
+            rev: 1,
+            name: name.into(),
+            value: Value::Text(OTHER_LINE.into()),
+            entries: vec![VersionEntry {
+                id: [3; 32],
+                author: [4; 32],
+                chain,
+            }],
+        };
+        Slot {
+            current: None,
+            lost: vec![
+                of(None),
+                of(Some(vec![link; MAX_ENTRY_LINKS])),
+                of(Some(vec![link; MAX_ENTRY_LINKS - 1])),
+                of(Some(vec![])),
+            ],
+            highest: None,
+            next: None,
+        }
+    };
+    let marked =
+        |slot: &Slot| -> Vec<bool> { lines::beside(slot).iter().map(|v| v.unknown).collect() };
+    assert_eq!(marked(&named(INDEX)), [true, true, true, true]);
+    assert_eq!(marked(&named("w.md")), [true, true, false, false]);
+    let beside = lines::beside(&named("w.md"));
+    // Where anything of a removed key is cut, no line is taken from a
+    // marked version, and one is from the other; where nothing is, from
+    // each.
+    let taken = |any: bool| -> Vec<bool> {
+        beside
+            .iter()
+            .map(|v| lines::lines_taken_from(v, |_| false, |_| false, any))
+            .collect()
+    };
+    assert_eq!(taken(true), [false, false, true, true]);
+    assert_eq!(taken(false), [true, true, true, true]);
+    // A version a cut key signed, or whose chain names one, gives none.
+    let one = &beside[2];
+    assert!(!lines::lines_taken_from(
+        one,
+        |k| *k == [4; 32],
+        |_| false,
+        false
+    ));
+    assert!(!lines::lines_taken_from(
+        one,
+        |_| false,
+        |s| *s == [2; 16],
+        false
+    ));
+}
+
+/// The put-back's record of a line this device removed from a version of
+/// the index (the fourth read of slice 8, its low): it keeps the keys that
+/// signed that version, and not its chain's, and a removed key's link may
+/// have gone from that chain (a merge, or 100 links). So it names every
+/// removed key: where anything of one is cut, no line of a record is put
+/// back, whoever signed the version, and where nothing is, each is; a
+/// record of a version that a cut key signed is never put back.
+#[test]
+fn a_line_removed_from_the_index_is_put_back_only_where_nothing_is_cut() {
+    let record = |from: Vec<[u8; 32]>| index_lines::Record {
+        file: "notes.md".into(),
+        line: NOTES.trim_end().into(),
+        put_back: 0,
+        from,
+    };
+    let honest = record(vec![[4; 32]]);
+    let of_none = record(vec![]);
+    let of_cut = record(vec![[9; 32]]);
+    let cut = |key: &[u8; 32]| *key == [9; 32];
+    assert!(!lines::line_put_back(&honest, cut, true));
+    assert!(!lines::line_put_back(&of_none, cut, true));
+    assert!(lines::line_put_back(&honest, cut, false));
+    assert!(lines::line_put_back(&of_none, cut, false));
+    assert!(!lines::line_put_back(&of_cut, cut, false));
+}

@@ -65,20 +65,24 @@
 //! phrase's statement key, the secrets of the generations before (which
 //! the machine keeps, as a device keeps a secret it left: §3, §9), and a
 //! word that the phrase signed for the look ([`crate::carry::Allows::Look`]).
-//! It applies the statement, lists the names in its new personal channel,
-//! and wakes the node: **the change entry is shown to every relay at
-//! once, before anything is carried,** and the names go straight after
-//! it.
+//! **It first reads each name's channel at every relay, in the generation
+//! recovered from and in those before it, before the change entry is shown
+//! to any relay** ([`read_before`]; decision 2026-10-24 (removal), the third
+//! read of slice 8, its third finding): a device the person called lost or
+//! broken may be in anyone's hands, and reads each statement once it is at
+//! a relay, so what it writes after that is never taken. Then it applies
+//! the statement, lists the names in its new personal channel, and wakes
+//! the node: **the change entry is shown to every relay at once, before
+//! anything is carried,** and the names go straight after it.
 //!
-//! **The look is then made once** ([`the_look`]): each name's channel is
-//! read at every relay, in the generation recovered from and in those
-//! before it, and what the keys of the word signed there is brought in
-//! through the one function that judges a version for a carry
-//! ([`crate::carry::bring`]). A look that is interrupted is not taken up
-//! again by itself. What it found is kept in memory for the command to
-//! read ([`progress`]): which relays and names it could not read, and,
-//! for each removed key, how much that key signed there that the new
-//! channels lack.
+//! **The look is then made once** ([`the_look`]): from what was read before
+//! the change was shown, and from nothing read after it, what the keys of
+//! the word signed is brought in through the one function that judges a
+//! version for a carry ([`crate::carry::bring`]). A look that is
+//! interrupted is not taken up again by itself. What it found is kept in
+//! memory for the command to read ([`progress`]): which relays and names it
+//! could not read, and, for each removed key, how much that key signed
+//! there that the new channels lack.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -1268,12 +1272,63 @@ fn held_back(state: &AppState, channels: &[Option<[u8; 32]>]) {
     }
 }
 
-/// `POST /api/v1/recover/make`: the node's half of `cordelia recover`
+/// What a recovery read of the channels of its names in the generations
+/// before, before its change entry was shown to any relay ([`read_before`]):
+/// for each name of the look, in its order, what each generation handed,
+/// or why the name could not be read.
+pub struct ReadBefore {
+    names: Vec<Result<Vec<carrying::Generation>, String>>,
+}
+
+impl ReadBefore {
+    /// What was read of no name: a look from it takes nothing.
+    pub fn nothing() -> Self {
+        Self { names: Vec::new() }
+    }
+}
+
+/// Read the channel of each of `to_look`'s names at every relay, in each
+/// generation of `left` (the secrets the command was handed), **before the
+/// recovery's change entry is shown to any relay** (decision 2026-10-24
+/// (removal), the third read of slice 8, its third finding). The look takes
+/// what the keys of its word signed, a device the person called lost or
+/// broken among them, by the person's word; that device may be in anyone's
+/// hands, and a removed device reads each later statement (property 1's
+/// limit). Read before the change is shown, what it signed was written
+/// before its removal; read after, it could be what it wrote once it had
+/// read the statement that removes it, which the person never saw.
+///
+/// The machine follows no phrase yet, so it shows nothing: the reads go
+/// through the door on the connections that the command read the phrase's
+/// channel on. All of them end by one deadline, `CARRY_READ_MAX_SECS` from
+/// now: the change waits for no longer. A name not read to its end by then
+/// is said to be so, and what was not read is not taken.
+pub async fn read_before(
+    state: &AppState,
+    to_look: &ToLook,
+    left: &[(u64, [u8; 32])],
+) -> ReadBefore {
+    let left: carrying::Secrets = left
+        .iter()
+        .map(|(number, secret)| (*number, Zeroizing::new(*secret)))
+        .collect();
+    let until = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
+    let mut names = Vec::with_capacity(to_look.names.len());
+    for name in &to_look.names {
+        let read = carrying::read_generations(state, name, &left, until).await;
+        names.push(read.map_err(|e| e.to_string()));
+    }
+    ReadBefore { names }
+}
+
+/// `POST /api/v1/recover/make`: the node's half of `cordelia recover`.
+/// **The channels of the look's names are read first** ([`read_before`]),
+/// before anything is applied or shown, and then the statement is applied
 /// ([`follow`]). The node is then woken: **it shows the change entry to
 /// every relay at once, before anything is carried,** and sends the
-/// names straight after it. The look is begun, and goes on after this
-/// has answered ([`the_look`]): the command reads how far it is
-/// ([`progress`]).
+/// names straight after it. The look is begun, from what was read before,
+/// and goes on after this has answered ([`the_look`]): the command reads
+/// how far it is ([`progress`]).
 pub async fn make(
     req: HttpRequest,
     state: web::Data<AppState>,
@@ -1305,13 +1360,26 @@ pub async fn make(
         still_have: labelled(&body.still_have)?,
         not_shown: labelled(&body.not_shown)?,
     };
-    let made = follow(&state, &entry, &statement_key, &left, &shown, &body.word);
+    // What the look may take is read before the change is shown: a word
+    // that does not hold, or a machine that follows a phrase, is refused
+    // before anything is read.
+    let read = match to_look(&state, &entry, &body.word) {
+        Ok(_) if person::held(&db(&state)).ok().flatten().is_some() => {
+            Err(PersonError::FollowsAPhrase)
+        }
+        Ok(looked) => Ok(read_before(&state, &looked, &left).await),
+        Err(e) => Err(e),
+    };
+    let made = read.and_then(|read| {
+        let made = follow(&state, &entry, &statement_key, &left, &shown, &body.word)?;
+        Ok((made, read))
+    });
     // What was handed of the secrets is overwritten here: the store
     // holds them now, or nothing was made.
     for (_, secret) in &mut left {
         zeroize::Zeroize::zeroize(secret);
     }
-    let (number, to_look) = made.map_err(commands::refused)?;
+    let ((number, to_look), read) = made.map_err(commands::refused)?;
     // One line in the log, of numbers alone: no key, and no name.
     tracing::info!(
         "a recovery was made on this machine: change {number}, {} to look through",
@@ -1328,7 +1396,7 @@ pub async fn make(
     state.sync_control.ask_cycle();
     let node = state.clone();
     actix_web::rt::spawn(async move {
-        the_look(&node, number, &to_look).await;
+        the_look(&node, number, &to_look, read).await;
     });
     Ok(HttpResponse::Ok().json(json!({ "change": number })))
 }
@@ -1390,20 +1458,27 @@ pub async fn progress(
     Ok(HttpResponse::Ok().json(json!({ "look": state.own_channels.look() })))
 }
 
+/// What the look says of a name that was not read before the change was
+/// shown: nothing of it is taken.
+const NOT_READ_BEFORE: &str = "it was not read before the change was shown, so nothing of it is \
+    taken";
+
 /// The look of a recovery (decision 2026-10-04 §9, step 5), made once.
 ///
 /// **The change entry goes first:** the node is asked for a whole pass,
 /// which shows the entry to every relay before anything else is done
 /// there, and the look waits for it.
 ///
-/// Then, for each name of `to_look`, in its order: the name's channel is
-/// read at every relay, in the generation recovered from and in each
-/// generation before it whose secret the machine was handed, and what the
-/// keys of `to_look` signed there goes to the one function that judges a
-/// version for a carry ([`carry::bring`]): it comes in as this machine's
-/// own entry, at its revision, with a first link for the key that signed
-/// it, where the new channel holds neither that version nor an entry at
-/// a higher revision. **From any other key it takes nothing.**
+/// Then, for each name of `to_look`, in its order: what `read` holds of
+/// the name's channel, read at every relay in the generation recovered
+/// from and in each generation before it whose secret the machine was
+/// handed **before the change was shown** ([`read_before`]), and nothing
+/// read since, goes to the one function that judges a version for a carry
+/// ([`carry::bring`]): what the keys of `to_look` signed there comes in as
+/// this machine's own entry, at its revision, with a first link for the
+/// key that signed it, where the new channel holds neither that version
+/// nor an entry at a higher revision. **From any other key it takes
+/// nothing.**
 ///
 /// **Where the new channels could not be fetched whole in that pass,
 /// nothing is taken** ([`carrying::fetched_whole`], §7.3): which of their
@@ -1426,7 +1501,12 @@ pub async fn progress(
 /// name** ([`held_back`]): each name that is still to be read is held
 /// back afresh when the look begins a name, and let go once it is read.
 /// Where the look takes nothing, every name is let go at once.
-pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_json::Value {
+pub async fn the_look(
+    state: &AppState,
+    number: u64,
+    to_look: &ToLook,
+    read: ReadBefore,
+) -> serde_json::Value {
     let channels = channels_of(&db(state), &to_look.names);
     let first = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
     if !carrying::fetched_whole(state, first).await {
@@ -1447,16 +1527,29 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
         return found;
     }
 
-    let (left, removed) = {
+    // Each generation read is judged where the machine knows it, now that
+    // the statement is applied: by its statement's commitment.
+    let (changes, removed) = {
         let conn = db(state);
         let left = carrying::left_secrets(&conn).unwrap_or_default();
+        let cuts = crate::cut::Cuts::read(&conn).ok();
+        let changes: BTreeMap<u64, Option<carry::Generation>> = left
+            .iter()
+            .map(|(number, secret)| {
+                let change = cuts
+                    .as_ref()
+                    .and_then(|cuts| cuts.generation_of(*number, secret));
+                (*number, change)
+            })
+            .collect();
         let removed = person::held(&conn)
             .ok()
             .flatten()
             .map(|held| held.statement.statement.removed)
             .unwrap_or_default();
-        (left, removed)
+        (changes, removed)
     };
+    let mut read_before = read.names.into_iter();
     let mut tally = Tally::default();
     let mut carried_names = 0usize;
     let mut not_read: Vec<serde_json::Value> = Vec::new();
@@ -1467,14 +1560,22 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
     for (done, name) in to_look.names.iter().enumerate() {
         // This name, and each after it, is still to be read.
         held_back(state, &channels[done..]);
-        let until = Instant::now() + Duration::from_secs(CARRY_READ_MAX_SECS);
-        let read = match carrying::read_generations(state, name, &left, until).await {
-            Ok(read) => read,
-            Err(e) => {
+        // What was read of it before the change was shown, and nothing
+        // read since.
+        let mut read = match read_before.next() {
+            Some(Ok(read)) => read,
+            Some(Err(e)) => {
                 failed.push(format!("{name}: {e}"));
                 continue;
             }
+            None => {
+                failed.push(format!("{name}: {NOT_READ_BEFORE}"));
+                continue;
+            }
         };
+        for generation in &mut read {
+            generation.change = changes.get(&generation.number).copied().flatten();
+        }
         for generation in &read {
             for relay in &generation.said {
                 let how = relay["read"].as_str().unwrap_or_default();
@@ -1504,13 +1605,19 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
                     generation.number,
                     |key| to_look.takes.contains(key),
                 )?;
+                // Judged by the cut where it was read (decision 2026-10-24
+                // (removal), rule 7), but for the keys the person said are
+                // lost or broken, whose writing the look takes by their
+                // word: a version that a removed key the person did not
+                // name signed, or wrote what it was written over, is left.
                 for version in &was.versions {
-                    let brought = carry::bring_by_command(
+                    let brought = carry::bring_by_word(
                         &conn,
                         &state.identity,
                         name,
                         version,
-                        Rule::Counts,
+                        Rule::Counts(generation.change),
+                        &to_look.takes,
                         now(),
                     )?;
                     tally.count(&format!("{name}: {}", version.name), brought);
@@ -1590,6 +1697,7 @@ pub async fn the_look(state: &AppState, number: u64, to_look: &ToLook) -> serde_
         "carried_names": carried_names,
         "held": tally.held,
         "higher": tally.higher,
+        "cut": tally.cut,
         "ties": tally.ties,
         "not_read": not_read,
         "failed": failed,
@@ -2492,6 +2600,16 @@ mod tests {
         )
     }
 
+    /// The node's half of a recovery, as `make` does it: the channels of the
+    /// look's names are read first, before anything is applied or shown
+    /// ([`read_before`]), and then the statement is applied ([`follow`]).
+    async fn recovered(node: &Node, made: &Made) -> (u64, ToLook, ReadBefore) {
+        let looked = to_look(&node.state, &made.entry, &made.word).unwrap();
+        let read = read_before(&node.state, &looked, &made.left).await;
+        let (number, to_look) = follows(node, made).unwrap();
+        (number, to_look, read)
+    }
+
     /// The node of a new machine, whose relay holds what `gone` says.
     fn new_machine(n: u16, gone: &TwoGone) -> Node {
         let node = Node::of(Machine::new(n));
@@ -2603,8 +2721,13 @@ mod tests {
         assert_eq!(node.stored(), 0);
 
         // The recovery: change 3, with this machine alone, and both
-        // devices removed.
-        let (number, to_look) = follows(&node, &made).unwrap();
+        // devices removed. What the look takes is read first, before
+        // anything is applied or shown: the machine follows no phrase
+        // while it reads.
+        node.did.lock().unwrap().clear();
+        let (number, to_look, read) = recovered(&node, &made).await;
+        assert_eq!(*node.did.lock().unwrap(), ["read", "read"]);
+        let asked_before = node.asked.lock().unwrap().clone();
         assert_eq!(number, 3);
         assert_eq!(to_look.names, [LAB]);
         assert_eq!(to_look.takes, [k0]);
@@ -2671,12 +2794,12 @@ mod tests {
         assert!(!says_sent(&node));
 
         // The look. The change entry goes first: the node is asked for
-        // a whole pass, which shows it to every relay, and nothing is
-        // read at a relay before that pass has been made.
+        // a whole pass, which shows it to every relay, and nothing more is
+        // read at a relay: the look brings from what was read before.
         node.asked.lock().unwrap().clear();
         node.did.lock().unwrap().clear();
-        let found = the_look(&node.state, number, &to_look).await;
-        assert_eq!(*node.did.lock().unwrap(), ["pass", "read", "read"]);
+        let found = the_look(&node.state, number, &to_look, read).await;
+        assert_eq!(*node.did.lock().unwrap(), ["pass"]);
         assert_eq!(found["finished"], true, "{found}");
         assert_eq!((&found["names"], &found["read"]), (&json!(1), &json!(1)));
         // What device 0 signed, in the generation recovered from and in
@@ -2696,10 +2819,11 @@ mod tests {
         assert_eq!(found["not_read"], json!([]));
         assert_eq!(node.state.own_channels.look(), Some(found.clone()));
         // It read the name in each generation that it was handed the
-        // secret of, with the node's own proof, and nothing else.
-        let asked = node.asked.lock().unwrap().clone();
-        assert_eq!(asked.len(), 2, "{asked:?}");
-        assert!(asked.iter().all(|(_, by_secret)| *by_secret));
+        // secret of, with the node's own proof, and nothing else: before
+        // the change was shown, and nothing in the look.
+        assert_eq!(asked_before.len(), 2, "{asked_before:?}");
+        assert!(asked_before.iter().all(|(_, by_secret)| *by_secret));
+        assert!(node.asked.lock().unwrap().is_empty());
         // Each is this machine's own entry, with a first link for the
         // key that signed it.
         let slot = crate::publish::read(&db(&node.state), LAB, "a.md")
@@ -2823,7 +2947,7 @@ mod tests {
         assert_eq!(made.shown.gone.len(), counted);
         assert!(made.shown.still_have.is_empty());
         assert_eq!(made.shown.not_shown.len(), 46);
-        let (number, to_look) = follows(&node, &made).unwrap();
+        let (number, to_look, read_before) = recovered(&node, &made).await;
         assert_eq!(to_look.takes, [k1]);
         {
             let conn = db(&node.state);
@@ -2871,7 +2995,7 @@ mod tests {
         }
 
         // What the other device wrote comes back: its file in each name.
-        let found = the_look(&node.state, number, &to_look).await;
+        let found = the_look(&node.state, number, &to_look, read_before).await;
         assert_eq!(found["carried"], 2, "{found}");
         assert_eq!(node.text(LAB, "b.md").as_deref(), Some("of device 1"));
         assert_eq!(node.text("desk", "d.md").as_deref(), Some("on the desk"));
@@ -3083,7 +3207,7 @@ mod tests {
                 .contains(&(phone_key, phone_label.to_string()))
         );
         assert!(made.shown.still_have.is_empty());
-        let (number, to_look) = follows(&node, &made).unwrap();
+        let (number, to_look, read) = recovered(&node, &made).await;
         assert_eq!(to_look.takes, [k1]);
         {
             let conn = db(&node.state);
@@ -3095,7 +3219,7 @@ mod tests {
         }
         // The look takes what device 1 wrote, and nothing of the phone:
         // it says how much the phone signed that the new channels lack.
-        let found = the_look(&node.state, number, &to_look).await;
+        let found = the_look(&node.state, number, &to_look, read).await;
         assert_eq!(found["carried"], 2, "{found}");
         assert_eq!(node.text(LAB, "b.md").as_deref(), Some("of device 1"));
         assert_eq!(node.text(LAB, "p.md"), None);
@@ -4065,7 +4189,7 @@ mod tests {
             &[Answer::Lost, Answer::Have],
         );
         assert_eq!(made.names.carried, ["desk", LAB]);
-        let (number, to_look) = follows(&node, &made).unwrap();
+        let (number, to_look, read) = recovered(&node, &made).await;
         assert_eq!(to_look.takes, [k0, k1]);
         {
             let conn = db(&node.state);
@@ -4088,7 +4212,7 @@ mod tests {
             assert_eq!(seen.removed.len(), 1);
             assert_eq!(seen.removed[0].label, "device 0");
         }
-        let found = the_look(&node.state, number, &to_look).await;
+        let found = the_look(&node.state, number, &to_look, read).await;
         // Both names, from both devices: a.md, b.md and old.md in the
         // one, and d.md in the other.
         assert_eq!(found["carried"], 4, "{found}");
@@ -4122,8 +4246,8 @@ mod tests {
             &gone.at_the_relay[1].1,
             &[Answer::Lost, Answer::Lost],
         );
-        let (number, to_look) = follows(&first, &made).unwrap();
-        let found = the_look(&first.state, number, &to_look).await;
+        let (number, to_look, read) = recovered(&first, &made).await;
+        let found = the_look(&first.state, number, &to_look, read).await;
         assert_eq!(found["carried"], 4, "{found}");
 
         // What the first machine had sent when it was lost: its change
@@ -4166,13 +4290,22 @@ mod tests {
         assert_eq!(made.cut_short, Some(first_key));
         assert_eq!(made.names.carried, ["desk", LAB]);
         assert_eq!(made.left.len(), 3);
-        let (number, to_look) = follows(&second, &made).unwrap();
+        let (number, to_look, read) = recovered(&second, &made).await;
         assert_eq!(number, 4);
         assert_eq!(to_look.takes, [first_key]);
-        let found = the_look(&second.state, number, &to_look).await;
-        // What the first machine had sent comes back: one file.
-        assert_eq!(found["carried"], 1, "{found}");
-        assert_eq!(second.text(LAB, "a.md").as_deref(), Some("of device 0"));
+        let found = the_look(&second.state, number, &to_look, read).await;
+        // What the first machine had sent is its carry of what device 0
+        // wrote, and its chain names device 0, which a change read
+        // removes: the look leaves it out (decision 2026-10-24 (removal),
+        // rules 7 and 22; the second read of slice 8, its second finding).
+        // This machine does not know the generation it read it in, so the
+        // cut fails safe there. `--from` brings it in, below.
+        assert_eq!(
+            (&found["carried"], &found["cut"]),
+            (&json!(0), &json!(1)),
+            "{found}"
+        );
+        assert_eq!(second.text(LAB, "a.md"), None);
         assert_eq!(second.text(LAB, "b.md"), None);
         assert_eq!(second.text("desk", "d.md"), None);
         // And it says, for each removed key, how much the new channels
@@ -4192,8 +4325,10 @@ mod tests {
                     .collect(),
             )
         };
-        assert_eq!(lacking.len(), 2, "{found}");
-        assert_eq!(lacks(&k0), (1, vec![LAB.to_string()]));
+        // The first machine among them: what it carried is said as its.
+        assert_eq!(lacking.len(), 3, "{found}");
+        assert_eq!(lacks(&first_key), (1, vec![LAB.to_string()]));
+        assert_eq!(lacks(&k0), (2, vec![LAB.to_string()]));
         assert_eq!(lacks(&k1), (2, vec!["desk".to_string(), LAB.to_string()]));
 
         // Both gone devices are named in one run, each by the first six
@@ -4203,7 +4338,7 @@ mod tests {
         let said = carrying::look_from(&second.state, LAB, &named)
             .await
             .unwrap();
-        assert_eq!(said["empty"], 2, "{said}");
+        assert_eq!(said["empty"], 3, "{said}");
         assert_eq!(said["above"], json!([]));
         let by_label = carrying::look_from(&second.state, LAB, &["device 0".to_string()]).await;
         assert!(matches!(by_label, Err(PersonError::NotCarried(_))));
@@ -4216,7 +4351,8 @@ mod tests {
             },
         );
         let done = carrying::take_from(&second.state, &word).await.unwrap();
-        assert_eq!(done["carried"], 2, "{done}");
+        assert_eq!(done["carried"], 3, "{done}");
+        assert_eq!(second.text(LAB, "a.md").as_deref(), Some("of device 0"));
         assert_eq!(second.text(LAB, "b.md").as_deref(), Some("of device 1"));
         assert_eq!(second.text(LAB, "old.md").as_deref(), Some("from before"));
         // A third recovery would bring back what the first machine had
@@ -4225,6 +4361,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(firsts["keys"][0]["key"], hex::encode(first_key));
+    }
+
+    /// **The look takes nothing written after its change was shown**
+    /// (decision 2026-10-24 (removal), the third read of slice 8, its third
+    /// finding). The person answers device 0 lost, so the look takes what
+    /// it signed, by their word. Whoever holds device 0 reads the new
+    /// statement once it is at a relay (a removed device reads each later
+    /// statement, property 1's limit), and writes into the old generation's
+    /// channel while the look runs. The look reads the old generations
+    /// before the change is shown, and brings from that read alone: what
+    /// device 0 wrote before is brought, and what it wrote after is not.
+    #[actix_web::test]
+    async fn test_the_look_takes_nothing_written_after_its_change_is_shown() {
+        let gone = two_gone();
+        let from = candidate(&gone.s[0].latest());
+        let node = new_machine(9, &gone);
+        let answers = [Answer::Lost, Answer::Lost];
+        let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
+        let (number, to_look, read) = recovered(&node, &made).await;
+        assert!(to_look.takes.contains(&gone.s.key(0)));
+
+        // Once the change is shown, device 0 writes again in the
+        // generation recovered from: a new file, and over its own.
+        let (lab, mut there) = gone.at_the_relay[2].clone();
+        let by_it = there
+            .iter()
+            .find(|entry| entry.author == gone.s.key(0))
+            .unwrap()
+            .clone();
+        let identity = &gone.s[0].identity;
+        let late = entry_by(identity, &lab, by_it.rev, "late.md", text("after"), &[]);
+        let over = entry_by(identity, &lab, by_it.rev + 1, "a.md", text("after"), &[]);
+        there.extend([late, over]);
+        node.relay_holds(&lab, &there);
+
+        let found = the_look(&node.state, number, &to_look, read).await;
+        assert_eq!(found["finished"], true, "{found}");
+        assert_eq!(node.text(LAB, "late.md"), None, "{found}");
+        assert_eq!(node.text(LAB, "a.md").as_deref(), Some("of device 0"));
+        assert_eq!(node.text(LAB, "b.md").as_deref(), Some("of device 1"));
     }
 
     /// The look says which names it could not read to their end, and
@@ -4239,10 +4415,10 @@ mod tests {
         let node = new_machine(9, &gone);
         let answers = [Answer::Lost, Answer::Lost];
         let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
-        let (number, to_look) = follows(&node, &made).unwrap();
         node.in_part
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let found = the_look(&node.state, number, &to_look).await;
+        let (number, to_look, read) = recovered(&node, &made).await;
+        let found = the_look(&node.state, number, &to_look, read).await;
         assert_eq!(found["carried"], 4, "{found}");
         // The relay holds `desk` in the generation recovered from, and
         // `lab` in that one and in the one before.
@@ -4273,8 +4449,8 @@ mod tests {
             own_round_waits: Default::default(),
         };
         let made = makes(&alone, &from, &gone.at_the_relay[1].1, &answers);
-        let (number, to_look) = follows(&alone, &made).unwrap();
-        let found = the_look(&alone.state, number, &to_look).await;
+        let (number, to_look, read) = recovered(&alone, &made).await;
+        let found = the_look(&alone.state, number, &to_look, read).await;
         assert_eq!(found["carried"], 0);
         let missed = found["not_read"].as_array().unwrap();
         assert_eq!(missed.len(), 4, "{found}");
@@ -4316,7 +4492,7 @@ mod tests {
         let node = new_machine(9, &gone);
         node.state.own_channels.set_up_with(1);
         let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
-        let (number, to_look) = follows(&node, &made).unwrap();
+        let (number, to_look, read) = recovered(&node, &made).await;
         assert_eq!(to_look.names, ["desk", LAB]);
         let (desk, lab) = (channel(&node, "desk"), channel(&node, LAB));
         // From the moment the statement is applied, neither name's
@@ -4337,15 +4513,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(held_back(&node, Instant::now() + nearly).is_empty());
 
-        let found = the_look(&node.state, number, &to_look).await;
+        let found = the_look(&node.state, number, &to_look, read).await;
         assert_eq!(found["carried"], 4, "{found}");
-        // The look read `desk` in two generations, and then `lab` in
-        // two. While it read `desk`, both names were held back afresh;
-        // while it read `lab`, that name alone: `desk` was let go.
+        // The look read `desk` in two generations, and then `lab` in two,
+        // before the statement was applied, when no name was held (the
+        // third read of slice 8, its third finding).
         let at_reads = node.held_back_at_reads.lock().unwrap().clone();
-        let both = BTreeSet::from([desk, lab]);
-        let last = BTreeSet::from([lab]);
-        assert_eq!(at_reads, [both.clone(), both, last.clone(), last]);
+        assert_eq!(at_reads, vec![BTreeSet::new(); 4]);
         // Once the look has ended, each folder has its first cycle.
         assert!(cycles(&node, &desk) && cycles(&node, &lab));
         assert!(held_back(&node, Instant::now()).is_empty());
@@ -4354,12 +4528,12 @@ mod tests {
         let node = new_machine(10, &gone);
         node.state.own_channels.set_up_with(1);
         let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
-        let (number, to_look) = follows(&node, &made).unwrap();
+        let (number, to_look, read) = recovered(&node, &made).await;
         let (desk, lab) = (channel(&node, "desk"), channel(&node, LAB));
         assert!(!cycles(&node, &desk) && !cycles(&node, &lab));
         node.not_connected
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let found = the_look(&node.state, number, &to_look).await;
+        let found = the_look(&node.state, number, &to_look, read).await;
         assert_eq!(found["new_not_read"], true, "{found}");
         assert!(cycles(&node, &desk) && cycles(&node, &lab));
 
@@ -4393,8 +4567,8 @@ mod tests {
         node.state.own_channels.set_up_with(1);
         node.maps_a_folder("desk");
         let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
-        let (number, to_look) = follows(&node, &made).unwrap();
-        let found = the_look(&node.state, number, &to_look).await;
+        let (number, to_look, read) = recovered(&node, &made).await;
+        let found = the_look(&node.state, number, &to_look, read).await;
         assert_eq!(found["carried"], 4, "{found}");
         {
             let db = db(&node.state);
@@ -4409,10 +4583,10 @@ mod tests {
         node.state.own_channels.set_up_with(1);
         node.maps_a_folder("desk");
         let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
-        let (number, to_look) = follows(&node, &made).unwrap();
+        let (number, to_look, read) = recovered(&node, &made).await;
         node.not_connected
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let found = the_look(&node.state, number, &to_look).await;
+        let found = the_look(&node.state, number, &to_look, read).await;
         assert_eq!(found["carried"], 0, "{found}");
         assert!(names::brought_in(&db(&node.state)).unwrap().is_empty());
         assert!(!unmaps_desk(&node));
@@ -4430,12 +4604,12 @@ mod tests {
         let node = new_machine(9, &gone);
         let answers = [Answer::Lost, Answer::Lost];
         let made = makes(&node, &from, &gone.at_the_relay[1].1, &answers);
-        let (number, to_look) = follows(&node, &made).unwrap();
+        let (number, to_look, read) = recovered(&node, &made).await;
         let before = node.stored();
         node.not_connected
             .store(true, std::sync::atomic::Ordering::SeqCst);
         node.asked.lock().unwrap().clear();
-        let found = the_look(&node.state, number, &to_look).await;
+        let found = the_look(&node.state, number, &to_look, read).await;
         assert_eq!(found["new_not_read"], true, "{found}");
         assert_eq!(
             (&found["finished"], &found["carried"]),

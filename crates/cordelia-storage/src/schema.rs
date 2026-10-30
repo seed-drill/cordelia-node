@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 24;
+pub const SCHEMA_VERSION: u32 = 25;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1182,9 +1182,13 @@ CREATE TABLE relay_head_rooms (
 ///   in 8 bytes, big-endian, then its hash) and the keys it lists as
 ///   devices (`devices`, 32 bytes each): the cut time of a removed key is
 ///   worked out from them (rule 2), and a key that rule 6 would remove is
-///   spared where a removal of its adder lists it. A change noted before
-///   the step has none, and is asked of nothing that needs them: that
-///   fails safe.
+///   spared where every removal of its adder lists it. A change noted
+///   before the step has none, and is asked of nothing that needs them:
+///   that fails safe. With them its statement's commitment to its secret
+///   (`commitment`), by which a carry by command knows which change a
+///   generation it left is (the second read of slice 8, its second
+///   finding); where it is not noted, the generation is not known, and
+///   everything of a removed key read there is left out.
 /// - `person_removed_keys_by`: beside a removed key, for one that rule 6
 ///   removes, the removed key whose record added it after that key's cut
 ///   time. Its cut is that key's.
@@ -1207,11 +1211,25 @@ CREATE TABLE relay_head_rooms (
 ///   full, the other keys its links name; and each arrival of it, a key
 ///   (the first 16 bytes) and, for a link, its hash and how many times it
 ///   stands. Kept per file, by its channel and slot, across carries; at
-///   most `MAX_FILE_ARRIVALS` a file.
+///   most `MAX_FILE_ARRIVALS` a file. `stored_id` is the ID of the entry
+///   it stored, made anew at each carry where that version is sealed
+///   again: a version gone back to counts as brought, and judged when it
+///   came, only where it is the device's own writing or a kept event
+///   stored exactly it (the second read of slice 8, its medium finding).
 /// - `file_arrivals_dropped`: for each file and generation, the newest
 ///   time of an arrival dropped past the bound, and the first event that
-///   went with the version current before it (sealed as this device's own):
-///   where what went is cut, the file goes back to that version.
+///   went with the version current before it (sealed as this device's own)
+///   and the ID of the entry it stored (`first_stored_id`): where what
+///   went is cut, the file goes back to that version.
+/// - `file_copies`: a conflict copy that a folder made and has not yet
+///   published, by the channel and slot of its name, with the folder, the
+///   name and the chain of the text it keeps (each link its hash, then its
+///   signer, 16 bytes each). The copy's first version is written after
+///   that chain, and the arrivals of the file it was made from are kept
+///   with it from when it is made, so that no copy carries out of the cut
+///   what a removed device wrote (the second read of slice 8, its first
+///   finding). The row goes once the copy is published; a carry before
+///   that judges it, and puts the folder's file back where it is cut.
 const MIGRATION_V24: &str = r#"
 CREATE TABLE person_change_times_lists (
     number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
@@ -1219,6 +1237,7 @@ CREATE TABLE person_change_times_lists (
     removed  BLOB NOT NULL CHECK(typeof(removed) = 'blob' AND length(removed) % 32 = 0),
     chain    BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 24 = 0),
     devices  BLOB NOT NULL CHECK(typeof(devices) = 'blob' AND length(devices) % 32 = 0),
+    commitment  BLOB CHECK(commitment IS NULL OR length(commitment) = 32),
     PRIMARY KEY (number, hash)
 );
 
@@ -1261,7 +1280,8 @@ CREATE TABLE file_arrivals_stored (
     before_delete       INTEGER,
     before_content      BLOB,
     before_author_sig   BLOB,
-    before_channel_sig  BLOB
+    before_channel_sig  BLOB,
+    stored_id           BLOB CHECK(stored_id IS NULL OR length(stored_id) = 32)
 );
 CREATE INDEX file_arrivals_stored_by_file ON file_arrivals_stored(channel_id, slot, place);
 
@@ -1286,8 +1306,54 @@ CREATE TABLE file_arrivals_dropped (
     before_content      BLOB,
     before_author_sig   BLOB,
     before_channel_sig  BLOB,
+    first_stored_id     BLOB CHECK(first_stored_id IS NULL OR length(first_stored_id) = 32),
     PRIMARY KEY (channel_id, slot, number, hash)
 );
+
+CREATE TABLE file_copies (
+    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot        BLOB NOT NULL CHECK(length(slot) = 32),
+    folder      TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    chain       BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 32 = 0),
+    PRIMARY KEY (channel_id, slot)
+);
+"#;
+
+/// Migration v25: a conflict copy whose text's history is not known, and an
+/// arrival whose chain may have dropped links (decision 2026-10-24
+/// (removal), rule 7; the third read of slice 8).
+///
+/// - `file_copies.held`: 1 where the folder's record of the file the copy
+///   was made from names no signer, or no chain, so that what the copy's
+///   text was written after is not known: its first version would name
+///   nothing, and a device that took it would make no arrival of a removed
+///   key whose text it keeps. Such a copy is never published: a carry that
+///   leaves it out puts it back to none, and one that does not moves it,
+///   still held. Every copy noted before the step is 0, as it was: its
+///   chain was given when it was made.
+///
+/// - `file_arrivals_stored.unknown`: 1 where the entry's chain may have
+///   dropped what it was written after: it was missing, or held
+///   `MAX_ENTRY_LINKS` links, the most a chain keeps, or the file is the
+///   index, whose merges stop a chain short (the fourth read of slice 8
+///   dropped the trust once given to a full chain that named a version held
+///   here). A removed key's link may have fallen off it, so at a carry the
+///   event is judged as an arrival of every removed key (the extra look of
+///   the third read of slice 8). An event kept before the step whose chain
+///   was full is so too: that fails safe. An event of the index kept before
+///   it with a shorter chain is not, since an event keeps no name: step 24
+///   was never released (slice 8's notes).
+///
+/// A step of its own, and not step 24 changed again: step 24 was changed
+/// in place twice while unreleased, and no node or relay ran a build of it
+/// (slice 8's notes).
+const MIGRATION_V25: &str = r#"
+ALTER TABLE file_copies ADD COLUMN held INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(held) = 'integer' AND held IN (0, 1));
+ALTER TABLE file_arrivals_stored ADD COLUMN unknown INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(unknown) = 'integer' AND unknown IN (0, 1));
+UPDATE file_arrivals_stored SET unknown = 1 WHERE full_signers IS NOT NULL;
 "#;
 
 /// Run `sql` and set the schema version to `version` as one transaction:
@@ -1525,6 +1591,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 24 {
         tracing::info!("applying migration v24 (what a device took before it knew)");
         migrate_in_one(conn, MIGRATION_V24, 24)?;
+    }
+
+    if current < 25 {
+        tracing::info!("applying migration v25 (a conflict copy kept on this device)");
+        migrate_in_one(conn, MIGRATION_V25, 25)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -5477,12 +5548,13 @@ mod tests {
     }
 
     /// What the step to version 24 makes, by name.
-    const NEW_IN_V24: [&str; 10] = [
+    const NEW_IN_V24: [&str; 11] = [
         "file_arrivals",
         "file_arrivals_by_stored",
         "file_arrivals_dropped",
         "file_arrivals_stored",
         "file_arrivals_stored_by_file",
+        "file_copies",
         "file_line_from",
         "file_put_back",
         "person_change_times_lists",
@@ -5612,6 +5684,18 @@ mod tests {
                 ),
             ),
             (
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices,
+                         commitment)
+                     VALUES (1, {hash}, x'', x'', x'', zeroblob(31))"
+                ),
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices,
+                         commitment)
+                     VALUES (1, {hash}, x'', x'', x'', zeroblob(32))"
+                ),
+            ),
+            (
                 format!("INSERT INTO person_removed_keys_by (key, added_by) VALUES ({key}, 'k')"),
                 format!("INSERT INTO person_removed_keys_by (key, added_by) VALUES ({key}, {key})"),
             ),
@@ -5635,11 +5719,91 @@ mod tests {
                      VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9)"
                 ),
             ),
+            (
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                         stored_id)
+                     VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9, zeroblob(31))"
+                ),
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                         stored_id)
+                     VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9, zeroblob(32))"
+                ),
+            ),
+            (
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+                 VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(31))"
+                    .into(),
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+                 VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(32))"
+                    .into(),
+            ),
         ];
         for (refused, taken) in cases {
             conn.execute_batch("SAVEPOINT one").unwrap();
             assert!(conn.execute_batch(&refused).is_err(), "{refused}");
             assert!(conn.execute_batch(&taken).is_ok(), "{taken}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
+    /// The step to version 25 adds `file_copies.held`, 0 on every copy noted
+    /// before it, and `file_arrivals_stored.unknown`, 1 on an event whose
+    /// chain was full; each takes no value but 0 or 1; it is made in one
+    /// step with its version, and asked for twice it is run once.
+    #[test]
+    fn step_25_holds_no_copy_noted_before_it() {
+        let conn = at_v21();
+        for (sql, version) in [
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+        ] {
+            migrate_in_one(&conn, sql, version).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+             VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(32));
+             INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
+             VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9);
+             INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                 full_signers)
+             VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 10, zeroblob(16));",
+        )
+        .unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let failing = format!("{MIGRATION_V25} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 25).is_err());
+        assert_eq!(version(&conn), 24);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 25);
+        migrate_in_one(&conn, MIGRATION_V25, 25).unwrap();
+        let held: i64 = conn
+            .query_row("SELECT held FROM file_copies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(held, 0);
+        // An event whose chain was full is judged as one that may have
+        // dropped links; one that was not, is not.
+        let unknown: Vec<i64> = conn
+            .prepare("SELECT unknown FROM file_arrivals_stored ORDER BY stored_at")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(unknown, [0, 1]);
+        for (value, taken) in [("0", true), ("1", true), ("2", false), ("'one'", false)] {
+            let sql = format!(
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain, held)
+                 VALUES (zeroblob(32), X'{}', '/m', 'b.md', x'', {value})",
+                "01".repeat(32)
+            );
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
             conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
         }
     }
@@ -5659,7 +5823,10 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found: 24, own: 23 })
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 23
+                })
             ),
             "{refused:?}"
         );

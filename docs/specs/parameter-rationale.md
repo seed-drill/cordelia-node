@@ -2371,6 +2371,12 @@ most (decision §7.3): the fetch of the new channel, and then the name's
 channel in each generation that the device left. What was not read to its
 end by then is said, and the command can be run again.
 
+A recovery reads the channels of all the names of its look in the
+generations before within one such time, before its change is shown to any
+relay (decision 2026-10-24 (removal), the third read of slice 8, its third
+finding), and `cordelia recover` waits for it and 60 seconds more, the wait
+it had for the apply alone. The change is shown no later for it than that.
+
 #### CARRY_FIRST_MAX_SECS = 180
 
 **Derivation:** `CARRY_READ_MAX_SECS` + 60: a little longer than the carry

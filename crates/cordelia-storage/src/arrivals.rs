@@ -56,9 +56,17 @@ pub struct Stored {
     /// Where its chain was full, the other keys that its links name: a
     /// removed key's link among them is cut all the same.
     pub full_signers: Vec<[u8; 16]>,
+    /// Whether its chain may have dropped what it was written after
+    /// ([`noted_unknown`]): it is judged as an arrival of every removed key.
+    pub unknown: bool,
     /// The version that was current in the file before it, as one entry:
     /// `None` where there was none.
     pub before: Option<Entry>,
+    /// The ID of the entry it stored, as sealed where the file is now:
+    /// `None` where no entry the store holds, or a carry sealed again, is
+    /// that entry. A version gone back to counts as brought where it is
+    /// one of these (decision 2026-10-24 (removal), rule 7).
+    pub stored_id: Option<[u8; 32]>,
     pub arrivals: Vec<Arrival>,
 }
 
@@ -76,6 +84,8 @@ pub struct Dropped {
     /// goes back to it, and not to before the oldest event kept, which may
     /// be a removed key's own.
     pub before: Option<Entry>,
+    /// The ID of the entry that first event stored, as [`Stored::stored_id`].
+    pub first_stored_id: Option<[u8; 32]>,
 }
 
 /// The entry of the six columns from `at` (`before_author` to
@@ -110,8 +120,20 @@ fn before_of(
     }))
 }
 
+/// An entry's ID, as a column holds it: `None` where it holds none, or
+/// what is no ID.
+fn id_of(column: Option<Vec<u8>>) -> Option<[u8; 32]> {
+    column.and_then(|id| id.try_into().ok())
+}
+
 /// Keep a store event of the file `slot` in `channel` and its arrivals,
-/// and keep the file to its bound. Returns its place.
+/// and keep the file to its bound. `stored_id` is the ID of the entry it
+/// stored. Returns its place.
+///
+/// **It is stamped no earlier than the newest event kept,** of any file
+/// (the second read of slice 8, a low finding): `stored_at` is the device's
+/// clock, and a clock stepped back would otherwise stamp a late arrival
+/// before a removal's cut time.
 #[allow(clippy::too_many_arguments)]
 pub fn note(
     conn: &Connection,
@@ -122,17 +144,25 @@ pub fn note(
     stored_at: i64,
     full_signers: &[[u8; 16]],
     before: Option<&Entry>,
+    stored_id: Option<&[u8; 32]>,
     arrivals: &[Arrival],
 ) -> Result<i64, CordeliaError> {
     conn.execute_batch("SAVEPOINT file_arrivals")
         .map_err(storage)?;
     let noted = (|| {
+        let newest: Option<i64> = conn.query_row(
+            "SELECT MAX(at) FROM (SELECT MAX(stored_at) AS at FROM file_arrivals_stored
+                                  UNION ALL SELECT MAX(newest_at) FROM file_arrivals_dropped)",
+            [],
+            |row| row.get(0),
+        )?;
+        let stored_at = newest.map_or(stored_at, |newest| stored_at.max(newest));
         let full = (!full_signers.is_empty()).then(|| full_signers.concat());
         conn.execute(
             "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
                  full_signers, before_author, before_rev, before_delete, before_content,
-                 before_author_sig, before_channel_sig)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 before_author_sig, before_channel_sig, stored_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 channel.as_slice(),
                 slot.as_slice(),
@@ -146,6 +176,7 @@ pub fn note(
                 before.map(|entry| entry.content.clone()),
                 before.map(|entry| entry.author_signature.to_vec()),
                 before.map(|entry| entry.channel_signature.to_vec()),
+                stored_id.map(|id| id.to_vec()),
             ],
         )?;
         let place = conn.last_insert_rowid();
@@ -170,6 +201,21 @@ pub fn note(
     };
     conn.execute_batch(end).map_err(storage)?;
     noted.map_err(storage)
+}
+
+/// The event at `place` ([`note`]) stored an entry whose chain may have
+/// dropped what it was written after (decision 2026-10-24 (removal), rule
+/// 7): it was missing, or full, or the index's (the fourth read of slice
+/// 8).
+/// A removed key's link may have fallen off it, so a carry judges it as an
+/// arrival of every removed key.
+pub fn noted_unknown(conn: &Connection, place: i64) -> Result<(), CordeliaError> {
+    conn.execute(
+        "UPDATE file_arrivals_stored SET unknown = 1 WHERE place = ?1",
+        params![place],
+    )
+    .map(|_| ())
+    .map_err(storage)
 }
 
 /// How a file counts toward its bound: each arrival, and an event that
@@ -208,10 +254,10 @@ fn keep_to_the_bound(
         conn.execute(
             "INSERT INTO file_arrivals_dropped (channel_id, slot, number, hash, newest_at,
                  first_place, before_author, before_rev, before_delete, before_content,
-                 before_author_sig, before_channel_sig)
+                 before_author_sig, before_channel_sig, first_stored_id)
              SELECT channel_id, slot, number, hash, stored_at, place, before_author,
                     before_rev, before_delete, before_content, before_author_sig,
-                    before_channel_sig
+                    before_channel_sig, stored_id
              FROM file_arrivals_stored WHERE place = ?1
              ON CONFLICT(channel_id, slot, number, hash)
              DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
@@ -244,7 +290,8 @@ pub fn of_file(
     let mut stmt = conn
         .prepare(
             "SELECT place, number, hash, stored_at, full_signers, before_author, before_rev,
-                    before_delete, before_content, before_author_sig, before_channel_sig
+                    before_delete, before_content, before_author_sig, before_channel_sig,
+                    stored_id, unknown
              FROM file_arrivals_stored WHERE channel_id = ?1 AND slot = ?2 ORDER BY place",
         )
         .map_err(storage)?;
@@ -261,6 +308,8 @@ pub fn of_file(
                     .map(|bytes| bytes.as_chunks::<16>().0.to_vec())
                     .unwrap_or_default(),
                 before,
+                stored_id: id_of(row.get(11)?),
+                unknown: row.get(12)?,
                 arrivals: Vec::new(),
             })
         })
@@ -286,7 +335,8 @@ pub fn of_file(
     let mut stmt = conn
         .prepare(
             "SELECT number, hash, newest_at, first_place, before_author, before_rev,
-                    before_delete, before_content, before_author_sig, before_channel_sig
+                    before_delete, before_content, before_author_sig, before_channel_sig,
+                    first_stored_id
              FROM file_arrivals_dropped
              WHERE channel_id = ?1 AND slot = ?2 ORDER BY first_place",
         )
@@ -299,6 +349,7 @@ pub fn of_file(
                 newest_at: row.get(2)?,
                 first_place: row.get(3)?,
                 before: before_of(row, 4, channel, slot)?,
+                first_stored_id: id_of(row.get(10)?),
             })
         })
         .map_err(storage)?
@@ -433,6 +484,46 @@ pub fn set_dropped_before(
     .map_err(storage)
 }
 
+/// The ID of the entry that the event at `place` stored, as sealed where
+/// the file now is (`None`: no entry is that one any more).
+pub fn set_stored_id(
+    conn: &Connection,
+    place: i64,
+    stored_id: Option<&[u8; 32]>,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "UPDATE file_arrivals_stored SET stored_id = ?2 WHERE place = ?1",
+        params![place, stored_id.map(|id| id.to_vec())],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
+/// The same, for the first event that went past the bound of the file
+/// `slot` in `channel`, in the generation `number` and `hash`.
+pub fn set_dropped_stored_id(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    number: u64,
+    hash: &[u8; 16],
+    stored_id: Option<&[u8; 32]>,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "UPDATE file_arrivals_dropped SET first_stored_id = ?5
+         WHERE channel_id = ?1 AND slot = ?2 AND number = ?3 AND hash = ?4",
+        params![
+            channel.as_slice(),
+            slot.as_slice(),
+            i64::try_from(number).unwrap_or(i64::MAX),
+            hash.as_slice(),
+            stored_id.map(|id| id.to_vec()),
+        ],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
 /// The file `from_slot` in `from` is the file `to_slot` in `to` from now
 /// on, with every event and what went past its bound: a carry (rule 7).
 pub fn move_file(
@@ -460,6 +551,232 @@ pub fn move_file(
     Ok(())
 }
 
+/// A conflict copy that a folder made and has not yet published
+/// (decision 2026-10-24 (removal), rule 7): the file of its name, the
+/// folder, its name, and the chain of the text it keeps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Copy {
+    pub slot: [u8; 32],
+    pub folder: String,
+    pub key: String,
+    /// Each link as its hash and then its signer, 16 bytes each.
+    pub chain: Vec<[u8; 32]>,
+}
+
+/// A folder (`folder`) makes `key`, the file `to_slot` in `channel`, a
+/// conflict copy of the file `from_slot` there, keeping a text written
+/// after `chain`: every event of the file and what went past its bound are
+/// the copy's too from now on, each with no version to go back to (the copy
+/// held none), and the copy is kept as not yet published. Its first version
+/// is written after `chain` ([`copy_chain`]). All of it, or none.
+///
+/// **`None`: what the text was written after is not known** (the folder's
+/// record names no signer, or no chain): the copy is kept as one that is
+/// never published ([`copy_held`]; the third read of slice 8, its second
+/// low finding).
+pub fn copy_file(
+    conn: &Connection,
+    channel: &[u8; 32],
+    from_slot: &[u8; 32],
+    to_slot: &[u8; 32],
+    folder: &str,
+    key: &str,
+    chain: Option<&[[u8; 32]]>,
+) -> Result<(), CordeliaError> {
+    let held = chain.is_none();
+    let chain = chain.unwrap_or_default();
+    conn.execute_batch("SAVEPOINT file_copy").map_err(storage)?;
+    let copied = (|| -> rusqlite::Result<()> {
+        let places: Vec<i64> = {
+            let mut stmt = conn.prepare(
+                "SELECT place FROM file_arrivals_stored
+                 WHERE channel_id = ?1 AND slot = ?2 ORDER BY place",
+            )?;
+            stmt.query_map(params![channel.as_slice(), from_slot.as_slice()], |row| {
+                row.get(0)
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        for place in places {
+            conn.execute(
+                "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                     full_signers, unknown)
+                 SELECT channel_id, ?2, number, hash, stored_at, full_signers, unknown
+                 FROM file_arrivals_stored WHERE place = ?1",
+                params![place, to_slot.as_slice()],
+            )?;
+            let copy = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO file_arrivals (stored, signer, link_hash, times)
+                 SELECT ?2, signer, link_hash, times FROM file_arrivals WHERE stored = ?1",
+                params![place, copy],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO file_arrivals_dropped (channel_id, slot, number, hash, newest_at,
+                 first_place)
+             SELECT channel_id, ?3, number, hash, newest_at, first_place
+             FROM file_arrivals_dropped WHERE channel_id = ?1 AND slot = ?2
+             ON CONFLICT(channel_id, slot, number, hash)
+             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at),
+                           first_place = MIN(first_place, excluded.first_place),
+                           before_author = NULL, before_rev = NULL, before_delete = NULL,
+                           before_content = NULL, before_author_sig = NULL,
+                           before_channel_sig = NULL, first_stored_id = NULL",
+            params![channel.as_slice(), from_slot.as_slice(), to_slot.as_slice()],
+        )?;
+        keep_to_the_bound(conn, channel, to_slot)?;
+        conn.execute(
+            "INSERT INTO file_copies (channel_id, slot, folder, key, chain, held)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(channel_id, slot) DO UPDATE SET folder = excluded.folder,
+                 key = excluded.key, chain = excluded.chain, held = excluded.held",
+            params![
+                channel.as_slice(),
+                to_slot.as_slice(),
+                folder,
+                key,
+                chain.concat(),
+                held
+            ],
+        )?;
+        Ok(())
+    })();
+    let end = match copied {
+        Ok(()) => "RELEASE file_copy",
+        Err(_) => "ROLLBACK TO file_copy; RELEASE file_copy",
+    };
+    conn.execute_batch(end).map_err(storage)?;
+    copied.map_err(storage)
+}
+
+/// The chain that the first version of the conflict copy in the file
+/// `slot` of `channel` is written after, where the copy is not yet
+/// published ([`copy_file`]): `None` where it is no such copy.
+pub fn copy_chain(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<Option<Vec<[u8; 32]>>, CordeliaError> {
+    let chain: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT chain FROM file_copies WHERE channel_id = ?1 AND slot = ?2",
+            params![channel.as_slice(), slot.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    Ok(chain.map(|chain| chain.as_chunks::<32>().0.to_vec()))
+}
+
+/// Whether the conflict copy in the file `slot` of `channel` is one whose
+/// text's history was not known when it was made ([`copy_file`]): it is
+/// never published. A carry that leaves it out puts it back to none; one
+/// that does not moves it, still so.
+pub fn copy_held(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<bool, CordeliaError> {
+    let held: Option<bool> = conn
+        .query_row(
+            "SELECT held FROM file_copies WHERE channel_id = ?1 AND slot = ?2",
+            params![channel.as_slice(), slot.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    Ok(held == Some(true))
+}
+
+/// The conflict copy in the file `slot` of `channel` is published, or put
+/// back: it is kept as a copy not yet published no more.
+pub fn copy_done(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "DELETE FROM file_copies WHERE channel_id = ?1 AND slot = ?2",
+        params![channel.as_slice(), slot.as_slice()],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
+/// Every conflict copy not yet published in `channel`.
+pub fn copies_of_channel(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<Copy>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT slot, folder, key, chain FROM file_copies WHERE channel_id = ?1
+             ORDER BY folder, key",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel.as_slice()], |row| {
+            let slot: Vec<u8> = row.get(0)?;
+            let chain: Vec<u8> = row.get(3)?;
+            Ok(Copy {
+                slot: slot.try_into().unwrap_or_default(),
+                folder: row.get(1)?,
+                key: row.get(2)?,
+                chain: chain.as_chunks::<32>().0.to_vec(),
+            })
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// The conflict copy not yet published in the file `slot` of `channel` is
+/// the one in the file `to_slot` of `to` from now on, with its arrivals: a
+/// carry (rule 7).
+pub fn move_copy(
+    conn: &Connection,
+    channel: &[u8; 32],
+    slot: &[u8; 32],
+    to: &[u8; 32],
+    to_slot: &[u8; 32],
+) -> Result<(), CordeliaError> {
+    move_file(conn, channel, slot, to, to_slot)?;
+    conn.execute(
+        "UPDATE file_copies SET channel_id = ?3, slot = ?4 WHERE channel_id = ?1 AND slot = ?2",
+        params![
+            channel.as_slice(),
+            slot.as_slice(),
+            to.as_slice(),
+            to_slot.as_slice()
+        ],
+    )
+    .map(|_| ())
+    .map_err(storage)
+}
+
+/// Every file that holds an event or what went past its bound in
+/// `channel`: a conflict copy not yet published holds no entry, and is one
+/// of them.
+pub fn files_of_channel(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT slot FROM file_arrivals_stored WHERE channel_id = ?1
+             UNION SELECT slot FROM file_arrivals_dropped WHERE channel_id = ?1
+             ORDER BY 1",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel.as_slice()], |row| {
+            let slot: Vec<u8> = row.get(0)?;
+            Ok(slot.try_into().unwrap_or_default())
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// Keep nothing of the files of `channel`: it was left, or dropped.
 pub fn forget_channel(conn: &Connection, channel: &[u8; 32]) -> Result<(), CordeliaError> {
     conn.execute(
@@ -468,7 +785,11 @@ pub fn forget_channel(conn: &Connection, channel: &[u8; 32]) -> Result<(), Corde
         params![channel.as_slice()],
     )
     .map_err(storage)?;
-    for table in ["file_arrivals_stored", "file_arrivals_dropped"] {
+    for table in [
+        "file_arrivals_stored",
+        "file_arrivals_dropped",
+        "file_copies",
+    ] {
         conn.execute(
             &format!("DELETE FROM {table} WHERE channel_id = ?1"),
             params![channel.as_slice()],
@@ -484,6 +805,7 @@ pub fn forget_all(conn: &Connection) -> Result<(), CordeliaError> {
         "file_arrivals",
         "file_arrivals_stored",
         "file_arrivals_dropped",
+        "file_copies",
     ] {
         conn.execute(&format!("DELETE FROM {table}"), [])
             .map_err(storage)?;
@@ -534,10 +856,11 @@ mod tests {
             100,
             &[],
             Some(&before),
+            Some(&[3; 32]),
             &[arrival(5), link],
         )
         .unwrap();
-        note(&conn, &c, &s, 2, &[2; 16], 101, &[[4; 16]], None, &[]).unwrap();
+        note(&conn, &c, &s, 2, &[2; 16], 101, &[[4; 16]], None, None, &[]).unwrap();
         assert_eq!(link_times(&conn, &c, &s, &[6; 16], &[5; 16]).unwrap(), 2);
         assert_eq!(link_times(&conn, &c, &s, &[6; 16], &[4; 16]).unwrap(), 0);
         let (events, dropped) = of_file(&conn, &c, &s).unwrap();
@@ -545,7 +868,9 @@ mod tests {
         assert_eq!(events[0].place, place);
         assert_eq!(events[0].before.as_ref(), Some(&before));
         assert_eq!(events[0].arrivals, vec![arrival(5), link]);
+        assert_eq!(events[0].stored_id, Some([3; 32]));
         assert_eq!(events[1].before, None);
+        assert_eq!(events[1].stored_id, None);
         assert_eq!(events[1].full_signers, vec![[4; 16]]);
         assert!(dropped.is_empty());
 
@@ -555,6 +880,63 @@ mod tests {
         assert_eq!(drop_from(&conn, &[3; 32], &[4; 32], place + 1).unwrap(), 1);
         forget_channel(&conn, &[3; 32]).unwrap();
         assert!(of_file(&conn, &[3; 32], &[4; 32]).unwrap().0.is_empty());
+    }
+
+    /// An event is stamped no earlier than the newest kept, of any file:
+    /// a clock stepped back stamps nothing before what came already.
+    #[test]
+    fn test_an_event_is_stamped_no_earlier_than_the_newest_kept() {
+        let conn = db::open_in_memory().unwrap();
+        let (c, s) = ([1u8; 32], [2u8; 32]);
+        note(
+            &conn,
+            &c,
+            &s,
+            2,
+            &[2; 16],
+            100,
+            &[],
+            None,
+            None,
+            &[arrival(5)],
+        )
+        .unwrap();
+        note(
+            &conn,
+            &c,
+            &[3; 32],
+            2,
+            &[2; 16],
+            40,
+            &[],
+            None,
+            None,
+            &[arrival(5)],
+        )
+        .unwrap();
+        note(
+            &conn,
+            &c,
+            &s,
+            2,
+            &[2; 16],
+            150,
+            &[],
+            None,
+            None,
+            &[arrival(5)],
+        )
+        .unwrap();
+        let at = |slot: &[u8; 32]| -> Vec<i64> {
+            of_file(&conn, &c, slot)
+                .unwrap()
+                .0
+                .iter()
+                .map(|event| event.stored_at)
+                .collect()
+        };
+        assert_eq!(at(&s), [100, 150]);
+        assert_eq!(at(&[3; 32]), [100]);
     }
 
     /// Past 1,024 arrivals a file, the oldest events go, and the newest
@@ -585,6 +967,7 @@ mod tests {
                 at,
                 &[],
                 Some(&version(at as u64)),
+                Some(&[at as u8; 32]),
                 &[arrival(5)],
             )
             .unwrap();
@@ -606,6 +989,7 @@ mod tests {
                 newest_at: 2,
                 first_place: first,
                 before: Some(version(0)),
+                first_stored_id: Some([0; 32]),
             }]
         );
         // Sealed again at a carry, it is what the carry set.
@@ -625,6 +1009,7 @@ mod tests {
             &[2; 16],
             9,
             &[],
+            None,
             None,
             &[arrival(5)],
         )

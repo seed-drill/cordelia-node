@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+use cordelia_core::protocol::{MAX_ENTRY_LINKS, REMOVAL_TAKEN_MARGIN_SECS};
 use cordelia_crypto::entry::Link as EntryLink;
 use cordelia_storage::person::{self as held_rows, NotedChange};
 
@@ -58,6 +58,9 @@ pub(crate) struct Cuts {
     chains: BTreeMap<Change, Option<Vec<Change>>>,
     /// The keys each noted change lists as devices.
     devices: BTreeMap<Change, Vec<[u8; 32]>>,
+    /// Each noted change by its number and its statement's commitment to
+    /// its secret, where that was noted.
+    by_commitment: BTreeMap<(u64, [u8; 32]), Change>,
 }
 
 impl Cuts {
@@ -82,6 +85,15 @@ impl Cuts {
         let devices = noted
             .iter()
             .filter_map(|change| Some(((change.number, change.hash), change.devices.clone()?)))
+            .collect();
+        let by_commitment = noted
+            .iter()
+            .filter_map(|change| {
+                Some((
+                    (change.number, change.commitment?),
+                    (change.number, change.hash),
+                ))
+            })
             .collect();
         let own_cut = |key: &[u8; 32]| -> (Option<i64>, Vec<(Change, Vec<Change>)>) {
             let mut removals = Vec::new();
@@ -137,27 +149,105 @@ impl Cuts {
             keys,
             chains,
             devices,
+            by_commitment,
         }
     }
 
+    /// The change of the generation numbered `number` whose person secret
+    /// is `secret`, where the device noted it with its commitment: `None`
+    /// where it did not, and the generation is not known.
+    pub(crate) fn generation_of(&self, number: u64, secret: &[u8; 32]) -> Option<Change> {
+        let commitment = cordelia_crypto::statement::commitment(secret);
+        self.by_commitment.get(&(number, commitment)).copied()
+    }
+
+    /// Whether a version read in `generation` of a channel left, by a
+    /// carry that a command makes at `now`, is left out (the second read
+    /// of slice 8, its second finding): a key that `signers` names, or that
+    /// a link of `chains` names, is cut there at that time. What a command
+    /// reads there has no time of arrival, so it is judged at its own: in a
+    /// generation that a removal of the key was made after, everything of
+    /// the key's is left out; in one that is a removal, or made after one,
+    /// nothing; and in one made apart, or not known (`None`), everything.
+    /// A key of `named` is not judged: the person named it, with the
+    /// phrase, as one whose writing is theirs (a recovery's look takes what
+    /// a device lost or broken wrote, decision 2026-10-04 §9).
+    ///
+    /// `name` is the version's name, and `chains` has the chain of each
+    /// entry of the version, `None` for one that lacks it. **A chain that
+    /// may have dropped links names every removed key**
+    /// ([`may_have_dropped_links`]; the third read of slice 8, its second
+    /// finding, and the fourth read's round): one of `MAX_ENTRY_LINKS`
+    /// links, the most a chain keeps, from which the oldest fall off as it
+    /// is written over; one that is missing; and every chain of the index.
+    /// So a version that a remaining device wrote over a removed key's late
+    /// text 100 times or more, or merged into the index, is left out
+    /// wherever any removed key is cut, which fails safe, at the cost of
+    /// honest busy files: that device carries them itself when it applies
+    /// the change (rule 7, by its arrivals).
+    pub(crate) fn leaves_out(
+        &self,
+        signers: &[[u8; 32]],
+        name: &str,
+        chains: &[Option<&[EntryLink]>],
+        generation: Option<&Change>,
+        now: i64,
+        named: &[[u8; 32]],
+    ) -> bool {
+        let cut = |key: &KeyCut| {
+            !named.contains(&key.key)
+                && match generation {
+                    Some(generation) => self.cuts(key, generation, now),
+                    None => true,
+                }
+        };
+        let names = |links: &[EntryLink]| {
+            links.iter().any(|link| {
+                self.keys
+                    .iter()
+                    .filter(|key| key.signer == link.signer)
+                    .any(cut)
+            })
+        };
+        signers
+            .iter()
+            .filter_map(|signer| self.of_key(signer))
+            .any(cut)
+            || chains.iter().any(|chain| match chain {
+                Some(links) if !may_have_dropped_links(Some(name), Some(links)) => names(links),
+                _ => self.keys.iter().any(cut),
+            })
+    }
+
     /// Whether `key`, which the removed key `adder` added by a record, is
-    /// listed as a device by a noted change that removes `adder` (rule 6):
-    /// the person kept it with the phrase in the change that removed its
-    /// adder, and it is not a key that `adder` added alone. For a key that
-    /// rule 6 removed, the changes are those that remove the key it goes
-    /// back to. A key that only a change on such a change's chain lists, or
-    /// a change made apart from every removal, is not: one the person
-    /// dropped from the list, and the removed device added again, holds the
-    /// secret by its record alone.
+    /// listed as a device by **every** noted change that removes `adder`
+    /// (rule 6): the person kept it with the phrase in each change that
+    /// removed its adder, and it is not a key that `adder` added alone. For
+    /// a key that rule 6 removed, the changes are those that remove the key
+    /// it goes back to. A key that only a change on such a change's chain
+    /// lists, or a change made apart from every removal, is not: one the
+    /// person dropped from the list, and the removed device added again,
+    /// holds the secret by its record alone.
+    ///
+    /// **Every, and not any** (the second read of slice 8, its third
+    /// finding). A removal can list a key only where the key existed when
+    /// it was made, so a removal made before `adder` added `key` never
+    /// lists it: a key that `adder` added after one of its removals is
+    /// spared nowhere that removal is noted, whatever another removal made
+    /// apart lists. One removal alone spares only a key that existed when
+    /// it was made, and that the person kept there: `cordelia
+    /// remove-device` asks of each key the device removed added, and says
+    /// that the device being removed added it.
     pub(crate) fn listed_toward_a_removal(&self, adder: &[u8; 32], key: &[u8; 32]) -> bool {
         let Some(cut) = self.of_key(adder) else {
             return false;
         };
-        cut.removals.iter().any(|(removal, _)| {
-            self.devices
-                .get(removal)
-                .is_some_and(|devices| devices.contains(key))
-        })
+        !cut.removals.is_empty()
+            && cut.removals.iter().all(|(removal, _)| {
+                self.devices
+                    .get(removal)
+                    .is_some_and(|devices| devices.contains(key))
+            })
     }
 
     /// The cut of `key`, where the device knows it to be removed.
@@ -215,6 +305,35 @@ impl Cuts {
     }
 }
 
+/// Whether `chain`, of an entry of the file `name` (`None` where it is not
+/// known), may have dropped a link of what the entry was written after
+/// (rule 7): where it may, it says nothing of which keys wrote before it,
+/// and names every removed key. Nothing in a chain, nor any version a
+/// device holds, is trusted to say that no link fell off it.
+///
+/// - **A chain that is missing.**
+/// - **A chain of `MAX_ENTRY_LINKS` links,** the most a chain keeps: the
+///   oldest fall off its end as it is written over. That a link of it
+///   names a version the device holds says nothing (the fourth read of
+///   slice 8, its high): a link is a text's hash and its signer, and a
+///   device that went back to that text, or deleted the file once (every
+///   delete's hash is the same), names it again after what fell off.
+/// - **Every chain of the index** (`MEMORY.md`), whatever its length: a
+///   merge weaves two chains, stops one where a hash of it stands further
+///   on in the other, and says nothing of what stood behind that link
+///   (`cordelia_crypto::chain::merged`). A text written back makes such a
+///   hash stand twice, and a removed key's link behind it goes from a
+///   chain far from full (the fourth read's round, its look for other
+///   paths). Only the door tells a merge from an edit, by the versions the
+///   file holds (`arrivals::written_over_held`); every other reader takes
+///   each chain of the index as one that may have dropped links.
+pub fn may_have_dropped_links(name: Option<&str>, chain: Option<&[EntryLink]>) -> bool {
+    match chain {
+        None => true,
+        Some(links) => links.len() >= MAX_ENTRY_LINKS || name == Some(crate::person::INDEX_FILE),
+    }
+}
+
 /// What a device cuts now, in the generation it follows (rules 6 and 7),
 /// for a reader that knows no time of arrival: the put-back of an index
 /// line. It judges at `now`, the latest anything came, which fails safe. In
@@ -261,6 +380,14 @@ impl CutNow {
             .any(|cut| self.cut(cut))
     }
 
+    /// Whether anything of any removed key is cut: what a chain names that
+    /// may have dropped links ([`may_have_dropped_links`]: missing, at the
+    /// most a chain keeps, or the index's; the extra look of the third read
+    /// of slice 8, and the fourth).
+    pub fn any(&self) -> bool {
+        self.cuts.keys().iter().any(|cut| self.cut(cut))
+    }
+
     fn cut(&self, cut: &KeyCut) -> bool {
         match &self.generation {
             Some(generation) => self.cuts.cuts(cut, generation, self.now),
@@ -284,7 +411,24 @@ fn time_of(
         let noted = noted.get(change)?;
         Some(noted.removed.as_ref()?.contains(key))
     };
-    let made_at = |change: &Change| noted.get(change).and_then(|noted| noted.made_at);
+    // A change's time, by its maker's clock, no later than that of any
+    // noted change made after it (the second read of slice 8, a low
+    // finding): an honest change made on a fast clock does not move the
+    // cut later than a change that followed it, the removal among them.
+    let made_at = |change: &Change| -> Option<i64> {
+        let own = noted.get(change)?.made_at?;
+        let after = noted
+            .values()
+            .filter(|later| {
+                later
+                    .chain
+                    .as_ref()
+                    .is_some_and(|chain| chain.contains(change))
+            })
+            .filter_map(|later| later.made_at)
+            .min();
+        Some(after.map_or(own, |after| own.min(after)))
+    };
     let first = links
         .iter()
         .position(|change| removes(change) == Some(true))?;
@@ -294,11 +438,14 @@ fn time_of(
     {
         return Some(time);
     }
+    // The newest change on the chain, by the chain's order, that the
+    // device noted with its time and that does not remove the key: not
+    // the latest time of any, which a fast clock on an older change gives.
     links[..first]
         .iter()
+        .rev()
         .filter(|change| removes(change) == Some(false))
-        .filter_map(made_at)
-        .max()
+        .find_map(made_at)
 }
 
 #[cfg(test)]
@@ -315,6 +462,7 @@ mod tests {
             removed: Some(removed.iter().map(|k| [*k; 32]).collect()),
             chain: Some(chain.iter().map(|n| (*n, [*n as u8; 16])).collect()),
             devices: Some(Vec::new()),
+            commitment: None,
         }
     }
 
@@ -346,6 +494,40 @@ mod tests {
         ];
         let cuts = Cuts::of(&noted, &[([9; 32], None)]);
         assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(100 - MARGIN));
+    }
+
+    /// The cut time goes by the chain's order, and no change's time is
+    /// later than that of a noted change made after it (the second read of
+    /// slice 8, a low finding): an honest change 2 made on a clock that is
+    /// fast does not move the cut later than the removal, change 4; and of
+    /// the changes before it, the newest gives the time, not the latest.
+    #[test]
+    fn the_cut_time_goes_by_the_chain_and_no_later_than_a_change_after() {
+        let noted = [
+            change(1, Some(100), &[], &[]),
+            change(2, Some(90_000), &[], &[1]),
+            change(4, Some(6_000), &[9], &[1, 2, 3]),
+        ];
+        let cuts = Cuts::of(&noted, &[([9; 32], None)]);
+        assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(6_000 - MARGIN));
+        let noted = [
+            change(1, Some(5_000), &[], &[]),
+            change(2, Some(4_000), &[], &[1]),
+            change(4, Some(6_000), &[9], &[1, 2, 3]),
+        ];
+        let cuts = Cuts::of(&noted, &[([9; 32], None)]);
+        assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(4_000 - MARGIN));
+        // Of two made apart, change 3, newer on the chain, gives the time,
+        // though change 2's clock says later (change 4, before the
+        // removal, is not noted).
+        let noted = [
+            change(1, Some(100), &[], &[]),
+            change(2, Some(5_000), &[], &[1]),
+            change(3, Some(4_000), &[], &[1]),
+            change(5, Some(6_000), &[9], &[1, 2, 3, 4]),
+        ];
+        let cuts = Cuts::of(&noted, &[([9; 32], None)]);
+        assert_eq!(cuts.of_key(&[9; 32]).unwrap().at, Some(4_000 - MARGIN));
     }
 
     /// Where no change on the chain has a time, there is none: everything
@@ -427,6 +609,24 @@ mod tests {
         assert!(!cuts.listed_toward_a_removal(&[8; 32], &[5; 32]));
     }
 
+    /// Of two removals made apart, a key is spared only where both list it
+    /// (the second read of slice 8, its third finding): one that lists the
+    /// key does not spare it where the other, made before the key was
+    /// added, cannot.
+    #[test]
+    fn a_key_is_spared_only_where_every_removal_of_its_adder_lists_it() {
+        let mut here = change(3, Some(6_000), &[9], &[1, 2]);
+        here.hash = [0x33; 16];
+        here.devices = Some(vec![[0; 32], [5; 32]]);
+        let mut apart = change(3, Some(5_000), &[9], &[1, 2]);
+        apart.devices = Some(vec![[0; 32]]);
+        let noted = [change(2, Some(100), &[], &[1]), here.clone()];
+        let removed = [([9; 32], None)];
+        assert!(Cuts::of(&noted, &removed).listed_toward_a_removal(&[9; 32], &[5; 32]));
+        let noted = [change(2, Some(100), &[], &[1]), here, apart];
+        assert!(!Cuts::of(&noted, &removed).listed_toward_a_removal(&[9; 32], &[5; 32]));
+    }
+
     /// What the put-back of an index line judges by (`CutNow`): in a
     /// generation before the removal, what the key signed or a chain names
     /// is cut at the time now; in the removal's generation, or one made
@@ -448,12 +648,104 @@ mod tests {
         for generation in [Some(at(2)), None] {
             assert!(now(generation).key(&[9; 32]));
             assert!(now(generation).signer(&signer));
+            // A chain that may have dropped links names every removed key
+            // (the extra look of the third read of slice 8).
+            assert!(now(generation).any());
         }
         for generation in [at(3), at(4)] {
             assert!(!now(Some(generation)).key(&[9; 32]));
             assert!(!now(Some(generation)).signer(&signer));
+            assert!(!now(Some(generation)).any());
         }
         assert!(!now(Some(at(2))).key(&[8; 32]));
+        let none = CutNow {
+            cuts: Cuts::of(&noted, &[]),
+            generation: Some(at(2)),
+            now: 1_000_000,
+        };
+        assert!(!none.any());
+    }
+
+    /// What a carry by command leaves out (the second read of slice 8, its
+    /// second finding): a version read in a generation the removal was made
+    /// after, whose signer or a link of whose chain is the removed key, at
+    /// the command's own time; in the removal's generation, nothing; in a
+    /// generation not known, everything of the key's. A generation is known
+    /// by its statement's commitment to its secret.
+    #[test]
+    fn a_carry_by_command_judges_where_the_version_was_read() {
+        let mut removal = change(3, Some(5_000), &[9], &[1, 2]);
+        removal.commitment = Some(cordelia_crypto::statement::commitment(&[3; 32]));
+        let mut before = change(2, Some(100), &[], &[1]);
+        before.commitment = Some(cordelia_crypto::statement::commitment(&[2; 32]));
+        let cuts = Cuts::of(&[before, removal], &[([9; 32], None)]);
+        assert_eq!(cuts.generation_of(2, &[2; 32]), Some(at(2)));
+        assert_eq!(cuts.generation_of(3, &[3; 32]), Some(at(3)));
+        assert_eq!(cuts.generation_of(3, &[2; 32]), None);
+        let named = [EntryLink {
+            hash: [1; 16],
+            signer: EntryLink::signer_of(&[9; 32]),
+        }];
+        let honest: [[u8; 32]; 1] = [[4; 32]];
+        let now = 1_000_000;
+        let over = Some(&named[..]);
+        // Signed by it, or over it, in the generation before: left out.
+        assert!(cuts.leaves_out(&[[9; 32]], "w.md", &[], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&honest, "w.md", &[over], Some(&at(2)), now, &[]));
+        // In the removal's generation: nothing.
+        assert!(!cuts.leaves_out(&honest, "w.md", &[over], Some(&at(3)), now, &[]));
+        // Not known: everything of the key's.
+        assert!(cuts.leaves_out(&honest, "w.md", &[over], None, now, &[]));
+        // What names no removed key is never left out.
+        assert!(!cuts.leaves_out(&honest, "w.md", &[], None, now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[Some(&[])], Some(&at(2)), now, &[]));
+        // Nor what the person named the key to take from.
+        assert!(!cuts.leaves_out(&[[9; 32]], "w.md", &[over], None, now, &[[9; 32]]));
+
+        // A chain that may have dropped links names every removed key (the
+        // third read of slice 8, its second finding): one at the most a
+        // chain keeps, and one that is missing. One link fewer is read.
+        let honest_link = EntryLink {
+            hash: [2; 16],
+            signer: EntryLink::signer_of(&[4; 32]),
+        };
+        let full = vec![honest_link; MAX_ENTRY_LINKS];
+        let short = vec![honest_link; MAX_ENTRY_LINKS - 1];
+        assert!(cuts.leaves_out(&honest, "w.md", &[Some(&full)], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&honest, "w.md", &[None], Some(&at(2)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[Some(&short)], Some(&at(2)), now, &[]));
+        // The index's chain, of any length, names every removed key (the
+        // fourth read's round): a merge says nothing of what stood behind
+        // the link where it stopped a chain.
+        assert!(cuts.leaves_out(
+            &honest,
+            "MEMORY.md",
+            &[Some(&short)],
+            Some(&at(2)),
+            now,
+            &[]
+        ));
+        assert!(cuts.leaves_out(&honest, "MEMORY.md", &[Some(&[])], Some(&at(2)), now, &[]));
+        assert!(!cuts.leaves_out(
+            &honest,
+            "MEMORY.md",
+            &[Some(&short)],
+            Some(&at(3)),
+            now,
+            &[]
+        ));
+        // Where nothing of a removed key is cut, it is carried all the same.
+        assert!(!cuts.leaves_out(&honest, "w.md", &[Some(&full)], Some(&at(3)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[None], Some(&at(3)), now, &[]));
+        // And a key the person named is not among those it names.
+        assert!(!cuts.leaves_out(
+            &honest,
+            "w.md",
+            &[Some(&full)],
+            Some(&at(2)),
+            now,
+            &[[9; 32]]
+        ));
     }
 
     /// A key that no noted change removes has everything cut.

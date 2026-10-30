@@ -177,6 +177,12 @@ fn publish_over(
                         .into(),
                 ));
             }
+            Published::KeptHere => {
+                return Err(ApiError::Conflict(
+                    "that key is a conflict copy kept on this device alone: nothing was written."
+                        .into(),
+                ));
+            }
         }
     };
     // Something was written in a channel of the device's own: the pass
