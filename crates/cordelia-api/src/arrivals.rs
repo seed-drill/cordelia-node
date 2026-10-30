@@ -896,67 +896,73 @@ mod tests {
         assert_eq!(s[1].text("notes", "z.md"), None);
     }
 
-    /// A version gone back to that nothing kept brought, whose chain is full
-    /// (the extra look of the third read of slice 8): device 0 wrote it a
-    /// hundred times over the tablet's late text, and the tablet's link fell
-    /// off its end. Its event is taken out by hand, as on a device stepped to
-    /// this version. The tablet's next late version is cut, and goes back to
-    /// it: no link of it names the tablet, but a chain at the most a chain
-    /// keeps names every removed key, and the file goes back to none.
+    /// A version gone back to that nothing kept brought, whose chain may
+    /// have dropped links (the extra look of the third read of slice 8, and
+    /// the fourth read's round): device 0 wrote it a hundred times over the
+    /// tablet's late text, and the tablet's link fell off its end; or it is
+    /// the index's, with a chain of one link, which a merge may have cut
+    /// short. Its event is taken out by hand, as on a device stepped to this
+    /// version. The tablet's next late version is cut, and goes back to it:
+    /// no link of it names the tablet, but such a chain names every removed
+    /// key, and the file goes back to none.
     #[test]
     fn a_version_gone_back_to_whose_chain_is_full_names_every_removed_key() {
         use crate::several::entry_by;
         use cordelia_core::protocol::MAX_ENTRY_LINKS;
-        let mut s = Several::of_one_person(3);
-        s.hold(&[0, 1, 2], "notes");
-        s.meet(&[0, 1, 2]);
-        let made = s.now + 10 * MARGIN;
-        s.now = made - MARGIN / 2;
-        let channel = s[1].own("notes");
-        let first_rev = cordelia_core::revision::next_under(None, 1).unwrap();
-        let full: Vec<Link> = (0..MAX_ENTRY_LINKS)
-            .map(|i| Link {
-                hash: [i as u8 + 1; 16],
-                signer: Link::signer_of(&s.key(0)),
-            })
-            .collect();
-        let busy = entry_by(
-            &s[0].identity,
-            &channel,
-            first_rev,
-            "z.md",
-            Value::Text("z, a hundred edits over the tablet's".into()),
-            &full,
-        );
-        let now = s.tick();
-        crate::take::take(&s[1].conn, &s[1].identity, &busy, now).unwrap();
-        let id = cordelia_crypto::derive::channel_id(&channel).unwrap();
-        let slot = s[1].slot_of("notes", "z.md");
-        kept::drop_from(&s[1].conn, &id, &slot, i64::MIN).unwrap();
-        let late = entry_by(
-            &s[2].identity,
-            &channel,
-            first_rev + 1,
-            "z.md",
-            Value::Text("z late".into()),
-            &[Link::of(
-                &Value::Text("z, a hundred edits over the tablet's".into()),
-                s.key(0),
-            )],
-        );
-        let now = s.tick();
-        crate::take::take(&s[1].conn, &s[1].identity, &late, now).unwrap();
-        let (events, _) = kept::of_file(&s[1].conn, &id, &slot).unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].before.as_ref().unwrap().author, s.key(0));
+        for file in ["z.md", INDEX] {
+            let mut s = Several::of_one_person(3);
+            s.hold(&[0, 1, 2], "notes");
+            s.meet(&[0, 1, 2]);
+            let made = s.now + 10 * MARGIN;
+            s.now = made - MARGIN / 2;
+            let channel = s[1].own("notes");
+            let first_rev = cordelia_core::revision::next_under(None, 1).unwrap();
+            let links = match file {
+                INDEX => 1,
+                _ => MAX_ENTRY_LINKS,
+            };
+            let chain: Vec<Link> = (0..links)
+                .map(|i| Link {
+                    hash: [i as u8 + 1; 16],
+                    signer: Link::signer_of(&s.key(0)),
+                })
+                .collect();
+            let busy_text = Value::Text("z, a hundred edits over the tablet's".into());
+            let busy = entry_by(
+                &s[0].identity,
+                &channel,
+                first_rev,
+                file,
+                busy_text.clone(),
+                &chain,
+            );
+            let now = s.tick();
+            crate::take::take(&s[1].conn, &s[1].identity, &busy, now).unwrap();
+            let id = cordelia_crypto::derive::channel_id(&channel).unwrap();
+            let slot = s[1].slot_of("notes", file);
+            kept::drop_from(&s[1].conn, &id, &slot, i64::MIN).unwrap();
+            let late = entry_by(
+                &s[2].identity,
+                &channel,
+                first_rev + 1,
+                file,
+                Value::Text("z late".into()),
+                &[Link::of(&busy_text, s.key(0))],
+            );
+            let now = s.tick();
+            crate::take::take(&s[1].conn, &s[1].identity, &late, now).unwrap();
+            let (events, _) = kept::of_file(&s[1].conn, &id, &slot).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].before.as_ref().unwrap().author, s.key(0));
 
-        s.now = made - 1;
-        let removal = s.change(0, &[0, 1], &[2]);
-        let now = s.tick();
-        let on = &s[1];
-        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
-        assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
-        assert_eq!(s[1].text("notes", "z.md"), None);
+            s.now = made - 1;
+            let removal = s.change(0, &[0, 1], &[2]);
+            let now = s.tick();
+            let on = &s[1];
+            let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+            assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+            assert_eq!(s[1].text("notes", file), None, "{file}");
+        }
     }
 
     /// A version gone back to counts as brought only where a kept event
