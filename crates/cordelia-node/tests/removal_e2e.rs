@@ -1338,15 +1338,21 @@ fn a_removed_device_that_shows_old_changes_pushes_no_head_out() {
                     key: relay_key,
                 };
                 let client = Client::to_relay(&relay).await.expect("the client connects");
-                let mut rounds = 0;
+                // Each show is counted where the relay answered it: a
+                // client whose shows were all refused would push nothing
+                // out, and prove nothing (the review of the whole build,
+                // its L5).
+                let (mut rounds, mut answered) = (0, 0);
                 while !stop.load(Ordering::SeqCst) {
                     for entry in &handed {
-                        let _ = client.show(entry).await;
+                        if client.show(entry).await.is_ok() {
+                            answered += 1;
+                        }
                     }
                     rounds += 1;
                     tokio::time::sleep(Duration::from_secs(6)).await;
                 }
-                rounds
+                (rounds, answered, handed.len())
             })
         })
     };
@@ -1378,8 +1384,13 @@ fn a_removed_device_that_shows_old_changes_pushes_no_head_out() {
     );
     assert_eq!(person_of(&f.laptop)["change"].as_u64(), Some(3));
     stop.store(true, Ordering::SeqCst);
-    let rounds = rounds.join().unwrap();
+    let (rounds, answered, each) = rounds.join().unwrap();
     assert!(rounds >= 4, "the client showed {rounds} rounds");
+    // The relay answered every show of at least four rounds' worth.
+    assert!(
+        answered >= 4 * each,
+        "the relay answered {answered} of the client's shows, of {each} each round"
+    );
     assert!(
         holds_change(&f.relay_a, &f.removal),
         "the removal was pushed out"
@@ -2467,7 +2478,43 @@ fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_kn
     );
 
     // After the laptop knows: a client with the tablet's key writes in every
-    // channel the tablet holds.
+    // channel the tablet holds, and sends a message in each messages
+    // channel it holds: a message of the ring, at a live number (the review
+    // of the whole build, its M2), whose ID (g) looks for.
+    use cordelia_crypto::message::{self, Message, To};
+    let late_message = Message {
+        asks: false,
+        sent: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        nonce: [0x5a; 16],
+        thread: [0; 16],
+        answers: [0; 16],
+        from: "plan".into(),
+        to: To::All,
+        link: None,
+        body: "the tablet, after the laptop knew".into(),
+    }
+    .to_value(|_| true)
+    .unwrap();
+    let late_id = hex::encode(message::message_id(&tablet_key, &late_message));
+    // Number 2: above every number of the tablet's a device holds less the
+    // ring, so live at each.
+    let late_number = 2;
+    let late_name = message::message_name(&tablet_key, late_number).unwrap();
+    let late_rev = message::message_rev(late_number).unwrap();
+    // It is a message as every reader takes one: in the tablet's ring.
+    assert!(matches!(
+        message::take(
+            &late_name,
+            &tablet_key,
+            late_rev,
+            &Value::Other(late_message.clone()),
+            |_| true
+        ),
+        Ok(message::Taken::Message { number: 2, .. })
+    ));
     let mut late = Vec::new();
     for secret in secrets_of(&tablet) {
         let number = 3;
@@ -2478,18 +2525,17 @@ fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_kn
             "late.md",
             "the tablet, after the laptop knew\n",
         ));
-        for channel in [
-            derive::personal_secret(&secret).unwrap(),
-            derive::messages_secret(&secret).unwrap(),
-        ] {
-            let inside = Inside {
-                name: "msg/late".into(),
-                value: Value::Text("the tablet, after the laptop knew".into()),
-                chain: Some(Vec::new()),
-            };
-            let rev = cordelia_core::revision::next_under(None, number).unwrap();
-            late.push(Entry::seal(&channel, &tablet_id, rev, &inside).unwrap());
-        }
+        let inside = Inside {
+            name: "late/word".into(),
+            value: Value::Text("the tablet, after the laptop knew".into()),
+            chain: Some(Vec::new()),
+        };
+        let rev = cordelia_core::revision::next_under(None, number).unwrap();
+        let personal = derive::personal_secret(&secret).unwrap();
+        late.push(Entry::seal(&personal, &tablet_id, rev, &inside).unwrap());
+        let messages = derive::messages_secret(&secret).unwrap();
+        let inside = message::inside(late_name.clone(), late_message.clone());
+        late.push(Entry::seal(&messages, &tablet_id, late_rev, &inside).unwrap());
     }
     pushes(&relay_a, &late);
     pushes(&relay_b, &late);
@@ -2511,11 +2557,22 @@ fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_kn
             assert!(!text.contains("after the laptop knew"), "(f): {text}");
         }
     }
-    // (g)
+    // (g) Neither shows the message, by its ID, in any command: not even
+    // `msg log`, which shows what a device held of a removed key's before
+    // it knew, since this was sent after.
+    let shown_id = &late_id[..8];
     for (n, notes) in [(&laptop, &l_notes), (&desktop, &d_notes)] {
-        let said = msg_in(n, notes, &["summary"]);
-        let said = String::from_utf8_lossy(&said.stdout).into_owned();
-        assert!(!said.contains("tablet"), "(g): {said}");
+        for args in [&["summary"][..], &["log"][..]] {
+            let said = msg_in(n, notes, args);
+            let said = String::from_utf8_lossy(&said.stdout).into_owned();
+            assert!(!said.contains(shown_id), "(g) {args:?}: {said}");
+            assert!(
+                !said.contains("after the laptop knew"),
+                "(g) {args:?}: {said}"
+            );
+        }
+        let read_it = msg_in(n, notes, &["read", &late_id]);
+        assert!(!read_it.status.success(), "(g) read");
     }
     let _ = p_notes;
 }
@@ -2622,6 +2679,33 @@ fn what_a_device_wrote_after_it_took_late_writing_is_set_aside() {
     assert!(history.contains("notes.md"), "(b): {history}");
     let status = laptop.cli(&["status"]);
     assert!(status.contains("set aside"), "(b): {status}");
+    // Said as rule 27's own, and put back by no restore (the review of the
+    // whole build, its H1 and M4): not by the local API, which any local
+    // process can call, an agent among them.
+    let listed = laptop.post(
+        "/api/v1/history/list",
+        serde_json::json!({ "of": "lab", "folder": null, "removed": false, "since": null }),
+    );
+    let own: Vec<&serde_json::Value> = listed["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|record| record["file"] == "notes.md" && record["change"] == "set_aside_own")
+        .collect();
+    assert_eq!(own.len(), 1, "(b): {listed}");
+    let restored = laptop.post(
+        "/api/v1/history/restore",
+        serde_json::json!({ "ids": [own[0]["id"].clone()] }),
+    );
+    let result = &restored["results"][0];
+    assert_eq!(result["done"], false, "(b): {restored}");
+    assert!(
+        result["message"]
+            .as_str()
+            .is_some_and(|said| said.contains("this device wrote it") && !said.contains("--from")),
+        "(b): {restored}"
+    );
+    assert_eq!(read(&l_mem.join("notes.md")), None, "(b)");
 
     // (c) A file written after reaches the desktop; neither the desktop's
     // folder nor a channel of its change holds the set-aside text.
