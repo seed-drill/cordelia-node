@@ -266,10 +266,17 @@ fn insert(
     stored_id: Option<&[u8; 32]>,
     own: bool,
 ) -> rusqlite::Result<i64> {
+    // An arrival is stamped no earlier than the newest arrival kept, as
+    // before the device's own versions were kept; a version of its own no
+    // earlier than the newest event of either kind, so that what it wrote
+    // after an arrival is never stamped before it (rule 27).
     let newest: Option<i64> = conn.query_row(
         "SELECT MAX(at) FROM (SELECT MAX(stored_at) AS at FROM file_arrivals_stored
-                              UNION ALL SELECT MAX(newest_at) FROM file_arrivals_dropped)",
-        [],
+                              WHERE own = 0 OR ?1
+                              UNION ALL SELECT MAX(newest_at) FROM file_arrivals_dropped
+                              UNION ALL SELECT MAX(newest_at) FROM file_own_dropped
+                              WHERE ?1)",
+        [own],
         |row| row.get(0),
     )?;
     let stored_at = newest.map_or(stored_at, |newest| stored_at.max(newest));

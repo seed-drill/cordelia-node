@@ -5633,8 +5633,10 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
+            // What a later step makes is no older object: step 26's tables.
             if NEW_IN_V24
                 .iter()
+                .chain(&["file_own_dropped", "file_own_set_aside"])
                 .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
             {
                 continue;
