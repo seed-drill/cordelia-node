@@ -784,24 +784,50 @@ pub fn relay_run_by(bin: PathBuf) -> Node {
     relay
 }
 
-/// The binary of the version before this one, which CI names in
-/// `CORDELIA_TEST_BINARY_BEFORE` (`.github/workflows/ci.yml`, TESTING.md).
-/// Where it is not given, `None`, and the test that asks says so and
-/// passes without running; but where `CI` is set, which it is on every CI
-/// runner, it fails, so that CI never passes it by.
-pub fn binary_before() -> Option<PathBuf> {
-    const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
-    let Some(before) = std::env::var_os(BINARY_BEFORE) else {
+/// The variable that names the binary of the release before messages
+/// between a person's agents (alpha.10): what the messages upgrade test
+/// runs (`.github/workflows/ci.yml`, `VERSION_BEFORE`; TESTING.md).
+pub const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
+
+/// The variable that names the binary of the release before shared
+/// channels (alpha.17, at step 20, with messages): the version before of
+/// the shared channel's record, which the relays and devices run now, and
+/// which `shared_e2e.rs` runs as the relay and as a device (`ci.yml`,
+/// `VERSION_BEFORE_SHARED`; decision 2026-10-10 §14).
+pub const BINARY_BEFORE_SHARED: &str = "CORDELIA_TEST_BINARY_BEFORE_SHARED";
+
+/// Whether the tests run in CI, as GitHub says it: `CI` is `true`. A `CI`
+/// set to anything else (`false`, `0`, empty) is not CI.
+pub fn in_ci() -> bool {
+    std::env::var("CI").is_ok_and(|ci| ci.eq_ignore_ascii_case("true") || ci == "1")
+}
+
+/// The binary that the variable `var` names. Where it is not given,
+/// `None`, and the test that asks says so and passes without running; but
+/// in CI ([`in_ci`]) it fails, so that CI never passes it by.
+pub fn binary_given(var: &str) -> Option<PathBuf> {
+    let Some(before) = std::env::var_os(var) else {
         assert!(
-            std::env::var_os("CI").is_none(),
-            "{BINARY_BEFORE} is not set: CI gives this test the binary of the version before"
+            !in_ci(),
+            "{var} is not set: CI gives this test the binary of the version before"
         );
-        eprintln!("{BINARY_BEFORE} is not set: this test did not run");
+        eprintln!("{var} is not set: this test did not run");
         return None;
     };
     let before = PathBuf::from(before);
     assert!(before.is_file(), "{}", before.display());
     Some(before)
+}
+
+/// The binary of the release before messages ([`BINARY_BEFORE`]).
+pub fn binary_before() -> Option<PathBuf> {
+    binary_given(BINARY_BEFORE)
+}
+
+/// The binary of the release before shared channels
+/// ([`BINARY_BEFORE_SHARED`]).
+pub fn binary_before_shared() -> Option<PathBuf> {
+    binary_given(BINARY_BEFORE_SHARED)
 }
 
 fn node_made(

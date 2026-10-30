@@ -2645,15 +2645,15 @@ fn the_status_carries_the_shared_object_and_no_level_of_it() {
 
 /// A relay of the version before carries a shared channel with no change
 /// (decision 2026-10-10 §8, §14 "A relay on the version before", T2): the
-/// relay is the binary CI names as the version before, as
-/// `Node::binary_given` runs it. Through it Alice shares a channel and Bob
+/// relay is the binary CI names as the version before shared channels
+/// (alpha.17, `CORDELIA_TEST_BINARY_BEFORE_SHARED`), the relays run now. Through it Alice shares a channel and Bob
 /// takes it, by its share pair channel; each comes to hold the other's key
 /// from its empty anew record; Bob's agent writes there, and Alice's reads
 /// it inside the frame of another person, and answers; the relay holds
 /// each message, sealed, under its author's key.
 #[test]
 fn a_relay_carries_a_shared_channel_with_no_change() {
-    let Some(before) = binary_before() else {
+    let Some(before) = binary_before_shared() else {
         return;
     };
     let relay = relay_run_by(before);
@@ -2700,19 +2700,56 @@ fn a_relay_carries_a_shared_channel_with_no_change() {
     }
 }
 
+/// The channel, slot and revision of each entry `author` signed that `n`
+/// stores, with the place `n` stored it at, in that order.
+fn entries_by(n: &Node, author: &str) -> Vec<(Vec<u8>, Vec<u8>, i64, i64)> {
+    let author = cordelia_crypto::bech32::decode_public_key(author).unwrap();
+    let db = rusqlite::Connection::open_with_flags(
+        n.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db.prepare("SELECT channel_id, slot, rev, seq FROM entries WHERE author = ?1 ORDER BY seq")
+        .unwrap()
+        .query_map([&author[..]], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+}
+
+/// The count `msg log` on `n`, in `dir`, says of the entries from
+/// `device` that were not messages: 0 where it says no such line.
+fn not_messages_from(n: &Node, dir: &Path, device: &str) -> u64 {
+    let said = msg_in(n, dir, &["log"], b"");
+    let printed = format!("{}{}", out_of(&said), err_of(&said));
+    let tail = format!(" entries from \"{device}\" were not messages, and were not shown.");
+    printed
+        .lines()
+        .find_map(|line| line.trim().strip_suffix(tail.as_str())?.parse().ok())
+        .unwrap_or(0)
+}
+
 /// A device of the version before ignores the person's lists of shared
 /// channels (decision 2026-10-10 §3.4, §14 "A device of the version
-/// before"): the desktop runs the binary CI names as the version before,
-/// beside the laptop on this version, through the test's own relay. The
-/// laptop makes a shared channel and subscribes a folder, and its list
-/// goes into the personal channel; the desktop's names are
-/// as they were, its database stays at the version before's step, and
-/// `accept --channel` is refused there by its parser. Once the desktop
-/// takes this version, on the same data directory, it holds the channel
-/// and the subscription.
+/// before"): the desktop runs the binary CI names as the version before
+/// shared channels (alpha.17, at step 20, with messages), beside the
+/// laptop on this version, through the test's own relay. The laptop makes
+/// a shared channel and subscribes two folders, its list goes into the
+/// personal channel, and one of its agents reads a shared message that the
+/// other sent, so that its `sread/` list goes into the messages channel.
+/// Once the desktop holds the laptop's list and an entry the laptop wrote
+/// after it, its names are as they were, its database stays at the
+/// version before's step, `accept --channel` is refused there by its
+/// parser, and its `msg log` counts the laptop's `sread/` list among the
+/// laptop's entries that were not messages (§14: `log`'s line). Once the
+/// desktop takes this version, on the same data directory, it holds the
+/// channel and the subscription, and that count is 0.
 #[test]
 fn a_device_of_the_version_before_ignores_shared_lists() {
-    let Some(before) = binary_before() else {
+    let Some(before) = binary_before_shared() else {
         return;
     };
     let relay = relay_started();
@@ -2729,7 +2766,8 @@ fn a_device_of_the_version_before_ignores_shared_lists() {
     has_applied(&desktop, 1, &all);
     sync_on(&desktop);
     let laptop_notes = maps_folder(&laptop, "notes", "notes");
-    maps_folder(&desktop, "notes", "notes");
+    let laptop_work = maps_folder(&laptop, "work", "work");
+    let desktop_notes = maps_folder(&desktop, "notes", "notes");
     let names_before = wait_for("the desktop holds the name", &all, 120, || {
         let names = desktop.cli(&["channels"]);
         names.contains("notes").then_some(names)
@@ -2741,12 +2779,68 @@ fn a_device_of_the_version_before_ignores_shared_lists() {
     .unwrap()
     .query_row("PRAGMA user_version", [], |row| row.get(0))
     .unwrap();
+    assert_eq!(
+        version, 20,
+        "the version before shared channels is at step 20"
+    );
+    assert_eq!(not_messages_from(&desktop, &desktop_notes, "laptop"), 0);
 
     makes(&laptop, "design-review", &[]);
     subscribes(&laptop, &laptop_notes, "design-review");
-    // Long enough for the desktop's passes to have gone through every
-    // channel it holds, several times over.
-    std::thread::sleep(Duration::from_secs(30));
+    subscribes(&laptop, &laptop_work, "design-review");
+    let shared = id_of(&channel_of(&laptop, "design-review").unwrap());
+    sends_into(
+        &[&relay, &laptop],
+        &laptop,
+        &laptop_work,
+        "design-review",
+        &[],
+        "from one agent to another",
+    );
+    let said = reads_next(&[&relay, &laptop], &laptop, &laptop_notes);
+    assert!(said.contains("\nfrom one agent to another\n"), "{said}");
+
+    // The laptop's list, and what it wrote after it outside the shared
+    // channel: its `sread/` list among them.
+    let list_rev: i64 = rusqlite::Connection::open_with_flags(
+        laptop.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap()
+    .query_row("SELECT rev FROM shared_lists", [], |row| row.get(0))
+    .unwrap();
+    let laptop_key = key_of(&laptop);
+    let wait_for_after = |what: &str| {
+        wait_for(what, &all, 180, || {
+            let written = entries_by(&laptop, &laptop_key);
+            let list = written
+                .iter()
+                .filter(|(channel, ..)| channel[..] != shared[..])
+                .find(|(_, _, rev, _)| *rev == list_rev)?
+                .clone();
+            let after: Vec<_> = written
+                .iter()
+                .filter(|(channel, _, _, seq)| channel[..] != shared[..] && *seq > list.3)
+                .collect();
+            let held = entries_by(&desktop, &laptop_key);
+            let holds = |(channel, slot, rev, _): &(Vec<u8>, Vec<u8>, i64, i64)| {
+                held.iter()
+                    .any(|(c, s, r, _)| c == channel && s == slot && r >= rev)
+            };
+            (holds(&list) && after.iter().any(|entry| holds(entry))).then_some(())
+        })
+    };
+    wait_for_after("the desktop holds the list and an entry written after it");
+    let counted = wait_for(
+        "the desktop's log counts the sread/ list",
+        &all,
+        120,
+        || {
+            let counted = not_messages_from(&desktop, &desktop_notes, "laptop");
+            (counted > 0).then_some(counted)
+        },
+    );
+    assert!(counted >= 1, "{counted}");
     assert_eq!(desktop.cli(&["channels"]), names_before);
     assert!(healthy(&desktop).is_some());
     let db = rusqlite::Connection::open_with_flags(
@@ -2759,7 +2853,6 @@ fn a_device_of_the_version_before_ignores_shared_lists() {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
     assert_eq!(after, version);
-    assert!(after < 21, "the version before is at step {after}");
     let tables: i64 = db
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'shared%'",
@@ -2795,4 +2888,7 @@ fn a_device_of_the_version_before_ignores_shared_lists() {
         subscribed.contains(&("notes".to_string(), "design-review".to_string())),
         "{subscribed:?}"
     );
+    let said = msg_in(&desktop, &desktop_notes, &["log"], b"");
+    assert!(said.status.success(), "{}", err_of(&said));
+    assert_eq!(not_messages_from(&desktop, &desktop_notes, "laptop"), 0);
 }
