@@ -2072,6 +2072,7 @@ fn as_a_fork_of_the_version_before(node: &Node) {
          DROP TABLE file_arrivals;
          DROP TABLE file_arrivals_stored;
          DROP TABLE file_arrivals_dropped;
+         DROP TABLE file_copies;
          DELETE FROM node_meta WHERE key = 'person.judge_kept';
          UPDATE person SET state = 'fork';
          COMMIT;",
