@@ -3204,13 +3204,8 @@ impl Carry<'_> {
             }
             carried += 1;
         }
-        // The events of each file that was not carried are kept, with
-        // nothing to go back to: a late arrival there still opens a window
-        // of rule 27 at a later carry (decision 2026-10-24 (removal)).
-        if cut.is_some() {
-            cordelia_storage::arrivals::keep_left(conn, &channel, &derive::channel_id(to)?)?;
-        }
-        // What the store holds of the channel that was left is dropped.
+        // What the store holds of the channel that was left is dropped, and
+        // with it the arrivals of each file that was not carried.
         entries::remove_channel(conn, &channel)?;
         // And with it what the device kept of each relay for it.
         kept_rows::forget_channel(conn, &channel)?;

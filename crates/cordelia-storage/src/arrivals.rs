@@ -91,12 +91,6 @@ pub struct OwnDropped {
     pub newest_at: i64,
 }
 
-/// The slot of a channel that keeps the events of files a carry did not
-/// carry (rule 27): what came in them still says when a device first took
-/// a removed key's late writing. No file's slot is it: a slot is a keyed
-/// hash of a name.
-pub const LEFT_SLOT: [u8; 32] = [0; 32];
-
 /// What went past the bound, for one generation of a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dropped {
@@ -955,60 +949,6 @@ pub fn files_of_channel(
         })
         .map_err(storage)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
-}
-
-/// Keep the events of every file of `from` that a carry did not move, and
-/// what went past their bounds, in [`LEFT_SLOT`] of `to`, with no version
-/// to go back to and no entry stored (rule 27): a file whose current
-/// version a carry made before the device knew did not carry (a delete,
-/// say) still says when a removed key's late writing first came. Called
-/// before the carry drops what it holds of `from`.
-pub fn keep_left(conn: &Connection, from: &[u8; 32], to: &[u8; 32]) -> Result<(), CordeliaError> {
-    conn.execute_batch("SAVEPOINT file_left").map_err(storage)?;
-    let kept = (|| -> rusqlite::Result<()> {
-        conn.execute(
-            "UPDATE file_arrivals_stored SET channel_id = ?2, slot = ?3, before_author = NULL,
-                 before_rev = NULL, before_delete = NULL, before_content = NULL,
-                 before_author_sig = NULL, before_channel_sig = NULL, stored_id = NULL
-             WHERE channel_id = ?1",
-            params![from.as_slice(), to.as_slice(), LEFT_SLOT.as_slice()],
-        )?;
-        conn.execute(
-            "INSERT INTO file_arrivals_dropped (channel_id, slot, number, hash, newest_at,
-                 first_place)
-             SELECT ?2, ?3, number, hash, MAX(newest_at), MIN(first_place)
-             FROM file_arrivals_dropped WHERE channel_id = ?1 GROUP BY number, hash
-             ON CONFLICT(channel_id, slot, number, hash)
-             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at),
-                           first_place = MIN(first_place, excluded.first_place),
-                           before_author = NULL, before_rev = NULL, before_delete = NULL,
-                           before_content = NULL, before_author_sig = NULL,
-                           before_channel_sig = NULL, first_stored_id = NULL",
-            params![from.as_slice(), to.as_slice(), LEFT_SLOT.as_slice()],
-        )?;
-        conn.execute(
-            "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at)
-             SELECT ?2, ?3, number, hash, MAX(newest_at)
-             FROM file_own_dropped WHERE channel_id = ?1 GROUP BY number, hash
-             ON CONFLICT(channel_id, slot, number, hash)
-             DO UPDATE SET newest_at = MAX(newest_at, excluded.newest_at)",
-            params![from.as_slice(), to.as_slice(), LEFT_SLOT.as_slice()],
-        )?;
-        for table in ["file_arrivals_dropped", "file_own_dropped"] {
-            conn.execute(
-                &format!("DELETE FROM {table} WHERE channel_id = ?1"),
-                params![from.as_slice()],
-            )?;
-        }
-        keep_to_the_bound(conn, to, &LEFT_SLOT)?;
-        keep_own_to_the_bound(conn, to, &LEFT_SLOT)
-    })();
-    let end = match kept {
-        Ok(()) => "RELEASE file_left",
-        Err(_) => "ROLLBACK TO file_left; RELEASE file_left",
-    };
-    conn.execute_batch(end).map_err(storage)?;
-    kept.map_err(storage)
 }
 
 /// Keep the generation `number` and `hash` as one in which a carry set

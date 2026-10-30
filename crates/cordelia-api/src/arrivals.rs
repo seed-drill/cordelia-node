@@ -1797,11 +1797,11 @@ mod tests {
     /// Rule 27, across a carry made before the device knew: the tablet's
     /// late writing is a delete of `w.md`, which the laptop takes, and then
     /// the laptop writes `notes.md` and renews, apart from the removal. Its
-    /// renewal carries no `w.md` (a delete is no version), but the events of
-    /// that file are kept: when it moves to the desktop's change, the late
-    /// delete still opens the window, and `notes.md` goes back to none.
+    /// renewal carries the delete with its events: when it moves to the
+    /// desktop's change, the late delete still opens the window, and
+    /// `notes.md` goes back to none.
     #[test]
-    fn a_late_arrival_in_a_file_not_carried_still_opens_the_window() {
+    fn a_late_delete_carried_before_the_device_knew_still_opens_the_window() {
         use crate::several::entry_by;
         let mut s = Several::of_one_person(3);
         s.hold(&[0, 1, 2], "notes");
@@ -1883,6 +1883,57 @@ mod tests {
             matches!(taken, Taken::Shown(Shown::Applied(_))),
             "{taken:?}"
         );
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+    }
+
+    /// Rule 27, what went past the arrivals' bound in a change made apart
+    /// from the removal: the laptop renews (its change 3, apart), writes
+    /// `notes.md` there, and then more than `MAX_FILE_ARRIVALS` arrivals of
+    /// the tablet's come in `w.md` (set by hand), so the first go past the
+    /// bound. Everything of the tablet's is cut there, at any time, and the
+    /// times of what went are not kept but the newest: the window opens at
+    /// any time, so `notes.md`, written before the arrivals kept, goes back
+    /// to none, though it was written long before the desktop's removal.
+    #[test]
+    fn what_went_past_the_bound_in_a_change_made_apart_opens_the_window_at_any_time() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.write(1, "notes", "w.md", "w, long before");
+        s.meet(&[0, 1, 2]);
+        s.change(1, &[1, 0, 2], &[]);
+        s.write(1, "notes", "notes.md", "written in the change made apart");
+        let generation = generation_of(&s, 1);
+        let on = &s[1];
+        let channel = cordelia_crypto::derive::channel_id(&on.own("notes")).unwrap();
+        let slot = on.slot_of("notes", "w.md");
+        let tablet = Arrival {
+            signer: Link::signer_of(&s.key(2)),
+            link: None,
+            times: 1,
+        };
+        for i in 0..=MAX_FILE_ARRIVALS {
+            kept::note(
+                &on.conn,
+                &channel,
+                &slot,
+                generation.0,
+                &generation.1,
+                s.now + 1 + i as i64,
+                &[],
+                None,
+                None,
+                &[tablet],
+            )
+            .unwrap();
+        }
+        assert_eq!(kept::of_file(&on.conn, &channel, &slot).unwrap().1.len(), 1);
+        // The desktop removes the tablet long after, from change 2.
+        s.now += 10 * MARGIN + MAX_FILE_ARRIVALS as i64;
+        let removal = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(matches!(taken, Taken::Shown(Shown::Moved(_))), "{taken:?}");
         assert_eq!(s[1].text("notes", "notes.md"), None);
     }
 
