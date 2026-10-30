@@ -25,6 +25,7 @@ use common::*;
 
 use cordelia_crypto::addition::Addition;
 use cordelia_crypto::bech32::decode_public_key;
+use cordelia_crypto::change_entry::{self, DeviceSecret};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
@@ -897,8 +898,19 @@ fn new_at_either(
 ///   tablet as removed by the change made apart;
 /// - (e) the desktop applies change 4, with no phrase typed there;
 /// - (f) the file edited on each while closed arrives on the other;
-/// - (g) neither the tablet's database nor the phone's holds change 4's
-///   secret.
+/// - (g) change 4's entry, as relay A holds it, gives neither the tablet's
+///   key nor the phone's its secret: not as a device reads it
+///   (`open_for_device`), and not at any place of its list of sealed
+///   secrets (`opens_at_any_place`), as a device taken over could read it
+///   (T20); and neither device's database holds the secret. A removed
+///   device asks for no change, so the database alone would hold nothing
+///   whatever change 4 sealed. The entry is checked as soon as change 4 is
+///   made, before (e).
+///
+/// Not checked here: rule 5's reset of a push open at the commit. (b)
+/// counts what either relay holds 15 seconds after both devices closed, so
+/// what was sent in those seconds is counted as held before. It catches
+/// rule 10 undone, as the files are written after the count.
 ///
 /// Taken out, each run once by hand when the test was built:
 ///
@@ -920,7 +932,14 @@ fn new_at_either(
 ///   `statement::judge` as well, `person::judged` refuses it for the head
 ///   set aside that it joins, and (d) fails;
 /// - rule 8, step 3 (a change made apart that removes a device is a fork
-///   there, as on the version before): (c) fails.
+///   there, as on the version before): (c) fails;
+/// - change 4 sealed to the tablet's key, its statement's lists unchanged
+///   (`change_entry::build` sealing the desktop's place to it: a list has
+///   one place for each device listed, and one more is no list): (g)
+///   fails, at `opens_at_any_place`. `open_for_device` alone does not catch
+///   it, as it tries only the place of a device the statement lists, nor
+///   does the database check. The laptop's own place sealed so is refused
+///   by `cordelia settle` itself.
 #[test]
 fn two_removals_made_apart_close_both_sides_until_settle() {
     let mut relay_a = relay_started();
@@ -1114,6 +1133,51 @@ fn two_removals_made_apart_close_both_sides_until_settle() {
     let change_4 = seen["latest"].as_str().unwrap().to_string();
     let four = applied_secret_of(&laptop);
 
+    // (g) Change 4's entry gives neither removed key its secret, at any
+    // place: a device taken over reads what it likes, and a removed device
+    // that keeps the rules asks for no change at all.
+    wait_for("relay A holds change 4", &all!(), 120, || {
+        holds_change(&relay_a, &change_4).then_some(())
+    });
+    let entry = change_entries_at(&relay_a)
+        .iter()
+        .map(|bytes| Entry::from_wire(bytes).unwrap())
+        .find(|entry| hex::encode(entry.id()) == change_4)
+        .unwrap()
+        .check()
+        .unwrap();
+    let following = cordelia_storage::person::person(&store_of(&laptop))
+        .unwrap()
+        .unwrap()
+        .following;
+    for (who, removed) in [("tablet", &tablet), ("phone", &phone)] {
+        let identity = NodeIdentity::from_file(&removed.data_dir().join("identity.key")).unwrap();
+        let opened = change_entry::open_for_device(
+            &entry,
+            &following.phrase_key,
+            &following.phrase_channel,
+            &following.statement_key,
+            &identity,
+        )
+        .unwrap();
+        assert!(
+            !matches!(opened.secret, DeviceSecret::Opened(_)),
+            "(g): change 4 opens for the {who}"
+        );
+        assert_eq!(
+            change_entry::opens_at_any_place(
+                &entry,
+                &following.phrase_key,
+                &following.phrase_channel,
+                &following.statement_key,
+                &identity,
+            )
+            .unwrap(),
+            None,
+            "(g): change 4 seals its secret to the {who}'s key"
+        );
+    }
+
     // (e) The desktop applies it, with no phrase.
     wait_for("the desktop applies change 4", &all!(), 180, || {
         let seen = person_of(&desktop);
@@ -1138,8 +1202,8 @@ fn two_removals_made_apart_close_both_sides_until_settle() {
         },
     );
 
-    // (g) Neither removed device holds change 4's secret, and each is
-    // still removed.
+    // (g), as the databases hold it: neither removed device holds change
+    // 4's secret, and each is still removed.
     for (who, removed) in [("tablet", &tablet), ("phone", &phone)] {
         assert!(
             !secrets_of(removed).contains(&four),
