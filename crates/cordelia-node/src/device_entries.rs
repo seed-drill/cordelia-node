@@ -1800,15 +1800,23 @@ impl DeviceEntries {
     /// 2026-10-10 §6.1; [`cordelia_api::shared_messages::write_list`]): only
     /// once the messages channel was fetched since the node started. Says
     /// whether it wrote one.
+    ///
+    /// As [`Self::write_person_list`], what decides it is read without
+    /// opening or checking anything first (issue #221).
     fn write_shared_list(&self) -> bool {
         let db = lock(&self.state.db);
-        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
         let identity = &self.state.identity;
-        let written = cordelia_api::shared_messages::write_list(
+        let written = cordelia_api::shared_messages::write_list_where_changed(
             &db,
             identity,
             self.unix(),
-            fetched.unwrap_or(false),
+            fetched,
+            &mut seen,
         );
         match written {
             Ok(written) => written.is_some(),

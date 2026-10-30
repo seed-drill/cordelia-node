@@ -204,6 +204,27 @@ pub fn write_list(
     in_one(conn, || list_written(conn, identity, now, fetched, None))
 }
 
+/// [`write_list`], as each pass asks it: where what decides it is what it
+/// was at a pass that wrote nothing, nothing is opened or checked
+/// ([`crate::marks::ListsSeen`], issue #221). `fetched` says, of the
+/// messages channel's ID, whether it was fetched since the node started.
+pub fn write_list_where_changed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    now: i64,
+    fetched: impl FnOnce(&[u8; 32]) -> bool,
+    seen: &mut crate::marks::ListsSeen,
+) -> Result<Option<u64>, PersonError> {
+    seen.where_changed(
+        conn,
+        &identity.public_key(),
+        PersonList::SharedReads,
+        now,
+        fetched,
+        |fetched| write_list(conn, identity, now, fetched),
+    )
+}
+
 /// [`write_list`], in the caller's write; with `above`, a relay answered
 /// that it holds another list of the device's at that revision, and it is
 /// written again above it, at most three times in a row, counted apart.

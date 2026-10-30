@@ -2175,4 +2175,59 @@ mod tests {
         assert_eq!(pass(&mut seen, true), None);
         assert_eq!(asked.get(), 7);
     }
+    /// The list of shared marks, `sread/` (decision 2026-10-10 §6.1), is
+    /// asked as the person's list is (issue #221): ten passes after it is
+    /// written ask nothing and change nothing; a new mark in the table and
+    /// a list of the device's own at a higher revision are each asked
+    /// once, and what is written holds every mark of the table.
+    #[test]
+    fn the_list_of_shared_marks_is_asked_again_only_where_what_decides_it_changed() {
+        let s = devices(2);
+        let t = s.now;
+        let conn = &s[0].conn;
+        let asked = std::cell::Cell::new(0);
+        let pass = |seen: &mut ListsSeen| {
+            let write = |fetched: bool| {
+                asked.set(asked.get() + 1);
+                crate::shared_messages::write_list(conn, &s[0].identity, t, fetched)
+            };
+            seen.where_changed(conn, &s.key(0), PersonList::SharedReads, t, |_| true, write)
+                .unwrap()
+        };
+        let listed = || {
+            let held = HeldList::of(conn, &s.key(0), PersonList::SharedReads).unwrap();
+            let (_, value) = held.held.expect("a list is held");
+            ReadMarks::from_value(&value.expect("the list reads"))
+                .unwrap()
+                .marks
+        };
+        let mut seen = ListsSeen::default();
+        crate::shared_messages::mark(conn, &[1; 16], t).unwrap();
+        assert_eq!(pass(&mut seen), Some(1));
+        assert_eq!(pass(&mut seen), None);
+        assert_eq!(asked.get(), 2);
+        let changes = conn.total_changes();
+        for _ in 0..10 {
+            assert_eq!(pass(&mut seen), None);
+        }
+        assert_eq!(asked.get(), 2, "nothing changed: nothing is asked");
+        assert_eq!(conn.total_changes(), changes);
+
+        // A new mark in the table.
+        crate::shared_messages::mark(conn, &[2; 16], t).unwrap();
+        assert_eq!(pass(&mut seen), Some(2));
+        assert_eq!(listed(), vec![[2; 16], [1; 16]]);
+        assert_eq!(pass(&mut seen), None);
+        assert_eq!(asked.get(), 4);
+
+        // A list of its own at a higher revision.
+        assert_eq!(
+            crate::shared_messages::list_written(conn, &s[0].identity, t, true, Some(2)).unwrap(),
+            Some(3)
+        );
+        assert_eq!(pass(&mut seen), None);
+        assert_eq!(asked.get(), 5);
+        assert_eq!(pass(&mut seen), None);
+        assert_eq!(asked.get(), 5);
+    }
 }
