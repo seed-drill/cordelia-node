@@ -7,7 +7,10 @@
 //! chain of the file stored before (a link is only a text's hash and its
 //! signer, so a text written back stands again). Where its chain is full
 //! (100 links), the other keys its links name are kept with it: a removed
-//! key's link there is cut all the same. With them are kept the generation
+//! key's link there is cut all the same. An entry whose chain may have
+//! dropped links ([`crate::cut::may_have_dropped_links`]: missing, full,
+//! or the index's) is marked, and judged as an arrival of every removed
+//! key. With them are kept the generation
 //! the device was in, when it stored the entry, and the version that was
 //! current in the file before it. The device's own versions make none.
 //!
@@ -50,9 +53,6 @@ pub(crate) struct Before {
     /// The most times each link, by hash and signer, stands in a chain of a
     /// version the file holds.
     times: HashMap<LinkOf, u32>,
-    /// The hash of each version the file holds, as a link names it: a full
-    /// chain that names one of them dropped nothing written since.
-    held: Vec<[u8; 16]>,
 }
 
 /// How many times each link stands in `chain`.
@@ -78,9 +78,7 @@ pub(crate) fn before(
     let held = entries::slot_entries(conn, &entry.channel, &entry.slot)?;
     let slot = version::current(&held, secret, statement, |key| counting.counts(key))?;
     let mut times: HashMap<LinkOf, u32> = HashMap::new();
-    let mut held_hashes: Vec<[u8; 16]> = Vec::new();
     for version in slot.current.iter().chain(&slot.lost) {
-        held_hashes.push(version.value.chain_hash());
         for one in &version.entries {
             for (link, count) in counted(one.chain.as_deref().unwrap_or_default()) {
                 let kept = times.entry(link).or_insert(0);
@@ -98,11 +96,7 @@ pub(crate) fn before(
             .find(|entry| entry.id() == one.id)
             .map(|entry| Entry::clone(entry))
     });
-    Ok(Before {
-        current,
-        times,
-        held: held_hashes,
-    })
+    Ok(Before { current, times })
 }
 
 /// Keep the arrivals that `entry`, which the door just stored in the file
@@ -130,22 +124,13 @@ pub(crate) fn noted_at_the_door(
     let opened = entry.open(secret).ok();
     let name = opened.as_ref().map(|inside| inside.name.clone());
     let chain = opened.and_then(|inside| inside.chain);
-    // A chain that may have dropped what it was written after (the extra
-    // look of the third read of slice 8): one that is missing, and one at
-    // the most a chain keeps that names no version the file holds here, so
-    // that what was written since that version may have fallen off its old
-    // end. The index's is never trusted so: a merge weaves two chains in
-    // turn and drops from the old end of both, so a removed key's link from
-    // one side can go while an older link from the other stays. Such an
-    // event is judged at a carry as an arrival of every removed key.
-    let unknown = match &chain {
-        None => true,
-        Some(links) if links.len() >= MAX_ENTRY_LINKS => {
-            name.as_deref() == Some(crate::person::INDEX_FILE)
-                || !links.iter().any(|link| before.held.contains(&link.hash))
-        }
-        Some(_) => false,
-    };
+    // A chain that may have dropped what it was written after
+    // ([`crate::cut::may_have_dropped_links`]): one that is missing, one at
+    // the most a chain keeps, whatever version the file holds here and
+    // whatever link of it names one (the fourth read of slice 8), and every
+    // chain of the index. Such an event is judged at a carry as an arrival
+    // of every removed key.
+    let unknown = crate::cut::may_have_dropped_links(name.as_deref(), chain.as_deref());
     let chain = chain.unwrap_or_default();
     let mut links: Vec<(LinkOf, u32)> = counted(&chain).into_iter().collect();
     links.sort();
@@ -333,8 +318,8 @@ pub(crate) fn cut_of_channel(
         // signers, and every key its chains name, are judged at the cut's
         // own generation and time, and where one is cut the file goes back
         // to none. That fails safe.
-        // A chain that may have dropped links, missing or at the most a
-        // chain keeps, names every removed key there.
+        // A chain that may have dropped links (missing, at the most a chain
+        // keeps, or the index's) names every removed key there.
         let target = target.filter(|version| {
             brought
                 || !version.entries.iter().any(|one| {
@@ -344,11 +329,10 @@ pub(crate) fn cut_of_channel(
                             .iter()
                             .flatten()
                             .any(|link| of_signer(&link.signer, &first.generation, first.at))
-                        || (one
-                            .chain
-                            .as_ref()
-                            .is_none_or(|chain| chain.len() >= MAX_ENTRY_LINKS)
-                            && any_key(&first.generation, first.at))
+                        || (crate::cut::may_have_dropped_links(
+                            Some(&version.name),
+                            one.chain.as_deref(),
+                        ) && any_key(&first.generation, first.at))
                 })
         });
         cut.insert(
@@ -595,7 +579,11 @@ mod tests {
     /// earlier standing of a removed key's link may have fallen off its end,
     /// that link is cut all the same, though it stands no more times than
     /// in a chain the file held before. With room in the chain, the same
-    /// link makes no arrival, and the honest version is carried.
+    /// link makes no arrival, and the honest version is carried. Since the
+    /// fourth read of slice 8, every full chain is judged as an arrival of
+    /// every removed key, so the keys it names are no longer what cuts it:
+    /// its old end names the version device 1 holds, and that is not
+    /// trusted either.
     #[test]
     fn in_a_full_chain_a_removed_keys_link_is_cut_all_the_same() {
         use crate::several::entry_by;
@@ -628,9 +616,8 @@ mod tests {
                     hash: [i as u8; 16],
                     signer: Link::signer_of(&s.key(0)),
                 }));
-                // Its old end names the version device 1 holds, so the chain
-                // is not taken as one that may have dropped links (the third
-                // read of slice 8): only the keys a full chain names cut it.
+                // Its old end names the version device 1 holds, which is no
+                // sign that nothing fell off it (the fourth read of slice 8).
                 chain[MAX_ENTRY_LINKS - 1] = Link::of(&Value::Text("one\n".into()), s.key(0));
             }
             let second = entry_by(
@@ -660,17 +647,20 @@ mod tests {
     }
 
     /// A full chain that may have dropped a removed key's link (the extra
-    /// look of the third read of slice 8): the tablet's late text reached
-    /// device 0, which edited it a hundred times and more before it heard,
-    /// so the tablet's link fell off the old end of its chain. Device 1
-    /// takes only device 0's newest version, after the cut time, and no link
-    /// of it names the tablet. Where device 1 held no version of the file
-    /// before, nothing in the chain says what was written since, so the
-    /// event is judged as an arrival of every removed key, and the carry
-    /// leaves it out. Where the chain names the version device 1 held, it
-    /// dropped nothing written since that one: it is carried. The index's
-    /// chain is never trusted so, since a merge drops links from either of
-    /// the chains it weaves.
+    /// look of the third read of slice 8, and the fourth read's high): the
+    /// tablet's late text reached device 0, which edited it a hundred times
+    /// and more before it heard, so the tablet's link fell off the old end
+    /// of its chain. Device 1 takes only device 0's newest version, after
+    /// the cut time, and no link of it names the tablet. A full chain says
+    /// nothing of what fell off its end, whatever version device 1 holds
+    /// and whatever link of it names one: the event is judged as an arrival
+    /// of every removed key, and the carry leaves it out. So with no version
+    /// held (the file goes back to none); with the version held named at
+    /// the chain's old end; with it named in the middle, where device 0
+    /// went back to "one" among its last hundred edits (the fourth read's
+    /// sequence); with a delete held, and a delete's link, whose hash is
+    /// every delete's, in the middle (the file goes back to the delete);
+    /// and the index's.
     #[test]
     fn a_full_chain_that_may_have_dropped_a_removed_keys_link_is_cut() {
         use crate::several::entry_by;
@@ -678,12 +668,16 @@ mod tests {
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum Held {
             Nothing,
-            NamedInTheChain,
+            NamedAtTheOldEnd,
+            NamedInTheMiddle,
+            ADeleteNamedInTheMiddle,
             NamedInTheIndexsChain,
         }
         for held in [
             Held::Nothing,
-            Held::NamedInTheChain,
+            Held::NamedAtTheOldEnd,
+            Held::NamedInTheMiddle,
+            Held::ADeleteNamedInTheMiddle,
             Held::NamedInTheIndexsChain,
         ] {
             let file = match held {
@@ -695,16 +689,20 @@ mod tests {
             s.meet(&[0, 1, 2]);
             let channel = s[1].own("notes");
             let first_rev = cordelia_core::revision::next_under(None, 1).unwrap();
-            let one = Value::Text("one\n".into());
+            let one = match held {
+                Held::ADeleteNamedInTheMiddle => Value::Delete,
+                _ => Value::Text("one\n".into()),
+            };
             if held != Held::Nothing {
-                // Long before the removal, device 1 takes device 0's text.
+                // Long before the removal, device 1 takes device 0's text,
+                // or its delete.
                 let first = entry_by(&s[0].identity, &channel, first_rev, file, one.clone(), &[]);
                 let now = s.tick();
                 crate::take::take(&s[1].conn, &s[1].identity, &first, now).unwrap();
             }
             // After the cut time, device 0's version: a full chain of its own
             // links, the tablet's gone from its end; where device 1 held a
-            // version, its link stands at the old end.
+            // version, a link of it stands at the old end or in the middle.
             let made = s.now + 10 * MARGIN;
             let mut chain: Vec<Link> = (0..MAX_ENTRY_LINKS)
                 .map(|i| Link {
@@ -712,8 +710,14 @@ mod tests {
                     signer: Link::signer_of(&s.key(0)),
                 })
                 .collect();
-            if held != Held::Nothing {
-                chain[MAX_ENTRY_LINKS - 1] = Link::of(&one, s.key(0));
+            match held {
+                Held::Nothing => {}
+                Held::NamedAtTheOldEnd | Held::NamedInTheIndexsChain => {
+                    chain[MAX_ENTRY_LINKS - 1] = Link::of(&one, s.key(0));
+                }
+                Held::NamedInTheMiddle | Held::ADeleteNamedInTheMiddle => {
+                    chain[MAX_ENTRY_LINKS / 2] = Link::of(&one, s.key(0));
+                }
             }
             let late = entry_by(
                 &s[0].identity,
@@ -735,16 +739,18 @@ mod tests {
             assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
             let carried = s[1].text("notes", file);
             match held {
-                Held::Nothing => assert_eq!(carried, None, "{held:?}"),
-                Held::NamedInTheChain => assert_eq!(
-                    carried.as_deref(),
-                    Some("over the tablet's late text\n"),
-                    "{held:?}"
-                ),
-                Held::NamedInTheIndexsChain => {
+                Held::Nothing | Held::ADeleteNamedInTheMiddle => {
+                    assert_eq!(carried, None, "{held:?}")
+                }
+                Held::NamedAtTheOldEnd | Held::NamedInTheMiddle | Held::NamedInTheIndexsChain => {
                     assert_eq!(carried.as_deref(), Some("one\n"), "{held:?}")
                 }
             }
+            assert!(
+                texts(&s, 1).iter().all(|text| !text.contains("late")),
+                "{held:?}: {:?}",
+                texts(&s, 1)
+            );
         }
     }
 
@@ -1155,6 +1161,84 @@ mod tests {
             assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
             assert_eq!(s[1].text("notes", INDEX).as_deref(), Some("- two\n"));
         }
+    }
+
+    /// An index merge that drops a removed key's link from a chain that is
+    /// not full (the fourth read's round, its look for other paths). The
+    /// tablet writes `MEMORY.md` late over device 0's `- one`; device 0
+    /// writes `- one` back over it, and then a line of its own over the
+    /// tablet's. Device 0 then merges that with a version whose chain names
+    /// `- one` too: the merge stops the channel's chain at that hash, and
+    /// what stood behind it, the tablet's link among it, is not said
+    /// (`chain::merged`). The merge's chain holds four links, none the
+    /// tablet's. The laptop stores only the merge: no chain of the index is
+    /// trusted to say that nothing fell off it, so the carry leaves it out.
+    #[test]
+    fn an_index_merge_that_drops_a_removed_keys_link_is_cut() {
+        use crate::several::entry_by;
+        use cordelia_crypto::chain;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        let channel = s[1].own("notes");
+        let rev = cordelia_core::revision::next_under(None, 1).unwrap();
+        let (b, k) = (s.key(0), s.key(2));
+        let one = Value::Text("- one\n".into());
+        let first = entry_by(&s[0].identity, &channel, rev, INDEX, one.clone(), &[]);
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &first, now).unwrap();
+
+        let made = s.now + 10 * MARGIN;
+        s.now = made - MARGIN / 2;
+        // Late: the tablet over `- one`; device 0's `- one` back over it;
+        // device 0's own line over that, which keeps the tablet's.
+        let late = Value::Text("- one\n- the tablet's late line\n".into());
+        let over_one = chain::written_over(&one, &b, Some(&[]));
+        let back = chain::written_over(&late, &k, Some(&over_one));
+        let mine = Value::Text("- one\n- the tablet's late line\n- mine\n".into());
+        let over_back = chain::written_over(&one, &b, Some(&back));
+        assert!(
+            over_back
+                .iter()
+                .any(|link| link.signer == Link::signer_of(&k))
+        );
+        // The other side: device 0's folder held `- two`, written over `- one`.
+        let two = Value::Text("- one\n- two\n".into());
+        let merged = chain::merged(
+            &mine,
+            &b,
+            Some(&over_back),
+            &Link::of(&two, b),
+            Some(&over_one),
+        );
+        assert!(merged.len() < MAX_ENTRY_LINKS);
+        assert!(
+            merged.iter().all(|link| link.signer != Link::signer_of(&k)),
+            "{merged:?}"
+        );
+        let merge = entry_by(
+            &s[0].identity,
+            &channel,
+            rev + 4,
+            INDEX,
+            Value::Text("- one\n- the tablet's late line\n- mine\n- two\n".into()),
+            &merged,
+        );
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &merge, now).unwrap();
+        assert!(
+            s[1].text("notes", INDEX)
+                .is_some_and(|text| text.contains("late"))
+        );
+
+        s.now = made - 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+        assert_eq!(s[1].text("notes", INDEX).as_deref(), Some("- one\n"));
+        assert!(texts(&s, 1).iter().all(|text| !text.contains("late")));
     }
 
     /// After a removal, honest arrivals are not cut again at a later change

@@ -763,9 +763,16 @@ fn left_out_from(
         .map(|one| one.chain.as_deref())
         .collect();
     let now = now();
-    Ok(read_in
-        .iter()
-        .any(|change| cuts.leaves_out(&signers, &chains, change.as_ref(), now, named)))
+    Ok(read_in.iter().any(|change| {
+        cuts.leaves_out(
+            &signers,
+            &version.name,
+            &chains,
+            change.as_ref(),
+            now,
+            named,
+        )
+    }))
 }
 
 /// What the relays hold of the channel of `name` in the generation

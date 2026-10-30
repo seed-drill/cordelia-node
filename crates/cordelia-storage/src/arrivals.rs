@@ -205,7 +205,8 @@ pub fn note(
 
 /// The event at `place` ([`note`]) stored an entry whose chain may have
 /// dropped what it was written after (decision 2026-10-24 (removal), rule
-/// 7): it was missing, or full and named no version the file held before.
+/// 7): it was missing, or full, or the index's (the fourth read of slice
+/// 8).
 /// A removed key's link may have fallen off it, so a carry judges it as an
 /// arrival of every removed key.
 pub fn noted_unknown(conn: &Connection, place: i64) -> Result<(), CordeliaError> {

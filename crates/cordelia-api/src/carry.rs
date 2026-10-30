@@ -405,7 +405,14 @@ fn judged(
             .map(|one| one.chain.as_deref())
             .collect();
         let cuts = crate::cut::Cuts::read(conn)?;
-        if cuts.leaves_out(&signers, &chains, read_in.as_ref(), now, named) {
+        if cuts.leaves_out(
+            &signers,
+            &version.name,
+            &chains,
+            read_in.as_ref(),
+            now,
+            named,
+        ) {
             return Ok(Some(Brought::Cut));
         }
     }

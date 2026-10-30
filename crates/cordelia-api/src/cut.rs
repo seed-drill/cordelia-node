@@ -173,18 +173,22 @@ impl Cuts {
     /// phrase, as one whose writing is theirs (a recovery's look takes what
     /// a device lost or broken wrote, decision 2026-10-04 §9).
     ///
-    /// `chains` has the chain of each entry of the version, `None` for one
-    /// that lacks it. **A chain that may have dropped links names every
-    /// removed key** (the third read of slice 8, its second finding): one of
-    /// `MAX_ENTRY_LINKS` links, the most a chain keeps, from which the
-    /// oldest fall off as it is written over, and one that is missing. So a
-    /// version that a remaining device wrote over a removed key's late text
-    /// 100 times or more is left out wherever any removed key is cut, which
-    /// fails safe, at the cost of honest busy files: that device carries
-    /// them itself when it applies the change (rule 7, by its arrivals).
+    /// `name` is the version's name, and `chains` has the chain of each
+    /// entry of the version, `None` for one that lacks it. **A chain that
+    /// may have dropped links names every removed key**
+    /// ([`may_have_dropped_links`]; the third read of slice 8, its second
+    /// finding, and the fourth read's round): one of `MAX_ENTRY_LINKS`
+    /// links, the most a chain keeps, from which the oldest fall off as it
+    /// is written over; one that is missing; and every chain of the index.
+    /// So a version that a remaining device wrote over a removed key's late
+    /// text 100 times or more, or merged into the index, is left out
+    /// wherever any removed key is cut, which fails safe, at the cost of
+    /// honest busy files: that device carries them itself when it applies
+    /// the change (rule 7, by its arrivals).
     pub(crate) fn leaves_out(
         &self,
         signers: &[[u8; 32]],
+        name: &str,
         chains: &[Option<&[EntryLink]>],
         generation: Option<&Change>,
         now: i64,
@@ -210,7 +214,7 @@ impl Cuts {
             .filter_map(|signer| self.of_key(signer))
             .any(cut)
             || chains.iter().any(|chain| match chain {
-                Some(links) if links.len() < MAX_ENTRY_LINKS => names(links),
+                Some(links) if !may_have_dropped_links(Some(name), Some(links)) => names(links),
                 _ => self.keys.iter().any(cut),
             })
     }
@@ -301,6 +305,33 @@ impl Cuts {
     }
 }
 
+/// Whether `chain`, of an entry of the file `name` (`None` where it is not
+/// known), may have dropped a link of what the entry was written after
+/// (rule 7): where it may, it says nothing of which keys wrote before it,
+/// and names every removed key. Nothing in a chain, nor any version a
+/// device holds, is trusted to say that no link fell off it.
+///
+/// - **A chain that is missing.**
+/// - **A chain of `MAX_ENTRY_LINKS` links,** the most a chain keeps: the
+///   oldest fall off its end as it is written over. That a link of it
+///   names a version the device holds says nothing (the fourth read of
+///   slice 8, its high): a link is a text's hash and its signer, and a
+///   device that went back to that text, or deleted the file once (every
+///   delete's hash is the same), names it again after what fell off.
+/// - **Every chain of the index** (`MEMORY.md`), whatever its length: a
+///   merge weaves two chains, stops one where a hash of it stands further
+///   on in the other, and says nothing of what stood behind that link
+///   (`cordelia_crypto::chain::merged`). A text written back makes such a
+///   hash stand twice, and a removed key's link behind it goes from a
+///   chain far from full (the fourth read's round, its look for other
+///   paths). A device cannot tell a merge from an edit by its chain.
+pub fn may_have_dropped_links(name: Option<&str>, chain: Option<&[EntryLink]>) -> bool {
+    match chain {
+        None => true,
+        Some(links) => links.len() >= MAX_ENTRY_LINKS || name == Some(crate::person::INDEX_FILE),
+    }
+}
+
 /// What a device cuts now, in the generation it follows (rules 6 and 7),
 /// for a reader that knows no time of arrival: the put-back of an index
 /// line. It judges at `now`, the latest anything came, which fails safe. In
@@ -348,8 +379,9 @@ impl CutNow {
     }
 
     /// Whether anything of any removed key is cut: what a chain names that
-    /// may have dropped links, missing or at the most a chain keeps (the
-    /// extra look of the third read of slice 8).
+    /// may have dropped links ([`may_have_dropped_links`]: missing, at the
+    /// most a chain keeps, or the index's; the extra look of the third read
+    /// of slice 8, and the fourth).
     pub fn any(&self) -> bool {
         self.cuts.keys().iter().any(|cut| self.cut(cut))
     }
@@ -656,17 +688,17 @@ mod tests {
         let now = 1_000_000;
         let over = Some(&named[..]);
         // Signed by it, or over it, in the generation before: left out.
-        assert!(cuts.leaves_out(&[[9; 32]], &[], Some(&at(2)), now, &[]));
-        assert!(cuts.leaves_out(&honest, &[over], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&[[9; 32]], "w.md", &[], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&honest, "w.md", &[over], Some(&at(2)), now, &[]));
         // In the removal's generation: nothing.
-        assert!(!cuts.leaves_out(&honest, &[over], Some(&at(3)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[over], Some(&at(3)), now, &[]));
         // Not known: everything of the key's.
-        assert!(cuts.leaves_out(&honest, &[over], None, now, &[]));
+        assert!(cuts.leaves_out(&honest, "w.md", &[over], None, now, &[]));
         // What names no removed key is never left out.
-        assert!(!cuts.leaves_out(&honest, &[], None, now, &[]));
-        assert!(!cuts.leaves_out(&honest, &[Some(&[])], Some(&at(2)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[], None, now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[Some(&[])], Some(&at(2)), now, &[]));
         // Nor what the person named the key to take from.
-        assert!(!cuts.leaves_out(&[[9; 32]], &[over], None, now, &[[9; 32]]));
+        assert!(!cuts.leaves_out(&[[9; 32]], "w.md", &[over], None, now, &[[9; 32]]));
 
         // A chain that may have dropped links names every removed key (the
         // third read of slice 8, its second finding): one at the most a
@@ -677,14 +709,41 @@ mod tests {
         };
         let full = vec![honest_link; MAX_ENTRY_LINKS];
         let short = vec![honest_link; MAX_ENTRY_LINKS - 1];
-        assert!(cuts.leaves_out(&honest, &[Some(&full)], Some(&at(2)), now, &[]));
-        assert!(cuts.leaves_out(&honest, &[None], Some(&at(2)), now, &[]));
-        assert!(!cuts.leaves_out(&honest, &[Some(&short)], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&honest, "w.md", &[Some(&full)], Some(&at(2)), now, &[]));
+        assert!(cuts.leaves_out(&honest, "w.md", &[None], Some(&at(2)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[Some(&short)], Some(&at(2)), now, &[]));
+        // The index's chain, of any length, names every removed key (the
+        // fourth read's round): a merge says nothing of what stood behind
+        // the link where it stopped a chain.
+        assert!(cuts.leaves_out(
+            &honest,
+            "MEMORY.md",
+            &[Some(&short)],
+            Some(&at(2)),
+            now,
+            &[]
+        ));
+        assert!(cuts.leaves_out(&honest, "MEMORY.md", &[Some(&[])], Some(&at(2)), now, &[]));
+        assert!(!cuts.leaves_out(
+            &honest,
+            "MEMORY.md",
+            &[Some(&short)],
+            Some(&at(3)),
+            now,
+            &[]
+        ));
         // Where nothing of a removed key is cut, it is carried all the same.
-        assert!(!cuts.leaves_out(&honest, &[Some(&full)], Some(&at(3)), now, &[]));
-        assert!(!cuts.leaves_out(&honest, &[None], Some(&at(3)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[Some(&full)], Some(&at(3)), now, &[]));
+        assert!(!cuts.leaves_out(&honest, "w.md", &[None], Some(&at(3)), now, &[]));
         // And a key the person named is not among those it names.
-        assert!(!cuts.leaves_out(&honest, &[Some(&full)], Some(&at(2)), now, &[[9; 32]]));
+        assert!(!cuts.leaves_out(
+            &honest,
+            "w.md",
+            &[Some(&full)],
+            Some(&at(2)),
+            now,
+            &[[9; 32]]
+        ));
     }
 
     /// A key that no noted change removes has everything cut.

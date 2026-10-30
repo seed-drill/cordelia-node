@@ -1335,12 +1335,15 @@ CREATE TABLE file_copies (
 ///
 /// - `file_arrivals_stored.unknown`: 1 where the entry's chain may have
 ///   dropped what it was written after: it was missing, or held
-///   `MAX_ENTRY_LINKS` links, the most a chain keeps, and named no version
-///   that the file held here before (or the file is the index, whose merges
-///   drop links from either side). A removed key's link may have fallen off
-///   it, so at a carry the event is judged as an arrival of every removed
-///   key (the extra look of the third read of slice 8). An event kept before
-///   the step whose chain was full is so too: that fails safe.
+///   `MAX_ENTRY_LINKS` links, the most a chain keeps, or the file is the
+///   index, whose merges stop a chain short (the fourth read of slice 8
+///   dropped the trust once given to a full chain that named a version held
+///   here). A removed key's link may have fallen off it, so at a carry the
+///   event is judged as an arrival of every removed key (the extra look of
+///   the third read of slice 8). An event kept before the step whose chain
+///   was full is so too: that fails safe. An event of the index kept before
+///   it with a shorter chain is not, since an event keeps no name: step 24
+///   was never released (slice 8's notes).
 ///
 /// A step of its own, and not step 24 changed again: step 24 was changed
 /// in place twice while unreleased, and no node or relay ran a build of it

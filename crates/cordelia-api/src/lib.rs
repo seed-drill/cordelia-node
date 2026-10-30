@@ -46,7 +46,7 @@ pub mod carrying;
 pub mod change;
 pub mod commands;
 pub(crate) mod cut;
-pub use cut::CutNow;
+pub use cut::{CutNow, may_have_dropped_links};
 pub mod entries;
 pub mod error;
 pub mod first_start;
