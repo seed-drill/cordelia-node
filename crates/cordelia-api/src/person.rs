@@ -1828,8 +1828,18 @@ fn moved_says(
         true => "which this change lists",
         false => "to which this change hands its secret",
     };
+    // Where a head set aside removed the key, and not the change moved
+    // to, the words name both: "that change" would be the head (the
+    // review of the whole build, its L9).
+    let follows = match by.link()? == to.link()? {
+        true => "this device follows that change now".to_string(),
+        false => format!(
+            "this device follows the change made on {} now",
+            lists_of(to)?.made_on.named()
+        ),
+    };
     Ok(format!(
-        "a change made apart on {} removed {removed}, {how}: this device follows that change now",
+        "a change made apart on {} removed {removed}, {how}: {follows}",
         lists_of(by)?.made_on.named()
     ))
 }
