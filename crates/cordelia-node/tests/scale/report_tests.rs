@@ -2086,14 +2086,23 @@ fn a_folder_without_the_inputs_of_this_version_is_refused() {
 
 // ── After stage 190, seed 2: bars 3 and 9 read what the record means ──
 
+/// A change of a node: when, to what, and how a stop ended (its seconds
+/// and its status; none where it is not known).
+type Became<'a> = (f64, Is, Option<(f64, &'a str)>);
+
 /// The high end of bar 9's band for relay 1 at 1000 s, where person 0's
-/// first device (node 2) is told to stop at `stopped` (none: it runs on).
-fn bar_9_ceiling(stopped: Option<f64>) -> f64 {
+/// first device (node 2) changes as `changes` says.
+fn bar_9_ceiling(changes: &[Became]) -> f64 {
     let (_dir, run) = made_up();
     all_running(&run, 0.0);
     window(&run, 150.0, 1500.0);
-    if let Some(t) = stopped {
-        becomes(&run, 2, t, Is::Stopped);
+    for (t, is, ended) in changes {
+        run.fleet.changes.lock().unwrap().push(Change {
+            t: *t,
+            node: 2,
+            is: *is,
+            ended: ended.map(|(took, said)| (took, said.to_string())),
+        });
     }
     relay_at(&run, 0, 1000.0, Some(&[("cordelia_connections_open", 0.0)]));
     let read = read_of(&run);
@@ -2105,23 +2114,89 @@ fn bar_9_ceiling(stopped: Option<f64>) -> f64 {
     hi.split(')').next().unwrap().parse().unwrap()
 }
 
-/// Bar 9's high end counts every device running or frozen at any moment of
-/// the last 90 s (the record's words): one stopped cleanly 0.5 s before the
-/// sample, whose connection the relay has not yet seen close, counts; one
-/// stopped 100 s before does not. At stage 190, seed 2, relay 2 held 178
-/// against a band of 174 to 177, two devices having stopped 0.2 s and
-/// 0.5 s before.
+/// Bar 9's high end counts a device stopped cleanly only until the relay's
+/// governor has had its tick after the exit (10 s, and 2 s for the tick's
+/// turn): one stopped 0.5 s and 0.2 s before the sample counts, as at
+/// stage 190, seed 2, where relay 2 held 178 against a band of 174 to 177;
+/// one that exited exactly 12 s before counts, one 12.5 s before or 50 s
+/// before does not. A device frozen, or stopped without a clean exit
+/// (killed, an exit with failure, a stop slower than
+/// `NODE_STOP_TIMEOUT_SECS`, or how it ended not known), counts for 90 s:
+/// at 89.5 s, and not at exactly 90 s.
 #[test]
-fn bar_9_counts_a_device_stopped_in_the_last_90_seconds_in_its_high_end() {
-    let running = bar_9_ceiling(None);
-    assert_eq!(bar_9_ceiling(Some(999.5)), running, "stopped 0.5 s before");
-    assert_eq!(bar_9_ceiling(Some(999.8)), running, "stopped 0.2 s before");
-    assert_eq!(bar_9_ceiling(Some(911.0)), running, "stopped 89 s before");
-    assert_eq!(
-        bar_9_ceiling(Some(900.0)),
-        running - 1.0,
-        "stopped 100 s before"
-    );
+fn bar_9_counts_a_device_stopped_cleanly_only_until_the_relays_tick() {
+    let running = bar_9_ceiling(&[]);
+    let clean = Some((0.3, "exit status: 0"));
+    let stop = |t: f64, ended: Option<(f64, &'static str)>| (t, Is::Stopped, ended);
+    for (case, changes, counted) in [
+        (
+            "stopped cleanly 0.5 s before",
+            vec![stop(999.5, clean)],
+            true,
+        ),
+        (
+            "stopped cleanly 0.2 s before",
+            vec![stop(999.8, clean)],
+            true,
+        ),
+        (
+            "exited cleanly exactly 12 s before",
+            vec![stop(987.5, Some((0.5, "exit status: 0")))],
+            true,
+        ),
+        (
+            "exited cleanly 12.5 s before",
+            vec![stop(987.0, Some((0.5, "exit status: 0")))],
+            false,
+        ),
+        (
+            "stopped cleanly 50 s before",
+            vec![stop(950.0, clean)],
+            false,
+        ),
+        (
+            "killed 89.5 s before",
+            vec![stop(910.5, Some((45.0, "killed: it did not stop")))],
+            true,
+        ),
+        (
+            "killed exactly 90 s before",
+            vec![stop(910.0, Some((45.0, "killed: it did not stop")))],
+            false,
+        ),
+        (
+            "exited with failure 89.5 s before",
+            vec![stop(910.5, Some((0.3, "exit status: 1")))],
+            true,
+        ),
+        (
+            "exited with success, but slower than its 30 s, 60 s before",
+            vec![stop(940.0, Some((31.0, "exit status: 0")))],
+            true,
+        ),
+        (
+            "how it ended not known, 89.5 s before",
+            vec![stop(910.5, None)],
+            true,
+        ),
+        (
+            "frozen, then stopped cleanly 89 s before",
+            vec![(900.0, Is::Frozen, None), stop(911.0, clean)],
+            true,
+        ),
+        (
+            "frozen, then stopped cleanly exactly 90 s before",
+            vec![(900.0, Is::Frozen, None), stop(910.0, clean)],
+            false,
+        ),
+        ("stopped 100 s before", vec![stop(900.0, None)], false),
+    ] {
+        let want = match counted {
+            true => running,
+            false => running - 1.0,
+        };
+        assert_eq!(bar_9_ceiling(&changes), want, "{case}");
+    }
 }
 
 /// Edit 10 of person 0, written at 1000 s by its first device (node 2),
@@ -2160,14 +2235,17 @@ fn bar_3_of_a_writer(lives: &[(f64, Is)], reader_off: bool) -> Line {
     bar_3(&read, &edits)
 }
 
-/// An edit not found by the end is lost only where its writer had the time
-/// to send it. Its writer stopped 36 ms after writing and off to the end
-/// (as at stage 190, seed 2), or back only for 30 s, or back too late for
-/// its catch-up and 120 s: passed over, and counted. Its writer ran on, or
-/// ran again a minute and more in time: lost. Either way with the reader
-/// off when it was written, as the catch-up reads it.
+/// An edit not found by the end is passed over only where its writer was
+/// told to stop within a cycle (5 s) of writing it, so that its cycle had
+/// at most that turn to read it, and did not run 60 s again 120 s or more
+/// before the end. Its writer stopped 36 ms after writing and off to the
+/// end (as at stage 190, seed 2, where the writer was removed), or back
+/// only for 30 s, or back too late: passed over, and counted. Its writer
+/// ran on, ran 5.5 s or 10 s and then stopped, froze, or ran again in
+/// time: lost. Either way with the reader off when it was written, as the
+/// catch-up reads it.
 #[test]
-fn bar_3_owes_an_edit_only_where_its_writer_had_the_time_to_send_it() {
+fn bar_3_passes_over_an_edit_only_where_its_writer_stopped_within_a_cycle() {
     let stopped = (1000.036, Is::Stopped);
     for (case, lives, lost) in [
         ("stopped 36 ms after, off to the end", vec![stopped], false),
@@ -2192,6 +2270,41 @@ fn bar_3_owes_an_edit_only_where_its_writer_had_the_time_to_send_it() {
             "frozen, then went on in time",
             vec![(1000.036, Is::Frozen), (1300.0, Is::Running)],
             true,
+        ),
+        // Its cycle had the time to read it and push it: owed, wherever
+        // it went after.
+        (
+            "ran 10 s, then stopped for good",
+            vec![(1010.0, Is::Stopped)],
+            true,
+        ),
+        (
+            "ran 5.5 s, then stopped for good",
+            vec![(1005.5, Is::Stopped)],
+            true,
+        ),
+        (
+            "frozen 36 ms after, then stopped for good",
+            vec![(1000.036, Is::Frozen), (1060.0, Is::Stopped)],
+            true,
+        ),
+        // The edges: a stop told exactly a cycle (5 s) after the edit; a
+        // writer back at 1820 s, whose 60 s end exactly 120 s before the
+        // end, and one back half a second later.
+        (
+            "stopped exactly 5 s after",
+            vec![(1005.0, Is::Stopped)],
+            false,
+        ),
+        (
+            "back with exactly 120 s left after its catch-up",
+            vec![stopped, (1820.0, Is::Running)],
+            true,
+        ),
+        (
+            "back with 119.5 s left after its catch-up",
+            vec![stopped, (1820.5, Is::Running)],
+            false,
         ),
     ] {
         for reader_off in [false, true] {
