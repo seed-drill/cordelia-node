@@ -859,7 +859,9 @@ fn listing_of(
         listing.asked.push(key.key);
     }
     listing.let_go = row.let_go;
-    if row.let_go > 0 {
+    if row.state == State::NotInForce {
+        listing.lines.push(past_a_bound_line(&row.name, row.let_go));
+    } else if row.let_go > 0 {
         listing.lines.push(format!(
             "  no longer known on this device, so left out: {}",
             row.let_go
@@ -867,6 +869,21 @@ fn listing_of(
     }
     listing.lines.push(LABEL_FIRST.into());
     Ok(listing)
+}
+
+/// What `shared anew` says of a channel past a bound (§3.4, the person's
+/// ruling for R1): this device has not read it since its filing went past
+/// the bound, so it lists only the keys of its table of keys. `let_go`
+/// counts the rows the table let go; a key that first wrote there since is
+/// not in the table and cannot be counted. None of them is asked about, and
+/// the offer seals to none of them: they need the new channel shared with
+/// them again. Reading the channel again first waits for after R1.
+pub fn past_a_bound_line(name: &str, let_go: u64) -> String {
+    format!(
+        "You could not list {let_go} keys of \"{}\", nor anyone who wrote there after it went \
+         past a bound: share the new channel with them again.",
+        crate::messages::cleaned(name)
+    )
 }
 
 /// What `shared anew` makes.
