@@ -2230,6 +2230,32 @@ fn a_version_beside_whose_chain_may_have_dropped_links_is_marked() {
         highest: None,
         next: None,
     };
-    let marked: Vec<bool> = lines::beside(&slot).iter().map(|v| v.unknown).collect();
+    let beside = lines::beside(&slot);
+    let marked: Vec<bool> = beside.iter().map(|v| v.unknown).collect();
     assert_eq!(marked, [true, true, false]);
+    // Where anything of a removed key is cut, no line is taken from a
+    // marked version, and one is from the other; where nothing is, from
+    // each.
+    let taken = |any: bool| -> Vec<bool> {
+        beside
+            .iter()
+            .map(|v| lines::lines_taken_from(v, |_| false, |_| false, any))
+            .collect()
+    };
+    assert_eq!(taken(true), [false, false, true]);
+    assert_eq!(taken(false), [true, true, true]);
+    // A version a cut key signed, or whose chain names one, gives none.
+    let one = &beside[2];
+    assert!(!lines::lines_taken_from(
+        one,
+        |k| *k == [4; 32],
+        |_| false,
+        false
+    ));
+    assert!(!lines::lines_taken_from(
+        one,
+        |_| false,
+        |s| *s == [2; 16],
+        false
+    ));
 }

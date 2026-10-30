@@ -76,6 +76,23 @@ pub(super) struct Beside {
     pub text: String,
 }
 
+/// Whether the put-back takes lines from `version`, a version beside the
+/// index's (decision 2026-10-24 (removal), rule 7): not where a key that
+/// signed it is cut (`key`), nor one that a link of its chain names
+/// (`signer`), nor, where its chain may have dropped links, where anything
+/// of a removed key is cut (`any`; the extra look of the third read of
+/// slice 8).
+pub(super) fn lines_taken_from(
+    version: &Beside,
+    key: impl Fn(&[u8; 32]) -> bool,
+    signer: impl Fn(&[u8; 16]) -> bool,
+    any: bool,
+) -> bool {
+    !version.signers.iter().any(key)
+        && !version.links.iter().any(signer)
+        && !(version.unknown && any)
+}
+
 /// What a cycle read of the index's slot, beyond the channel's version.
 #[derive(Default)]
 pub(super) struct IndexRead {
@@ -531,9 +548,12 @@ fn put_back(
         let stands: Vec<Beside> = stands
             .into_iter()
             .filter(|version| {
-                !version.signers.iter().any(|key| cut.key(key))
-                    && !version.links.iter().any(|link| cut.signer(link))
-                    && !(version.unknown && cut.any())
+                lines_taken_from(
+                    version,
+                    |key| cut.key(key),
+                    |link| cut.signer(link),
+                    cut.any(),
+                )
             })
             .collect();
         let (due, of_removed): (Vec<&index_lines::Record>, Vec<&index_lines::Record>) = due
