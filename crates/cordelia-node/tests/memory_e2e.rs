@@ -1496,6 +1496,11 @@ fn median(mut times: Vec<std::time::Duration>) -> std::time::Duration {
 ///   store taking it: the pass that took it wakes the sync cycle. Without
 ///   that the cycle's timer, which runs in step with the pass's, had every
 ///   edit wait the whole of a cycle there.
+///
+/// The last two catch the wake undone: without it the median through the
+/// outage was about 14 s, above 12 s, and every edit waited about 5 s in
+/// the reader's store. The first does not, since both medians grow
+/// alike; it holds that the relay that is down holds up nothing.
 #[test]
 fn edits_arrive_as_fast_while_one_of_two_relays_is_down() {
     use cordelia_core::protocol::OUT_OF_REACH_SECS;
