@@ -795,9 +795,12 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
     let history = two.desktop.cli(&["history", "lab"]);
     assert!(history.contains("late.md"), "{history}");
     assert!(history.contains("set aside"), "{history}");
-    wait_for("the new machine has what the look brought", &all, 60, || {
-        (text_of(&new, "b.md")? == ON_THE_DESKTOP).then_some(())
-    });
+    wait_for(
+        "the new machine has what the look brought",
+        &all,
+        60,
+        || (text_of(&new, "b.md")? == ON_THE_DESKTOP).then_some(()),
+    );
     assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
     assert_eq!(text_of(&new, "late.md"), None);
 }
