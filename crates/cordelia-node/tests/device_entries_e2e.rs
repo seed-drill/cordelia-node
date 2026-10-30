@@ -6494,6 +6494,59 @@ async fn a_read_with_places_of_its_own_starts_from_the_start_and_leaves_the_stor
     assert_eq!(kept(&device).place, Some(([8; 8], 3)));
 }
 
+/// Whether the device's sync cycle has been asked for, and not yet
+/// begun: the wake is taken, so that the next look starts afresh.
+async fn cycle_asked(device: &Device) -> bool {
+    let woken = device.state.sync_control.woken();
+    tokio::time::timeout(Duration::ZERO, woken).await.is_ok()
+}
+
+/// **A read with places of its own that stores an entry of a name wakes
+/// the sync cycle**, as a page of the pass does, so that the entry is
+/// written to its file at once and not a cycle later. A read that
+/// stores nothing new does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_with_places_of_its_own_that_stores_an_entry_of_a_name_wakes_the_sync_cycle() {
+    let relay = StandIn::started().await;
+    relay.holds_what_is_proved(true);
+    let (mut device, desktop) = (Device::new("laptop"), Device::new("desktop"));
+    device.makes_the_phrase(&phrase());
+    device.adds(&desktop);
+    device.holds("notes");
+    desktop.holds("notes");
+    let mine = device.writes("notes", "a.md", "by the laptop");
+    let notes = device.channel("notes");
+    let holding: Holding = Arc::new(Mutex::new(([9; 8], vec![mine.to_wire()])));
+    relay.pulls(page_by_page(notes, holding.clone()));
+    device.connects_to("relay", relay.port, relay.key).await;
+    device.passes().await;
+    // The relay comes to hold an entry of the desktop's, which no pass
+    // has read yet.
+    let theirs = desktop.writes("notes", "c.md", "by the desktop");
+    holding.lock().unwrap().1.push(theirs.to_wire());
+    cycle_asked(&device).await;
+    assert!(!device.holds_of(&notes).contains(&theirs.id()));
+
+    let read = begins_a_read(&device, notes, Duration::from_secs(30)).await;
+    assert!(
+        read.is_some(),
+        "a read of a channel of the device's own begins"
+    );
+    assert!(device.holds_of(&notes).contains(&theirs.id()));
+    assert!(
+        cycle_asked(&device).await,
+        "the read stored c.md, and the cycle was not woken"
+    );
+
+    // Read again, it stores nothing it did not hold.
+    let again = begins_a_read(&device, notes, Duration::from_secs(30)).await;
+    assert!(again.is_some());
+    assert!(
+        !cycle_asked(&device).await,
+        "a read that stored nothing woke the cycle"
+    );
+}
+
 /// A read with places of its own runs outside the database's lock
 /// (decision 2026-10-17 §4.2 item 3): while a relay is asked for each
 /// page, the lock is free for anything else the node does.
