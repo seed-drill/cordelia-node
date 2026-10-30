@@ -1343,6 +1343,74 @@ mod tests {
         }
     }
 
+    /// An index edit is trusted as one over a held version only by that
+    /// version's hash and signer both (the fourth read's round). The laptop
+    /// holds device 0's `- one`, whose chain is `- zero`, and beside it at
+    /// the same revision its own, whose chain names the tablet's `- one`
+    /// twice. Device 0's version after the cut time is written, it says,
+    /// over the tablet's `- one`, and then `- zero`: the text and the rest
+    /// of the chain are those of the version held, but not the signer. The
+    /// tablet's link stands there no more times than in a chain held, so it
+    /// makes no arrival; the chain is no edit over a version held, and the
+    /// carry leaves it out.
+    #[test]
+    fn an_index_edit_over_a_held_text_another_key_signed_is_cut() {
+        use crate::several::entry_by;
+        use cordelia_crypto::chain;
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        let channel = s[1].own("notes");
+        let rev = cordelia_core::revision::next_under(None, 1).unwrap();
+        let (b, k) = (s.key(0), s.key(2));
+        let zero = Value::Text("- zero\n".into());
+        let one = Value::Text("- one\n".into());
+        let rest = chain::written_over(&zero, &b, Some(&[]));
+        let tablets = Link::of(&one, k);
+        let held = entry_by(&s[0].identity, &channel, rev, INDEX, one.clone(), &rest);
+        let beside = entry_by(
+            &s[1].identity,
+            &channel,
+            rev,
+            INDEX,
+            Value::Text("- one, the laptop's\n".into()),
+            &[tablets, tablets],
+        );
+        for entry in [&held, &beside] {
+            let now = s.tick();
+            crate::take::take(&s[1].conn, &s[1].identity, entry, now).unwrap();
+        }
+        let before = s[1].text("notes", INDEX);
+
+        let made = s.now + 10 * MARGIN;
+        s.now = made - MARGIN / 2;
+        let mut chain = vec![tablets];
+        chain.extend(rest.iter().copied());
+        let late = entry_by(
+            &s[0].identity,
+            &channel,
+            rev + 1,
+            INDEX,
+            Value::Text("- one\n- over the tablet's late text\n".into()),
+            &chain,
+        );
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &late, now).unwrap();
+        assert!(
+            s[1].text("notes", INDEX)
+                .is_some_and(|text| text.contains("late"))
+        );
+
+        s.now = made - 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+        assert_eq!(s[1].text("notes", INDEX), before);
+        assert!(texts(&s, 1).iter().all(|text| !text.contains("late")));
+    }
+
     /// After a removal, honest arrivals are not cut again at a later change
     /// (the review of slice 8, its second finding). The laptop applies the
     /// removal. Long after, device 0 writes `w.md` with a full chain that
