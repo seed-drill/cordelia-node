@@ -2046,6 +2046,97 @@ mod tests {
         assert!(!by_time.sets_aside(201, 60));
     }
 
+    /// Rule 27 across a change made apart (the review of rule 27, its
+    /// high): the desktop (0) removes the tablet (2). The laptop (1) takes
+    /// the tablet's late `w.md` under change 2, then makes a change apart
+    /// from the removal (its change 3) before it knows, and its agent
+    /// writes `notes.md` there. When the laptop is shown the removal and
+    /// moves, `notes.md` is set aside with `w.md`: the window opened in
+    /// change 2 is not of change 2 alone. What it wrote in change 3 before
+    /// it took the late text is kept.
+    #[test]
+    fn own_writing_in_a_later_generation_is_set_aside() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        s.change(0, &[0, 1], &[2]);
+        s.write(1, "notes", "early.md", "written before the late text came");
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        assert_eq!(
+            s[1].text("notes", "w.md").as_deref(),
+            Some("the tablet's late text")
+        );
+        s.change(1, &[1, 0, 2], &[]);
+        s.write(
+            1,
+            "notes",
+            "notes.md",
+            "the late text, written down in change 3",
+        );
+        assert_eq!(
+            s[1].text("notes", "notes.md").as_deref(),
+            Some("the late text, written down in change 3")
+        );
+        let taken = s.pass(0, 1);
+        assert!(
+            matches!(taken[0], Taken::Shown(Shown::Moved(_))),
+            "{:?}",
+            taken[0]
+        );
+        assert_eq!(s[1].text("notes", "w.md"), None);
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+        assert_eq!(
+            s[1].text("notes", "early.md").as_deref(),
+            Some("written before the late text came")
+        );
+        // The desktop is given what the laptop carried: none of it.
+        s.pass(1, 0);
+        assert_eq!(s[0].text("notes", "notes.md"), None);
+    }
+
+    /// Rule 27 with a clock that was once ahead (the review of rule 27, its
+    /// clock): the laptop (1) stores `ahead.md` while its clock is an hour
+    /// ahead, and the clock is put right. Within that hour it takes the
+    /// tablet's late `w.md`, and writes `notes.md`, which is stamped no
+    /// earlier than `ahead.md`; then it applies the removal. The window
+    /// closes no earlier than the newest time stamped when the device knew,
+    /// so `notes.md` is set aside; `ahead.md`, stored before the late
+    /// arrival by its place, is kept.
+    #[test]
+    fn a_clock_once_ahead_does_not_empty_the_window() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        s.now += 3600;
+        s.write(1, "notes", "ahead.md", "stored with the clock ahead");
+        s.now -= 3600;
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        s.write(
+            1,
+            "notes",
+            "notes.md",
+            "the late text, as the agent wrote it down",
+        );
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(
+            matches!(taken, Taken::Shown(Shown::Applied(_))),
+            "{taken:?}"
+        );
+        assert_eq!(s[1].text("notes", "w.md"), None);
+        assert_eq!(s[1].text("notes", "notes.md"), None);
+        assert_eq!(
+            s[1].text("notes", "ahead.md").as_deref(),
+            Some("stored with the clock ahead")
+        );
+    }
+
     /// Rule 27, after the device knew: the laptop follows a change made
     /// apart from the removal that never listed the tablet (its change 3
     /// lists the desktop, the laptop and the phone), so it stays clear and
