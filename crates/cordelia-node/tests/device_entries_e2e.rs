@@ -11254,9 +11254,15 @@ async fn at_a_relay_that_keeps_heads_a_head_answered_with_another_is_shown_again
 /// the whole build, its H2): the relay remembers each head it handed on a
 /// connection, and an answer that handed a removal and was lost after the
 /// relay wrote it would leave the device told "held" at its next show
-/// there. At a relay that names no role `heads` the connection stays.
+/// there. At a relay that names no role `heads` the connection stays. So
+/// does it at one that names the role and refuses the show for now
+/// (ERR_RATE_LIMIT), which it does before it hands anything (the review of
+/// the fixes of the whole build, its M3); a show answered with what is no
+/// answer to one drops it.
 ///
-/// Taken out: the drop (the connection stays open: the first fails).
+/// Taken out: the drop (the connection stays open: the first fails); the
+/// show refused for now let be (the connection is dropped: the assertion
+/// of a refused show fails).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_show_at_a_relay_that_keeps_heads_drops_the_connection() {
     let (mut laptop, _, _, _) = keeping_heads();
@@ -11283,6 +11289,30 @@ async fn a_failed_show_at_a_relay_that_keeps_heads_drops_the_connection() {
     laptop.passes().await;
     assert!(!shows_in(&before.requests()).is_empty());
     assert!(laptop.link("before").is_open());
+
+    // Refused for now at a relay that keeps heads: nothing was handed,
+    // and the connection stays, pass after pass.
+    let busy = StandIn::naming(&["relay", "heads"]).await;
+    busy.says(Say::NotNow, Say::NotNow);
+    laptop.connects_to("busy", busy.port, busy.key).await;
+    assert!(laptop.link("busy").keeps_heads());
+    for _ in 0..2 {
+        laptop.passes().await;
+        assert!(!shows_in(&busy.requests()).is_empty());
+        assert!(
+            laptop.link("busy").is_open(),
+            "a show refused for now dropped the connection"
+        );
+    }
+    assert_ne!(laptop.has_leave("busy"), Ok(()));
+
+    // Answered with what is no answer to a show: dropped.
+    let wrong = StandIn::naming(&["relay", "heads"]).await;
+    wrong.says(Say::NotAShow, Say::NotAShow);
+    laptop.connects_to("wrong", wrong.port, wrong.key).await;
+    laptop.passes().await;
+    assert!(!shows_in(&wrong.requests()).is_empty());
+    assert!(!laptop.link("wrong").is_open());
 }
 
 /// Test 8 of decision 2026-10-24 (removal), section 7: a relay of the

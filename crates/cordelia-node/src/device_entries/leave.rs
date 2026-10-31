@@ -809,16 +809,23 @@ impl Leave {
         };
         let bytes = codec::encode_message(&request).map_or(0, |bytes| bytes.len());
         // A show that fails at a relay that keeps every head drops the
-        // connection ([`Link::drop_after_a_failed_show`]).
+        // connection ([`Link::drop_after_a_failed_show`]): it may have
+        // handed a head that was lost on the way. One refused for now
+        // does not: a relay refuses so (ERR_RATE_LIMIT) before it hands
+        // anything, and a drop would only cost the device its open
+        // streams and its proofs again, against the same rates (the
+        // review of the fixes of the whole build, its M3).
         let answer = match self.ask_counted(link, Protocol::EntryShow, &request).await {
             Ok(WireMessage::EntryShown(shown)) => shown.answer,
             Ok(_) => {
                 link.drop_after_a_failed_show();
                 return Err("a show was not answered as one".into());
             }
-            Err(e) => {
-                link.drop_after_a_failed_show();
-                return Err(e);
+            Err(failed) => {
+                if !failed.refused_for_now {
+                    link.drop_after_a_failed_show();
+                }
+                return Err(failed.why);
             }
         };
         if followed {
@@ -1398,22 +1405,30 @@ impl Leave {
     /// `protocol`, and read its answer: every step has the codec's one
     /// timeout. Where the relay refuses it for now, that is counted for
     /// the relay ([`Self::refused_for_now`]). What failed is said as it
-    /// was.
+    /// was, with whether the relay refused it for now: it reset the stream
+    /// with ERR_RATE_LIMIT, which it does before it hands anything.
     async fn ask_counted(
         &self,
         link: &Link,
         protocol: Protocol,
         request: &WireMessage,
-    ) -> Result<WireMessage, String> {
-        let (mut send, mut recv) = open_stream(&link.conn).await?;
+    ) -> Result<WireMessage, Failed> {
+        let (mut send, mut recv) = open_stream(&link.conn).await.map_err(|why| Failed {
+            why,
+            refused_for_now: false,
+        })?;
         let sent = self.counts_as_sent(link, protocol, request);
         exchange(&mut send, &mut recv, protocol, request, sent)
             .await
             .map_err(|e| {
-                if refused_for_now(&e) {
+                let refused = refused_for_now(&e);
+                if refused {
                     self.refused_at(link);
                 }
-                e.to_string()
+                Failed {
+                    why: e.to_string(),
+                    refused_for_now: refused,
+                }
             })
     }
 
@@ -1543,6 +1558,13 @@ async fn exchange(
     .await;
     let _ = send.finish();
     answer
+}
+
+/// Why a request of a relay failed.
+struct Failed {
+    why: String,
+    /// The relay refused it for now ([`refused_for_now`]).
+    refused_for_now: bool,
 }
 
 /// Whether a request failed because the relay reset its stream with
