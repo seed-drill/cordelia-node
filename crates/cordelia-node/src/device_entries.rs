@@ -597,7 +597,9 @@ impl DeviceEntries {
         let counts = state.load.device.clone();
         Arc::new(Self {
             state,
-            leave: Leave::new(clock.clone()).counting(counts),
+            leave: Leave::new(clock.clone())
+                .counting(counts)
+                .reading_dials_in(Arc::clone(&reach)),
             watching: AtomicBool::new(false),
             clock,
             most_proved: most_proved.min(MAX_CHANNELS_PROVED_ON_A_CONNECTION),
@@ -1204,6 +1206,12 @@ impl DeviceEntries {
                 self.say(relays, stands);
                 return false;
             }
+            // The wake ended in this pass, before its wait ran out: where
+            // the pass only sends, a whole pass is asked, so that what
+            // waits is pulled at once and not at the fetch's timer.
+            if !whole {
+                self.state.own_channels.ask_whole();
+            }
         }
 
         // Awake: each relay has its turn, and none waits for another.
@@ -1228,6 +1236,18 @@ impl DeviceEntries {
         let stands = at_relays::stands(&lock(&self.state.db)).unwrap_or(stands);
         self.say(relays, stands);
         read_all
+    }
+
+    /// A dial ended with no connection: where that ends the wake of the
+    /// device (`waking` is whether it was waking before), a whole pass is
+    /// asked at once (decision 2026-10-24 (removal), section 8). The wake
+    /// waits no more for a relay whose dial has failed since it began,
+    /// once another has answered; what waits is pulled then, and not at
+    /// the end of the wait or at the fetch's timer.
+    pub fn dial_failed(&self, waking: bool) {
+        if waking && !self.leave.is_waking() {
+            self.state.own_channels.ask_whole();
+        }
     }
 
     /// Ask for a whole pass at the moment the wait of the device that

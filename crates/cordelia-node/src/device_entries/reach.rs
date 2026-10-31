@@ -109,6 +109,10 @@ struct Of {
     /// dial that connected and waits for a show on its connection to say
     /// something, by when it connected.
     dials: Vec<Instant>,
+    /// When the latest dial to end ended with no connection to it, where
+    /// it did and no dial has connected since: what a wake reads
+    /// ([`Reach::dial_failed_since`]).
+    dial_failed: Option<Instant>,
     shows: u32,
     awaiting: Option<Instant>,
     /// The number of the last show that ended here ([`Inner::shown`]).
@@ -137,6 +141,7 @@ impl Of {
             reached: None,
             last_reached: None,
             dials: Vec::new(),
+            dial_failed: None,
             shows: 0,
             awaiting: None,
             shown: 0,
@@ -255,6 +260,10 @@ struct Inner {
     /// How many shows have ended: a pass that read the database before a
     /// show ended does not write what it read over what the show said.
     shown: u64,
+    /// Whether the device woke since the dial loop last asked: each relay
+    /// it does not reach is dialled at once (decision 2026-10-24
+    /// (removal), section 8).
+    woke: bool,
 }
 
 impl Inner {
@@ -298,6 +307,7 @@ impl Reach {
                 relays: HashMap::new(),
                 came_to_lack: HashSet::new(),
                 shown: 0,
+                woke: false,
             }),
             lookups: tokio::sync::Notify::new(),
         })
@@ -535,10 +545,48 @@ impl Reach {
                     of.dials.remove(0);
                 }
             }
-            if connected {
-                of.awaiting = Some(now.at);
+            match connected {
+                true => {
+                    of.awaiting = Some(now.at);
+                    of.dial_failed = None;
+                }
+                false => of.dial_failed = Some(now.at),
             }
         });
+    }
+
+    /// Whether the relay called `name` is one that a device which woke at
+    /// `since` waits for no more (decision 2026-10-04 §4.6; decision
+    /// 2026-10-24 (removal), section 8): the latest dial of it to end
+    /// ended after `since` with no connection to it, and since then no
+    /// dial of it is in flight, none has connected, and it is not
+    /// reached. A relay that may still answer is waited for: one with a
+    /// dial in flight, one whose dial connected and waits for a show, and
+    /// one whose last dial failed before the wake began.
+    pub fn dial_failed_since(&self, name: &str, since: Instant) -> bool {
+        lock(&self.inner).relays.iter().any(|(relay, of)| {
+            relay.name == name
+                && of.dial_failed.is_some_and(|at| at >= since)
+                && of.dials.is_empty()
+                && of.awaiting.is_none()
+                && of.reached.is_none()
+        })
+    }
+
+    /// The device woke: it reached a relay after having reached none, or
+    /// its machine slept. The dial loop dials each relay that it does not
+    /// reach at once ([`Self::dials_at_wake`]), whatever wait was set.
+    pub fn woke(&self) {
+        lock(&self.inner).woke = true;
+    }
+
+    /// Whether the device woke since this was last asked: the dial loop
+    /// then dials each relay that it does not reach at once, so that a
+    /// relay that is down is known to be by a dial that failed since the
+    /// wake began, and one that came back is asked within the wake
+    /// (decision 2026-10-24 (removal), section 8).
+    pub fn dials_at_wake(&self) -> bool {
+        std::mem::take(&mut lock(&self.inner).woke)
     }
 
     /// An attempt at `relay` was begun and failed now: a lookup of its
