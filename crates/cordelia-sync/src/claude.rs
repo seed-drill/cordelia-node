@@ -4887,8 +4887,9 @@ mod tests {
         // 2026-10-24 (removal), rule 7): an edit not yet published, over
         // the version its folder agreed. And an index merged with the
         // channel's is over the channel's. The version that this device's
-        // own file held is in that version's chain already, and nothing is
-        // added for it.
+        // own file held is in that version's chain already, and its link
+        // stands second all the same: a merge's chain is never an edit's
+        // (decision 2026-10-24 (removal), rule 7, the index rule).
         let index = crate::memory_md::INDEX_FILE;
         p.file(index, "- a\n");
         p.file("both.md", "base\n");
@@ -4906,13 +4907,14 @@ mod tests {
         );
         let first = link(Some("- a\n"), me);
         let second = link(Some("- a\n- theirs\n"), them);
-        assert_eq!(said(index), Some(vec![second, first]));
+        assert_eq!(said(index), Some(vec![second, first, first]));
 
         // An index merged with a version that was written apart from this
         // device's own (the two tie at one revision, and the other's text
         // wins): it is over the channel's, the version that this device's
         // file held comes second, and what the two descend from follows
-        // once.
+        // as that version's chain says it: the merge above stood `first`
+        // twice, so it stands twice here too.
         let mine = p.read(index).unwrap();
         let wins = a_text_above(&mine);
         write(&p.other, NAME, index, text(&wins));
@@ -4925,6 +4927,7 @@ mod tests {
             link(Some(&wins), them),
             link(Some(&mine), me),
             second,
+            first,
             first,
         ];
         assert_eq!(said(index), Some(apart));
@@ -5142,8 +5145,11 @@ mod tests {
         let merged = record("MEMORY.md");
         assert_eq!((merged.rev, merged.signer), (3, Some(me)));
         assert_eq!(merged.hash, hash(&p.read("MEMORY.md").unwrap()));
+        // Over theirs, with this device's own text, which theirs was
+        // written over, second all the same: a merge is never an edit.
         let over_theirs = vec![
             link(Some("- theirs\n"), &p.other),
+            link(Some("- mine\n"), &p.st),
             link(Some("- mine\n"), &p.st),
         ];
         assert_eq!(merged.chain, Some(over_theirs));
