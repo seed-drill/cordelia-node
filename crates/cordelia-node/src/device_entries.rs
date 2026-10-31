@@ -1241,8 +1241,8 @@ impl DeviceEntries {
     /// A dial ended with no connection: where that ends the wake of the
     /// device (`waking` is whether it was waking before), a whole pass is
     /// asked at once (decision 2026-10-24 (removal), section 8). The wake
-    /// waits no more for a relay whose dial has failed since it began,
-    /// once another has answered; what waits is pulled then, and not at
+    /// waits no more for a relay whose dial, begun since it began, timed
+    /// out, once another has answered; what waits is pulled then, and not at
     /// the end of the wait or at the fetch's timer.
     pub fn dial_failed(&self, waking: bool) {
         if waking && !self.leave.is_waking() {
