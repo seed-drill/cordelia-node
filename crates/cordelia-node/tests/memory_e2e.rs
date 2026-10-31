@@ -1606,3 +1606,183 @@ fn edits_arrive_as_fast_while_one_of_two_relays_is_down() {
         );
     }
 }
+
+/// **A device that its relay's warm churn closed, while its other relay
+/// is down, takes what waits for it as soon as its wake is over**
+/// (decision 2026-10-04 §4.6; decision 2026-10-22, bars 2, 9 and 15).
+/// Two devices of one person, each set up with two relays, the second
+/// stopped as the scale test stops it ([`closed_by_warm_churn`]).
+///
+/// The device reached no relay, and reaches one again: it wakes, and
+/// takes nothing until every relay has answered or WAKE_WAIT_SECS have
+/// gone by, **but for a relay whose dial has failed since the wake
+/// began** (decision 2026-10-24 (removal), section 8). The wake has the
+/// second relay dialled at once; that dial times out
+/// (STREAM_TIMEOUT_SECS: a stopped relay gives no answer), the wake is
+/// over, and a whole pass is made at once. So the edit arrives within a
+/// few seconds of that timeout, well within the wait. **Where a dial of
+/// the second relay is in flight as the device wakes,** begun before the
+/// wake, that dial says nothing of the wake: the device waits for it to
+/// time out, and for the wake's own dial after it. Before the wake read a
+/// failed dial, it was 30.8 to 32.1 s after the connection was made again
+/// (with #263's pass at the wait's end), and 31.4 to 39.4 s before that;
+/// with it, some 12 s, and some 21 to 22 s in a round that finds a dial in
+/// flight (often the first, when the relay has only just stopped and is
+/// dialled every few seconds).
+#[test]
+fn a_device_closed_by_warm_churn_takes_what_waits_as_soon_as_its_wake_is_over() {
+    use cordelia_core::protocol::{STREAM_TIMEOUT_SECS, WAKE_WAIT_SECS};
+    use std::time::Duration;
+    // A pass of the send timer to begin the wake (2 s), a tick of the
+    // dial loop (1 s), what is left of a dial in flight from before the
+    // wake, the wake's own dial's timeout, and then the pull, the cycle
+    // and the write. Under the wait: a wake that waited for it would take
+    // 30 s and more.
+    let most = Duration::from_secs(2 * STREAM_TIMEOUT_SECS + 8);
+    assert!(most < Duration::from_secs(WAKE_WAIT_SECS));
+    for (round, after) in closed_by_warm_churn(true).iter().enumerate() {
+        assert!(
+            *after <= most,
+            "round {round}: the edit arrived {after:?} after the connection was made again, \
+             above two dials of {STREAM_TIMEOUT_SECS} s and the {:?} after them: the wake \
+             waited for a relay whose dial had failed",
+            most - Duration::from_secs(2 * STREAM_TIMEOUT_SECS),
+        );
+    }
+}
+
+/// Two devices of one person, each set up with a first relay, and with a
+/// second that is stopped where `second_down`. The first relay churns
+/// about every minute, with a cold peer, so that its warm churn closes a
+/// device's connection, as it did in the scale test: that device's only
+/// path. As soon as the closed device has its connection made again, an
+/// edit is written on the other, and its arrival is timed from then, in
+/// each of three rounds. (On this machine the connection is made again
+/// within a second, too soon to write in between; the device is waking
+/// from then either way.)
+fn closed_by_warm_churn(second_down: bool) -> Vec<std::time::Duration> {
+    use std::time::{Duration, Instant};
+    // The relay checks its churn on its 2 s tick, so a churn of 63 s comes
+    // every 64 s: each round's closure falls 4 s later in the device's 10 s
+    // fetch timer, so the three rounds do not all find the pass just begun,
+    // and one of them falls where the next whole pass is furthest off.
+    const CHURN_SECS: u64 = 63;
+    const ROUNDS: usize = 3;
+
+    let mut first = node("first", "relay", None);
+    first.churn_every_secs(CHURN_SECS);
+    first.start();
+    wait_for("relay healthy", &[&first], 30, || healthy(&first));
+    let mut second = second_down.then(|| relay_named("second"));
+    let relays: Vec<&Node> = std::iter::once(&first).chain(second.as_ref()).collect();
+    let a = device_at("a", &relays);
+    let b = device_at("b", &relays);
+    let (a_notes, a_mem) = notes_of(&a);
+    let (b_notes, b_mem) = notes_of(&b);
+    std::fs::write(a_mem.join("edit.md"), "the first text\n").unwrap();
+    {
+        let all: Vec<&Node> = relays.iter().copied().chain([&a, &b]).collect();
+        syncs_notes_as_lab(&a, &a_notes);
+        syncs_notes_as_lab(&b, &b_notes);
+        makes_a_phrase(&a, "desktop");
+        adds(&a, &b, "laptop");
+        has_applied(&b, 1, &all);
+        wait_for("the two folders hold the same files", &all, 150, || {
+            (read(&b_mem.join("edit.md")).as_deref() == Some("the first text\n")).then_some(())
+        });
+    }
+    // A cold peer at the first relay: its warm churn closes a warm peer
+    // only where it has one.
+    let mut gone = device_at("gone", &[&first]);
+    gone.stop();
+    let all = [&first, &a, &b];
+    if let Some(second) = &mut second {
+        second.stop();
+        for device in [&a, &b] {
+            wait_for("the device sees the second relay gone", &all, 60, || {
+                let relays = relays_of(device);
+                let connected = relays.iter().filter(|r| r["state"] == "connected");
+                (relays.len() == 2 && connected.count() == 1).then_some(())
+            });
+        }
+    }
+
+    // Each connection a device makes is a line of its log; where the
+    // second relay is down, each is one to the first. A closure by churn
+    // is seen by the connection made again: on this machine that is a
+    // few tenths of a second later, too soon to see the closure itself.
+    let connections = |n: &Node| {
+        std::fs::read_to_string(n.log())
+            .unwrap_or_default()
+            .matches("handshake complete (outbound)")
+            .count()
+    };
+    let logs = || -> String {
+        all.iter()
+            .map(|n| format!("\n===== {} =====\n{}", n.name, n.log_tail()))
+            .collect()
+    };
+    let mut took = Vec::new();
+    for round in 0..ROUNDS {
+        let since = Instant::now();
+        let made = (connections(&a), connections(&b));
+        let (reader, reader_mem, writer_mem) = loop {
+            if connections(&a) > made.0 {
+                break (&a, &a_mem, &b_mem);
+            }
+            if connections(&b) > made.1 {
+                break (&b, &b_mem, &a_mem);
+            }
+            assert!(
+                since.elapsed() < Duration::from_secs(2 * CHURN_SECS + 30),
+                "no churn closed a device's connection: {}{}",
+                governor_of(&first),
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let reconnected = Instant::now();
+        // Written as the reader wakes: it is what waits for it.
+        let text = format!("written as the reader woke, round {round}\n");
+        std::fs::write(writer_mem.join("edit.md"), &text).unwrap();
+        let arrived = loop {
+            if read(&reader_mem.join("edit.md")).as_ref() == Some(&text) {
+                break Instant::now();
+            }
+            assert!(
+                reconnected.elapsed() < Duration::from_secs(120),
+                "round {round}: the edit did not reach {} within 120 s{}",
+                reader.name,
+                logs()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        let after = arrived - reconnected;
+        eprintln!(
+            "round {round}: {} was closed and connected again; the edit arrived {:.1} s after that",
+            reader.name,
+            after.as_secs_f64(),
+        );
+        took.push(after);
+    }
+    took
+}
+
+/// What `relay`'s governor counted: its peers by state, its churns and
+/// what its warm churn closed.
+fn governor_of(relay: &Node) -> String {
+    relay
+        .get_text("/api/v1/metrics/load")
+        .lines()
+        .filter(|line| {
+            [
+                "cordelia_governor_peers",
+                "cordelia_churns_total",
+                "cordelia_closed_by_warm_churn",
+            ]
+            .iter()
+            .any(|counted| line.starts_with(counted))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}

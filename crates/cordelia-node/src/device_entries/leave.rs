@@ -27,7 +27,12 @@
 //!   or reaches a relay after having reached none, there is no leave
 //!   anywhere until each relay it is set up with has answered a show and
 //!   its answer is judged ([`Leave::heard`], decision 2026-10-24 (removal),
-//!   rule 5), or WAKE_WAIT_SECS have gone by.
+//!   rule 5), or WAKE_WAIT_SECS have gone by. **A relay whose dial has
+//!   failed since the wake began is waited for no more,** once another
+//!   has answered ([`Reach::dial_failed_since`], section 8 of that
+//!   record): a dial begun since the wake that timed out, for every
+//!   relay of its name. One that may still answer is waited for, up to
+//!   the wait: one refused, or answered by another key, among them.
 //! - **A push open at the commit after which the device may use the
 //!   connection no more, and not yet answered, is reset** (rule 5): the
 //!   commit that closes it, or has it apply a change. The node's database
@@ -139,6 +144,8 @@ use cordelia_storage::acts::TypedKey;
 use cordelia_storage::person::State;
 use cordelia_storage::relay::NO_MARK;
 use rusqlite::Connection;
+
+use super::reach::Reach;
 
 /// How long a leave lasts.
 const LEAVE: Duration = Duration::from_secs(SHOW_LEAVE_SECS);
@@ -550,8 +557,11 @@ impl Inner {
             .check_and_record()
     }
 
-    /// Whether the node is still waking at `now`.
-    fn is_waking(&mut self, now: Instant) -> bool {
+    /// Whether the node is still waking at `now`. `reach` says which
+    /// relays a dial has failed for since the wake began: once one relay
+    /// has answered, those are waited for no more (decision 2026-10-24
+    /// (removal), section 8).
+    fn is_waking(&mut self, now: Instant, reach: Option<&Reach>) -> bool {
         let Some(woke) = &mut self.woke else {
             // It reaches no relay: there is nothing to have leave on.
             return true;
@@ -561,7 +571,14 @@ impl Inner {
                 .set_up_with
                 .iter()
                 .all(|relay| woke.heard.contains(relay));
-            woke.awake = all_heard || now.saturating_duration_since(woke.at) >= WAKE_WAIT;
+            let all_answered_or_failed = !woke.heard.is_empty()
+                && self.set_up_with.iter().all(|relay| {
+                    woke.heard.contains(relay)
+                        || reach.is_some_and(|reach| reach.dial_failed_since(relay, woke.at))
+                });
+            woke.awake = all_heard
+                || all_answered_or_failed
+                || now.saturating_duration_since(woke.at) >= WAKE_WAIT;
         }
         !woke.awake
     }
@@ -583,6 +600,10 @@ pub struct Leave {
     /// now: counted, and read by nothing here (decision 2026-10-22 §1.2,
     /// §7.3).
     counts: Arc<DeviceCounts>,
+    /// What is known of each relay's dials ([`Self::reading_dials_in`]):
+    /// a wake waits no more for a relay whose dial has failed since it
+    /// began. `None`: every relay is waited for, up to the wait.
+    reach: Option<Arc<Reach>>,
 }
 
 impl Leave {
@@ -594,7 +615,23 @@ impl Leave {
             inner: Mutex::default(),
             commits: tokio::sync::watch::Sender::new(0),
             counts: Arc::default(),
+            reach: None,
         }
+    }
+
+    /// The same leave, reading in `reach` which relays a dial has failed
+    /// for since the node woke: those a wake waits for no more, once
+    /// another relay has answered (decision 2026-10-24 (removal), section
+    /// 8). It tells `reach` when the node wakes, so that the dial loop
+    /// dials each relay that it does not reach at once.
+    pub fn reading_dials_in(mut self, reach: Arc<Reach>) -> Self {
+        self.reach = Some(reach);
+        self
+    }
+
+    /// Whether the node is still waking at `now`, under `inner`.
+    fn waking(&self, inner: &mut Inner, now: Instant) -> bool {
+        inner.is_waking(now, self.reach.as_deref())
     }
 
     /// Count each transaction that `conn` commits, so that a push open at
@@ -693,19 +730,41 @@ impl Leave {
                 inner.unwoken_since = Some(wall);
             }
         } else if inner.woke.is_none() {
-            inner.woke = Some(Woke {
-                at: now,
-                wall,
-                heard: HashSet::new(),
-                awake: false,
-            });
+            self.wakes(&mut inner, (now, wall));
         }
         slept
     }
 
+    /// The node wakes at `at` (by its clock, and by the time of day in
+    /// seconds): it reached a relay after having reached none, or its
+    /// machine slept. `reach`, where it is read, is told, so that the dial
+    /// loop dials each relay that it does not reach at once (decision
+    /// 2026-10-24 (removal), section 8).
+    fn wakes(&self, inner: &mut Inner, (at, wall): (Instant, i64)) {
+        inner.woke = Some(Woke {
+            at,
+            wall,
+            heard: HashSet::new(),
+            awake: false,
+        });
+        if let Some(reach) = &self.reach {
+            reach.woke();
+        }
+    }
+
     /// Whether the node is still waking.
     pub fn is_waking(&self) -> bool {
-        lock(&self.inner).is_waking(self.clock.now())
+        self.waking(&mut lock(&self.inner), self.clock.now())
+    }
+
+    /// When the wait of a node that is waking ends, by its clock: `None`
+    /// where it is awake, or reaches no relay and so has no wait begun.
+    pub fn wake_ends(&self) -> Option<Instant> {
+        let mut inner = lock(&self.inner);
+        if !self.waking(&mut inner, self.clock.now()) {
+            return None;
+        }
+        inner.woke.as_ref().map(|woke| woke.at + WAKE_WAIT)
     }
 
     /// When the node last woke, by the time of day, in seconds: where it
@@ -752,7 +811,7 @@ impl Leave {
     pub fn has(&self, conn: &Connection, link: &Link) -> Result<(), NoLeave> {
         let now = self.clock.now();
         let mut inner = lock(&self.inner);
-        if inner.is_waking(now) {
+        if self.waking(&mut inner, now) {
             return Err(NoLeave::Waking);
         }
         if inner.not_applied {
@@ -1838,8 +1897,8 @@ mod tests {
             ..Inner::default()
         };
         // It reaches none.
-        assert!(inner.is_waking(now));
-        assert!(inner.is_waking(now + Duration::from_secs(3600)));
+        assert!(inner.is_waking(now, None));
+        assert!(inner.is_waking(now + Duration::from_secs(3600), None));
 
         let woke = |heard: &[&str]| Woke {
             at: now,
@@ -1849,23 +1908,163 @@ mod tests {
         };
         // One of two has answered: waking, up to the wait.
         inner.woke = Some(woke(&["one"]));
-        assert!(inner.is_waking(now));
-        assert!(inner.is_waking(now + Duration::from_millis(29_999)));
-        assert!(!inner.is_waking(now + Duration::from_secs(30)));
+        assert!(inner.is_waking(now, None));
+        assert!(inner.is_waking(now + Duration::from_millis(29_999), None));
+        assert!(!inner.is_waking(now + Duration::from_secs(30), None));
         // And awake from then, whatever the time says later.
-        assert!(!inner.is_waking(now));
+        assert!(!inner.is_waking(now, None));
 
         // Both have answered: awake at once.
         inner.woke = Some(woke(&["one", "two"]));
-        assert!(!inner.is_waking(now));
+        assert!(!inner.is_waking(now, None));
         // A relay that it is not set up with does not stand for one that
         // it is.
         inner.woke = Some(woke(&["one", "three"]));
-        assert!(inner.is_waking(now));
+        assert!(inner.is_waking(now, None));
         // Set up with none, there is nobody to wait for.
         inner.set_up_with.clear();
         inner.woke = Some(woke(&[]));
-        assert!(!inner.is_waking(now));
+        assert!(!inner.is_waking(now, None));
+    }
+
+    /// A wake waits no more for a relay whose dial has failed since it
+    /// began, once another relay has answered (decision 2026-10-24
+    /// (removal), section 8): **a dial that began at or after the wake and
+    /// timed out.** It waits for a relay whose dial is in flight, whose
+    /// dial connected and has not been answered, that is reached, whose
+    /// dial was refused or answered by another key, or whose dial began
+    /// before the wake; for a name of two relays where one of them may
+    /// still answer; and, with no relay heard, whatever failed.
+    #[test]
+    fn a_wake_waits_no_more_for_a_relay_whose_dial_failed_since_it_began() {
+        use super::super::reach::Said;
+        use cordelia_api::at_relays::known::RelayId;
+        use cordelia_api::state::Holds;
+        let clock = Clock::system();
+        let tick = || clock.run_ahead(Duration::from_millis(1));
+        let fresh = || Reach::new(clock.clone());
+        let two = RelayId {
+            name: "two".into(),
+            key: None,
+        };
+        let woke = |heard: &[&str]| Woke {
+            at: clock.now(),
+            wall: 0,
+            heard: heard.iter().map(|name| name.to_string()).collect(),
+            awake: false,
+        };
+        let waking = |woke: &Woke, reach: &Reach| {
+            let mut inner = Inner {
+                set_up_with: vec!["one".to_string(), "two".to_string()],
+                woke: Some(woke.clone()),
+                ..Inner::default()
+            };
+            inner.is_waking(clock.now(), Some(reach))
+        };
+
+        // A dial that timed out before the wake began says nothing of now.
+        let reach = fresh();
+        reach.dial_begins(&two);
+        reach.dial_timed_out(&two);
+        tick();
+        let began = woke(&["one"]);
+        assert!(waking(&began, &reach));
+        // A dial in flight: the relay may still answer.
+        reach.dial_begins(&two);
+        assert!(waking(&began, &reach));
+        // It timed out: the wake is over, as the other has answered.
+        reach.dial_timed_out(&two);
+        assert!(!waking(&began, &reach));
+        // With no relay heard, it is not.
+        let none_heard = Woke {
+            heard: HashSet::new(),
+            ..began.clone()
+        };
+        assert!(waking(&none_heard, &reach));
+        // Another dial in flight, and then a connection: waited for again,
+        // until it answers or the wait has gone by.
+        reach.dial_begins(&two);
+        assert!(waking(&began, &reach));
+        reach.dial_ends(&two, true);
+        assert!(waking(&began, &reach));
+        // Connected and not yet answered, a later dial that times out
+        // does not stand for it: the connection may still answer.
+        reach.dial_begins(&two);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+        // Answered, and so reached: a dial that times out (one made at its
+        // address for another) does not stand for it either.
+        reach.show_ends(&two, [7; 32], Said::Holds, Holds::Holds);
+        reach.dial_begins(&two);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+
+        // A refusal, another key answering, an address that moved: one
+        // round trip of anyone on the path. They do not end the wait.
+        let reach = fresh();
+        let began = woke(&["one"]);
+        reach.dial_begins(&two);
+        reach.dial_ends(&two, false);
+        assert!(waking(&began, &reach));
+
+        // A dial begun before the wake that times out after it: it is not
+        // the wake's dial, and the wake waits for the dial it is owed.
+        let reach = fresh();
+        reach.dial_begins(&two);
+        tick();
+        let began = woke(&["one"]);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+        reach.dial_begins(&two);
+        reach.dial_timed_out(&two);
+        assert!(!waking(&began, &reach));
+        // A timeout of a dial that this relay did not begin, one made at its
+        // address for another, has no beginning known: not read.
+        let reach = fresh();
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+
+        // Two relays of one name, a keyed one and one given no key: the
+        // keyed one connects and waits for its show, the other's dial times
+        // out. The name may still answer.
+        let reach = fresh();
+        let began = woke(&["one"]);
+        let keyed = RelayId {
+            name: "two".into(),
+            key: Some([2; 32]),
+        };
+        reach.dial_begins(&keyed);
+        reach.dial_begins(&two);
+        reach.dial_ends(&keyed, true);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+        // Both timed out: the name is waited for no more.
+        reach.show_ends(&keyed, [8; 32], Said::Neither, Holds::Neither);
+        reach.dial_begins(&keyed);
+        reach.dial_timed_out(&keyed);
+        assert!(!waking(&began, &reach));
+        // A name that no relay of is known: waited for.
+        let reach = fresh();
+        assert!(waking(&began, &reach));
+
+        clock.run_ahead(WAKE_WAIT);
+        assert!(!waking(&began, &reach));
+
+        // A leave that reads the dials tells them when the node wakes, so
+        // that the dial loop dials each relay it does not reach at once;
+        // the flag is read once.
+        let reach = fresh();
+        let leave = Leave::new(clock.clone()).reading_dials_in(reach.clone());
+        assert!(!leave.reaches(&["one".to_string()], &[]));
+        assert!(!reach.dials_at_wake(), "no relay reached, no wake");
+        leave.wakes(&mut lock(&leave.inner), (clock.now(), 0));
+        assert!(reach.dials_at_wake(), "the wake has every relay dialled");
+        assert!(!reach.dials_at_wake());
+        // A leave that does not read them tells nobody.
+        let reach = fresh();
+        let leave = Leave::new(clock.clone());
+        leave.wakes(&mut lock(&leave.inner), (clock.now(), 0));
+        assert!(!reach.dials_at_wake());
     }
     /// A request held back by the device's own pace is counted for its
     /// relay, and a request that may be asked is not (decision 2026-10-22

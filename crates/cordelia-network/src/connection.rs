@@ -71,6 +71,25 @@ pub enum ConnectionError {
     NotTheRelay(NodeId),
 }
 
+impl ConnectionError {
+    /// Whether a dial ended so by a timeout: QUIC's handshake not done
+    /// within STREAM_TIMEOUT_SECS (or QUIC's own timeout), or Cordelia's
+    /// handshake not done within HANDSHAKE_TIMEOUT_SECS after it. Where
+    /// it is not, the dial was refused, closed or answered wrongly: what
+    /// anyone on the path can cause in one round trip (decision
+    /// 2026-10-24 (removal), section 8).
+    pub fn timed_out(&self) -> bool {
+        use crate::codec::CodecError;
+        use crate::handshake::HandshakeError;
+        match self {
+            Self::Quinn(error) => error == "timed out",
+            Self::Handshake(HandshakeError::Timeout)
+            | Self::Handshake(HandshakeError::Codec(CodecError::Timeout(_))) => true,
+            _ => false,
+        }
+    }
+}
+
 /// Metadata for an active peer connection.
 pub struct PeerConnection {
     /// The underlying QUIC connection.
@@ -681,6 +700,31 @@ async fn inbound_on(
 mod tests {
     use super::*;
     use crate::transport;
+
+    /// A dial ends as a timeout only where QUIC's handshake or Cordelia's
+    /// timed out (decision 2026-10-24 (removal), section 8): a refusal,
+    /// another key or an error of TLS is not one, as anyone on the path
+    /// can cause it in one round trip.
+    #[test]
+    fn a_dial_ends_as_a_timeout_only_where_it_timed_out() {
+        use crate::codec::CodecError;
+        use crate::handshake::HandshakeError;
+        assert!(ConnectionError::Quinn("timed out".into()).timed_out());
+        assert!(ConnectionError::Handshake(HandshakeError::Timeout).timed_out());
+        assert!(
+            ConnectionError::Handshake(HandshakeError::Codec(CodecError::Timeout(10))).timed_out()
+        );
+        for not in [
+            ConnectionError::Quinn("the cryptographic handshake failed: error 42".into()),
+            ConnectionError::Quinn("connection refused".into()),
+            ConnectionError::Handshake(HandshakeError::Rejected("no".into())),
+            ConnectionError::Handshake(HandshakeError::IdentityMismatch),
+            ConnectionError::Transport(TransportError::Tls("bad certificate".into())),
+            ConnectionError::NotTheRelay(NodeId([1; 32])),
+        ] {
+            assert!(!not.timed_out(), "{not}");
+        }
+    }
 
     fn make_test_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::generate().unwrap())
