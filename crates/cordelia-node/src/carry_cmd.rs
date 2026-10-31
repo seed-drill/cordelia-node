@@ -2019,18 +2019,18 @@ mod tests {
 
         let mut total = json!({
             "carried": 1, "held": 0, "higher": 0, "ties": ["a.md"], "above": [],
-            "deletes": 0, "cut": 0, "by_other_keys": 2,
+            "deletes": 0, "cut": 0, "cut_own": 1, "by_other_keys": 2,
         });
         let done = json!({
             "carried": 2, "held": 1, "higher": 3, "ties": ["b.md"], "above": ["c.md"],
-            "deletes": 1, "cut": 2, "by_other_keys": 1,
+            "deletes": 1, "cut": 2, "cut_own": 2, "by_other_keys": 1,
         });
         add_to(&mut total, &done);
         assert_eq!(
             total,
             json!({
                 "carried": 3, "held": 1, "higher": 3, "ties": ["a.md", "b.md"],
-                "above": ["c.md"], "deletes": 1, "cut": 2, "by_other_keys": 3,
+                "above": ["c.md"], "deletes": 1, "cut": 2, "cut_own": 3, "by_other_keys": 3,
             })
         );
     }
