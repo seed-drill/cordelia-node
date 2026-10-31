@@ -2397,13 +2397,16 @@ come up one at a time: without the wait a device would take what the first
 relay held, and send it what waited, before a second, which had a change,
 had answered.
 
-**What it costs:** with one relay slow but still answering, or whose name
-does not resolve, a device waits this long before it syncs. A relay whose
-dial has failed since the wake began is waited for no more once another
-has answered (decision 2026-10-24 (removal), section 8): with one relay
-down, the wait is that relay's dial, which the wake begins at once, some
-10 to 13 seconds where it gives no answer (`STREAM_TIMEOUT_SECS` and a
-tick or two).
+**What it costs:** with one relay slow but still answering, refusing,
+answering with another key, or whose name does not resolve, a device
+waits this long before it syncs. A relay whose dial, begun since the wake
+began, timed out is waited for no more once another has answered
+(decision 2026-10-24 (removal), section 8): with one relay down, the wait
+is that relay's dial, which the wake begins at once, some 10 to 13
+seconds where it gives no answer (`STREAM_TIMEOUT_SECS` and a tick or
+two), and up to some 23 where QUIC's handshake is done and Cordelia's
+stalls (`HANDSHAKE_TIMEOUT_SECS` more). Only a timeout counts: a refusal
+or another key is had in one round trip by anyone on the path.
 
 **Why 30:** chosen with that cost; no measurement behind it yet.
 
