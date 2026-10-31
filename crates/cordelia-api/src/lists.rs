@@ -945,6 +945,13 @@ pub enum Do {
         to: Filing,
         agents: Vec<String>,
     },
+    /// The drops a removal makes of the channels past their bound that it
+    /// makes anew (decision 2026-10-10 §3.5): a drop of each, which takes
+    /// no place, and no filing of the new channel, which takes the old
+    /// one's place past the bound. The lists of the new generation carry
+    /// no filing of such a channel, since the one list that did is of the
+    /// generation before: so it is not refused as `NotFiled`.
+    DropPastBound(Vec<[u8; 32]>),
     /// Subscribe an agent to a channel, or end its subscription.
     Subscribe(Subscription),
     /// Give a key a label, or take its label away.
@@ -1096,6 +1103,14 @@ fn decide(
                 make(dropped, dated(&key)?, identity).map(AnyAct::Drop),
             )?])
         }
+        Do::DropPastBound(channels) => channels
+            .iter()
+            .map(|channel| {
+                let key = (Part::Channel, channel.to_vec());
+                let dropped = Dropped { channel: *channel };
+                signed(make(dropped, dated(&key)?, identity).map(AnyAct::Drop))
+            })
+            .collect(),
         Do::MoveWith { from, to, agents } => {
             let mut made = decide(
                 computed,

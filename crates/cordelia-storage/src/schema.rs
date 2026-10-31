@@ -1362,8 +1362,9 @@ CREATE TABLE shared_msg_kept_numbers (
 /// - `shared_anew_made`: each channel this device made anew, with the new
 ///   channel, the offer's revision, when, whether a removal made it,
 ///   whether the old channel's entries wait for the offer to be at each
-///   relay, and, at a removal, how many keys it left out past the 64 and
-///   how many rows the table had let go.
+///   relay, and, at a removal, how many keys it left out past the 64,
+///   how many rows the table had let go, and whether the old channel was
+///   past a bound.
 /// - `shared_anew_not_clean`: each channel this device held when it applied
 ///   a statement that removed a key, with when, whether it makes the
 ///   channel anew itself once read (a recovery), and whether the removal
@@ -1402,7 +1403,8 @@ CREATE TABLE shared_anew_made (
     at_removal   INTEGER NOT NULL CHECK(at_removal IN (0, 1)),
     delivering   INTEGER NOT NULL CHECK(delivering IN (0, 1)),
     past_64      INTEGER NOT NULL DEFAULT 0 CHECK(typeof(past_64) = 'integer' AND past_64 >= 0),
-    let_go       INTEGER NOT NULL DEFAULT 0 CHECK(typeof(let_go) = 'integer' AND let_go >= 0)
+    let_go       INTEGER NOT NULL DEFAULT 0 CHECK(typeof(let_go) = 'integer' AND let_go >= 0),
+    past_bound   INTEGER NOT NULL DEFAULT 0 CHECK(past_bound IN (0, 1))
 );
 
 CREATE TABLE shared_anew_not_clean (
@@ -5616,7 +5618,7 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32),
                  zeroblob(33), zeroblob(64), NULL, 9, 0);
-             INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 0, 0);
+             INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 0, 0, 0);
              INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 1, 0);",
         )
         .unwrap();
@@ -5644,10 +5646,11 @@ mod tests {
             "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(33), zeroblob(2080), NULL, 9, 0)",
             "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(33), zeroblob(64), zeroblob(91), 9, 0)",
             "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(33), zeroblob(64), NULL, 9, 2)",
-            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 2, 1, 0, 0)",
-            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, -1, 0)",
-            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 0, 'one')",
-            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(31), 1, 9, 0, 1, 0, 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 2, 1, 0, 0, 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, -1, 0, 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 0, 'one', 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(31), 1, 9, 0, 1, 0, 0, 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 0, 0, 2)",
             "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 'nine', 1, 0)",
             "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 2, 0)",
             "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 0, 2)",
@@ -5656,7 +5659,7 @@ mod tests {
         }
         for taken in [
             "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(65), zeroblob(2048), zeroblob(92), 9, 1)",
-            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 1, 0, 3, 5)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 1, 0, 3, 5, 1)",
             "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 0, 1)",
         ] {
             assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");

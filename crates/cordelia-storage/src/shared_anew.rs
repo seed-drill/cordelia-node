@@ -222,6 +222,10 @@ pub struct MadeRow {
     pub past_64: u64,
     /// At a removal, how many rows the table had let go, left out.
     pub let_go: u64,
+    /// Whether the old channel was past a bound when a removal made it
+    /// anew, so that the new channel is not filed (decision 2026-10-10
+    /// §3.5).
+    pub past_bound: bool,
 }
 
 fn made_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<MadeRow> {
@@ -234,6 +238,7 @@ fn made_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<MadeRow> {
         delivering: row.get::<_, i64>(5)? == 1,
         past_64: row.get::<_, i64>(6)?.max(0) as u64,
         let_go: row.get::<_, i64>(7)?.max(0) as u64,
+        past_bound: row.get::<_, i64>(8)? == 1,
     })
 }
 
@@ -241,8 +246,9 @@ fn made_of(row: &rusqlite::Row<'_>) -> rusqlite::Result<MadeRow> {
 pub fn made(conn: &Connection, made: &MadeRow) -> Result<(), CordeliaError> {
     conn.execute(
         "INSERT OR REPLACE INTO shared_anew_made
-             (channel, new_channel, rev, made_at, at_removal, delivering, past_64, let_go)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (channel, new_channel, rev, made_at, at_removal, delivering, past_64, let_go,
+              past_bound)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             &made.channel[..],
             &made.new_channel[..],
@@ -252,6 +258,7 @@ pub fn made(conn: &Connection, made: &MadeRow) -> Result<(), CordeliaError> {
             made.delivering as i64,
             i64::try_from(made.past_64).unwrap_or(i64::MAX),
             i64::try_from(made.let_go).unwrap_or(i64::MAX),
+            made.past_bound as i64,
         ],
     )
     .map_err(storage)?;
@@ -264,7 +271,8 @@ pub fn made_of_channel(
     channel: &[u8; 32],
 ) -> Result<Option<MadeRow>, CordeliaError> {
     conn.query_row(
-        "SELECT channel, new_channel, rev, made_at, at_removal, delivering, past_64, let_go
+        "SELECT channel, new_channel, rev, made_at, at_removal, delivering, past_64, let_go,
+                    past_bound
              FROM shared_anew_made WHERE channel = ?1",
         [&channel[..]],
         made_of,
@@ -276,7 +284,8 @@ pub fn made_of_channel(
 /// Every channel this device made anew, oldest first.
 pub fn made_all(conn: &Connection) -> Result<Vec<MadeRow>, CordeliaError> {
     conn.prepare(
-        "SELECT channel, new_channel, rev, made_at, at_removal, delivering, past_64, let_go
+        "SELECT channel, new_channel, rev, made_at, at_removal, delivering, past_64, let_go,
+                    past_bound
              FROM shared_anew_made ORDER BY made_at, channel",
     )
     .map_err(storage)?

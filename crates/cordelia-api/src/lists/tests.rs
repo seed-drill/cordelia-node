@@ -30,6 +30,19 @@ pub(crate) fn filing(seed: u8, name: &str) -> Filing {
     }
 }
 
+/// A filing as [`filing`] makes it, of a card at the relay of `relay`.
+fn filing_at(seed: u8, name: &str, relay: [u8; 32]) -> Filing {
+    let mut bytes = vec![seed; 32];
+    bytes.extend_from_slice(&Relays::new(&[relay]).unwrap().to_bytes());
+    let card = Card::from_bytes(&bytes).unwrap();
+    Filing {
+        channel: card.channel_id().unwrap(),
+        card,
+        name: name.into(),
+        came: Came::Made,
+    }
+}
+
 /// The ID of the channel of the card made from `seed`.
 fn channel(seed: u8) -> [u8; 32] {
     filing(seed, "x").channel
@@ -3503,7 +3516,8 @@ struct PastABound {
 /// each, apart, and `review`, the oldest of 17, is past the bound. The
 /// table lets go the row of the member that wrote first (by hand: see
 /// below), and Dave writes there after the bound, of which the door takes
-/// nothing.
+/// nothing. The desktop's last channel, `d7`, is at a relay of its own,
+/// which the laptop does not reach.
 fn past_a_bound(
     s: &Several,
     while_held: &dyn Fn(&Several, &crate::shared::tests::Shared, &NodeIdentity),
@@ -3529,7 +3543,11 @@ fn past_a_bound(
     for k in 0..8u8 {
         let at = t1 + i64::from(k);
         on(s, laptop, Do::File(filing(10 + k, &format!("l{k}"))), at);
-        on(s, desktop, Do::File(filing(20 + k, &format!("d{k}"))), at);
+        let d = match k {
+            7 => filing_at(20 + k, "d7", [4; 32]),
+            _ => filing(20 + k, &format!("d{k}")),
+        };
+        on(s, desktop, Do::File(d), at);
     }
     for round in 0..3 {
         let now = t1 + 10 + round;
@@ -3789,4 +3807,394 @@ fn shared_move_past_a_bound_judges_the_offers_read_before() {
     assert_eq!(plan.what.to.channel, new_channel);
     crate::shared_anew::make_move(conn, identity, &plan.what, t2 + 3).unwrap();
     assert_eq!(row(&s, laptop, &review).state, State::Moved);
+}
+
+/// A removal makes a channel past its bound anew (decision 2026-10-10 §3.5,
+/// the person's ruling of 30 October; T23). With the channel of
+/// `past_a_bound`, which only the phone's list carries and the laptop no
+/// longer holds, and Dave writing there after the bound, the laptop removes
+/// the phone, which holds the channel's seed. Before its yes the removal
+/// names the channel among those past a bound. It is made anew under the
+/// lists of the generation before, though channels held come before it and
+/// after it in the order of the channels not clean: its offer seals to the
+/// one member the table holds alone, so to no key the laptop does not
+/// hold, and to none of the person's own devices, which hold neither
+/// channel: the phone's key and the desktop's cannot open the new seed
+/// (the review of `feat/shared-anew-past-bound`, high 2). Each relay
+/// answered the laptop's anew record at revision 2 before the bound (it
+/// was dropped and taken again), and the store holds none of it: the offer
+/// goes at 3 and is pushed (high 1). A relay that holds a later one of the
+/// laptop's has not got the offer, which is written again above it, and is
+/// delivered only once a relay holds it. The line says how many keys it
+/// could not list, and that only someone in it can share the new channel
+/// with them (the medium). The new channel takes the old one's place past the bound:
+/// the 15 channels held that the laptop reaches are made anew and filed,
+/// `d7`, which it does not reach, stays as it was, and none goes past the
+/// bound. A take-out that the bound began and that has not ended when the
+/// removal comes ends there: the old channel is moved from, keeps its
+/// offer, and the pass sends it there alone; the look and the status say
+/// the line.
+#[test]
+fn a_removal_makes_a_channel_past_its_bound_anew() {
+    use crate::shared::tests::row;
+    use crate::shared_anew::{LeftOut, made_anew_past_a_bound_line, past_a_bound_line};
+    use cordelia_crypto::shared::Anew;
+    use cordelia_storage::shared::State;
+
+    let mut s = person(3, 3);
+    let (laptop, desktop, phone) = (0, 1, 2);
+    let PastABound {
+        review,
+        gone,
+        kept,
+        dave,
+        t2,
+    } = past_a_bound(&s, &|_, _, _| {});
+    // The take-out that the bound began has not ended yet.
+    let id = row(&s, laptop, &review).id;
+    cordelia_storage::shared_pass::begin_channel(
+        &s[laptop].conn,
+        id,
+        cordelia_storage::shared_pass::ChannelOut::Dropped,
+    )
+    .unwrap();
+    // Each relay of its card answered the laptop's anew record at 2: it was
+    // dropped and taken again, its record went at 1 and was answered as
+    // another, and was written at 2 (`shared_pass::anew_again`). The store
+    // holds none of it past the bound; the answers stay.
+    use cordelia_crypto::derive;
+    use cordelia_crypto::shared::anew_name;
+    use cordelia_crypto::slots::slot_id;
+    use cordelia_storage::shared_pass::Answer;
+    const AT: [u8; 32] = [3; 32];
+    let slot = slot_id(
+        &derive::slot_key(&review.secret).unwrap(),
+        &anew_name(&s.key(laptop)).unwrap(),
+    );
+    cordelia_storage::shared_pass::answered(&s[laptop].conn, id, &AT, &slot, 2, Answer::Holds)
+        .unwrap();
+    s.now = t2 + 10;
+    s.change(laptop, &[laptop, desktop], &[phone]);
+    let now = s.now + 1;
+    let conn = &s[laptop].conn;
+    let identity = &s[laptop].identity;
+    let own_relays = vec![crate::sharing::OwnRelay {
+        name: "relay.example.org:9474".into(),
+        key: AT,
+    }];
+
+    // Before its yes, the removal names it among the channels past a bound.
+    let (made_anew, _, past, _) = crate::shared_anew::at_a_removal(conn, &own_relays).unwrap();
+    assert_eq!(past, ["review"]);
+    assert_eq!(made_anew.len(), 15, "d7 is not reached");
+    // Channels held come before it and after it among those not clean.
+    let order: Vec<[u8; 32]> = cordelia_storage::shared_anew::not_clean_all(conn)
+        .unwrap()
+        .iter()
+        .map(|mark| mark.channel)
+        .collect();
+    assert_eq!(order.len(), 17);
+    let at = order.iter().position(|id| *id == review.id).unwrap();
+    assert!(at > 0 && at + 1 < order.len(), "at {at}");
+
+    let said = crate::shared_anew::anew_at_removal(conn, identity, &own_relays, now).unwrap();
+    assert_eq!(said.len(), 17, "{said:?}");
+    assert!(
+        !said
+            .iter()
+            .any(|line| line.contains("could not be made anew")),
+        "{said:?}"
+    );
+    assert!(
+        said.contains(&crate::shared_anew::unreached_line("d7")),
+        "{said:?}"
+    );
+
+    // The offer, in the old channel.
+    let offers: Vec<_> = s[laptop]
+        .stored_in(&review.secret)
+        .into_iter()
+        .filter(|entry| entry.author == s.key(laptop))
+        .collect();
+    assert_eq!(offers.len(), 1, "the offer");
+    assert_eq!(offers[0].rev, 3, "above what each relay answered");
+    let opened = offers[0].open(&review.secret).unwrap();
+    let Ok(Anew::Offer(offer)) = Anew::from_value(&opened.value) else {
+        panic!("no offer");
+    };
+    let mut sealed: Vec<[u8; 32]> = offer.seals.iter().map(|seal| seal.key).collect();
+    sealed.sort();
+    assert_eq!(
+        sealed,
+        vec![kept.public_key()],
+        "only the members the laptop holds"
+    );
+    assert!(offer.open(&s[phone].identity, &review.id).is_err());
+    assert!(offer.open(&s[desktop].identity, &review.id).is_err());
+    assert!(offer.open(&s[laptop].identity, &review.id).is_err());
+    assert!(offer.open(&gone, &review.id).is_err());
+    assert!(offer.open(&dave, &review.id).is_err());
+    assert!(offer.open(&kept, &review.id).is_ok());
+    // What was made records that it was past a bound.
+    let made = cordelia_storage::shared_anew::made_of_channel(conn, &review.id)
+        .unwrap()
+        .unwrap();
+    assert!(made.past_bound && made.at_removal && made.delivering);
+
+    // The line counts what it could not list.
+    let line = made_anew_past_a_bound_line(
+        "review",
+        &offer.new_channel,
+        LeftOut {
+            past_64: 0,
+            let_go: 1,
+        },
+    );
+    assert!(said.contains(&line), "{said:?}");
+    assert_eq!(
+        line,
+        format!(
+            "\"review\" is made anew without the device removed: it is channel {} now. It was \
+             past a bound, so your devices hold neither it nor the new channel: ask someone in \
+             it to share the new channel with you. You could not list everyone in \"review\" \
+             since it went past a bound: up to 1 key you no longer hold, and anyone who wrote \
+             there since: ask someone in it to share the new channel with them too.",
+            crate::sharing::channel_words(&offer.new_channel)
+        )
+    );
+    // The person holds no card of the new channel to share it with.
+    assert!(!line.contains(&past_a_bound_line("review", 1)), "{line}");
+
+    // No other channel goes past the bound: the 16 held are filed, anew.
+    let filings = crate::sharing::filed(conn).unwrap();
+    let mut names: Vec<String> = filings.iter().map(|filing| filing.name.clone()).collect();
+    names.sort();
+    let mut expected: Vec<String> = (0..8u8)
+        .flat_map(|k| [format!("l{k}"), format!("d{k}")])
+        .collect();
+    expected.sort();
+    assert_eq!(names, expected);
+    // Each but d7 is made anew; d7 keeps its filing.
+    for filing in &filings {
+        assert_eq!(filing.came == Came::Made, filing.name == "d7", "{filing:?}");
+    }
+    let worked = holds_worked_out(conn, &s.key(laptop), now).unwrap();
+    assert!(
+        !worked
+            .left_out
+            .iter()
+            .any(|(act, _)| matches!(act, AnyAct::Filing(_))),
+        "{:?}",
+        worked.left_out
+    );
+    assert!(
+        worked
+            .drops
+            .iter()
+            .any(|(drop, _)| drop.item.channel == review.id)
+    );
+
+    // The old channel is moved from, and its offer is sent there alone.
+    crate::shared::tests::out(&s, laptop, now);
+    assert_eq!(row(&s, laptop, &review).state, State::Moved);
+    let usable = crate::shared_pass::usable(conn, &review.id, &AT)
+        .unwrap()
+        .unwrap();
+    let most = crate::at_relays::Most {
+        entries: 100,
+        bytes: 1 << 20,
+    };
+    let batch = crate::shared_pass::to_send(conn, identity, &usable, &AT, most).unwrap();
+    assert_eq!(batch.len(), 1, "the offer alone");
+    assert_eq!(batch[0].rev, 3);
+    // A relay that holds a later one of the laptop's has not got the offer:
+    // it is not delivered, and is written again above.
+    use crate::at_relays::Pushed;
+    let delivering = || {
+        cordelia_storage::shared_anew::made_of_channel(conn, &review.id)
+            .unwrap()
+            .unwrap()
+            .delivering
+    };
+    crate::shared_pass::pushed(
+        conn,
+        identity,
+        &usable,
+        &AT,
+        &batch,
+        &[Pushed::HoldsLater],
+        now,
+    )
+    .unwrap();
+    assert!(delivering(), "not at the relay");
+    let again = crate::shared_pass::to_send(conn, identity, &usable, &AT, most).unwrap();
+    assert_eq!(again.len(), 1, "the offer alone");
+    assert_eq!((again[0].slot, again[0].rev), (slot, 4));
+    let opened = again[0].open(&review.secret).unwrap();
+    assert!(matches!(
+        Anew::from_value(&opened.value),
+        Ok(Anew::Offer(again)) if again.new_channel == offer.new_channel
+    ));
+    crate::shared_pass::pushed(conn, identity, &usable, &AT, &again, &[Pushed::Holds], now)
+        .unwrap();
+    assert!(!delivering(), "at the one relay of its card");
+
+    // The look and the status say the line.
+    let look = crate::shared_anew::made_at_the_last_removal(conn, Some(now)).unwrap();
+    assert!(look.contains(&line), "{look:?}");
+    let said = crate::state::SharedSaid::default();
+    let beside = crate::shared_status::Beside {
+        own_relays: &own_relays,
+        connected: &[AT],
+        said: &said,
+    };
+    let status = crate::shared_status::status_of(conn, identity, &beside, now)
+        .unwrap()
+        .unwrap();
+    let made = status["made_anew_past_a_bound"].as_array().unwrap();
+    assert_eq!(made.len(), 1, "{status}");
+    assert_eq!(made[0]["name"], "review");
+    assert_eq!(made[0]["said"], line.as_str());
+    // Only d7, which it did not reach, is still held by the removed device.
+    assert_eq!(
+        status["removed_device_holds"][0]["channels"],
+        serde_json::json!(["d7"])
+    );
+
+    // A channel held that the removal made anew, whose new channel then
+    // loses its row (it is dropped and forgotten within the seven days), is
+    // not named as past a bound: what was made records it (low 1).
+    let l0 = filings
+        .iter()
+        .find(|filing| filing.name == "l0")
+        .unwrap()
+        .channel;
+    let l0_row = cordelia_storage::shared::channel(conn, &l0)
+        .unwrap()
+        .unwrap();
+    cordelia_storage::shared::forget(conn, l0_row.id).unwrap();
+    let look = crate::shared_anew::made_at_the_last_removal(conn, Some(now)).unwrap();
+    assert_eq!(
+        look.iter()
+            .filter(|said| said.contains("past a bound"))
+            .collect::<Vec<_>>(),
+        vec![&line],
+        "{look:?}"
+    );
+    assert!(
+        look.iter()
+            .any(|said| said.starts_with("\"l0\" is made anew")
+                && said.contains("The other people in it move")),
+        "{look:?}"
+    );
+    let status = crate::shared_status::status_of(conn, identity, &beside, now)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        status["made_anew_past_a_bound"].as_array().unwrap().len(),
+        1,
+        "{status}"
+    );
+}
+
+/// A channel past its bound that a removal does not make anew, since the
+/// laptop does not reach its relays, is named at the removal and stays
+/// named (the review of `feat/shared-anew-past-bound`, low 2): no list of
+/// the generation the removal began carries it, and it is not forgotten
+/// while it is not clean. With the channels of `past_a_bound`, the laptop
+/// reaches only `d7`'s relay: it makes `d7` anew, which writes a list of
+/// the new generation, and leaves `review` and the 15 others not clean.
+/// `review` keeps its row past the bound, and `cordelia devices` names it
+/// with the line said at the removal.
+#[test]
+fn a_channel_past_its_bound_not_made_anew_at_a_removal_stays_named() {
+    use crate::shared::tests::row;
+    use crate::shared_anew::unreached_past_a_bound_line;
+    use cordelia_storage::shared::State;
+
+    let mut s = person(3, 3);
+    let (laptop, desktop, phone) = (0, 1, 2);
+    let PastABound { review, t2, .. } = past_a_bound(&s, &|_, _, _| {});
+    s.now = t2 + 10;
+    s.change(laptop, &[laptop, desktop], &[phone]);
+    let now = s.now + 1;
+    let conn = &s[laptop].conn;
+    let identity = &s[laptop].identity;
+    let own_relays = vec![crate::sharing::OwnRelay {
+        name: "elsewhere.example.org:9474".into(),
+        key: [4; 32],
+    }];
+    let said = crate::shared_anew::anew_at_removal(conn, identity, &own_relays, now).unwrap();
+    let line = unreached_past_a_bound_line("review");
+    assert!(said.contains(&line), "{said:?}");
+    assert!(
+        crate::sharing::filed(conn)
+            .unwrap()
+            .iter()
+            .any(|filing| filing.name == "d7" && filing.came != Came::Made),
+        "d7 is made anew"
+    );
+    for at in [now, now + 1] {
+        crate::shared::tests::out(&s, laptop, at);
+        assert_eq!(row(&s, laptop, &review).state, State::NotInForce);
+        assert!(crate::shared_anew::is_not_clean(conn, &review.id).unwrap());
+        let told = crate::shared_anew::notices(conn).unwrap();
+        assert!(
+            told.iter()
+                .any(|(_, kind, says)| *kind == "not_clean" && *says == line),
+            "{told:?}"
+        );
+    }
+}
+
+/// A recovery does not make a channel past its bound anew, and names it
+/// (decision 2026-10-10 §3.5): the new machine never read it, and holds no
+/// table of its keys to seal to. With the lists of `past_a_bound`, whose
+/// phone carries the filing of `review` and the laptop and the desktop 16
+/// newer ones, a recovery told every device is gone brings back the 16 and
+/// not `review`, which it names, past a bound, with what to ask of the
+/// others in it; told every device is still had, it removes nobody, and
+/// says nothing of it.
+#[test]
+fn a_recovery_names_a_channel_past_its_bound_and_does_not_make_it_anew() {
+    use cordelia_crypto::entry::CheckedEntry;
+
+    let s = person(3, 3);
+    let PastABound { review, .. } = past_a_bound(&s, &|_, _, _| {});
+    let personal = s[0].personal();
+    let handed: Vec<CheckedEntry> = (0..3).flat_map(|n| s[n].stored()).collect();
+    let keys = [s.key(0), s.key(1), s.key(2)];
+    let lists = lists_in(&handed, &personal, &keys).unwrap();
+    assert_eq!(lists.len(), 3);
+    let devices: Vec<([u8; 32], String)> = keys.iter().map(|key| (*key, String::new())).collect();
+
+    let lines = crate::shared_anew::recovery_lines(&lists, &devices, &[]).unwrap();
+    let all = lines.join("\n");
+    assert!(
+        all.contains(
+            "Past a bound, so not brought back or made anew: \"review\". A device you said is \
+             gone may still read what is written in each: ask someone in each to make it anew \
+             without your old devices, and to share it with you again."
+        ),
+        "{all}"
+    );
+    let (written, past) = recovered(&lists, |key| keys.contains(key).then_some(Maker::Removed));
+    let filed_in = |list: &SharedList| {
+        acts_of(list)
+            .iter()
+            .filter_map(|act| match act {
+                AnyAct::Filing(filing) => Some(filing.item.channel),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(filed_in(&written).len(), 16);
+    assert!(!filed_in(&written).contains(&review.id));
+    assert_eq!(filed_in(&past), [review.id]);
+
+    let lines = crate::shared_anew::recovery_lines(&lists, &[], &devices).unwrap();
+    assert!(
+        !lines.iter().any(|line| line.contains("Past a bound")),
+        "{lines:?}"
+    );
 }

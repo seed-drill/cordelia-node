@@ -183,6 +183,21 @@ pub fn status_of(
             past_a_bound.push(json!({ "act": kind, "item": item, "channel": channel }));
         }
 
+        // Each channel past a bound that a removal here made anew in the
+        // last seven days (§3.5): the person's devices hold neither it nor
+        // the new one. It sets no level.
+        let shown_since =
+            now - cordelia_core::protocol::REMOVAL_NOT_APPLIED_SHOWN_DAYS as i64 * 86_400;
+        let mut made_anew_past_a_bound = Vec::new();
+        for (name, made, line) in shared_anew::made_anew_past_a_bound(conn, shown_since)? {
+            made_anew_past_a_bound.push(json!({
+                "name": name,
+                "words": channel_words(&made.new_channel),
+                "made": rfc3339(made.made_at),
+                "said": line,
+            }));
+        }
+
         Ok(Some(json!({
             "channels": channels,
             "typed": typed,
@@ -190,6 +205,7 @@ pub fn status_of(
             "acts_of_removed_devices": acts_of_removed_devices,
             "passed_over": passed_over,
             "past_a_bound": past_a_bound,
+            "made_anew_past_a_bound": made_anew_past_a_bound,
         })))
     })
 }

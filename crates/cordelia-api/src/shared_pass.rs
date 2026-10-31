@@ -393,7 +393,10 @@ pub fn pushed(
         for (entry, pushed) in batch.iter().zip(answers) {
             let answer = match pushed {
                 Pushed::Holds => Answer::Holds,
-                Pushed::HoldsLater => Answer::HoldsLater,
+                Pushed::HoldsLater => {
+                    offer_again(conn, identity, usable, entry, now)?;
+                    Answer::HoldsLater
+                }
                 Pushed::HoldsAnother => {
                     anew_again(conn, identity, usable, entry, now)?;
                     Answer::HoldsAnother
@@ -459,6 +462,27 @@ fn anew_again(
         }
     }
     Ok(())
+}
+
+/// A relay holds a later entry of this device's than `entry` in its slot
+/// (`Pushed::HoldsLater`): where `entry` is the offer of a channel this
+/// device made anew, whose delivery waits, it is not at that relay, and it
+/// is written again one revision above, as [`anew_again`] does (§7). A
+/// relay that holds a later one still answers so again, and the offer
+/// climbs until it is above what that relay holds.
+fn offer_again(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    usable: &Usable,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<(), PersonError> {
+    let delivering = cordelia_storage::shared_anew::made_of_channel(conn, &usable.channel)?
+        .is_some_and(|made| made.delivering);
+    if !delivering {
+        return Ok(());
+    }
+    anew_again(conn, identity, usable, entry, now)
 }
 
 /// The share pair channel of this device and `key` (decision 2026-10-10

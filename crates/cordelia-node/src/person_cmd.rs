@@ -1653,6 +1653,11 @@ struct Handed {
     /// leaves not clean rather than making anew (decision 2026-10-24,
     /// rules 24 and 25).
     shared_unreached: Vec<String>,
+    /// The shared channels past a bound, which the person's devices do not
+    /// hold: the removal makes each anew where this device reaches it, and
+    /// the new channel takes the old one's place past the bound (decision
+    /// 2026-10-10 §3.5).
+    shared_past_bound: Vec<String>,
     shared_acts: Vec<([u8; 32], String)>,
 }
 
@@ -1770,6 +1775,9 @@ impl Handed {
         let shared_unreached: Vec<String> = list(handed, "shared_unreached")
             .filter_map(|name| name.as_str().map(str::to_string))
             .collect();
+        let shared_past_bound: Vec<String> = list(handed, "shared_past_bound")
+            .filter_map(|name| name.as_str().map(str::to_string))
+            .collect();
         let shared_acts: Vec<([u8; 32], String)> = list(handed, "shared_acts")
             .filter_map(|act| {
                 let maker = decode_public_key(act["maker"].as_str()?).ok()?;
@@ -1779,6 +1787,7 @@ impl Handed {
         Ok(Self {
             shared_channels,
             shared_unreached,
+            shared_past_bound,
             shared_acts,
             this_device: *own,
             applied,
@@ -1898,6 +1907,20 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
             "\nThese shared channels are not reached from this device, so they are not made anew \
              in this change: {}. Your devices send nothing in each until you make it anew with \
              cordelia shared anew <name> on a device of yours that reaches its relays.",
+            names.join(", ")
+        ));
+    }
+    if !handed.shared_past_bound.is_empty() {
+        let names: Vec<String> = handed
+            .shared_past_bound
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect();
+        lines.push(format!(
+            "\nThese shared channels were past a bound, so your devices do not hold them: {}. \
+             Each is made anew without the device removed, in this change, where this device \
+             reaches its relays. Your devices do not hold the new one either: ask someone in it \
+             to share the new channel with you, and with anyone who wrote there since.",
             names.join(", ")
         ));
     }
