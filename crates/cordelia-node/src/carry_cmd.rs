@@ -1115,7 +1115,6 @@ fn add_to(total: &mut Value, done: &Value) {
         "higher",
         "deletes",
         "cut",
-        "cut_own",
         "by_other_keys",
     ] {
         let sum = total[field].as_u64().unwrap_or(0) + done[field].as_u64().unwrap_or(0);
@@ -1145,27 +1144,6 @@ pub(crate) fn left_out_line(how_many: usize, name: &str) -> String {
         match how_many {
             1 => "it was",
             _ => "they were",
-        }
-    )
-}
-
-/// What is said of the versions a carry left out because this device wrote
-/// them itself, after it took a removed device's late writing and before it
-/// knew of the removal (decision 2026-10-24 (removal), rule 27): no command
-/// brings them in, `--from` least of all, which brings only what the keys
-/// it names wrote (the review of the whole build, its M4).
-pub(crate) fn own_left_out_line(how_many: usize) -> String {
-    format!(
-        "  {} left out: this device wrote {} after it took a removed device's late writing, \
-         and before it knew of the removal. No command brings {} in.",
-        counted(how_many, "version"),
-        match how_many {
-            1 => "it",
-            _ => "them",
-        },
-        match how_many {
-            1 => "it",
-            _ => "them",
         }
     )
 }
@@ -1285,9 +1263,6 @@ pub(crate) fn carried_lines(done: &Value) -> Vec<String> {
     }
     if number("cut") > 0 {
         lines.push(left_out_line(number("cut"), &name));
-    }
-    if number("cut_own") > 0 {
-        lines.push(own_left_out_line(number("cut_own")));
     }
     // What could not be read, by generation and relay.
     lines.extend(not_read_lines(done));
@@ -2019,18 +1994,18 @@ mod tests {
 
         let mut total = json!({
             "carried": 1, "held": 0, "higher": 0, "ties": ["a.md"], "above": [],
-            "deletes": 0, "cut": 0, "cut_own": 1, "by_other_keys": 2,
+            "deletes": 0, "cut": 0, "by_other_keys": 2,
         });
         let done = json!({
             "carried": 2, "held": 1, "higher": 3, "ties": ["b.md"], "above": ["c.md"],
-            "deletes": 1, "cut": 2, "cut_own": 2, "by_other_keys": 1,
+            "deletes": 1, "cut": 2, "by_other_keys": 1,
         });
         add_to(&mut total, &done);
         assert_eq!(
             total,
             json!({
                 "carried": 3, "held": 1, "higher": 3, "ties": ["a.md", "b.md"],
-                "above": ["c.md"], "deletes": 1, "cut": 2, "cut_own": 3, "by_other_keys": 3,
+                "above": ["c.md"], "deletes": 1, "cut": 2, "by_other_keys": 3,
             })
         );
     }
@@ -2058,30 +2033,6 @@ mod tests {
         assert!(one.contains("1 version left out: a removed device wrote it, or what it was"));
         let none = json!({ "name": "lab", "carried": 1, "cut": 0, "nothing": null });
         assert!(!carried_lines(&none).join("\n").contains("left out"));
-    }
-
-    /// What a carry left out because this device wrote it in its window
-    /// (decision 2026-10-24 (removal), rule 27) is said apart, in its own
-    /// words, with no `--from`, which never brings this device's own
-    /// writing (the review of the whole build, its M4).
-    #[test]
-    fn test_what_a_carry_left_out_of_this_devices_own_writing_is_said_apart() {
-        let done = json!({
-            "name": "lab", "generations": [], "carried": 1, "higher": 0, "ties": [],
-            "above": [], "deletes": 0, "cut": 0, "cut_own": 2, "by_other_keys": 0,
-            "nothing": null,
-        });
-        let all = carried_lines(&done).join("\n");
-        assert!(
-            all.contains(
-                "  2 versions left out: this device wrote them after it took a removed \
-                 device's late writing, and before it knew of the removal. No command brings \
-                 them in."
-            ),
-            "{all}"
-        );
-        assert!(!all.contains("--from"), "{all}");
-        assert!(!all.contains("a removed device wrote them"), "{all}");
     }
 
     /// What a carry with the phrase left is said too: what stands above

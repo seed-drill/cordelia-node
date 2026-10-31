@@ -462,14 +462,13 @@ fn text_now(path: &Path) -> Result<Option<String>, String> {
 }
 
 /// Why the record `id`, which says `about`, is not put back, where a carry
-/// cut its file (decision 2026-10-24 (removal), rules 7 and 27; the
-/// reviews of the whole build, H1, and of its fixes, H1, M2 and L5).
-/// `cordelia restore` is open to any local process, an agent included,
-/// through the local API, so it brings back none of:
+/// cut its file (decision 2026-10-24 (removal), rule 7; the reviews of the
+/// whole build, H1, and of its fixes, H1, M2 and L5). `cordelia restore`
+/// is open to any local process, an agent included, through the local
+/// API, so it brings back none of:
 ///
 /// - a version that a carry set aside: what a removed device wrote, or
-///   what was written over it (rule 7), or what this device wrote itself
-///   in its window (rule 27);
+///   what was written over it;
 /// - **any version of a file that a carry cut**, as the database says it
 ///   (`file_cut`), whether or not the carry changed what the folder held,
 ///   and whatever the record's id: it asks neither a record set aside,
@@ -487,30 +486,18 @@ fn text_now(path: &Path) -> Result<Option<String>, String> {
 /// the database. `cordelia history show` still prints each, and the
 /// person may copy it into the file by hand. What a removed device wrote
 /// comes back only by `cordelia sync carry --from`, at a terminal, with
-/// the recovery phrase; what this device wrote in its window comes back by
-/// no command. Where the database or history cannot be read, or history
-/// holds a record that cannot be read, nothing is put back. It is asked
-/// with the turn held, so the pending records are marked first, and asked
-/// with the rest.
+/// the recovery phrase. Where the database or history cannot be read, or
+/// history holds a record that cannot be read, nothing is put back. It is
+/// asked with the turn held, so the pending records are marked first, and
+/// asked with the rest.
 fn set_aside_refusal(state: &AppState, store: &Store, about: &About) -> Option<String> {
     let from = "What a removed device wrote comes back only at a terminal, with the recovery \
                 phrase: `cordelia sync carry <name> --from <its label>`";
-    match about.change {
-        Change::SetAside => {
-            return Some(format!(
-                "this version was set aside at a change: a removed device wrote it, or it was \
-                 written over what one wrote. `cordelia restore` does not put it back. {from}"
-            ));
-        }
-        Change::SetAsideOwn => {
-            return Some(
-                "this version was set aside at a change: this device wrote it after it took a \
-                 removed device's late writing, and before it knew of the removal. `cordelia \
-                 restore` does not put it back, and no command does"
-                    .to_string(),
-            );
-        }
-        _ => {}
+    if about.change == Change::SetAside {
+        return Some(format!(
+            "this version was set aside at a change: a removed device wrote it, or it was \
+             written over what one wrote. `cordelia restore` does not put it back. {from}"
+        ));
     }
     let sha = about.kept.as_ref().map(|kept| kept.sha256.as_str());
     let refused = state.db.lock().map_err(|e| e.to_string()).and_then(|db| {
@@ -560,7 +547,7 @@ fn set_aside_refusal(state: &AppState, store: &Store, about: &About) -> Option<S
         .iter()
         .map(|r| &r.about)
         .chain(stuck.iter().filter_map(|s| s.about.as_ref()))
-        .filter(|about| about.change.is_set_aside());
+        .filter(|about| about.change == Change::SetAside);
     for set in set_aside {
         if sha.is_some() && set.kept.as_ref().map(|kept| kept.sha256.as_str()) == sha {
             return Some(format!(

@@ -114,26 +114,18 @@ pub enum Action {
     /// rule 7): write the channel's version to the file (`Some`), or remove
     /// it (`None`), whatever it holds, keeping what it held in local history
     /// alone; then record it as `agreed`. Nothing is published, and no
-    /// conflict file is made. `own`: the device wrote what the file holds
-    /// itself, in a window of rule 27.
+    /// conflict file is made.
     PutBack {
         text: Option<String>,
         agreed: Agreed,
-        own: bool,
     },
 }
 
 /// Plan a file that a carry left out (decision 2026-10-24 (removal), rule
 /// 7): the folder takes the channel's version back, whatever its file holds.
 /// `agreed` is the folder's record, which names the version the carry went
-/// back to, or none. `own`: what is left out is the device's own writing
-/// in a window of rule 27.
-pub fn put_back(
-    local: Option<&Content>,
-    remote: Option<&Remote>,
-    agreed: &Agreed,
-    own: bool,
-) -> Vec<Action> {
+/// back to, or none.
+pub fn put_back(local: Option<&Content>, remote: Option<&Remote>, agreed: &Agreed) -> Vec<Action> {
     let there = remote.and_then(|r| r.content.as_ref());
     let record = match remote {
         Some(r) => r.agreed_with(there.map(|c| c.hash)),
@@ -148,7 +140,6 @@ pub fn put_back(
         (_, there) => vec![Action::PutBack {
             text: there.map(|c| c.text.clone()),
             agreed: record,
-            own,
         }],
     }
 }

@@ -211,12 +211,6 @@ pub enum Brought {
     /// cut leaves that key out where it was read ([`Rule::Counts`]).
     /// Nothing was written.
     Cut,
-    /// This device signed it, or its chain names this device, or may have
-    /// dropped links, in a generation where a carry set aside what this
-    /// device wrote itself (decision 2026-10-24 (removal), rule 27): it is
-    /// at the relays, and left out. No command brings it in. Nothing was
-    /// written.
-    CutOwn,
 }
 
 /// Judge one version for a carry, and bring it in where it may come
@@ -264,29 +258,8 @@ fn bring_named(
             return Ok(left);
         }
         let entry = carried_entry(identity, &secret, version)?;
-        // What it brings is a version this device writes itself: it is
-        // kept as an event of its own, over the version current before
-        // (decision 2026-10-24 (removal), rule 27).
-        let current = standing.slot(conn, &secret, &version.name)?.current;
-        let before = crate::arrivals::own_before(
-            conn,
-            &identity.public_key(),
-            &secret,
-            &version.name,
-            current.as_ref(),
-        )?;
         Ok(match entries::store(conn, &entry, now)? {
-            Outcome::Stored => {
-                let link = standing.held.statement.statement.link()?;
-                crate::arrivals::noted_own(
-                    conn,
-                    &entry,
-                    &(link.number, link.hash),
-                    before.as_ref(),
-                    now,
-                )?;
-                Brought::Carried
-            }
+            Outcome::Stored => Brought::Carried,
             Outcome::AlreadyHeld => Brought::Tie,
             Outcome::OlderThanHeld => Brought::Higher,
         })
@@ -442,16 +415,6 @@ fn judged(
         ) {
             return Ok(Some(Brought::Cut));
         }
-        // What this device wrote itself in a generation where a carry set
-        // it aside (rule 27): it is at the relays, and is left out.
-        if crate::arrivals::own_window_leaves_out(
-            conn,
-            &identity.public_key(),
-            read_in.as_ref(),
-            version,
-        )? {
-            return Ok(Some(Brought::CutOwn));
-        }
     }
     let slot = standing.slot(conn, secret, &version.name)?;
     let is_it = |held: &Version| held.rev == rev && held.value == version.value;
@@ -501,10 +464,6 @@ pub struct Tally {
     /// Left out by the cut: a removed key signed them, or wrote what they
     /// were written over ([`Brought::Cut`]).
     pub cut: usize,
-    /// Left out because this device wrote them in its window (rule 27;
-    /// [`Brought::CutOwn`]): counted apart, since no command brings them
-    /// in (the review of the whole build, its M4).
-    pub cut_own: usize,
 }
 
 impl Tally {
@@ -518,7 +477,6 @@ impl Tally {
             Brought::Above => self.above.push(file.to_string()),
             Brought::Delete => self.deletes += 1,
             Brought::Cut => self.cut += 1,
-            Brought::CutOwn => self.cut_own += 1,
         }
     }
 }

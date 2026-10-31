@@ -2692,19 +2692,6 @@ fn come_to(
         // everything stored over it ([`crate::arrivals::cut_of_channel`]).
         let counting = Counting::of(leaving, &held_rows::additions(conn)?, &[]);
         let cuts = crate::cut::Cuts::read(conn)?;
-        // When the device first took a removed key's late writing, in each
-        // generation, in any name, is worked out before any file is judged
-        // (decision 2026-10-24 (removal), rule 27): what it wrote itself
-        // from then to its knowing is set aside in every name.
-        let mut left_channels = Vec::new();
-        for name in &names {
-            left_channels.push(derive::channel_id(&derive::own_secret(
-                &from.secret,
-                &name.name,
-            )?)?);
-        }
-        let windows = crate::arrivals::windows(conn, &left_channels, &cuts)?;
-        let mut set_aside_in = std::collections::BTreeSet::new();
         applied.left = Some(from.number);
 
         let own = identity.public_key();
@@ -2743,14 +2730,7 @@ fn come_to(
             // first: nothing is carried there.
             // What the cut leaves out of each file (rule 7) is worked out
             // first: the folders' records and the carry both go by it.
-            let cut = crate::arrivals::cut_of_channel(
-                conn,
-                &own,
-                &old,
-                &cuts,
-                &windows,
-                &mut set_aside_in,
-            )?;
+            let cut = crate::arrivals::cut_of_channel(conn, &own, &old, &cuts)?;
             let dropped = move_records(conn, &carry, &counting, &old, &new, &cut)?;
             applied
                 .not_carried
@@ -2767,11 +2747,6 @@ fn come_to(
             if no_version > 0 {
                 applied.no_version.push(name.name.clone());
             }
-        }
-        // A carry by command leaves out what the device wrote itself in a
-        // generation where it was set aside (rule 27): it is at the relays.
-        for (number, hash) in &set_aside_in {
-            cordelia_storage::arrivals::own_set_aside_in(conn, *number, hash)?;
         }
         // Nothing of messages is carried (decision 2026-10-09 §9.1): what
         // the store holds of the messages channel that is left goes, as
@@ -2930,7 +2905,7 @@ fn move_records(
     // or none, and the folder takes that version back, whatever its file
     // holds, with that kept in local history alone. The record is written
     // once the others have moved.
-    let mut put_back: Vec<(String, String, sync_state::Agreed, bool)> = Vec::new();
+    let mut put_back: Vec<(String, String, sync_state::Agreed)> = Vec::new();
     for (folder, file, rev) in sync_state::files_at(conn, &old)? {
         if let Some(cut) = cut.get(&slot_id(&slot_key, &file)) {
             let back = cut.target.as_ref().and_then(|version| {
@@ -2956,7 +2931,7 @@ fn move_records(
                 )?;
             }
             sync_state::forget_file(conn, &folder, &old, &file)?;
-            put_back.push((folder, file, agreed, cut.own));
+            put_back.push((folder, file, agreed));
             continue;
         }
         let held = entries::slot_entries(conn, &channel, &slot_id(&slot_key, &file))?;
@@ -2973,8 +2948,8 @@ fn move_records(
     dropped.dedup();
     // Each record left has a revision that the renumbering carries.
     sync_state::move_channel(conn, &old, &new, |rev| carry.renumbered(rev).unwrap_or(rev))?;
-    for (folder, file, agreed, own) in put_back {
-        sync_state::save_put_back(conn, &folder, &new, &file, &agreed, own)?;
+    for (folder, file, agreed) in put_back {
+        sync_state::save_put_back(conn, &folder, &new, &file, &agreed)?;
     }
     // A conflict copy that a folder made and has not yet published holds
     // no entry, and is in no record: it is judged by the arrivals it was
@@ -2985,25 +2960,18 @@ fn move_records(
     let to_channel = derive::channel_id(to)?;
     let to_slot_key = derive::slot_key(to)?;
     for copy in cordelia_storage::arrivals::copies_of_channel(conn, &channel)? {
-        match cut.get(&copy.slot) {
-            Some(copy_cut) => {
+        match cut.contains_key(&copy.slot) {
+            true => {
                 let none = sync_state::Agreed {
                     hash: None,
                     rev: 0,
                     signer: None,
                     chain: None,
                 };
-                sync_state::save_put_back(
-                    conn,
-                    &copy.folder,
-                    &new,
-                    &copy.key,
-                    &none,
-                    copy_cut.own,
-                )?;
+                sync_state::save_put_back(conn, &copy.folder, &new, &copy.key, &none)?;
                 cordelia_storage::arrivals::copy_done(conn, &channel, &copy.slot)?;
             }
-            None => cordelia_storage::arrivals::move_copy(
+            false => cordelia_storage::arrivals::move_copy(
                 conn,
                 &channel,
                 &copy.slot,

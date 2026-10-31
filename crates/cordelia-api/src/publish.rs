@@ -241,12 +241,10 @@ pub fn publish(
         if cordelia_storage::arrivals::copy_held(conn, &id, &file)? {
             return Ok(Published::KeptHere);
         }
-        let link = standing.held.statement.statement.link()?;
         let over = Over {
             channel: &channel,
             slot: &slot,
             merge: write.merge,
-            generation: (link.number, link.hash),
         };
         let written = written_over(conn, identity, &over, write.file, &write.value, now)?;
         Ok(written.map_or(Published::OutOfReach, |entry| {
@@ -509,10 +507,6 @@ struct Over<'a> {
     slot: &'a Slot,
     /// The other source, where the entry is a merged index.
     merge: Option<&'a OtherSource>,
-    /// The generation the device follows, by its statement's number and
-    /// hash: what its own version is noted in (decision 2026-10-24
-    /// (removal), rule 27).
-    generation: crate::cut::Change,
 }
 
 /// Write `value` under `file` over what a slot holds, as this device's
@@ -562,17 +556,11 @@ fn written_over(
         chain: Some(chain),
     };
     let entry = Entry::seal(over.channel, identity, rev, &inside)?.check()?;
-    // The version it is written over, read before the store keeps this
-    // device's one entry in the slot: each version the device writes is
-    // kept as an event of its own (decision 2026-10-24 (removal), rule 27).
-    let before =
-        crate::arrivals::own_before(conn, &identity.public_key(), over.channel, file, current)?;
     if entries::store(conn, &entry, now)? != Outcome::Stored {
         return Err(PersonError::Held(
             "the store holds an entry of this device's at or above the slot's next revision".into(),
         ));
     }
-    crate::arrivals::noted_own(conn, &entry, &over.generation, before.as_ref(), now)?;
     if copy.is_some() {
         cordelia_storage::arrivals::copy_done(conn, &channel, &slot)?;
     }
