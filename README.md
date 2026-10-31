@@ -341,8 +341,10 @@ Then it asks you to type yes, and then for the phrase.
     device that held that change. If you remove a device that was still in
     use, expect this: each device's window can be up to about eleven and a
     half minutes, and your other devices hold copies of most of it. The
-    removed device still cannot read any of it. The agent's own context
-    also still holds what it read.
+    removed device cannot read the copies carried into the new change. It
+    can read what the laptop sent in that window, before it knew, at the
+    relays, as it can anything sent before a device knows. The agent's own
+    context also still holds what it read.
   - The limits. Each device goes by its own clock. If its clock is more
     than ten minutes behind the clock of the device that made the change,
     it keeps what reached it in the time past those ten minutes. If its
