@@ -123,26 +123,18 @@
 >   signed the version a line was removed from. All empty at the step,
 >   which changes no older table or row.
 >
-> - **v26:** what a device wrote itself (decision 2026-10-24 (removal),
->   rule 27). `file_arrivals_stored.own`: 1 on an event that is a version
->   the device wrote itself, with no arrivals; 0 on every event kept
->   before. `file_own_dropped`: for each file and generation, the oldest
->   and the newest time of such a version that went past its bound, and
->   the newest place among them. `file_own_set_aside`:
->   each generation where a carry set the device's own writing aside.
-> - **v27:** why a carry left a file out (the review of the removal build,
->   its M4). `file_put_back.own`: 1 where the device wrote what is left out
->   itself (rule 27), 0 where a removed device wrote it, or it was written
->   over what one wrote (rule 7); 0 on every row kept before.
-> - **v28:** what a cut touched (the review of the fixes of the removal
+> - **v26:** what a cut touched (the review of the fixes of the removal
 >   build, its H1 and M2). `file_cut (folder, file)`: a file of a folder
->   that a carry cut (rules 7 and 27), whether or not the carry changed
+>   that a carry cut (rule 7), whether or not the carry changed
 >   what the folder holds; kept for as long as the database is.
 >   `file_cut_written (folder, file, sha256, at)`: each text (SHA-256 in
 >   hex) the device published itself of such a file after its latest cut,
 >   with when by its clock; a row older than 30 days goes, and a cut of the
 >   file again clears them. `cordelia restore` puts back no version of a
->   file cut but one of these texts.
+>   file cut but one of these texts. It was step 28 while rule 27 of that
+>   record was built; steps 26 and 27 held that rule's columns and tables,
+>   and went with it, unreleased. A database of such a build at step 27 or
+>   28 is refused as one from a later version.
 >
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
@@ -1298,8 +1290,6 @@ CREATE TABLE person_clear_mark (                    -- v21
 | `person_removed_keys_spared` | A key that the person said, at the terminal of a recovery made on this device, is a device they still have, with that change's number. Rule 6 does not remove it: it is added again (decision 2026-10-04 §9, step 6) | decision 2026-10-24 (removal), rule 6 |
 | `file_arrivals_stored`, `file_arrivals` | For each file, by its channel and slot, each entry the door stored that made arrivals: the generation it came in (the change followed, by number and hash), when it was stored, the version current before it as one entry (sealed again as this device's own at each carry), and, where its chain was full, the other keys its links name; and each arrival, a key's first 16 bytes and, for a link, its hash and how many times it stands. A carry goes back to the version before the first arrival it cuts, and leaves out that arrival and everything after it. At most 1,024 arrivals a file (`MAX_FILE_ARRIVALS`), the oldest going first | decision 2026-10-24 (removal), rule 7 |
 | `file_arrivals_dropped` | For each file and generation, the newest time an event went past the bound, judged as an arrival of every removed key, and the place of the first event of it that went with the version current before that event (sealed again at each carry, as the events' are): where what went is cut, the file goes back to that version, and not to before the oldest event kept, which a removed key may have written | decision 2026-10-24 (removal), rule 7 |
-| `file_arrivals_stored.own`, `file_own_dropped` | An event that is a version the device wrote itself in the channel of a name (a publish, a conflict copy's first version, a carry by command), with its generation, when it was stored and the version current before it, kept across carries as arrivals are and counted apart from them, at most 1,024 a file; past that, the oldest and newest time that went for each generation, and the newest place. At a carry each one stored, in any generation and any name, after the first arrival that rule 7 cuts (by its place) or the first message of a removed key's held where it is cut (by its time), to the device's first keeping the key as removed (stamped no earlier than any event kept then), is set aside, and the file goes back to before it; one past the bound that may have been in such a window takes the file back to none. | decision 2026-10-24 (removal), rule 27 |
-| `file_own_set_aside` | Each generation where a carry set aside what the device wrote itself: a carry by command on the device leaves out what it signed there, or whose chain names its key | decision 2026-10-24 (removal), rule 27 |
 | `file_cut`, `file_cut_written` | Each file of a folder that a carry cut, whether or not it changed what the folder holds, kept for as long as the database is; and each text the device published itself of it after its latest cut, for 30 days. `cordelia restore` puts back no version of such a file but one of those texts | decision 2026-10-24 (removal), rule 7; the review of the fixes of the removal build, H1 and M2 |
 | `person_additions` | The records of additions it has seen under the applied statement, in the order it saw them, each counted or not. At most 64 devices count in all, and at most 256 records are kept as not counted | §6 |
 | `person_names` | The names it holds in the generation it has applied, each with its channel's ID, so that either is found from the other: the names its folders are mapped to, and those that a carry by command or a recovery brought in (`person.names_carried`, §11.1) | §2.2, §7.3 |
@@ -1440,12 +1430,9 @@ CREATE TABLE sync_files (
   out: the record names the version the carry went back to (a NULL hash and
   revision 0 for none), and the next cycle puts that version into the file,
   whatever it holds, with what it held kept in local history alone; the
-  mark goes when the record is saved again. Step 27 adds `own` (0 or 1):
-  1 where the device wrote what is left out itself, in a window of rule 27,
-  and 0 where a removed device wrote it or it was written over what one
-  wrote (rule 7). The status counts the two apart, and local history keeps
-  each as a record of its own (`set_aside`, `set_aside_own`), neither of
-  which `cordelia restore` puts back. Step 28 adds `file_cut (folder,
+  mark goes when the record is saved again. Local history keeps what it
+  held as a record set aside (`set_aside`), which `cordelia restore` does
+  not put back. Step 26 adds `file_cut (folder,
   file)`, written with each mark, which stays when the mark goes: restore
   puts back no version of such a file but a text the device published
   itself after the cut (`file_cut_written`). `file_line_from (folder,
