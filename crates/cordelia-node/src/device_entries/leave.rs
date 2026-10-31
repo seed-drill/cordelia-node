@@ -632,6 +632,16 @@ impl Leave {
         lock(&self.inner).is_waking(self.clock.now())
     }
 
+    /// When the wait of a node that is waking ends, by its clock: `None`
+    /// where it is awake, or reaches no relay and so has no wait begun.
+    pub fn wake_ends(&self) -> Option<Instant> {
+        let mut inner = lock(&self.inner);
+        if !inner.is_waking(self.clock.now()) {
+            return None;
+        }
+        inner.woke.as_ref().map(|woke| woke.at + WAKE_WAIT)
+    }
+
     /// When the node last woke, by the time of day, in seconds: where it
     /// reaches no relay, and so has not woken, since when it has reached
     /// none, from its start or a sleep (decision 2026-10-19 §5, D2 and
