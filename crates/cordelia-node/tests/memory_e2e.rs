@@ -1617,7 +1617,7 @@ fn edits_arrive_as_fast_while_one_of_two_relays_is_down() {
 /// takes nothing until every relay has answered or WAKE_WAIT_SECS have
 /// gone by, **but for a relay whose dial has failed since the wake
 /// began** (decision 2026-10-24 (removal), section 8). The wake has the
-/// second relay dialled at once; that dial fails at its timeout
+/// second relay dialled at once; that dial times out
 /// (STREAM_TIMEOUT_SECS: a stopped relay gives no answer), the wake is
 /// over, and a whole pass is made at once. So the edit arrives within a
 /// few seconds of that timeout, well within the wait. Before the wake

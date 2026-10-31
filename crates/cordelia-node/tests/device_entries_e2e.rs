@@ -3420,9 +3420,10 @@ async fn with_a_relay_out_of_reach_a_device_waits_half_a_minute_and_then_goes_on
 /// since the wake began,** once another relay has answered (decision
 /// 2026-10-04 §4.6; decision 2026-10-24 (removal), section 8). The relay
 /// is down from before the wake: its dial is in flight when the device
-/// reaches the other, and the device waits; the dial fails, and it goes
-/// on at once, well within the wait, with no time run ahead. The wake
-/// had the dial loop dial each relay it does not reach.
+/// reaches the other, and the device waits. That dial times out, and the
+/// device still waits: it began before the wake. The wake's own dial,
+/// owed to the relay, begins and times out, and the device goes on at
+/// once, well within the wait, with no time run ahead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_wakes_goes_on_once_the_dial_to_a_relay_that_is_down_has_failed() {
     let relay = relay_started("reached", None);
@@ -3448,8 +3449,16 @@ async fn a_device_that_wakes_goes_on_once_the_dial_to_a_relay_that_is_down_has_f
     assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
     assert_eq!(device.counts("reached").pushes, 0);
 
-    // The dial fails: the wake is over, and the device goes on.
-    reach.dial_ends(&down, false);
+    // The dial from before the wake times out: it says nothing of the
+    // wake, and the device waits.
+    reach.dial_timed_out(&down);
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    assert_eq!(device.counts("reached").pushes, 0);
+
+    // The wake's dial times out: the wake is over, and the device goes on.
+    reach.dial_begins(&down);
+    reach.dial_timed_out(&down);
     device.passes().await;
     assert_eq!(device.has_leave("reached"), Ok(()));
     assert!(holds_at(&relay, &notes, &waiting.id()));
@@ -3460,8 +3469,9 @@ async fn a_device_that_wakes_goes_on_once_the_dial_to_a_relay_that_is_down_has_f
 /// **A relay that is slow but may still answer is waited for, up to the
 /// wait** (decision 2026-10-24 (removal), section 8): its dial is in
 /// flight throughout, or it connected and has not answered a show. A dial
-/// that failed before the wake began says nothing of now. At the wait the
-/// device goes on, as before.
+/// that timed out before the wake began says nothing of now, and a dial
+/// refused within it, as anyone on the path can have it refused, says
+/// nothing either. At the wait the device goes on, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_that_wakes_waits_for_a_relay_that_may_still_answer_up_to_the_wait() {
     let relay = relay_started("reached", None);
@@ -3474,14 +3484,19 @@ async fn a_device_that_wakes_waits_for_a_relay_that_may_still_answer_up_to_the_w
     device.passes().await;
     let reach = device.engine.reach().clone();
     let slow = relay_id("slow");
-    // A dial that failed before the wake.
+    // A dial that timed out before the wake.
     reach.dial_begins(&slow);
-    reach.dial_ends(&slow, false);
+    reach.dial_timed_out(&slow);
     device.clock.run_ahead(Duration::from_millis(10));
 
     device.connects("reached", &relay).await;
     device.sends().await;
     assert!(device.at("reached").heard_since_woke);
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    // A dial begun within the wake and refused: still waited for.
+    reach.dial_begins(&slow);
+    reach.dial_ends(&slow, false);
     device.passes().await;
     assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
     // A dial begun within the wake, in flight short of the wait.
@@ -3537,11 +3552,11 @@ async fn a_change_held_by_a_relay_that_comes_back_within_the_wake_is_heard_first
     assert!(holds_at(&has, &change.channel, &change.id()));
     assert!(!holds_at(&lacks, &change.channel, &change.id()));
 
-    // The second relay's last dial failed before the laptop wakes.
+    // The second relay's last dial timed out before the laptop wakes.
     let reach = wakes.engine.reach().clone();
     let second = relay_id("has");
     reach.dial_begins(&second);
-    reach.dial_ends(&second, false);
+    reach.dial_timed_out(&second);
     wakes.clock.run_ahead(Duration::from_millis(10));
 
     // The laptop reaches the first, and the wake dials the second.
