@@ -666,6 +666,20 @@ The whole of `feat/removal` against main had one more review. Each finding was c
 
 **Mutations of this round,** each undone in turn and its test run: H2's note before the write (caught by test 21's first), H2's drop (caught by test 22's first), M1's page (caught), M3's holder (caught), H1's refusal (caught), H1's refusal of older versions (caught), M4's mark in the cut (caught), M4's count apart in the status (caught), M4's count apart in a carry by command (not caught at first: an existing test asserted the old count; that assertion now holds the count apart, and catches it), L1 (caught), and rule 19's wake after an apply, a head set aside, a move and a pull (each caught). A close wakes in two places, where what the change removes commits and where the device is kept closed: both taken out are caught, either alone is not, since one wake is all rule 19 asks.
 
+### The review of the fixes of the whole build (31 October)
+
+The fixes of the review above had a review of their own. Each finding was checked against the code; none was wrong. The review's probe of H1 was made a test first, and failed on the code before the fix.
+
+| # | The review found | Settled |
+|---|---|---|
+| H1 | Restore's refusal asked history for a record set aside, which a carry that changed nothing in the folder never wrote: a late file absent and taken back to none, or one the removed device wrote back to the version gone back to, had every version restored and published | Restore asks the database: every file a carry cuts is recorded (`file_cut`, step 28) with the folder's record, whether or not the folder changes, and no version of it is put back but a text the device published itself after the cut (rule 7; test 25) |
+| M2 | "Kept before the set-aside" was ordered by record ids, which are the device's clock | No record's time is asked: every version of a file cut is refused, whatever its id, but the device's own writing after the cut; the cost is stated (rule 7, section 9; test 25) |
+| M3 | A show refused for now dropped the connection, though the relay hands nothing before such a refusal | It keeps the connection; only an unanswered or wrong-kind answer drops it (rule 18; test 26) |
+| L4 | Section 8's 5 seconds between relays ignored the backlog of heads, which anyone can build | Stated in section 8, the threat model and the whitepaper. A slot holding two heads is not offered first: the list of what waits does not say which heads sit beside another, and to say it would read the store for each head at each offer |
+| L5 | A record set aside left pending, or one unreadable, was not asked | Restore marks pending records first and asks them with the rest; it refuses where history holds a record that cannot be read (rule 7; test 25) |
+
+**Mutations of this round,** each undone in turn and its test run, all caught: the note of a file cut at the carry (test 25's probe, its first refusal); the database's refusal (`test_a_restore_of_a_file_cut_asks_no_clock`); the note of the device's own writing after a cut (the probe's last restore); a cut again clearing that writing (step 28's test); the marking of pending records, and the refusal on an unreadable one (each by test 25's L5 test); and the drop on a show refused for now let be (test 26).
+
 ## 14. The build, in slices
 
 Each slice is a pull request of its own into the integration branch `feat/removal`, from a branch `feat/removal-<n>`, reviewed in one sitting and tested alone. They come in the order their dependencies need, and **the first is what makes a device fail closed:** from it on, no device seals under a secret it knows a removed key to hold, and none takes what a key it knows to be removed signs. Every later slice only adds what a device comes to know, and how it goes on; none makes a device less safe than the slice before it. Gate 4 of release R1 stays open until slice 8 is merged. A mutation check runs with each slice (section 7): each rule it builds is undone in turn, and the tests that should catch it are run.
