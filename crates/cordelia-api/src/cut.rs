@@ -334,12 +334,12 @@ impl Cuts {
 /// - **Every chain of the index** (`MEMORY.md`), whatever its length: a
 ///   merge weaves two chains, stops one where a hash of it stands further
 ///   on in the other, and says nothing of what stood behind that link
-///   (`cordelia_crypto::chain::merged`). A text written back makes such a
-///   hash stand twice, and a removed key's link behind it goes from a
-///   chain far from full (the fourth read's round, its look for other
-///   paths). Only the door tells a merge from an edit, by the versions the
-///   file holds (`arrivals::written_over_held`); every other reader takes
-///   each chain of the index as one that may have dropped links.
+///   (`cordelia_crypto::chain::merged`), and a merge may come out as
+///   exactly an edit's chain. A link is only a hash and a signer and
+///   records no time, so no chain tells an edit over a version held from
+///   one over a removed key's late re-send of an old text (the read of the
+///   index rule). No reader, the door among them, asks which an index's
+///   chain is.
 pub fn may_have_dropped_links(name: Option<&str>, chain: Option<&[EntryLink]>) -> bool {
     match chain {
         None => true,
