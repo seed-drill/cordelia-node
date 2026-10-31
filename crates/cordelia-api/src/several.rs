@@ -1357,7 +1357,8 @@ mod tests {
         }
 
         // Where the other source's hash is in the channel's chain already,
-        // nothing is added: the channel's version descends from it.
+        // its link is second all the same, and the channel's chain follows
+        // whole: a merge's chain is never an edit's.
         let descended = crate::publish::OtherSource {
             hash: hash("second of 0"),
             signer: keys[0],
@@ -1376,7 +1377,10 @@ mod tests {
             publish(&on.conn, &on.identity, &write, now).unwrap(),
             Published::Made(_)
         ));
-        let mut over = vec![link("the two, merged", keys[1])];
+        let mut over = vec![
+            link("the two, merged", keys[1]),
+            link("second of 0", keys[0]),
+        ];
         over.extend(chain);
         assert_eq!(
             on.slot("notes", index).current.unwrap().entries[0].chain,
