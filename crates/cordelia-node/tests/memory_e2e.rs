@@ -1617,10 +1617,11 @@ fn a_device_closed_by_warm_churn_takes_what_waits_as_soon_as_its_wake_is_over() 
 /// from then either way.)
 fn closed_by_warm_churn(second_down: bool) -> Vec<std::time::Duration> {
     use std::time::{Duration, Instant};
-    // Not a multiple of the device's timers (2 s and 10 s): each round's
-    // closure falls at another point of its fetch's pass, so that the
-    // rounds do not all find the pass just begun.
-    const CHURN_SECS: u64 = 67;
+    // The relay checks its churn on its 2 s tick, so a churn of 63 s comes
+    // every 64 s: each round's closure falls 4 s later in the device's 10 s
+    // fetch timer, so the three rounds do not all find the pass just begun,
+    // and one of them falls where the next whole pass is furthest off.
+    const CHURN_SECS: u64 = 63;
     const ROUNDS: usize = 3;
 
     let mut first = node("first", "relay", None);
