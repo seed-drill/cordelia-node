@@ -2100,11 +2100,28 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
     assert!(!offer.seals.iter().any(|seal| {
         cordelia_crypto::bech32::encode_public_key(&seal.key).unwrap() == key_of(&tablet)
     }));
-    // Bob's device reads it and sends nothing in the old channel.
-    let paused = wait_for("Bob's device is paused", &after_removal, 300, || {
-        send_refused(&bob, &bob_dir, "review", "into the old channel")
-            .filter(|said| said.contains("so your devices send nothing more there"))
+    // Bob's device reads it: the offer pauses the old channel. The wait
+    // asks `shared stay` to look, which reads the same pause a send does
+    // and sends nothing: each send tried before the offer was read would
+    // be a message left unread, and ten of them start Bob's hold of ten.
+    wait_for("Bob's device is paused", &after_removal, 300, || {
+        let (status, answer) = bob.post_told(
+            "/api/v1/shared/stay",
+            &json!({ "name": "review", "look": true }),
+        );
+        (status == 200
+            && answer["asks"].as_str().is_some_and(|asks| {
+                asks.contains("Your devices send nothing more in the old channel")
+            }))
+        .then_some(())
     });
+    // And it sends nothing in the old channel.
+    let paused = send_refused(&bob, &bob_dir, "review", "into the old channel")
+        .expect("a send into the old channel, paused, is refused");
+    assert!(
+        paused.contains("so your devices send nothing more there"),
+        "{paused}"
+    );
     assert!(paused.contains("cordelia shared stay review"), "{paused}");
     // Bob stays: he writes there again, where the tablet reads.
     let mut at = bob.at_terminal(&["shared", "stay", "review"]);
