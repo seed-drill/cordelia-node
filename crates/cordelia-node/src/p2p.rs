@@ -2749,7 +2749,7 @@ pub async fn p2p_loop(
     // the size of the older kind's, and the relays it works with. A node
     // of any other role has none, and answers none of their streams.
     let relay_entries: Option<std::sync::Arc<crate::relay_entries::RelayEntries>> =
-        (node_role == "relay").then(|| {
+        crate::relay_entries::kept_by(&node_role).then(|| {
             std::sync::Arc::new(
                 crate::relay_entries::RelayEntries::new(
                     max_storage_bytes,
@@ -2885,6 +2885,20 @@ pub async fn p2p_loop(
         cordelia_core::protocol::ENTRY_CHANNEL_SWEEP_INTERVAL_SECS,
     ));
     entry_sweep_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The uses of channels that a relay keeps in memory (issue #214): a
+    // proof and a show are reads, and the uses are written once a minute.
+    let mut relay_uses_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::RELAY_USES_WRITE_INTERVAL_SECS,
+    ));
+    relay_uses_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The checkpoint of a relay's store (issue #224), in a take of the
+    // lock of its own: its connection has SQLite's automatic checkpoint
+    // off. A tick each second from when it starts, which checkpoints once
+    // the log holds RELAY_CHECKPOINT_LOG_PAGES.
+    let mut relay_checkpoint_interval = tokio::time::interval(std::time::Duration::from_secs(
+        cordelia_core::protocol::RELAY_CHECKPOINT_INTERVAL_SECS,
+    ));
+    relay_checkpoint_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The hourly task of messages (decision 2026-10-09 §7.1), on a
     // personal node: when it starts, and each hour after.
     let mut messages_interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -3469,6 +3483,26 @@ pub async fn p2p_loop(
                 }
             }
 
+            // The uses of channels it kept are written, in one
+            // transaction (issue #214). Off the select loop: it writes
+            // under the db lock.
+            _ = relay_uses_interval.tick(), if relay_entries.is_some() => {
+                if let Some(entries) = relay_entries.clone() {
+                    let uses_state = state.clone();
+                    tokio::task::spawn_blocking(move || entries.write_uses(&uses_state.db));
+                }
+            }
+
+            // The store's log is written back once it is long enough
+            // (issue #224). Off the select loop: it writes under the db
+            // lock. A tick that finds the last still running does nothing.
+            _ = relay_checkpoint_interval.tick(), if relay_entries.is_some() => {
+                if let Some(entries) = relay_entries.clone() {
+                    let checkpoint_state = state.clone();
+                    tokio::task::spawn_blocking(move || entries.checkpoint(&checkpoint_state.db));
+                }
+            }
+
             // What this relay took is passed on to the relays it works
             // with that are connected (§2.4 item 6).
             _ = entry_offer_interval.tick(), if relay_entries.is_some() => {
@@ -3931,6 +3965,19 @@ pub async fn p2p_loop(
                     ).await.is_err() {
                         tracing::warn!("closing the connections took longer than a stream timeout; not waiting for it");
                     }
+                    // A relay writes the uses of channels it kept since
+                    // its last sweep (issue #214), once no stream asks,
+                    // and then checkpoints its store (issue #224).
+                    if let Some(entries) = relay_entries.clone() {
+                        let stop_state = state.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            entries.write_uses(&stop_state.db);
+                            if entries.checkpoint_at_stop(&stop_state.db) {
+                                tracing::info!("the store's log was written back and truncated");
+                            }
+                        })
+                        .await;
+                    }
                     break;
                 }
             }
@@ -4030,17 +4077,25 @@ impl Sightings {
         let Some(secret) = self.secret else { return };
 
         let now = chrono::Utc::now().timestamp();
-        for p in due {
-            let mut keyed = secret.to_vec();
-            keyed.extend_from_slice(&p.node_id.0);
-            let hash = cordelia_crypto::sha256(&keyed);
-            if usage::record_sighting(&db, &hash, p.is_relay, now).is_ok() {
+        let seen: Vec<([u8; 32], bool)> = due
+            .iter()
+            .map(|p| {
+                let mut keyed = secret.to_vec();
+                keyed.extend_from_slice(&p.node_id.0);
+                (cordelia_crypto::sha256(&keyed), p.is_relay)
+            })
+            .collect();
+        let prune_before = prune_due.then(|| now - SIGHTING_RETENTION_DAYS * 86_400);
+        // One write for every peer due, and the prune (issue #221).
+        let written = usage::record_sightings(&db, &seen, now, prune_before).is_ok();
+        drop(db);
+        if written {
+            for p in due {
                 self.noted
                     .insert(p.node_id.clone(), std::time::Instant::now());
             }
         }
         if prune_due {
-            let _ = usage::prune_sightings(&db, now - SIGHTING_RETENTION_DAYS * 86_400);
             self.noted.retain(|_, t| t.elapsed() < refresh);
             self.pruned = Some(std::time::Instant::now());
         }

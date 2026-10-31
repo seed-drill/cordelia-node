@@ -1923,6 +1923,146 @@ channel is kept, an hour is nothing.
 **Derivation:** As often as expired deletes are collected,
 `TOMBSTONE_GC_INTERVAL_SECS`. Hourly is plenty against 90 days.
 
+The sweep writes the uses that the relay keeps in memory first, in the
+same hold of the lock (`RELAY_USES_WRITE_INTERVAL_SECS`), so that it reads
+every use there was.
+
+#### RELAY_USES_WRITE_INTERVAL_SECS = 60
+
+**Rationale:** How often a relay writes the uses of channels that it keeps
+in memory (issue #214). A proof, and an entry shown that the relay holds,
+are reads: neither writes with the relay's lock held. In stage 100 of the
+scale test a proof held the lock 16.4 ms at p99, against 1 ms for a read,
+because where the time kept was more than an hour old it was written, a
+commit for each, and after churn or a restart every device proves all its
+channels at once. The relay keeps each channel's latest use in memory and
+writes them in one transaction: at this interval, at its hourly sweep
+(before the sweep reads them, in the same hold of the lock), and at a clean
+stop. The rule of `ENTRY_CHANNEL_USED_STEP_SECS` holds at the write itself:
+a time more than an hour later than the one kept, never an earlier one.
+
+**Why a minute, and not an existing constant:** the two at hand are an
+hour. `ENTRY_CHANNEL_USED_STEP_SECS` says how much later a time must be to
+be written, not when writes are made. `ENTRY_CHANNEL_SWEEP_INTERVAL_SECS`
+would do for the sweep alone, but a relay tells a relay it works with when
+each channel was last used from what it has written (§2.4 item 6), and an
+hour more of lag there, and an hour of uses lost when a relay stops
+uncleanly, buy nothing: a channel is written at most once in the step
+whatever the interval, so a minute writes no more rows in an hour than an
+hour does, in smaller transactions, each a short hold of the lock. Under a
+minute would be more commits for no gain against 90 days.
+
+**What it costs:** a time on disk, and what a listed relay is told, lags
+the last use by at most the step and a minute. A relay that stops
+uncleanly loses at most a minute of uses: a channel in use is proved again
+on its devices' next passes, and one that is not had its time kept at most
+an hour and a minute early, which brings its drop that much nearer after
+90 days. Measured with 2,000 proofs on one relay with its database on
+disk, each of a channel whose time kept was two hours old: a proof's hold
+of the lock went from a mean of 517 µs (at most 31 ms) to 10 µs (at most
+0.2 ms), and the one write of the 2,000 uses held it for about 6 ms.
+
+#### RELAY_CHECKPOINT_INTERVAL_SECS = 1, RELAY_CHECKPOINT_LOG_PAGES = 1000, RELAY_LOG_KEPT_BYTES = 64 MiB
+
+**Rationale:** A relay's store is in SQLite's write-ahead mode. SQLite's
+automatic checkpoint runs inside whichever commit crosses about 1,000 pages
+of log, so the push that crosses it paid for the checkpoint with the
+relay's lock held: in the scale test (issue #224) a push held the lock for a
+median of 2 ms, and for 38 to 42 ms where it checkpointed, with a sync of
+10 ms. A relay's connection has the automatic checkpoint off, and the relay
+checkpoints in a take of its lock of its own, of kind Checkpoint, so that
+no push or show pays for it. A device does not: its store is written by its
+own cycles and passes, and its hourly task truncates the log (decision
+2026-10-09 §7.1).
+
+**When it checkpoints.** A timer ticks every second, from when the relay
+starts. A tick reads how many pages the relay has written to its log since
+its last whole checkpoint (SQLite's own count of the pages a connection
+writes, which in write-ahead mode are the log's frames), and checkpoints
+only where that is `RELAY_CHECKPOINT_LOG_PAGES` or more; otherwise it lets
+go at once, a take of the lock of some µs. The threshold is SQLite's own,
+kept on purpose: SQLite's synchronous setting is FULL, so every commit syncs
+the log; a checkpoint syncs the log and the database once each, and the
+first commit after a whole checkpoint starts the log again and syncs its
+header before its own commit. Those three syncs come once for each 1,000
+pages, about 250 pushes, as they did with SQLite's checkpoint; only the
+checkpoint's two are moved out of a push into a take of their own. A
+checkpoint at each tick whatever was written would cost them at each tick
+that follows a write, and at the scale test's rates (a relay sees about 11
+writes a minute at stage 100, 21 at stage 190, 55 at stage 500) nearly
+every push has a tick of its own: four syncs a push, not one. A tick that
+finds the last one still running, as behind a long hold of the lock, does
+nothing, so that ticks do not queue on the lock.
+
+**The checkpoint is passive.** It writes back as much of the log as no
+reader holds, and waits for none: a command that reads a relay's store from
+another process (`cordelia stats`) cannot hold the lock for the busy
+timeout. A checkpoint that a reader holds back writes back the rest; the
+count of pages is not cleared, so the next tick, a second later, tries
+again. The next commit after a whole checkpoint starts the log again from
+the start of its file, over what the file holds, and cuts the file to
+`RELAY_LOG_KEPT_BYTES` where it is longer (SQLite's `journal_size_limit`).
+A relay that stops cleanly, once no stream asks, writes the log back whole
+and truncates it, waiting for a reader up to the connection's busy timeout
+(5 s, within `NODE_STOP_TIMEOUT_SECS`).
+
+**What bounds the log.** At the scale test's rates, the threshold: 1,000
+pages and the commit that crossed it, about 4 MiB, as with SQLite's
+checkpoint. At the most a relay can be pushed, a second's commits: what a
+relay can be pushed is bounded by `PUSH_BYTES_PER_PEER_PER_MINUTE` for each
+of at most `MAX_INBOUND_CONNECTIONS`, 400 MiB a minute of entries as they
+are counted, and the relay's one lock puts its commits one after another,
+each holding it for some 0.8 ms on a fast disk. Measured at about 800 pushes
+a second, the log's file reached 18 MiB between two checkpoints, and 27 MiB
+at a thousand pushes a second in an earlier run. With a ten-second timer
+the same load made a log of 180 MiB. While a reader holds a part of the
+log, it also holds what was committed since that reader began, as it did
+with SQLite's checkpoint.
+
+**Why 64 MiB:** above the longest log a second makes, 27 MiB, with room,
+rounded up to a power of two. A limit below a second's log cuts the file at
+each checkpoint, and the next second's commits must grow it again, which
+costs every push: with 4 MiB, at about 800 pushes a second, a push's mean
+hold was 1.1 to 1.3 ms against 0.8 ms with 64 MiB or with no limit, and 77
+to 137 pushes in 20,000 held the lock over 5 ms against 11 to 23. Above it,
+as after a reader held the log for long, the file is cut back, so that one
+long log does not keep its disk until a clean stop.
+
+**Measured** on a relay's store on disk, with the node's own counters
+(`bench_a_pushs_hold_with_and_without_the_automatic_checkpoint` in
+`relay_entries.rs`, a debug build), in three ways: SQLite's automatic
+checkpoint (before issue #224), a checkpoint at each tick whatever was
+written, and this relay's, at the threshold. The syncs are counted by
+`strace`, which also slows each by 10 ms.
+
+- **At the scale test's rates,** one push and then 5, 3 or 1 ticks (a push
+  every 5, 3 or 1 seconds: stages 100, 190 and 500), 2,000 pushes, a sync
+  of 10 ms. With SQLite's checkpoint and with this relay's: 1.01 syncs a
+  push, the lock held some 12.1 ms a push in all. With a checkpoint at each
+  tick: 4.0 syncs a push, the lock held 45 ms a push in all, a push's mean
+  hold 23 ms against 12 ms, and a checkpoint of some 22 ms after every
+  push. With this relay's, 8 checkpoints held the lock for about 23 ms
+  each, under bar 4(c)'s 50 ms, a push's p99 was in the bucket to 16 ms,
+  and 0 to 3 pushes in each run held it over 32 ms, none of them a
+  checkpoint's (a pause with no system call in it, seen as well with
+  SQLite's checkpoint); with SQLite's, the 8 to 11 pushes that checkpointed
+  held it for 32 to 64 ms, and a push's p99 was in the bucket to 32 ms in
+  two runs of three. A tick that let go held it for a mean of 2 µs on a
+  fast disk.
+- **At the most,** 100 devices pushing from four threads, two runs each
+  way. With a sync of 10 ms, 2,000 pushes at some 80 a second: 1.02 syncs
+  a push with SQLite's checkpoint, 1.04 with one at each tick, 1.01 with
+  this relay's; a push's mean hold about 12.2 ms each way, its p99 in the
+  bucket to 16 ms with this relay's and to 32 ms with the other two; 12 to
+  14 pushes over 32 ms with SQLite's, where they checkpointed, and with
+  this relay's 9 checkpoints of some 24 ms each. On a fast disk, 20,000
+  pushes at about 800 a second: a push's mean hold 820 to 850 µs with
+  SQLite's checkpoint, and 800 to 840 µs with this relay's, which then
+  checkpoints at each tick, each holding the lock for some 3 ms, at most
+  23 ms. The mean that rose to 820 to 900 µs in the first measurement of
+  this change was the cost of a file cut at each checkpoint to the 4 MiB
+  limit it had then, and not of a longer log.
+
 #### KEYED_TOMBSTONE_RETENTION_DAYS = 90, for a delete among entries
 
 **Rationale:** The value is the one that the record of 2026-09-30 gives a
@@ -3252,17 +3392,34 @@ least 16 s; checked at compile time.
 them reads other bounds. A power of two a bucket keeps a percentile within
 a factor of two; finer buckets cost an atomic each.
 
-### LOCK_COUNTED_OVER_MS = [5, 50, 100, 250]
+### LOCK_COUNTED_OVER_MS = [5, 10, 50, 100, 250]
 
 **Rationale:** the lengths past which a wait or a hold is counted apart,
 for the bars that a histogram of powers of two cannot read exactly: 5 ms
 and 50 ms, the counts of §1.2 and bar 4 (c) (at most ten holds over 50 ms);
-100 ms, the waits of a device that bar 5 counts (`cordelia msg summary`
-tries the lock for `AGENT_MESSAGE_SUMMARY_WAIT_MS`, 100 ms); and 250 ms,
-which bar 4 (c) holds every write under. 250 ms falls inside the bucket of
-131 to 262 ms, so it is counted by itself.
+10 ms, bar 4 (a)'s wait at p99 (barred for the kinds of a device's
+requests, and reported for a relay's own kinds); 100 ms, the waits of a device that bar 5
+counts (`cordelia msg summary` tries the lock for
+`AGENT_MESSAGE_SUMMARY_WAIT_MS`, 100 ms); and 250 ms, which bar 4 (c) holds
+every write under. 10 ms falls inside the bucket of 8,193 to 16,384 µs and
+250 ms inside the bucket of 131 to 262 ms, so each is counted by itself.
+
+**How bar 4 (a) reads 10 ms:** a kind's wait at p99 is at most 10 ms where
+at most 1% of that kind's waits in the window are over 10 ms, and over it
+where more are; the count settles the bar where the p99's bucket holds it.
+Before 10 ms was counted, a p99 in that bucket was settled only where at
+most 1% were over 5 ms or more than 1% over 50 ms, and was otherwise NOT
+RESOLVED, as relay 2's sweeps were in two of stage 190's runs (104 waits,
+2 over 5 ms, the most 17,004 µs). Bar 4 (b)'s 1 ms is settled where its
+bucket holds it only by the most held, where that is at most 1 ms.
+
+**Derivation:** chosen, each from the bar that reads it; checked at
+compile time to rise and to fall inside the histogram.
 
 **If you change it:** a bar that reads one of these reads another count.
+A route's line for each is added or lost (`ms="10"` and the rest), and the
+scale test's report reads a count that is missing as one it cannot use:
+bar 4 (a) is then NOT RESOLVED where the bucket holds the bar.
 
 ### LOAD_RELAYS_COUNTED = 16
 

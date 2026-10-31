@@ -247,7 +247,7 @@ pub fn check_earlier_pids(path: &Path) -> Result<(), String> {
 // ── What is read from outside a process ─────────────────────────────
 
 /// What /proc says of one process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProcRead {
     pub rss_kib: u64,
     pub hwm_kib: u64,
@@ -299,7 +299,7 @@ pub fn ticks_a_second() -> u64 {
 }
 
 /// What is read of the machine once a minute (§1.3).
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct MachineRead {
     /// /proc/stat's first line: all ticks, idle and iowait.
     pub cpu_all: u64,

@@ -591,6 +591,12 @@ pub struct DeviceEntries {
     /// Whether the start was noted in what is known of the relays
     /// ([`known::started`]): once a node runs, at its first pass.
     started: AtomicBool,
+    /// What the passes found last of what decides whether the lists of a
+    /// person's reads and of bounds are due (issue #221).
+    lists_seen: Mutex<marks::ListsSeen>,
+    /// Whether the lists that the store held from before step 20 are known
+    /// to have been read: once they are, a pass asks no more.
+    held_lists_read: AtomicBool,
 }
 
 impl DeviceEntries {
@@ -629,6 +635,8 @@ impl DeviceEntries {
             reach,
             set_up: Mutex::default(),
             started: AtomicBool::new(false),
+            lists_seen: Mutex::default(),
+            held_lists_read: AtomicBool::new(false),
         })
     }
 
@@ -1732,11 +1740,20 @@ impl DeviceEntries {
     /// [`cordelia_api::marks::write_person_list`]): only once the messages
     /// channel was fetched since the node started. Says whether it wrote
     /// one.
+    ///
+    /// What decides it is read without opening or checking anything, and
+    /// where it is what it was at a pass that changed nothing, nothing more
+    /// is done ([`marks::ListsSeen`], issue #221).
     fn write_person_list(&self) -> bool {
         let db = lock(&self.state.db);
-        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
         let identity = &self.state.identity;
-        match marks::write_person_list(&db, identity, self.unix(), fetched.unwrap_or(false)) {
+        match marks::write_person_list_where_changed(&db, identity, self.unix(), fetched, &mut seen)
+        {
             Ok(written) => written.is_some(),
             Err(e) => {
                 tracing::debug!(error = %e, "could not write the list of what a person read here");
@@ -1751,15 +1768,23 @@ impl DeviceEntries {
     /// list 7 days and 10 minutes after it was set, or that another
     /// device's later bound overrode, goes. Only once the messages channel
     /// was fetched since the node started. Says whether it wrote one.
+    ///
+    /// As [`Self::write_person_list`], what decides it is read without
+    /// opening or checking anything first (issue #221).
     fn write_bounds_list(&self) -> bool {
         let db = lock(&self.state.db);
-        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
         let identity = &self.state.identity;
-        let written = cordelia_api::bounds::write_bounds_list(
+        let written = cordelia_api::bounds::write_bounds_list_where_changed(
             &db,
             identity,
             self.unix(),
-            fetched.unwrap_or(false),
+            fetched,
+            &mut seen,
         );
         match written {
             Ok(written) => written.is_some(),
@@ -1775,15 +1800,23 @@ impl DeviceEntries {
     /// 2026-10-10 §6.1; [`cordelia_api::shared_messages::write_list`]): only
     /// once the messages channel was fetched since the node started. Says
     /// whether it wrote one.
+    ///
+    /// As [`Self::write_person_list`], what decides it is read without
+    /// opening or checking anything first (issue #221).
     fn write_shared_list(&self) -> bool {
         let db = lock(&self.state.db);
-        let fetched = sender::fetched(&db, &self.state.own_channels, self.clock.now());
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
         let identity = &self.state.identity;
-        let written = cordelia_api::shared_messages::write_list(
+        let written = cordelia_api::shared_messages::write_list_where_changed(
             &db,
             identity,
             self.unix(),
-            fetched.unwrap_or(false),
+            fetched,
+            &mut seen,
         );
         match written {
             Ok(written) => written.is_some(),
@@ -1832,7 +1865,12 @@ impl DeviceEntries {
     /// held from before step 20 (decision 2026-10-25, rule 1;
     /// [`cordelia_api::reader::read_held_lists`]): at the first pass at
     /// which the device stands applied, where the start did not.
+    /// And the `sread/` lists held from before step 25. Once both are known
+    /// to be read, a pass does nothing here, and takes no lock (issue #221).
     fn read_held_lists(&self) {
+        if self.held_lists_read.load(Ordering::Relaxed) {
+            return;
+        }
         let db = lock(&self.state.db);
         match cordelia_api::reader::read_held_lists(&db, &self.state.identity, self.unix()) {
             Ok(true) => tracing::info!("read the lists of messages held from before this version"),
@@ -1847,6 +1885,12 @@ impl DeviceEntries {
             Ok(true) => tracing::info!("read the lists of shared marks held from before"),
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "could not read the lists of shared marks held"),
+        }
+        // Only once both are read does a pass stop asking (issue #221).
+        if cordelia_api::reader::held_lists_were_read(&db)
+            && cordelia_api::reader::held_shared_lists_were_read(&db)
+        {
+            self.held_lists_read.store(true, Ordering::Relaxed);
         }
     }
 
@@ -2935,6 +2979,7 @@ impl DeviceEntries {
                             Ok(PageTaken::Taken { each, read_again }) => Some(PageSeen {
                                 entries: entries.len(),
                                 read_again,
+                                stored: stored_one(&each),
                                 // A page asked from a place forgotten
                                 // since is no end of the channel: the pull
                                 // goes on, from the start.
@@ -2959,6 +3004,17 @@ impl DeviceEntries {
             match taken {
                 Ok(Some(page)) if page.entries == 0 && !page.stale => return Step::Done(true),
                 Ok(Some(page)) => {
+                    // What the store took of a name is written to its
+                    // folder at once: the sync cycle is woken, and not
+                    // waited for. Its timer and the pass's run in step,
+                    // so a page taken just after the cycle's tick waited
+                    // for the whole of the next one, a cycle's time
+                    // added to every edit (decision 2026-10-22, bars 2
+                    // and 15). A publish wakes the pass that sends in the
+                    // same way.
+                    if page.stored && matches!(channel.kind, Kind::Name(_)) {
+                        self.state.sync_control.ask_cycle();
+                    }
                     let mut kept = lock(&self.kept);
                     let of = kept.relays.entry(link.name().to_string()).or_default();
                     of.counts.pages += 1;
@@ -4026,6 +4082,22 @@ struct PageSeen {
     /// Whether it was asked from a place that is no longer the one kept:
     /// every place was forgotten while it was asked for.
     stale: bool,
+    /// Whether the store took an entry of it that it did not hold.
+    stored: bool,
+}
+
+/// Whether the store took one of `each`, the entries of a page, that it
+/// did not hold: a new entry, or a later revision of one it held.
+fn stored_one(each: &[Taken]) -> bool {
+    each.iter().any(|taken| {
+        matches!(
+            taken,
+            Taken::Own {
+                stored: Outcome::Stored,
+                ..
+            }
+        )
+    })
 }
 
 /// What the answer `done` to a push of a channel of `kind` says of what of
@@ -4515,6 +4587,14 @@ mod tests {
             256 + 1024
         );
         assert_eq!(counted_as_handed(3), entry_cost(0));
+        // A page wakes the sync cycle only where the store took something
+        // it did not hold.
+        assert!(stored_one(&stored));
+        assert!(stored_one(&held_and_stored));
+        assert!(!stored_one(&held));
+        assert!(!stored_one(&held_and_refused));
+        assert!(!stored_one(&[own(Outcome::OlderThanHeld)]));
+        assert!(!stored_one(&[]));
     }
 
     /// What a push's answer says of what waits at a relay (decision
@@ -4571,5 +4651,43 @@ mod tests {
             pushed_as(&PushAnswer::Refused(EntryRefused::OverLimit)),
             Pushed::OverAllowance
         );
+    }
+
+    /// Once the lists that the store held from before step 20, and the
+    /// `sread/` lists held from before step 25, are known to have been
+    /// read, a pass asks no more, and takes no lock for them (issue #221).
+    /// Before, and while only one of them is, each pass asks.
+    #[test]
+    fn a_pass_takes_no_lock_for_the_held_lists_once_they_were_read() {
+        let state = a_node();
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        let takes = || state.db.times().hold(TakeKind::Other).count;
+        let before = takes();
+        device.read_held_lists();
+        device.read_held_lists();
+        assert_eq!(takes(), before + 2);
+        cordelia_storage::meta::set(
+            &lock(&state.db),
+            cordelia_storage::meta::MESSAGES_LISTS_READ,
+            "1",
+        )
+        .unwrap();
+        let before = takes();
+        device.read_held_lists();
+        device.read_held_lists();
+        assert_eq!(takes(), before + 2);
+        cordelia_storage::meta::set(
+            &lock(&state.db),
+            cordelia_storage::meta::MESSAGES_SREAD_LISTS_READ,
+            "1",
+        )
+        .unwrap();
+        let before = takes();
+        device.read_held_lists();
+        assert_eq!(takes(), before + 1);
+        for _ in 0..10 {
+            device.read_held_lists();
+        }
+        assert_eq!(takes(), before + 1);
     }
 }
