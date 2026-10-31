@@ -1620,26 +1620,33 @@ fn edits_arrive_as_fast_while_one_of_two_relays_is_down() {
 /// second relay dialled at once; that dial times out
 /// (STREAM_TIMEOUT_SECS: a stopped relay gives no answer), the wake is
 /// over, and a whole pass is made at once. So the edit arrives within a
-/// few seconds of that timeout, well within the wait. Before the wake
-/// read a failed dial, it was 30.8 to 32.1 s after the connection was
-/// made again (with #263's pass at the wait's end), and 31.4 to 39.4 s
-/// before that; with it, some 12 s.
+/// few seconds of that timeout, well within the wait. **Where a dial of
+/// the second relay is in flight as the device wakes,** begun before the
+/// wake, that dial says nothing of the wake: the device waits for it to
+/// time out, and for the wake's own dial after it. Before the wake read a
+/// failed dial, it was 30.8 to 32.1 s after the connection was made again
+/// (with #263's pass at the wait's end), and 31.4 to 39.4 s before that;
+/// with it, some 12 s, and some 21 to 22 s in a round that finds a dial in
+/// flight (often the first, when the relay has only just stopped and is
+/// dialled every few seconds).
 #[test]
 fn a_device_closed_by_warm_churn_takes_what_waits_as_soon_as_its_wake_is_over() {
     use cordelia_core::protocol::{STREAM_TIMEOUT_SECS, WAKE_WAIT_SECS};
     use std::time::Duration;
     // A pass of the send timer to begin the wake (2 s), a tick of the
-    // dial loop (1 s), the dial's timeout, and then the pull, the cycle
-    // and the write.
-    let most = Duration::from_secs(STREAM_TIMEOUT_SECS + 8);
+    // dial loop (1 s), what is left of a dial in flight from before the
+    // wake, the wake's own dial's timeout, and then the pull, the cycle
+    // and the write. Under the wait: a wake that waited for it would take
+    // 30 s and more.
+    let most = Duration::from_secs(2 * STREAM_TIMEOUT_SECS + 8);
     assert!(most < Duration::from_secs(WAKE_WAIT_SECS));
     for (round, after) in closed_by_warm_churn(true).iter().enumerate() {
         assert!(
             *after <= most,
             "round {round}: the edit arrived {after:?} after the connection was made again, \
-             above the dial's {STREAM_TIMEOUT_SECS} s and the {:?} after it: the wake waited \
-             for a relay whose dial had failed",
-            most - Duration::from_secs(STREAM_TIMEOUT_SECS),
+             above two dials of {STREAM_TIMEOUT_SECS} s and the {:?} after them: the wake \
+             waited for a relay whose dial had failed",
+            most - Duration::from_secs(2 * STREAM_TIMEOUT_SECS),
         );
     }
 }
