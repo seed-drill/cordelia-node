@@ -73,10 +73,18 @@ pub(crate) struct Before {
 /// 8, its look for other paths): it is empty, or its first link is an
 /// entry of a held version, by hash and signer, and the rest is exactly
 /// that entry's chain. Such a chain drops no link: `chain::written_over`
-/// drops none short of 100. A merge's never is: its second link is the
-/// other version's, which stands nowhere in the chain it is written over
-/// (`chain::merged`), and a merge is what can drop a removed key's link
-/// from a chain that is not full.
+/// drops none short of 100. A merge is what can drop a removed key's link
+/// from a chain that is not full, and its chain does not pass: its second
+/// link is always the other version's, by hash and signer, even where that
+/// version's hash stands in the chain it is written over or is that
+/// version's own (`chain::merged`; the read of the index rule). It passes
+/// only where a held entry was itself written straight over the other
+/// version, whose link then stands in a held chain already and was judged
+/// when that entry came. What it costs: a merge that only fast-forwards,
+/// stored in a removal's window, is set aside like any other merge. And
+/// only a chain under 100 links is asked: an index edited 100 times or
+/// more has a full chain, and each of its versions in the window is set
+/// aside, edit or merge.
 fn written_over_held(chain: &[Link], before: &Before) -> bool {
     let Some((first, rest)) = chain.split_first() else {
         return true;
@@ -1615,6 +1623,94 @@ mod tests {
         assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
         assert_eq!(s[1].text("notes", INDEX).as_deref(), Some("- one\n"));
         assert!(texts(&s, 1).iter().all(|text| !text.contains("late")));
+    }
+
+    /// A merge whose other source's hash stands in the channel's chain
+    /// (the read of the index rule, #252, its medium). The desktop (0)
+    /// wrote `T`, then `U` without the line `- gone`. Late, the tablet (2)
+    /// writes `T` back over `U`; the phone (3) takes it, so its folder
+    /// agreed the tablet's `T`. The desktop, which has not taken it, writes
+    /// `V` and then `C` over `U`. The phone takes them and merges its own
+    /// edit with `C`, through `publish`: a union, so `- gone` comes back.
+    /// `T`'s hash stands in `C`'s chain, by the desktop's link. The laptop
+    /// (1) holds `C` and takes only the phone's merge, never the tablet's
+    /// write-back. The merge's chain is not an edit's over `C`: the
+    /// tablet's link stands second, and the carry leaves the merge out.
+    #[test]
+    fn a_merge_over_a_chain_that_names_a_text_written_back_is_cut_at_a_third_device() {
+        use crate::publish::{OtherSource, PlannedAgainst, Published, Write, publish, value_hash};
+        let mut s = Several::of_one_person(4);
+        s.hold(&[0, 1, 2, 3], "notes");
+        let t = "- one\n- gone\n";
+        s.write(0, "notes", INDEX, t);
+        s.write(0, "notes", INDEX, "- one\n");
+        s.meet(&[0, 1, 2, 3]);
+
+        let made = s.now + 10 * MARGIN;
+        s.now = made - MARGIN / 2;
+        // Late: the tablet writes `T` back, and only the phone takes it.
+        let back = s.write(2, "notes", INDEX, t);
+        let now = s.tick();
+        crate::take::take(&s[3].conn, &s[3].identity, &back, now).unwrap();
+        let back_chain = back.open(&s[3].own("notes")).unwrap().chain;
+        // The desktop goes on over `U`, and the phone and the laptop take
+        // each version as it is written.
+        let c = "- one\n- new\n";
+        for said in ["- one\n- between\n", c] {
+            s.write(0, "notes", INDEX, said);
+            s.pass(0, 3);
+            s.pass(0, 1);
+        }
+        assert_eq!(s[3].text("notes", INDEX).as_deref(), Some(c));
+        assert_eq!(s[1].text("notes", INDEX).as_deref(), Some(c));
+        let c_chain = s[3].slot("notes", INDEX).current.unwrap().entries[0]
+            .chain
+            .clone()
+            .unwrap();
+        assert!(
+            c_chain
+                .iter()
+                .any(|link| link.hash == Link::of(&Value::Text(t.into()), [0; 32]).hash)
+        );
+
+        // The phone's folder agreed the tablet's `T`, and its agent added a
+        // line: the plan merges, `C`'s lines and then its own not in `C`.
+        let tablets = OtherSource {
+            hash: value_hash(&Value::Text(t.into())),
+            signer: s.key(2),
+            chain: back_chain,
+        };
+        let now = s.tick();
+        let on = &s[3];
+        let write = Write {
+            name: "notes",
+            file: INDEX,
+            value: Value::Text("- one\n- new\n- gone\n- mine\n".into()),
+            planned: PlannedAgainst::what_is_in(&on.slot("notes", INDEX)),
+            merge: Some(&tablets),
+        };
+        let Published::Made(merge) = publish(&on.conn, &on.identity, &write, now).unwrap() else {
+            panic!("not made");
+        };
+        let merged_chain = merge.open(&s[3].own("notes")).unwrap().chain.unwrap();
+        assert_eq!(merged_chain[1], Link::of(&Value::Text(t.into()), s.key(2)));
+
+        // The laptop takes the merge alone.
+        let now = s.tick();
+        crate::take::take(&s[1].conn, &s[1].identity, &merge, now).unwrap();
+        assert!(
+            s[1].text("notes", INDEX)
+                .is_some_and(|text| text.contains("gone"))
+        );
+
+        s.now = made - 1;
+        let removal = s.change(0, &[0, 1, 3], &[2]);
+        let now = s.tick();
+        let on = &s[1];
+        let taken = crate::take::take(&on.conn, &on.identity, &removal, now).unwrap();
+        assert!(matches!(taken, Taken::Shown(Shown::Applied(_))));
+        assert_eq!(s[1].text("notes", INDEX).as_deref(), Some(c));
+        assert!(texts(&s, 1).iter().all(|text| !text.contains("gone")));
     }
 
     /// An honest edit of the index, written over the version the laptop
