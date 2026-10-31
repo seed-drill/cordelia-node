@@ -1615,26 +1615,31 @@ fn edits_arrive_as_fast_while_one_of_two_relays_is_down() {
 ///
 /// The device reached no relay, and reaches one again: it wakes, and
 /// takes nothing until every relay has answered or WAKE_WAIT_SECS have
-/// gone by. The second relay never answers, so the wait is the whole of
-/// it, and that is the rule's cost. **What it must not add is a pass:**
-/// once the wait is over a whole pass is made at once, and the edit
-/// arrives within a few seconds of the wait. Without that, nothing
-/// pulled until the next whole pass on the node's timer, up to ten
-/// seconds later: 31.4 to 39.4 s after the connection was made again,
-/// where with it 30.8 to 32.0 s.
+/// gone by, **but for a relay whose dial has failed since the wake
+/// began** (decision 2026-10-24 (removal), section 8). The wake has the
+/// second relay dialled at once; that dial fails at its timeout
+/// (STREAM_TIMEOUT_SECS: a stopped relay gives no answer), the wake is
+/// over, and a whole pass is made at once. So the edit arrives within a
+/// few seconds of that timeout, well within the wait. Before the wake
+/// read a failed dial, it was 30.8 to 32.1 s after the connection was
+/// made again (with #263's pass at the wait's end), and 31.4 to 39.4 s
+/// before that; with it, some 12 s.
 #[test]
 fn a_device_closed_by_warm_churn_takes_what_waits_as_soon_as_its_wake_is_over() {
-    use cordelia_core::protocol::WAKE_WAIT_SECS;
+    use cordelia_core::protocol::{STREAM_TIMEOUT_SECS, WAKE_WAIT_SECS};
     use std::time::Duration;
-    // A pass of the send timer to begin the wake (2 s), the wait, and
-    // then the pull, the cycle and the write.
-    let most = Duration::from_secs(WAKE_WAIT_SECS + 5);
+    // A pass of the send timer to begin the wake (2 s), a tick of the
+    // dial loop (1 s), the dial's timeout, and then the pull, the cycle
+    // and the write.
+    let most = Duration::from_secs(STREAM_TIMEOUT_SECS + 8);
+    assert!(most < Duration::from_secs(WAKE_WAIT_SECS));
     for (round, after) in closed_by_warm_churn(true).iter().enumerate() {
         assert!(
             *after <= most,
             "round {round}: the edit arrived {after:?} after the connection was made again, \
-             above the wake's {WAKE_WAIT_SECS} s and the {:?} after it",
-            most - Duration::from_secs(WAKE_WAIT_SECS),
+             above the dial's {STREAM_TIMEOUT_SECS} s and the {:?} after it: the wake waited \
+             for a relay whose dial had failed",
+            most - Duration::from_secs(STREAM_TIMEOUT_SECS),
         );
     }
 }
