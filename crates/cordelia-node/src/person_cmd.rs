@@ -1919,8 +1919,8 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
         lines.push(format!(
             "\nThese shared channels were past a bound, so your devices do not hold them: {}. \
              Each is made anew without the device removed, in this change, where this device \
-             reaches its relays; your devices do not hold the new one either, so ask someone in \
-             it to share it with you again.",
+             reaches its relays. Your devices do not hold the new one either: ask someone in it \
+             to share the new channel with you, and with anyone who wrote there since.",
             names.join(", ")
         ));
     }

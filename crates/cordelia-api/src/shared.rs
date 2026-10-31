@@ -551,6 +551,16 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
                 pass_rows::begin_channel(conn, row.id, ChannelOut::Dropped)?;
             }
         } else {
+            // A channel past its bound that a removal could not make anew
+            // (refused, or not reached) is carried by no list of the
+            // generation the removal began: it stays, past the bound and
+            // not clean, so that it is named until a person clears it
+            // (§3.5). Its entries went at the bound.
+            if row.state == State::NotInForce
+                && cordelia_storage::shared_anew::not_clean_of(conn, &row.channel)?.is_some()
+            {
+                continue;
+            }
             if matches!(row.state, State::Held | State::NotInForce) {
                 kept::set_state(conn, row.id, State::Dropped, now)?;
             }
