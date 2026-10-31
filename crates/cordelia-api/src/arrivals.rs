@@ -1864,10 +1864,7 @@ mod tests {
             if straight_over {
                 // The desktop's own edit, which it carried, comes back.
                 s.pass(0, 1);
-                assert_eq!(
-                    s[1].text("notes", INDEX).as_deref(),
-                    Some("- one\n- two\n")
-                );
+                assert_eq!(s[1].text("notes", INDEX).as_deref(), Some("- one\n- two\n"));
             }
         }
     }
@@ -1892,7 +1889,12 @@ mod tests {
             s.write(1, "notes", INDEX, mine);
             if desktop_after {
                 s.pass(1, 0);
-                s.write(0, "notes", INDEX, "- one\n- the laptop's\n- the desktop's\n");
+                s.write(
+                    0,
+                    "notes",
+                    INDEX,
+                    "- one\n- the laptop's\n- the desktop's\n",
+                );
                 s.pass(0, 1);
                 assert!(
                     s[1].text("notes", INDEX)
