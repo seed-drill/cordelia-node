@@ -461,6 +461,117 @@ fn text_now(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Why the record `id`, which says `about`, is not put back, where a carry
+/// cut its file (decision 2026-10-24 (removal), rules 7 and 27; the
+/// reviews of the whole build, H1, and of its fixes, H1, M2 and L5).
+/// `cordelia restore` is open to any local process, an agent included,
+/// through the local API, so it brings back none of:
+///
+/// - a version that a carry set aside: what a removed device wrote, or
+///   what was written over it (rule 7), or what this device wrote itself
+///   in its window (rule 27);
+/// - **any version of a file that a carry cut**, as the database says it
+///   (`file_cut`), whether or not the carry changed what the folder held,
+///   and whatever the record's id: it asks neither a record set aside,
+///   which history may not have written, nor the order of the device's
+///   clock. The one version let through is a text this device published
+///   itself of that file after the latest cut (`file_cut_written`);
+/// - any version that holds the very text of one set aside, under any
+///   name.
+///
+/// That fails safe. **What the person gives up:** `cordelia restore` of
+/// every version of a file a carry cut but those this device wrote itself
+/// after the cut, for as long as the database is kept: what another
+/// device wrote of it afterwards is not restored either, nor a text this
+/// device wrote after the cut that has been more than `HISTORY_DAYS` in
+/// the database. `cordelia history show` still prints each, and the
+/// person may copy it into the file by hand. What a removed device wrote
+/// comes back only by `cordelia sync carry --from`, at a terminal, with
+/// the recovery phrase; what this device wrote in its window comes back by
+/// no command. Where the database or history cannot be read, or history
+/// holds a record that cannot be read, nothing is put back. It is asked
+/// with the turn held, so the pending records are marked first, and asked
+/// with the rest.
+fn set_aside_refusal(state: &AppState, store: &Store, about: &About) -> Option<String> {
+    let from = "What a removed device wrote comes back only at a terminal, with the recovery \
+                phrase: `cordelia sync carry <name> --from <its label>`";
+    match about.change {
+        Change::SetAside => {
+            return Some(format!(
+                "this version was set aside at a change: a removed device wrote it, or it was \
+                 written over what one wrote. `cordelia restore` does not put it back. {from}"
+            ));
+        }
+        Change::SetAsideOwn => {
+            return Some(
+                "this version was set aside at a change: this device wrote it after it took a \
+                 removed device's late writing, and before it knew of the removal. `cordelia \
+                 restore` does not put it back, and no command does"
+                    .to_string(),
+            );
+        }
+        _ => {}
+    }
+    let sha = about.kept.as_ref().map(|kept| kept.sha256.as_str());
+    let refused = state.db.lock().map_err(|e| e.to_string()).and_then(|db| {
+        cordelia_storage::sync_state::restore_refused(&db, &about.folder, &about.file, sha)
+            .map_err(|e| e.to_string())
+    });
+    match refused {
+        Ok(false) => {}
+        Ok(true) => {
+            return Some(format!(
+                "{} was cut at a change, so this version may hold what a removed device \
+                 wrote: `cordelia restore` puts back only what this device wrote itself after \
+                 the change. `cordelia history show` prints it. {from}",
+                about.file
+            ));
+        }
+        Err(e) => {
+            return Some(format!(
+                "the database cannot be read to say whether a change cut this file ({e}): \
+                 nothing was put back"
+            ));
+        }
+    }
+    let cannot = |e: std::io::Error| {
+        Some(format!(
+            "history cannot be read to say whether a change set this version aside ({e}): \
+             nothing was put back"
+        ))
+    };
+    let stuck = match store.recover() {
+        Ok(recovered) => recovered.left,
+        Err(e) => return cannot(e),
+    };
+    let listing = match store.list() {
+        Ok(listing) => listing,
+        Err(e) => return cannot(e),
+    };
+    if !listing.unreadable.is_empty() || stuck.iter().any(|s| s.about.is_none()) {
+        return Some(
+            "history holds a record that cannot be read, and it may be one a change set aside: \
+             nothing was put back. `cordelia history drop --all` removes every record"
+                .to_string(),
+        );
+    }
+    let set_aside = listing
+        .records
+        .iter()
+        .map(|r| &r.about)
+        .chain(stuck.iter().filter_map(|s| s.about.as_ref()))
+        .filter(|about| about.change.is_set_aside());
+    for set in set_aside {
+        if sha.is_some() && set.kept.as_ref().map(|kept| kept.sha256.as_str()) == sha {
+            return Some(format!(
+                "this version holds a text that was set aside at a change: `cordelia restore` \
+                 does not put it back. {from}"
+            ));
+        }
+    }
+    None
+}
+
 /// Put one kept text back. `Err` is the reason nothing was done.
 /// `flushed` is run once the text is flushed and before the last look at
 /// the file: nothing, except in a test.
@@ -480,6 +591,12 @@ fn restore_one(
         })?
         .ok_or_else(|| "no such record in history".to_string())?;
     let about = &record.about;
+    // What a carry set aside, and every version that may hold it, stays
+    // out: no local process, an agent included, brings it back unasked
+    // (the review of the whole build, its H1).
+    if let Some(why) = set_aside_refusal(state, store, about) {
+        return Err(why);
+    }
     let text = text.ok_or_else(|| {
         format!(
             "this record keeps no text: {} was not here before the change",
@@ -1082,6 +1199,95 @@ mod tests {
 
         std::fs::write(&path, &whole).unwrap();
         assert!(n.restore(&[&before])[0].done);
+    }
+
+    /// A file a carry cut (the database's `file_cut`) has no version put
+    /// back by `cordelia restore`, whatever its record's id, and so
+    /// whatever the device's clock said when each was kept (the review of
+    /// the fixes of the whole build, its M2): the clock was ahead when a
+    /// version after the removed device's text was kept, and set back
+    /// before the carry, so that the record set aside sorts before it. The
+    /// one version put back is a text this device published itself after
+    /// the cut; a cut of the file again takes that from it too.
+    ///
+    /// Taken out: the database's refusal (the version kept ahead of the
+    /// set-aside, whose text is not the text set aside, is restored).
+    #[test]
+    fn test_a_restore_of_a_file_cut_asks_no_clock() {
+        let n = node();
+        let folder = n.memory.display().to_string();
+        n.write("notes.md", "gone back to\n");
+        // Kept with the clock ahead, then the clock set back for the carry.
+        let ahead = n.kept("notes.md", Change::Pulled, Some("after it\n"), 5000);
+        let earlier = n.kept("notes.md", Change::Pulled, Some("before\n"), 0);
+        let set = n.kept("notes.md", Change::SetAside, Some("the late text\n"), 10);
+        assert!(set < ahead, "the record set aside sorts first");
+        {
+            let db = n.state.db.lock().unwrap();
+            cordelia_storage::sync_state::note_cut(&db, &folder, "notes.md").unwrap();
+        }
+        for id in [&ahead, &earlier, &set] {
+            let done = n.restore(&[id]);
+            assert!(!done[0].done, "{id}: {done:?}");
+            assert!(done[0].message.contains("--from <its label>"), "{done:?}");
+        }
+        assert_eq!(n.read("notes.md").as_deref(), Some("gone back to\n"));
+
+        // What this device published itself after the cut is put back.
+        let own = n.kept("notes.md", Change::Pulled, Some("mine after\n"), 20);
+        {
+            let db = n.state.db.lock().unwrap();
+            let sha = kept(Whose::Here { agreed: None }, "mine after\n").sha256;
+            cordelia_storage::sync_state::note_written(&db, &folder, "notes.md", &sha, 1).unwrap();
+        }
+        assert!(n.restore(&[&own])[0].done);
+        assert_eq!(n.read("notes.md").as_deref(), Some("mine after\n"));
+
+        // Cut again, it is no longer let through.
+        n.write("notes.md", "gone back to\n");
+        {
+            let db = n.state.db.lock().unwrap();
+            cordelia_storage::sync_state::note_cut(&db, &folder, "notes.md").unwrap();
+        }
+        assert!(!n.restore(&[&own])[0].done);
+        // Another file is restored as before.
+        let other = n.kept("other.md", Change::Pulled, Some("other\n"), 30);
+        assert!(n.restore(&[&other])[0].done);
+    }
+
+    /// A restore marks the pending records first, and asks them with the
+    /// rest: a record set aside whose rename did not happen is found, and
+    /// its text is not put back under any name. Where history holds a
+    /// record that cannot be read, which may be one set aside, nothing is
+    /// put back (the review of the fixes of the whole build, its L5).
+    ///
+    /// Taken out: the marking (the pending record set aside is not listed,
+    /// and the copy of its text is restored), or the refusal on a record
+    /// that cannot be read (the version is restored).
+    #[test]
+    fn test_a_restore_asks_records_left_pending_and_refuses_on_one_unreadable() {
+        let n = node();
+        n.write("notes.md", "now\n");
+        n.write("copy.md", "now\n");
+        let store = n.store();
+        let about = n.about("notes.md", Change::SetAside, Some("the late text\n"));
+        let pending = store.keep(about, Some("the late text\n"), at(10)).unwrap();
+        std::mem::forget(pending);
+        let copy = n.kept("copy.md", Change::Pulled, Some("the late text\n"), 20);
+        let done = n.restore(&[&copy]);
+        assert!(!done[0].done, "{done:?}");
+        assert!(done[0].message.contains("set aside"), "{done:?}");
+        assert_eq!(n.read("copy.md").as_deref(), Some("now\n"));
+
+        let fine = n.kept("other.md", Change::Pulled, Some("other\n"), 30);
+        let broken = n.kept("broken.md", Change::Pulled, Some("x\n"), 40);
+        let path = n.state.home_dir.join("history").join(&broken);
+        std::fs::write(&path, b"not a record").unwrap();
+        let done = n.restore(&[&fine]);
+        assert!(!done[0].done, "{done:?}");
+        assert!(done[0].message.contains("cannot be read"), "{done:?}");
+        std::fs::remove_file(&path).unwrap();
+        assert!(n.restore(&[&fine])[0].done);
     }
 
     /// A file of any size is kept before it is replaced: one too large to

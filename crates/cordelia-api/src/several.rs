@@ -1471,22 +1471,29 @@ mod tests {
         }
 
         // Nor is what it signs taken in the new channels, were it to
-        // write there.
+        // write there. An entry of its that opens under the new secret is
+        // proof that it holds that secret: each device keeps it as a holder
+        // and closes (the review of the whole build, its M3).
         let removed = &s[2].identity;
         let in_notes = entry_by(removed, &s[0].own("notes"), 9, "a.md", text("late"), &[]);
         let in_personal = entry_by(removed, &s[0].personal(), 9, "syncing", text("notes"), &[]);
         for n in [0, 1, 3] {
             let on = &s[n];
-            let before = on.everything();
-            for entry in [&in_notes, &in_personal] {
-                assert_eq!(
-                    take(&on.conn, &on.identity, entry, s.now).unwrap(),
-                    Taken::Refused(NotTaken::SignerDoesNotCount),
-                    "{n}"
-                );
-            }
-            assert_eq!(on.everything(), before, "{n}");
+            let before = on.stored();
+            assert_eq!(
+                take(&on.conn, &on.identity, &in_notes, s.now).unwrap(),
+                Taken::Refused(NotTaken::SignerDoesNotCount),
+                "{n}"
+            );
+            // Closed by it: the next is refused as by a device stopped.
+            assert_eq!(
+                take(&on.conn, &on.identity, &in_personal, s.now).unwrap(),
+                Taken::Refused(NotTaken::Stopped(State::Fork)),
+                "{n}"
+            );
+            assert_eq!(on.stored(), before, "{n}");
             assert_eq!(on.text("notes", "a.md").as_deref(), Some("a one"));
+            assert_eq!(on.state(), State::Fork, "{n}");
         }
     }
 

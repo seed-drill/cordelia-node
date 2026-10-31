@@ -319,8 +319,25 @@ Then it asks you to type yes, and then for the phrase.
   edit reached the laptop: after the removal was made, less ten minutes. It
   does the same for what the tablet wrote under a change made apart from
   the removal. `cordelia status` says how many edits were set aside, for
-  seven days. `cordelia history` lists them, and
-  `cordelia restore` puts one back. With local history off, they are gone.
+  seven days, and `cordelia history` lists them. With local history off,
+  they are gone. `cordelia restore` does not put one back, nor any older
+  version of that file: no program on the device, an agent included, can
+  bring them back that way. What the removed device wrote comes back only
+  at a terminal, with the recovery phrase: `cordelia sync carry <name>
+  --from <its label>`.
+- **What your device wrote after it took the late edit is set aside too.**
+  An agent that read the tablet's late text may have written it, or what it
+  said, into another file. So from the first late edit it took to its
+  knowing of the removal, the laptop sets aside everything it wrote itself,
+  in every file and name, into local history. `cordelia status` counts
+  these apart. No command puts them back: `cordelia history show` prints
+  each, to copy by hand. This window is short in an ordinary removal (some
+  minutes), and as long as the laptop could not reach a relay that had the
+  removal.
+  - What this does not cover: another of your devices that took the
+    laptop's writing from that window before it knew of the removal carries
+    it on, and so does `cordelia sync carry` on any device that held that
+    change. The agent's own context still holds what it read.
   - The limits. Each device goes by its own clock. If its clock is more
     than ten minutes behind the clock of the device that made the change,
     it keeps what reached it in the time past those ten minutes. If its

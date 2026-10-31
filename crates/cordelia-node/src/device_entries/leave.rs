@@ -326,6 +326,22 @@ impl Link {
     pub fn is_open(&self) -> bool {
         self.conn.close_reason().is_none()
     }
+
+    /// A show on this connection failed: it was not answered, or not as a
+    /// show is. At a relay that names the role RELAY_ROLE_HEADS the
+    /// connection is dropped, and the node makes another (the review of
+    /// the whole build, its H2). The relay remembers, for a connection,
+    /// each head it handed there, and hands none of them again on it: an
+    /// answer that handed a removal and was lost on the way, after the
+    /// relay wrote it, would leave the device to be told "held" at its next
+    /// show there, and to have leave without the removal. A new connection
+    /// is handed every head again. At a relay that does not name the role,
+    /// nothing is remembered of what it handed, and the connection stays.
+    pub fn drop_after_a_failed_show(&self) {
+        if self.heads {
+            self.conn.close(0u32.into(), b"a show failed");
+        }
+    }
 }
 
 impl std::fmt::Debug for Link {
@@ -792,12 +808,25 @@ impl Leave {
             })
         };
         let bytes = codec::encode_message(&request).map_or(0, |bytes| bytes.len());
-        let answer = match self
-            .ask_counted(link, Protocol::EntryShow, &request)
-            .await?
-        {
-            WireMessage::EntryShown(shown) => shown.answer,
-            _ => return Err("a show was not answered as one".into()),
+        // A show that fails at a relay that keeps every head drops the
+        // connection ([`Link::drop_after_a_failed_show`]): it may have
+        // handed a head that was lost on the way. One refused for now
+        // does not: a relay refuses so (ERR_RATE_LIMIT) before it hands
+        // anything, and a drop would only cost the device its open
+        // streams and its proofs again, against the same rates (the
+        // review of the fixes of the whole build, its M3).
+        let answer = match self.ask_counted(link, Protocol::EntryShow, &request).await {
+            Ok(WireMessage::EntryShown(shown)) => shown.answer,
+            Ok(_) => {
+                link.drop_after_a_failed_show();
+                return Err("a show was not answered as one".into());
+            }
+            Err(failed) => {
+                if !failed.refused_for_now {
+                    link.drop_after_a_failed_show();
+                }
+                return Err(failed.why);
+            }
         };
         if followed {
             match gives_leave(&answer) {
@@ -1376,22 +1405,30 @@ impl Leave {
     /// `protocol`, and read its answer: every step has the codec's one
     /// timeout. Where the relay refuses it for now, that is counted for
     /// the relay ([`Self::refused_for_now`]). What failed is said as it
-    /// was.
+    /// was, with whether the relay refused it for now: it reset the stream
+    /// with ERR_RATE_LIMIT, which it does before it hands anything.
     async fn ask_counted(
         &self,
         link: &Link,
         protocol: Protocol,
         request: &WireMessage,
-    ) -> Result<WireMessage, String> {
-        let (mut send, mut recv) = open_stream(&link.conn).await?;
+    ) -> Result<WireMessage, Failed> {
+        let (mut send, mut recv) = open_stream(&link.conn).await.map_err(|why| Failed {
+            why,
+            refused_for_now: false,
+        })?;
         let sent = self.counts_as_sent(link, protocol, request);
         exchange(&mut send, &mut recv, protocol, request, sent)
             .await
             .map_err(|e| {
-                if refused_for_now(&e) {
+                let refused = refused_for_now(&e);
+                if refused {
                     self.refused_at(link);
                 }
-                e.to_string()
+                Failed {
+                    why: e.to_string(),
+                    refused_for_now: refused,
+                }
             })
     }
 
@@ -1521,6 +1558,13 @@ async fn exchange(
     .await;
     let _ = send.finish();
     answer
+}
+
+/// Why a request of a relay failed.
+struct Failed {
+    why: String,
+    /// The relay refused it for now ([`refused_for_now`]).
+    refused_for_now: bool,
 }
 
 /// Whether a request failed because the relay reset its stream with

@@ -1698,6 +1698,7 @@ pub async fn the_look(
         "held": tally.held,
         "higher": tally.higher,
         "cut": tally.cut,
+        "cut_own": tally.cut_own,
         "ties": tally.ties,
         "not_read": not_read,
         "failed": failed,

@@ -1259,7 +1259,7 @@ impl World {
             let folder = device.mem.display().to_string();
             sync_state::put_back(&db, &folder, &channel)
                 .unwrap()
-                .into_iter()
+                .into_keys()
                 .collect()
         };
         // A conflict copy that a carry left out is let go of by its root,
@@ -1396,7 +1396,7 @@ impl World {
             // A file that the carry left out goes back by a rule of its own
             // (decision 2026-10-24 (removal), rule 7), and meets none of
             // the five.
-            if put_back.contains(file) {
+            if put_back.contains_key(file) {
                 continue;
             }
             let (Some(a), Some(held)) = (agreed.get(file), device.carried.get(file)) else {

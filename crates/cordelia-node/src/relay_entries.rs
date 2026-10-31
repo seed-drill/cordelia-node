@@ -282,10 +282,24 @@ const ENTRIES_SHOWN_IN_A_SLOT: usize = 2 * MAX_CHANGE_HEADS;
 /// its person's channel, one slot. In a slot, at most
 /// [`ENTRIES_SHOWN_IN_A_SLOT`]: one more puts out the one remembered
 /// longest.
+///
+/// **An entry handed is remembered only once its answer is written
+/// whole** (the review of the whole build, its H2): one whose answer could
+/// not be written, or was dropped, is handed again at the next show on the
+/// connection. Remembered before, a lost answer would have the relay say
+/// "held" to the change followed with a removal never handed, and the
+/// device would have leave without it.
 #[derive(Debug, Default)]
 pub struct ShownWhole {
     slots: Vec<ShownSlot>,
+    /// The entry handed whole in the answer being made, by its slot, its
+    /// revision and its ID: remembered once that answer is written.
+    handing: Option<Handing>,
 }
+
+/// An entry handed whole in an answer: its slot (its channel, its slot and
+/// its author), its revision and its ID.
+type Handing = ([[u8; 32]; 3], (u64, [u8; 32]));
 
 /// An author's slot in a channel, and the entries that a connection showed
 /// whole there or was handed whole there.
@@ -318,11 +332,40 @@ impl ShownWhole {
             .unwrap_or_default()
     }
 
-    /// The connection showed `entry` whole, and both its signatures held,
-    /// or the relay handed it whole.
+    /// The connection showed `entry` whole, and both its signatures held.
     fn remember(&mut self, entry: &CheckedEntry) {
-        let place = [entry.channel, entry.slot, entry.author];
-        let shown = (entry.rev, entry.id());
+        self.remember_at(
+            [entry.channel, entry.slot, entry.author],
+            (entry.rev, entry.id()),
+        );
+    }
+
+    /// The answer being made hands `entry` whole: it is remembered once
+    /// that answer is written whole ([`Self::written`]).
+    fn handing(&mut self, entry: &CheckedEntry) {
+        self.handing = Some((
+            [entry.channel, entry.slot, entry.author],
+            (entry.rev, entry.id()),
+        ));
+    }
+
+    /// What the answer just made hands, taken out: nothing is remembered
+    /// of it unless it is given back to [`Self::written`].
+    fn take_handing(&mut self) -> Option<Handing> {
+        self.handing.take()
+    }
+
+    /// The answer that handed `handed` was written whole: the entry is
+    /// remembered as handed on the connection.
+    fn written(&mut self, handed: Option<Handing>) {
+        if let Some((place, shown)) = handed {
+            self.remember_at(place, shown);
+        }
+    }
+
+    /// The connection showed the entry `shown` whole in the slot `place`,
+    /// or was handed it whole there.
+    fn remember_at(&mut self, place: [[u8; 32]; 3], shown: (u64, [u8; 32])) {
         if let Some(kept) = self.slots.iter_mut().find(|kept| kept.place == place) {
             if !kept.entries.contains(&shown) {
                 if kept.entries.len() >= ENTRIES_SHOWN_IN_A_SLOT {
@@ -1163,9 +1206,10 @@ impl RelayEntries {
             return Answer::NotNow;
         }
         // An entry handed whole is not handed again on this connection
-        // (decision 2026-10-24 (removal), rule 16).
+        // (decision 2026-10-24 (removal), rule 16), once the answer that
+        // hands it is written whole ([`ShownWhole::written`]).
         if let Shown::Another { entry, .. } = &showing.answer {
-            whole.remember(entry);
+            whole.handing(entry);
         }
         Answer::of(WireMessage::EntryShown(EntryShown {
             answer: (&showing.answer).into(),
@@ -1794,30 +1838,73 @@ impl RelayEntries {
         if (taken.is_empty() && offers.is_empty()) || relays.is_empty() {
             return Vec::new();
         }
-        // The two times of each channel, and each head that is offered as
-        // it is kept. An entry of a channel that was dropped since is
-        // passed on to nobody.
-        let (times, kept): (ChannelTimes, HashMap<[u8; 32], Vec<u8>>) = {
+        // Each head that is offered, as it is kept: at most a page of them
+        // to each relay at an offer (ENTRY_PAGE_MAX_BYTES), the ones that
+        // waited longest first, read MAX_CHANGE_HEADS at a time with the
+        // lock taken for each (the review of the whole build, its M1).
+        // What is not offered now waits for the next offer, in its place.
+        // So an offer holds no more than a page for each relay, however
+        // many heads wait, and no read of them holds the lock for long.
+        let mut kept: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let mut gone: Vec<[u8; 32]> = Vec::new();
+        let mut paged: Vec<(NodeId, Vec<HeadAt>)> = Vec::new();
+        for (relay, heads) in offers {
+            let mut page: Vec<HeadAt> = Vec::new();
+            let mut bytes = 0usize;
+            let mut full = false;
+            for batch in heads.chunks(MAX_CHANGE_HEADS) {
+                {
+                    let Ok(db) = db.lock() else {
+                        return Vec::new();
+                    };
+                    for (place, id) in batch {
+                        if kept.contains_key(id) || gone.contains(id) {
+                            continue;
+                        }
+                        match relay::kept_entry(&db, (&place[0], &place[1], &place[2]), id) {
+                            Ok(Some(entry)) => {
+                                kept.insert(*id, entry.to_wire());
+                            }
+                            Ok(None) => gone.push(*id),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "could not read a head to offer");
+                            }
+                        }
+                    }
+                }
+                for head in batch {
+                    let Some(entry) = kept.get(&head.1) else {
+                        continue;
+                    };
+                    if !page.is_empty() && bytes + entry.len() > ENTRY_PAGE_MAX_BYTES {
+                        full = true;
+                        break;
+                    }
+                    bytes += entry.len();
+                    page.push(*head);
+                }
+                if full {
+                    break;
+                }
+            }
+            if !page.is_empty() {
+                paged.push((relay, page));
+            }
+        }
+        lock(&*self.heads).gone(&gone);
+        // A head read and not offered to any relay now is not held.
+        kept.retain(|id, _| {
+            paged
+                .iter()
+                .any(|(_, page)| page.iter().any(|head| head.1 == *id))
+        });
+        let offers = paged;
+        // The two times of each channel. An entry of a channel that was
+        // dropped since is passed on to nobody.
+        let times: ChannelTimes = {
             let Ok(db) = db.lock() else {
                 return Vec::new();
             };
-            let mut kept = HashMap::new();
-            let mut gone = Vec::new();
-            for (place, id) in offers.iter().flat_map(|(_, heads)| heads) {
-                if kept.contains_key(id) || gone.contains(id) {
-                    continue;
-                }
-                match relay::kept_entry(&db, (&place[0], &place[1], &place[2]), id) {
-                    Ok(Some(entry)) => {
-                        kept.insert(*id, entry.to_wire());
-                    }
-                    Ok(None) => gone.push(*id),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "could not read a head to offer");
-                    }
-                }
-            }
-            lock(&*self.heads).gone(&gone);
             let channels: HashSet<[u8; 32]> = taken
                 .iter()
                 .map(|taken| taken.channel)
@@ -1827,14 +1914,13 @@ impl RelayEntries {
                         .flat_map(|(_, heads)| heads.iter().map(|(place, _)| place[0])),
                 )
                 .collect();
-            let times = channels
+            channels
                 .into_iter()
                 .filter_map(|channel| {
                     let held = relay::held_channel(&db, &channel).ok()??;
                     Some((channel, (held.held_since, held.used_at)))
                 })
-                .collect();
-            (times, kept)
+                .collect()
         };
         let passed: Vec<(NodeId, Vec<RelayPush>)> = relays
             .iter()
@@ -2102,6 +2188,9 @@ impl RelayEntries {
             serving.rates,
             unix_now(),
         );
+        // What the answer hands is remembered only once it is written
+        // whole: an answer not made, or not written, hands nothing.
+        let handed = whole.take_handing();
         // The answer is made, and needs nothing more of the request, which
         // is large where its answer is small (a push of a page of
         // entries), nor of its frame, which a pull may pad to a message
@@ -2154,6 +2243,9 @@ impl RelayEntries {
                 .then_some(written.len()),
             Err(_) => None,
         };
+        if wrote.is_some() {
+            whole.written(handed);
+        }
         match (wrote, stream) {
             (Some(bytes), Some(stream)) => {
                 self.counts.wrote(stream, FRAME_LENGTH_BYTES + bytes);
@@ -2758,6 +2850,21 @@ mod tests {
         /// connection that has shown `whole` so far: of the entry whole,
         /// or in short.
         fn show_on(&self, n: u8, whole: &mut ShownWhole, request: WireMessage) -> ShowAnswer {
+            let answer = self.show_unwritten(n, whole, request);
+            // The answer is written whole: what it hands is remembered.
+            let handed = whole.take_handing();
+            whole.written(handed);
+            answer
+        }
+
+        /// As [`Self::show_on`], where the answer is made and never
+        /// written: what it hands is not remembered as handed.
+        fn show_unwritten(
+            &self,
+            n: u8,
+            whole: &mut ShownWhole,
+            request: WireMessage,
+        ) -> ShowAnswer {
             let peer = peer(n);
             shown(self.entries.answer(
                 Protocol::EntryShow,
@@ -7494,6 +7601,78 @@ mod tests {
         );
     }
 
+    /// A head is remembered as handed only once the answer that hands it
+    /// is written whole (the review of the whole build, its H2). A show
+    /// whose answer cannot be written, the device gone or its stream reset,
+    /// is handed the head again at the next show on the same connection,
+    /// and the relay says "held" only after that: so a lost answer gives
+    /// the device no leave without the removal.
+    #[tokio::test]
+    async fn a_head_whose_answer_was_not_written_is_handed_again() {
+        let at = relay();
+        let (laptop, desktop) = made_apart(1);
+        // The relay keeps the laptop's change, and then the desktop's
+        // beside it; the second connection was handed the laptop's.
+        let mut first = ShownWhole::default();
+        assert_eq!(
+            at.show_on(1, &mut first, whole_of(&laptop)),
+            ShowAnswer::Taken
+        );
+        let mut second = ShownWhole::default();
+        let answer = at.show_on(2, &mut second, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+
+        // A third connection shows the desktop's change, as a device that
+        // follows it does, on a stream whose answer cannot be written: the
+        // device has gone from it.
+        let peer3 = peer(3);
+        let serving = Serving {
+            conn: None,
+            peer: &peer3,
+            address: address(3),
+            db: &at.db,
+            rates: &at.rates,
+            permits: None,
+        };
+        let mut proved = Proved::default();
+        let mut third = ShownWhole::default();
+        let (mut relay_w, peer_r) = tokio::io::duplex(1 << 20);
+        drop(peer_r);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(1 << 20);
+        let frame = codec::encode_message(&whole_of(&desktop)).unwrap();
+        codec::write_raw_frame(&mut peer_w, &frame).await.unwrap();
+        at.entries
+            .serve(
+                Protocol::EntryShow,
+                &mut relay_w,
+                &mut relay_r,
+                &serving,
+                &mut proved,
+                &mut third,
+            )
+            .await;
+        // The next show on the same connection is handed the laptop's
+        // change, whose first answer was lost, and only then told "held".
+        let answer = at.show_on(3, &mut third, whole_of(&desktop));
+        assert_eq!(
+            handed_whole(&answer),
+            Some(laptop.id()),
+            "a head whose answer was never written counted as handed: {answer:?}"
+        );
+        assert_eq!(
+            at.show_on(3, &mut third, whole_of(&desktop)),
+            ShowAnswer::Held
+        );
+
+        // An answer made and dropped before its write hands nothing either.
+        let mut fourth = ShownWhole::default();
+        let answer = at.show_unwritten(4, &mut fourth, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+        let _ = fourth.take_handing();
+        let answer = at.show_on(4, &mut fourth, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+    }
+
     /// Rule 17: a head that a relay keeps, beside another or alone, is
     /// offered to each relay it works with, but the one it came from, at
     /// each offer until that relay has answered for it: one connected then
@@ -7577,6 +7756,59 @@ mod tests {
                 .is_empty()
         );
         assert!(lock(&*at.entries.heads).heads.is_empty());
+    }
+
+    /// An offer of heads holds at most a page for each relay (the review
+    /// of the whole build, its M1): of 40 heads that wait, each a change
+    /// entry of 32 KB, an offer carries no more than ENTRY_PAGE_MAX_BYTES
+    /// of them, those that waited longest first, and the rest are offered
+    /// at the offers after, in order, until each is answered.
+    ///
+    /// Taken out: the page (all 40 go in one offer: the first fails).
+    #[test]
+    fn an_offer_of_heads_holds_at_most_a_page_for_each_relay() {
+        let at = relay_of(u64::MAX, &[9]);
+        let heads: Vec<CheckedEntry> = (0..40u16)
+            .map(|n| change(100 + n, 1, 3, 0x13, &[0x01, 0x02]))
+            .collect();
+        for head in &heads {
+            assert_eq!(
+                pushed(at.push(1, vec![head.to_wire()])),
+                [PushAnswer::Stored]
+            );
+        }
+        let mut offered: Vec<[u8; 32]> = Vec::new();
+        for _ in 0..heads.len() {
+            let passed = at.entries.to_pass_on(&at.db, &[peer(9)]);
+            if passed.is_empty() {
+                break;
+            }
+            let messages = waiting_for(&passed, 9);
+            let bytes: usize = messages
+                .iter()
+                .flatten()
+                .map(|passed| passed.entry.len())
+                .sum();
+            assert!(
+                bytes <= ENTRY_PAGE_MAX_BYTES,
+                "an offer of {bytes} bytes of heads to one relay"
+            );
+            for message in &passed[0].1 {
+                offered.extend(
+                    message
+                        .entries
+                        .iter()
+                        .map(|passed| Entry::from_wire(&passed.entry).unwrap().id()),
+                );
+                RelayEntries::heads_answered(&at.entries.heads, &peer(9), message);
+            }
+            RelayEntries::offer_ended(&at.entries.heads, &peer(9));
+        }
+        let ids: Vec<[u8; 32]> = heads.iter().map(|head| head.id()).collect();
+        assert_eq!(
+            offered, ids,
+            "every head is offered once, in the order it waited"
+        );
     }
 
     /// Rule 17, where the asker is over its allowance (the review of slice

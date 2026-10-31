@@ -519,6 +519,9 @@ struct First<'a> {
     /// a version gone back to that one of them stored was judged when it
     /// came.
     stored_before: Vec<[u8; 32]>,
+    /// It is a version of the device's own in a window of rule 27, and no
+    /// earlier event of the file is cut by rule 7.
+    own: bool,
 }
 
 /// What the cut leaves of a file at a carry (rule 7).
@@ -532,6 +535,11 @@ pub(crate) struct FileCut {
     pub(crate) at: i64,
     /// The version the file goes back to; `None` for none.
     pub(crate) target: Option<Version>,
+    /// What is left out is the device's own writing in a window of rule 27,
+    /// and nothing earlier of the file is cut by rule 7: what is said of it
+    /// differs, and no command brings it back (the review of the whole
+    /// build, its M4).
+    pub(crate) own: bool,
 }
 
 /// Each file of the channel whose secret is `from`, under the statement
@@ -606,6 +614,7 @@ pub(crate) fn cut_of_channel(
                     at: windows.opens_at().unwrap_or(own_went.newest_at),
                     before: None,
                     stored_before: Vec::new(),
+                    own: true,
                 })
             }
             (None, Some(at)) => {
@@ -619,11 +628,11 @@ pub(crate) fn cut_of_channel(
                         .iter()
                         .filter_map(|went| went.first_stored_id)
                         .collect(),
+                    own: false,
                 })
             }
-            (None, None) => events
-                .iter()
-                .position(|event| {
+            (None, None) => {
+                let by_rule_7 = events.iter().position(|event| {
                     let generation = (event.number, event.hash);
                     event
                         .arrivals
@@ -634,11 +643,8 @@ pub(crate) fn cut_of_channel(
                         // A chain that may have dropped links names every
                         // removed key.
                         || (event.unknown && any_key(&generation, event.stored_at))
-                })
-                .into_iter()
-                .chain(own_first)
-                .min()
-                .map(|index| {
+                });
+                by_rule_7.into_iter().chain(own_first).min().map(|index| {
                     let event = &events[index];
                     let stored = events[..index].iter().map(|event| event.stored_id);
                     let went = dropped.iter().map(|went| went.first_stored_id);
@@ -648,8 +654,10 @@ pub(crate) fn cut_of_channel(
                         at: event.stored_at,
                         before: event.before.as_ref(),
                         stored_before: stored.chain(went).flatten().collect(),
+                        own: by_rule_7.is_none_or(|first| first > index),
                     }
-                }),
+                })
+            }
         };
         let Some(first) = first else {
             continue;
@@ -697,6 +705,7 @@ pub(crate) fn cut_of_channel(
                 place: first.place,
                 at: first.at,
                 target,
+                own: first.own,
             },
         );
     }
@@ -1805,6 +1814,53 @@ mod tests {
         );
     }
 
+    /// The cut says which rule leaves each file out (the review of the
+    /// whole build, its M4): the tablet's late `w.md` by rule 7, and what
+    /// the laptop wrote itself after it took it (`notes.md`, `keep.md`) by
+    /// rule 27, so that the status and the commands say each in its own
+    /// words, and point to `--from` only for the first.
+    ///
+    /// Taken out: the mark (every file is said as rule 7's: the second
+    /// fails).
+    #[test]
+    fn the_cut_tells_rule_27s_files_from_rule_7s() {
+        let mut s = Several::of_one_person(3);
+        s.hold(&[0, 1, 2], "notes");
+        s.write(1, "notes", "keep.md", "keep, long before");
+        s.meet(&[0, 1, 2]);
+        s.now += MARGIN + 1;
+        let removal = s.change(0, &[0, 1], &[2]);
+        s.write(2, "notes", "w.md", "the tablet's late text");
+        s.pass(2, 1);
+        s.write(
+            1,
+            "notes",
+            "notes.md",
+            "the late text, as the agent wrote it",
+        );
+        s.write(1, "notes", "keep.md", "keep, edited after the late text");
+        let now = s.tick();
+        let on = &s[1];
+        crate::person::know_what_is_shown(&on.conn, &on.identity, &removal, now).unwrap();
+        let secret = on.own("notes");
+        let channel = cordelia_crypto::derive::channel_id(&secret).unwrap();
+        let cuts = crate::cut::Cuts::read(&on.conn).unwrap();
+        let windows = windows(&on.conn, &[channel], &cuts).unwrap();
+        let cut = cut_of_channel(
+            &on.conn,
+            &on.key(),
+            &secret,
+            &cuts,
+            &windows,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+        let own_of = |file: &str| cut.get(&on.slot_of("notes", file)).map(|cut| cut.own);
+        assert_eq!(own_of("w.md"), Some(false));
+        assert_eq!(own_of("notes.md"), Some(true));
+        assert_eq!(own_of("keep.md"), Some(true));
+    }
+
     /// Rule 27: what a device wrote before the first late arrival it took
     /// is kept, though it came after the cut time; and a late arrival in
     /// one name sets aside what the device wrote in another name after it.
@@ -2374,7 +2430,8 @@ mod tests {
         assert_eq!(s[1].text("notes", "notes.md"), None);
 
         // A carry by command on the laptop, of what the relays hold of the
-        // old generation, leaves its window writing out.
+        // old generation, leaves its window writing out, as rule 27's own:
+        // no command brings it in (the review of the whole build, its M4).
         let version = version_of(&written, &old_secret).unwrap().unwrap();
         let now = s.tick();
         let on = &s[1];
@@ -2387,7 +2444,7 @@ mod tests {
             now,
         )
         .unwrap();
-        assert_eq!(brought, crate::carry::Brought::Cut);
+        assert_eq!(brought, crate::carry::Brought::CutOwn);
 
         // The phone applies the removal, and carries the laptop's version.
         let now = s.tick();
