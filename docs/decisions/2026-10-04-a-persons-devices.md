@@ -343,7 +343,8 @@ So a laptop that was closed over a removal sends none of its waiting edits to an
 - It is one wait, for all of them together: a relay that is reached later holds nothing up, and is shown the entry before it is used, like any connection.
 - **Why.** Connections come up one at a time. Without this, a device that woke would take what the first relay held, and send it what waited, before the second, which had the change, had answered.
 - A relay that was not reached is named in its status: "has not heard from <relay> since it started or woke at <when>: a change made while this device was off may be there, and not have reached it" ([decision 2026-10-19](2026-10-19-a-relay-out-of-reach.md) §5, T1).
-- **The cost:** with one relay out of reach, a device that starts, or comes back online, waits 30 seconds before it syncs.
+- **A relay whose dial has failed since the wake began is waited for no more,** once another relay has answered ([decision 2026-10-24 (removal)](2026-10-24-removal-fails-safe.md), section 8, which says what counts as a dial that failed). It cannot tell the device of a change; one that may still answer, with a dial in flight or connected and not yet answered, is waited for, up to the 30 seconds. When the device wakes, each relay that it does not reach is dialled at once, so that this is known within the wake.
+- **The cost:** with one relay out of reach, a device that starts, or comes back online, waits for that relay's dial to fail, some 10 to 13 seconds where it gives no answer, before it syncs; 30 seconds where the relay is slow but still answers, or its name does not resolve.
 
 **What can still keep a change from a device:**
 
