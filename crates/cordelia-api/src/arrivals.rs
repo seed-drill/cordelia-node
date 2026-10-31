@@ -1667,6 +1667,10 @@ mod tests {
         let Published::Made(merge) = publish(&on.conn, &on.identity, &write, now).unwrap() else {
             panic!("not made");
         };
+        let merged_chain = merge.open(&s[3].own("notes")).unwrap().chain.unwrap();
+        let mut as_an_edit = vec![Link::of(&Value::Text(c.into()), s.key(0))];
+        as_an_edit.extend(c_chain.iter().copied());
+        assert_eq!(merged_chain, as_an_edit);
 
         // The laptop takes the merge alone.
         let now = s.tick();

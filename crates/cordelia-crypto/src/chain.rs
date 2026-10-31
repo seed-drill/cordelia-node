@@ -14,8 +14,8 @@
 //!   is where the device that carries signed it, and otherwise as one
 //!   written over it.
 //! - **A merge of two versions** ([`merged`]): written over the one, with
-//!   the other's link always second and what it descends from woven in,
-//!   as far as the two chains say nothing of one version at two places.
+//!   the other and what it descends from woven in, as far as the two
+//!   chains say nothing of one version at two places.
 //!
 //! A chain holds 100 links at most, and each of the three cuts it there,
 //! from the old end: what is older than the hundredth is not said. A link
@@ -75,23 +75,17 @@ pub fn carried_from(
 /// chain (`others_chain`).
 ///
 /// - Written over the channel's version, as any entry: that version's
-///   link first.
-/// - **The other's link always comes second,** by its hash and its
-///   signer, and after it the links of the two chains, one from each in
-///   turn, the channel's first. So a merge's chain is never an edit's,
-///   whatever the other's hash: the door tells the two apart
-///   (decision 2026-10-24 (removal), rule 7, the index rule), and a merge
-///   may drop a link. **This holds where the other's hash already stands
-///   in the channel's chain, or is the channel's version's own**: the
-///   channel's version may descend from that text, but a link is only a
-///   hash and a signer, and a key that wrote an older text back makes
-///   its hash stand there though its own version is not behind the
-///   channel's. A link may stand in a chain twice. Where the other's
-///   chain is the tail of the channel's (a fast-forward), the weave below
-///   stops the other's chain at its first link, and the result is the
-///   other's link and then the channel's chain whole. What it costs: a
-///   fast-forward merge stored in a removal's window is set aside at a
-///   carry like any other merge.
+///   link first, and then its chain.
+/// - **Where the other's hash is already in that chain, nothing is
+///   added.** The channel's version descends from it, and every link
+///   between the two stays between them. So a merge's chain may be
+///   exactly an edit's, and nothing tells the two apart by their chains:
+///   at a removal every index version another device wrote is set aside
+///   in its window, edit or merge (decision 2026-10-24 (removal), rule 7,
+///   the index rule).
+/// - **Where it is not,** the two were written apart. The other's link
+///   comes second, and after it the links of the two chains, one from
+///   each in turn, the channel's first.
 /// - **A link whose hash stands further on in the other chain is left
 ///   out, and nothing more is taken from its chain.** The other chain
 ///   goes on whole. The two descend from that version, and the chain that
@@ -119,6 +113,9 @@ pub fn merged(
 ) -> Vec<Link> {
     let over = Link::of(value, *signer);
     let ours = chain.unwrap_or_default();
+    if over.hash == other.hash || ours.iter().any(|link| link.hash == other.hash) {
+        return written_over(value, signer, chain);
+    }
     let theirs = others_chain.unwrap_or_default();
 
     // One from each in turn, the channel's first, each with whether it is
@@ -338,91 +335,39 @@ mod tests {
 
     // ── A merge ──────────────────────────────────────────────────────
 
-    /// Where the other source's hash already stands in the chain of the
-    /// channel's version, its link still comes second, by hash and signer,
-    /// and the channel's chain follows whole (decision 2026-10-24
-    /// (removal), rule 7, the index rule). A merge's chain is never an
-    /// edit's: a key that wrote an older text back makes that hash stand
-    /// in a chain though its own version is not behind the channel's.
+    /// Where the version the file held is already in the chain of the
+    /// channel's version, the merge is written over the channel's version
+    /// and nothing is added: the channel's version descends from it.
     #[test]
-    fn a_merge_puts_the_other_source_second_where_its_hash_is_in_the_chain() {
+    fn a_merge_adds_nothing_where_the_other_source_is_in_the_chain() {
         let value = text_of("the channel's");
         let chain = [link("C", 2), link("B", 1), link("A", 1)];
         let over = written_over(&value, &key(2), Some(&chain));
-        let with = |held: Link| {
-            let mut built = vec![link("the channel's", 2), held];
-            built.extend(chain);
-            built
-        };
 
-        // The file held B, which the channel's version was written after:
-        // B's link stands twice, second and at its place.
+        // The file held B, which the channel's version was written after.
         let held = link("B", 1);
-        let built = merged(&value, &key(2), Some(&chain), &held, Some(&[link("A", 1)]));
-        assert_eq!(built, with(held));
-        assert_ne!(built, over);
-        is_sealed_and_read(&built);
-        // B written back by another key, which stands nowhere in the
-        // chain: its link, with its own signer.
+        let held_after = [link("A", 1)];
+        assert_eq!(
+            merged(&value, &key(2), Some(&chain), &held, Some(&held_after)),
+            over
+        );
+        // Whoever signed the entry the folder took it from.
         let by_another = link("B", 9);
-        let built = merged(&value, &key(2), Some(&chain), &by_another, None);
-        assert_eq!(built, with(by_another));
-        assert_eq!(built[1].signer, signer(9));
-        // And with a chain of its own that says more than the channel's:
-        // the two are woven as for any merge. C stands further on in the
-        // other's chain, so the channel's stops there.
-        let built = merged(
-            &value,
-            &key(2),
-            Some(&chain),
-            &by_another,
-            Some(&[link("late", 9), link("C", 2)]),
-        );
         assert_eq!(
-            built,
-            [
-                link("the channel's", 2),
-                by_another,
-                link("late", 9),
-                link("C", 2),
-            ]
+            merged(&value, &key(2), Some(&chain), &by_another, None),
+            over
         );
-        // The oldest of them.
-        let oldest = link("A", 1);
-        assert_eq!(
-            merged(&value, &key(2), Some(&chain), &oldest, Some(&[])),
-            with(oldest)
-        );
-        // A folder at B is told that the merge follows it only where the
-        // channel's version's signer counts, as before: B's link second
-        // has that one link above it.
-        let built = with(held);
-        assert!(known_to_follow(Some(&built), &named("B"), only(&[2])));
-        assert!(!known_to_follow(Some(&built), &named("B"), only(&[1])));
-    }
-
-    /// Where the other source's hash is the channel's version's own (the
-    /// same text, by the same key or another), its link still comes
-    /// second, and the channel's chain follows.
-    #[test]
-    fn a_merge_puts_the_other_source_second_where_its_hash_is_the_channels_own() {
-        let value = text_of("the channel's");
-        let chain = [link("C", 2), link("B", 1)];
-        for held in [link("the channel's", 3), link("the channel's", 2)] {
-            let built = merged(&value, &key(2), Some(&chain), &held, Some(&chain));
+        // The oldest of them, and the channel's version itself.
+        for held in [link("A", 1), link("the channel's", 3)] {
             assert_eq!(
-                built,
-                [link("the channel's", 2), held, link("C", 2), link("B", 1)]
+                merged(&value, &key(2), Some(&chain), &held, Some(&[])),
+                over
             );
-            assert_ne!(built, written_over(&value, &key(2), Some(&chain)));
-            is_sealed_and_read(&built);
         }
-        // Over a new name's version, whose chain is empty: the two links.
-        let held = link("the channel's", 3);
-        assert_eq!(
-            merged(&value, &key(2), Some(&[]), &held, Some(&[])),
-            [link("the channel's", 2), held]
-        );
+        // Every link between the two stays between them: a folder at B is
+        // told that the merge follows it only where C's signer counts.
+        assert!(known_to_follow(Some(&over), &named("B"), only(&[2])));
+        assert!(!known_to_follow(Some(&over), &named("B"), only(&[1])));
     }
 
     /// Where the two were written apart, the other source's link comes
@@ -789,12 +734,11 @@ mod tests {
         }
         is_sealed_and_read(&built);
 
-        // Where the other's hash stands in the channel's chain, its link
-        // is second all the same, and the channel's oldest two fall off.
+        // Where nothing is added, it is cut as an entry written over the
+        // channel's version is.
         let in_the_chain = ours[99];
         let built = merged(&value, &key(1), Some(&ours), &in_the_chain, None);
+        assert_eq!(built, written_over(&value, &key(1), Some(&ours)));
         assert_eq!(built.len(), 100);
-        assert_eq!(built[..2], [link("the channel's", 1), in_the_chain]);
-        assert_eq!(built[2..], ours[..98]);
     }
 }
