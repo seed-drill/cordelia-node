@@ -57,7 +57,9 @@
 //! and does nothing more until each relay it is set up with has answered
 //! or the wait has gone by. While it wakes, one pass at a time asks the
 //! relays, and waits for all of them: that is the rule. Once it is
-//! awake, no relay waits for another.
+//! awake, no relay waits for another. **Where the wait runs out, it
+//! pulls at once:** a whole pass is asked for the moment the wait is
+//! over, and not left for the fetch's timer.
 //!
 //! ## A show that gets no leave
 //!
@@ -538,6 +540,9 @@ pub struct DeviceEntries {
     kept: Mutex<Kept>,
     /// While the device wakes, one pass at a time asks every relay first.
     waking: tokio::sync::Mutex<()>,
+    /// The end of the wake for which a whole pass is asked, once the wait
+    /// is over ([`Self::whole_pass_once_awake`]): one asking a wake.
+    wake_asked: Mutex<Option<Instant>>,
     /// One turn at a time at each relay, by the relay's name.
     turns: Mutex<HashMap<String, Arc<Turn>>>,
     /// One asking at a time at each relay for what the device of a typed
@@ -598,6 +603,7 @@ impl DeviceEntries {
             most_proved: most_proved.min(MAX_CHANNELS_PROVED_ON_A_CONNECTION),
             kept: Mutex::default(),
             waking: tokio::sync::Mutex::new(()),
+            wake_asked: Mutex::default(),
             turns: Mutex::default(),
             asking: Mutex::default(),
             own_rounds: tokio::sync::Mutex::new(()),
@@ -1194,6 +1200,7 @@ impl DeviceEntries {
                 }
             }
             if self.leave.is_waking() {
+                self.whole_pass_once_awake();
                 self.say(relays, stands);
                 return false;
             }
@@ -1221,6 +1228,30 @@ impl DeviceEntries {
         let stands = at_relays::stands(&lock(&self.state.db)).unwrap_or(stands);
         self.say(relays, stands);
         read_all
+    }
+
+    /// Ask for a whole pass at the moment the wait of the device that
+    /// wakes is over, where a relay it is set up with has not answered
+    /// (decision 2026-10-04 §4.6). The wait is the rule's cost: a pass is
+    /// not. A pass that ends the wait by its time finds the device awake
+    /// at its start, and where it is a pass that sends it pulls nothing;
+    /// without this, what came while the device reached no relay waited
+    /// for the fetch's timer, up to REALTIME_SYNC_INTERVAL_SECS more.
+    /// Asked once a wake: each pass that finds the device still waking
+    /// calls this.
+    fn whole_pass_once_awake(&self) {
+        let Some(ends) = self.leave.wake_ends() else {
+            return;
+        };
+        if lock(&self.wake_asked).replace(ends) == Some(ends) {
+            return;
+        }
+        let wait = ends.saturating_duration_since(self.clock.now());
+        let state = Arc::clone(&self.state);
+        tokio::spawn(async move {
+            tokio::time::sleep(wait).await;
+            state.own_channels.ask_whole();
+        });
     }
 
     /// What the pass finds of each relay in `relays`, for what is known of
