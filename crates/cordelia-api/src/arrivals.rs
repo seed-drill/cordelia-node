@@ -73,10 +73,18 @@ pub(crate) struct Before {
 /// 8, its look for other paths): it is empty, or its first link is an
 /// entry of a held version, by hash and signer, and the rest is exactly
 /// that entry's chain. Such a chain drops no link: `chain::written_over`
-/// drops none short of 100. A merge's never is: its second link is the
-/// other version's, which stands nowhere in the chain it is written over
-/// (`chain::merged`), and a merge is what can drop a removed key's link
-/// from a chain that is not full.
+/// drops none short of 100. A merge is what can drop a removed key's link
+/// from a chain that is not full, and its chain does not pass: its second
+/// link is always the other version's, by hash and signer, even where that
+/// version's hash stands in the chain it is written over or is that
+/// version's own (`chain::merged`; the read of the index rule). It passes
+/// only where a held entry was itself written straight over the other
+/// version, whose link then stands in a held chain already and was judged
+/// when that entry came. What it costs: a merge that only fast-forwards,
+/// stored in a removal's window, is set aside like any other merge. And
+/// only a chain under 100 links is asked: an index edited 100 times or
+/// more has a full chain, and each of its versions in the window is set
+/// aside, edit or merge.
 fn written_over_held(chain: &[Link], before: &Before) -> bool {
     let Some((first, rest)) = chain.split_first() else {
         return true;
