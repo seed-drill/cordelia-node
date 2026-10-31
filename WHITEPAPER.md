@@ -405,7 +405,10 @@ removed key among the keys removed, and a commitment to a new person secret.
   the removed device can read, and takes what the removed device writes. It
   reads the removal within 90 seconds of any relay it is connected to
   holding it, and a relay holds it within 5 seconds of being connected to a
-  relay that holds it. A device that reaches no relay which holds it writes
+  relay that holds it, where no backlog of heads waits ahead of it (anyone
+  who can write entries can build one, and delay it between relays by as
+  long as the backlog takes to offer). A device that reaches no relay which
+  holds it writes
   so for as long as that lasts. `cordelia devices` shows which devices have
   not applied the change. A device whose clock is behind the maker's by
   more than ten minutes carries what reached it in that excess, and a
