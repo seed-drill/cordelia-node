@@ -2490,7 +2490,11 @@ fn apply(
     // entry replaces was kept for, if one was.
     let publish_merged = |text: &str, at: Option<u64>| -> Result<Option<Made>, Failure> {
         let db = lock(state)?;
-        publish_over(ctx, &db, key, Some(text), at, other_source.as_ref())
+        let published = publish_over(ctx, &db, key, Some(text), at, other_source.as_ref())?;
+        if published.is_some() {
+            written_here(&db, folder, key, text);
+        }
+        Ok(published)
     };
     // The same, for an edit or a delete that this device makes of its own
     // (not a merge): what it published is written down for the file's
@@ -2500,6 +2504,11 @@ fn apply(
     let publish_own = |text: Option<&str>, at: Option<u64>| -> Result<Option<Made>, Failure> {
         let db = lock(state)?;
         let published = publish_over(ctx, &db, key, text, at, None)?;
+        if published.is_some()
+            && let Some(text) = text
+        {
+            written_here(&db, folder, key, text);
+        }
         if ctx.lines
             && published.is_some()
             && let Err(error) = lines::published(ctx, &db, key, text)
@@ -2806,6 +2815,20 @@ fn kept_after(agreed: Option<&Agreed>, text: &str, me: &[u8; 32]) -> Option<Vec<
     };
     built.truncate(cordelia_core::protocol::MAX_ENTRY_LINKS);
     Some(built)
+}
+
+/// Note that this device published `text` of `key` in `folder` itself,
+/// under the hold of the lock it was published under: where a carry cut
+/// the file, `cordelia restore` may put this text back, and no other
+/// version of it (the review of the fixes of the whole build, its H1 and
+/// M2). One that cannot be noted is said in the log, and costs only a
+/// restore of it, which is refused.
+fn written_here(db: &rusqlite::Connection, folder: &str, key: &str, text: &str) {
+    let sha256 = history::kept(history::Whose::Here { agreed: None }, text).sha256;
+    let now = chrono::Utc::now().timestamp();
+    if let Err(error) = sync_state::note_written(db, folder, key, &sha256, now) {
+        tracing::warn!(%folder, file = %key, %error, "published, and it could not be noted as this device's own writing after a cut: a restore of it is refused");
+    }
 }
 
 /// Count an edit that a carry set aside (decision 2026-10-24 (removal),
@@ -3452,6 +3475,166 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(mem.join("other.md")).unwrap(),
             "one\n"
+        );
+    }
+
+    /// `cordelia restore` brings back nothing of a file a carry cut where
+    /// the carry changed nothing in the folder, so that history keeps no
+    /// record set aside of it (the review of the fixes of the whole build,
+    /// its H1), in the review's two sequences:
+    ///
+    /// - the tablet, removed elsewhere, writes a new `late.md`, and then
+    ///   deletes it; the laptop takes both before it knows, so the file is
+    ///   absent, and the carry takes it back to none;
+    /// - the tablet writes over `notes.md`, and then writes back the text
+    ///   it held; the laptop takes both, so the file holds the version the
+    ///   carry goes back to.
+    ///
+    /// Each version of either that history kept is refused, the next cycle
+    /// publishes nothing, and the desktop is never given the tablet's text.
+    /// A version the laptop wrote itself after the carry is restored.
+    ///
+    /// Taken out: the record of the cut in the database (`late.md`'s
+    /// `Removed` record is restored, and the next cycle publishes it: the
+    /// first assertion of a refusal fails).
+    #[test]
+    fn a_restore_brings_back_nothing_of_a_file_cut_that_the_carry_left_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let (channel, phrase) = person_of(&st, NAME);
+        let desktop = another_device(&st, &tmp.path().join("desktop"), NAME);
+        let tablet = another_device(&st, &tmp.path().join("tablet"), NAME);
+        deliver(&st, &desktop, NAME);
+        deliver(&st, &tablet, NAME);
+        let store = history::Store::new(&st.home_dir, 30, 1 << 24).unwrap();
+        st.history.open(Some(store.clone()));
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let cycle = |channel: &str| {
+            let generation = st.sync_control.generation();
+            sync_folder(&st, &mem, channel, NAME, "abcd", generation).unwrap()
+        };
+        std::fs::write(mem.join("notes.md"), "mine\n").unwrap();
+        assert_eq!(cycle(&channel).published, 1);
+
+        // The tablet's late writing, each taken before the laptop knew.
+        deliver(&st, &tablet, NAME);
+        write(&tablet, NAME, "late.md", text("the tablet's late\n"));
+        write(&tablet, NAME, "notes.md", text("mine\nthe tablet's\n"));
+        deliver(&tablet, &st, NAME);
+        assert_eq!(cycle(&channel).pulled, 2);
+        write(&tablet, NAME, "late.md", Value::Delete);
+        write(&tablet, NAME, "notes.md", text("mine\n"));
+        deliver(&tablet, &st, NAME);
+        assert_eq!(cycle(&channel).pulled, 2);
+        assert!(!mem.join("late.md").exists());
+
+        let removal = removes_at(&desktop, &phrase, &tablet.identity.public_key(), now());
+        {
+            let db = st.db.lock().unwrap();
+            take::take(&db, &st.identity, &removal, now()).unwrap();
+        }
+        let channel = {
+            let db = st.db.lock().unwrap();
+            let id = held_rows::channel_of_name(&db, NAME).unwrap().unwrap();
+            encode_channel_id(&id).unwrap()
+        };
+        // The carry changes nothing in the folder: nothing is set aside.
+        let carried = cycle(&channel);
+        assert_eq!(
+            (carried.set_aside, carried.published),
+            (0, 0),
+            "{carried:?}"
+        );
+        assert!(
+            store
+                .list()
+                .unwrap()
+                .records
+                .iter()
+                .all(|record| !record.about.change.is_set_aside())
+        );
+
+        let restore = |id: &history::Id| {
+            let request = cordelia_api::history::RestoreRequest {
+                ids: vec![id.to_string()],
+            };
+            let answer =
+                cordelia_api::history::restore(&st, &request, std::time::Duration::from_secs(5))
+                    .unwrap();
+            answer.results.into_iter().next().unwrap()
+        };
+        let listing = store.list().unwrap();
+        let kept_tablets = |file: &str| {
+            listing.records.iter().any(|record| {
+                record.about.file == file
+                    && store
+                        .read(&record.id)
+                        .unwrap()
+                        .and_then(|(_, text)| text)
+                        .is_some_and(|text| text.contains("tablet"))
+            })
+        };
+        assert!(kept_tablets("late.md") && kept_tablets("notes.md"));
+        for record in listing
+            .records
+            .iter()
+            .filter(|record| record.about.file != "other.md")
+        {
+            let restored = restore(&record.id);
+            assert!(
+                !restored.done,
+                "a version of a file the carry cut was restored: {} {:?} {restored:?}",
+                record.about.file, record.about.change
+            );
+            assert!(
+                restored.message.contains("--from <its label>"),
+                "{restored:?}"
+            );
+        }
+        assert!(!mem.join("late.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+            "mine\n"
+        );
+        let again = cycle(&channel);
+        assert_eq!((again.published, again.set_aside), (0, 0), "{again:?}");
+        deliver(&st, &desktop, NAME);
+        let secret = name_secret(&desktop, NAME);
+        for entry in held(&desktop, NAME) {
+            let inside = entry.open(&secret).unwrap();
+            assert!(
+                !matches!(&inside.value, Value::Text(t) if t.contains("tablet")),
+                "{inside:?}"
+            );
+        }
+
+        // What the laptop writes itself after the carry is its own: a
+        // version of it that history keeps is restored.
+        std::fs::write(mem.join("notes.md"), "mine\nafter\n").unwrap();
+        assert_eq!(cycle(&channel).published, 1);
+        std::fs::write(mem.join("notes.md"), "mine\nlater\n").unwrap();
+        assert_eq!(cycle(&channel).published, 1);
+        let own = store
+            .list()
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|record| {
+                record.about.file == "notes.md"
+                    && store
+                        .read(&record.id)
+                        .unwrap()
+                        .and_then(|(_, text)| text)
+                        .as_deref()
+                        == Some("mine\nafter\n")
+            })
+            .expect("the laptop's own version is kept");
+        let restored = restore(&own.id);
+        assert!(restored.done, "{restored:?}");
+        assert_eq!(
+            std::fs::read_to_string(mem.join("notes.md")).unwrap(),
+            "mine\nafter\n"
         );
     }
 

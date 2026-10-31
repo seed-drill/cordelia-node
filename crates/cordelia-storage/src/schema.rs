@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 27;
+pub const SCHEMA_VERSION: u32 = 28;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1410,6 +1410,35 @@ ALTER TABLE file_put_back ADD COLUMN own INTEGER NOT NULL DEFAULT 0
     CHECK(typeof(own) = 'integer' AND own IN (0, 1));
 "#;
 
+/// Step 28: what a cut touched, which `cordelia restore` asks (the review
+/// of the fixes of the whole build, its H1 and M2).
+///
+/// - `file_cut`: a file of a folder that a carry cut (decision 2026-10-24
+///   (removal), rules 7 and 27), by the folder and the file's name, whether
+///   or not the carry changed what the folder holds. Kept for as long as
+///   the database is: `cordelia restore` puts back no version of it but
+///   one this device wrote itself after the cut.
+/// - `file_cut_written`: each text (SHA-256 in hex, as local history names
+///   a text) that this device published itself of such a file after its
+///   latest cut, with when (the device's clock, used only to let a row go
+///   once local history keeps nothing so old). A cut of the file again
+///   clears them.
+const MIGRATION_V28: &str = r#"
+CREATE TABLE file_cut (
+    folder  TEXT NOT NULL,
+    file    TEXT NOT NULL,
+    PRIMARY KEY (folder, file)
+);
+
+CREATE TABLE file_cut_written (
+    folder  TEXT NOT NULL,
+    file    TEXT NOT NULL,
+    sha256  TEXT NOT NULL CHECK(typeof(sha256) = 'text' AND length(sha256) = 64),
+    at      INTEGER NOT NULL CHECK(typeof(at) = 'integer'),
+    PRIMARY KEY (folder, file, sha256)
+);
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -1660,6 +1689,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 27 {
         tracing::info!("applying migration v27 (why a file was put back)");
         migrate_in_one(conn, MIGRATION_V27, 27)?;
+    }
+
+    if current < 28 {
+        tracing::info!("applying migration v28 (what a cut touched)");
+        migrate_in_one(conn, MIGRATION_V28, 28)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -5654,10 +5688,16 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            // What a later step makes is no older object: step 26's tables.
+            // What a later step makes is no older object: step 26's tables
+            // and step 28's.
             if NEW_IN_V24
                 .iter()
-                .chain(&["file_own_dropped", "file_own_set_aside"])
+                .chain(&[
+                    "file_own_dropped",
+                    "file_own_set_aside",
+                    "file_cut",
+                    "file_cut_written",
+                ])
                 .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
             {
                 continue;
@@ -5976,7 +6016,7 @@ mod tests {
         assert!(migrate_in_one(&conn, &failing, 27).is_err());
         assert_eq!(version(&conn), 26);
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 27);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
         migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
         let own: i64 = conn
             .query_row("SELECT own FROM file_put_back", [], |row| row.get(0))
@@ -5991,6 +6031,77 @@ mod tests {
             assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
             conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
         }
+    }
+
+    /// Step 28 (the review of the fixes of the whole build, its H1 and M2):
+    /// it makes the two tables of what a cut touched in one step with its
+    /// version, and asked for twice it is run once; a text's hash is 64
+    /// characters of text, and its time an integer. A file cut is refused a
+    /// restore of any text but one written after the cut, which a cut
+    /// again takes back.
+    #[test]
+    fn step_28_records_what_a_cut_touched() {
+        let conn = at_v21();
+        for (sql, version) in [
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+            (MIGRATION_V25, 25),
+            (MIGRATION_V26, 26),
+            (MIGRATION_V27, 27),
+        ] {
+            migrate_in_one(&conn, sql, version).unwrap();
+        }
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let failing = format!("{MIGRATION_V28} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 28).is_err());
+        assert_eq!(version(&conn), 27);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 28);
+        migrate_in_one(&conn, MIGRATION_V28, 28).unwrap();
+        let sha = "ab".repeat(32);
+        for (sql, taken) in [
+            (
+                format!("INSERT INTO file_cut_written VALUES ('f', 'a.md', '{sha}', 1)"),
+                true,
+            ),
+            (
+                "INSERT INTO file_cut_written VALUES ('f', 'a.md', 'ab', 1)".to_string(),
+                false,
+            ),
+            (
+                format!("INSERT INTO file_cut_written VALUES ('f', 'a.md', '{sha}', 'one')"),
+                false,
+            ),
+        ] {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+
+        use crate::sync_state::{note_cut, note_written, restore_refused};
+        let refused = |sha: Option<&str>| restore_refused(&conn, "f", "a.md", sha).unwrap();
+        assert!(!refused(Some(&sha)) && !refused(None));
+        // Nothing is noted as written of a file never cut.
+        note_written(&conn, "f", "a.md", &sha, 100).unwrap();
+        note_cut(&conn, "f", "a.md").unwrap();
+        assert!(refused(Some(&sha)) && refused(None));
+        note_written(&conn, "f", "a.md", &sha, 100).unwrap();
+        assert!(!refused(Some(&sha)));
+        assert!(refused(Some(&"cd".repeat(32))));
+        assert!(!restore_refused(&conn, "f", "b.md", None).unwrap());
+        assert!(!restore_refused(&conn, "g", "a.md", None).unwrap());
+        // What is older than history keeps goes, with the next note.
+        let later = 100 + i64::from(cordelia_core::protocol::HISTORY_DAYS) * 86_400 + 1;
+        note_written(&conn, "f", "a.md", &"cd".repeat(32), later).unwrap();
+        assert!(refused(Some(&sha)));
+        assert!(!refused(Some(&"cd".repeat(32))));
+        // Cut again, nothing written before is let through.
+        note_cut(&conn, "f", "a.md").unwrap();
+        assert!(refused(Some(&"cd".repeat(32))));
     }
 
     /// The version before, whose schema is at step 23, stops on a database

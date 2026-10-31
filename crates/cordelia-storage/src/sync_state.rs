@@ -227,7 +227,78 @@ pub fn save_put_back(
         params![folder, channel_id, key, i64::from(own)],
     )
     .map_err(storage)?;
+    note_cut(conn, folder, key)
+}
+
+/// Note that a carry cut `file` of `folder` (decision 2026-10-24
+/// (removal), rules 7 and 27), whether or not it changes what the folder
+/// holds: `cordelia restore` then puts back no version of it but one this
+/// device writes itself from now on ([`restore_refused`]; the review of
+/// the fixes of the whole build, its H1 and M2). What it wrote before is
+/// no longer its own, for a later cut may have cut it.
+pub fn note_cut(conn: &Connection, folder: &str, file: &str) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO file_cut (folder, file) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        params![folder, file],
+    )
+    .map_err(storage)?;
+    conn.execute(
+        "DELETE FROM file_cut_written WHERE folder = ?1 AND file = ?2",
+        params![folder, file],
+    )
+    .map_err(storage)?;
     Ok(())
+}
+
+/// Note that this device published the text whose SHA-256 is `sha256` (in
+/// hex, as local history names a text) of `file` in `folder` itself, at
+/// `now` (Unix seconds): where a carry has cut the file, `cordelia
+/// restore` may put that text back. Nothing is noted of a file never cut.
+/// A row older than local history keeps a record (`HISTORY_DAYS`) goes:
+/// one that goes early, on a clock set back, only refuses a restore.
+pub fn note_written(
+    conn: &Connection,
+    folder: &str,
+    file: &str,
+    sha256: &str,
+    now: i64,
+) -> Result<(), CordeliaError> {
+    let kept = i64::from(cordelia_core::protocol::HISTORY_DAYS) * 86_400;
+    conn.execute(
+        "DELETE FROM file_cut_written WHERE folder = ?1 AND file = ?2 AND at < ?3",
+        params![folder, file, now.saturating_sub(kept)],
+    )
+    .map_err(storage)?;
+    conn.execute(
+        "INSERT INTO file_cut_written (folder, file, sha256, at)
+         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS
+             (SELECT 1 FROM file_cut WHERE folder = ?1 AND file = ?2)
+         ON CONFLICT DO UPDATE SET at = excluded.at",
+        params![folder, file, sha256, now],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Whether `cordelia restore` refuses a version of `file` in `folder`
+/// whose text has the SHA-256 `sha256` (`None`: a record of no text): a
+/// carry cut the file, and this is not a text this device published itself
+/// after the latest cut (the review of the fixes of the whole build, its
+/// H1 and M2). It asks no record's time, so no clock orders anything.
+pub fn restore_refused(
+    conn: &Connection,
+    folder: &str,
+    file: &str,
+    sha256: Option<&str>,
+) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM file_cut WHERE folder = ?1 AND file = ?2)
+            AND NOT EXISTS (SELECT 1 FROM file_cut_written
+                            WHERE folder = ?1 AND file = ?2 AND sha256 = ?3)",
+        params![folder, file, sha256],
+        |row| row.get(0),
+    )
+    .map_err(storage)
 }
 
 /// The files of `folder` in `channel_id` that a carry left out, and that
