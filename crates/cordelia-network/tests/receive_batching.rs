@@ -349,6 +349,16 @@ fn held_by_the_node(node: Node, pace: Duration, lasting: Duration) -> isize {
 /// 4,601 to 6,627 KiB.)
 const THRESHOLD_BYTES: isize = 1200 * 1024;
 
+/// How many times the control is measured before the test says it
+/// checked nothing. A busy host can leave one reading short of the
+/// threshold (1,194 KiB on CI, where it is 1,828 KiB or more on a quiet
+/// host): with twice as many busy processes as cores, 3 first readings in
+/// 12 were short, 1,082 to 1,167 KiB, and each second reading was over. A
+/// host that hands a socket no batches leaves every reading short, as
+/// does one loaded far past its cores (four busy processes to a core:
+/// every reading 989 to 1,182 KiB).
+const CONTROL_TRIES: usize = 3;
+
 /// Decision 2026-10-22, memory across connections, rule 10. A peer that
 /// sends its datagrams in large GSO batches, bulk on a stream the node
 /// reads and a byte at a time on its other streams, cannot make a node
@@ -356,13 +366,15 @@ const THRESHOLD_BYTES: isize = 1200 * 1024;
 /// THRESHOLD_BYTES over its level, at two pacings. The same peer against
 /// an endpoint that quinn makes by itself, with GRO on, takes it over
 /// first: that control shows that this host hands a socket batches and
-/// that the peer loads them.
+/// that the peer loads them. It is measured again, up to `CONTROL_TRIES`
+/// times, until one reading is over the threshold.
 ///
-/// Where the control stays under the threshold, the test checks nothing,
-/// and says so loudly on its output. Off CI it is not failed, since that
-/// is a property of the host (a kernel without GRO, a loopback that does
-/// not coalesce, or a machine too loaded for the peer to fill its batches)
-/// and not of the node, and a node on such a host takes no batches either.
+/// Where every reading of the control stays under the threshold, the test
+/// checks nothing, and says so loudly on its output. Off CI it is not
+/// failed, since that is a property of the host (a kernel without GRO, a
+/// loopback that does not coalesce, or a machine too loaded for the peer
+/// to fill its batches) and not of the node, and a node on such a host
+/// takes no batches either.
 /// On CI (where `CI` is set, as GitHub Actions sets it) it fails: CI is
 /// where rule 10 is held to, and a run there that checked nothing must not
 /// pass as one that did, as `msg_e2e.rs` fails without the binary of the
@@ -370,13 +382,21 @@ const THRESHOLD_BYTES: isize = 1200 * 1024;
 #[test]
 fn a_peer_cannot_make_a_node_hold_its_batches_of_datagrams() {
     let lasting = Duration::from_secs(3);
-    let with_gro = held_by_the_node(Node::AsQuinnMakesIt, Duration::from_millis(4), lasting);
+    let mut readings = Vec::new();
+    let with_gro = loop {
+        let held = held_by_the_node(Node::AsQuinnMakesIt, Duration::from_millis(4), lasting);
+        readings.push(held / 1024);
+        if held >= THRESHOLD_BYTES || readings.len() == CONTROL_TRIES {
+            break held;
+        }
+    };
+    println!("the control held {readings:?} KiB");
     if with_gro < THRESHOLD_BYTES {
         let said = format!(
-            "\n*** TEST 8 CHECKED NOTHING: with GRO on, the control held {} KiB, \
-             under the threshold of {} KiB, so this host hands a socket no batches \
-             (or is too loaded to fill them), and rule 10 was not tested here ***\n",
-            with_gro / 1024,
+            "\n*** TEST 8 CHECKED NOTHING: with GRO on, the control held {readings:?} KiB \
+             in {CONTROL_TRIES} tries, each under the threshold of {} KiB, so this host \
+             hands a socket no batches (or is too loaded to fill them), and rule 10 was \
+             not tested here ***\n",
             THRESHOLD_BYTES / 1024
         );
         // On both streams, so that it is seen whether or not the output
