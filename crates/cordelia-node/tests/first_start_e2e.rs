@@ -2039,7 +2039,8 @@ fn folders_of_an_install_from_before_mappings_stop_and_sync_again_once_mapped() 
 /// entry it follows kept as `latest` and the head it sets aside as
 /// `apart`, no time of any change, and schema version 21. What step 23
 /// adds goes too: the table of the room a relay keeps for heads; and the
-/// tables step 24 adds (decision 2026-10-24 (removal), rules 6 and 7). (Step 23
+/// tables step 24 adds (decision 2026-10-24 (removal), rules 6 and 7), and
+/// those of steps 26 and 28. (Step 23
 /// makes the table of entries again from the columns it had at step 22,
 /// so the one column more it finds there changes nothing.)
 fn as_a_fork_of_the_version_before(node: &Node) {
@@ -2075,6 +2076,8 @@ fn as_a_fork_of_the_version_before(node: &Node) {
          DROP TABLE file_copies;
          DROP TABLE file_own_dropped;
          DROP TABLE file_own_set_aside;
+         DROP TABLE file_cut;
+         DROP TABLE file_cut_written;
          DELETE FROM node_meta WHERE key = 'person.judge_kept';
          UPDATE person SET state = 'fork';
          COMMIT;",
