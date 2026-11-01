@@ -2095,6 +2095,9 @@ fn as_a_fork_of_the_version_before(node: &Node) {
         .collect::<Result<_, _>>()
         .unwrap();
     assert!(!shared.is_empty());
+    // In any order: a table that names another by a foreign key is
+    // dropped with nothing checked of it.
+    conn.pragma_update(None, "foreign_keys", false).unwrap();
     for table in shared {
         conn.execute_batch(&format!("DROP TABLE \"{table}\";"))
             .unwrap();

@@ -100,9 +100,18 @@ pub enum Cut {
     Times(Vec<(u64, Option<i64>)>),
 }
 
+/// The time of taking kept for an act that the person took at a
+/// recovery's terminal, with the phrase ([`write_recovered`]): no cut takes
+/// it back (decision 2026-10-24 (removal), rule 6, "one way in is a
+/// person's"). No clock reads it.
+pub const TAKEN_BY_THE_PERSONS_WORD: i64 = i64::MIN;
+
 impl Cut {
     /// Whether an act this device took as `taken` counts for nothing.
     pub fn cuts(&self, taken: Taken) -> bool {
+        if taken.taken_at == TAKEN_BY_THE_PERSONS_WORD {
+            return false;
+        }
         match self {
             Cut::StatementAlone => false,
             Cut::Times(times) => match times.iter().find(|(g, _)| *g == taken.generation) {
@@ -1457,9 +1466,11 @@ pub fn write_recovered(
     // from the lists of the generation recovered from: a removed device's
     // acts among them by the person's word, as the look takes what a lost
     // device wrote (decision 2026-10-24 (removal), rule 6, "one way in is
-    // a person's"). So each is kept as taken in that generation, before
-    // any cut time, and the cut of the device the recovery removes does
-    // not take them back when this machine works its lists out.
+    // a person's"). So each is kept as taken by the person's word, in the
+    // generation recovered from, and the cut of the device the recovery
+    // removes does not take them back when this machine works its lists
+    // out: this machine noted no time of that generation, so the cut would
+    // otherwise take back everything of the device's.
     let statement = &standing.held.statement.statement;
     let recovered_from = statement.chain.iter().map(|link| link.number).max();
     if let Some(generation) = recovered_from {
@@ -1468,7 +1479,7 @@ pub fn write_recovered(
             .map(|act| {
                 let taken = Taken {
                     generation,
-                    taken_at: 0,
+                    taken_at: TAKEN_BY_THE_PERSONS_WORD,
                 };
                 (
                     act.signature(),
