@@ -3641,7 +3641,25 @@ mod tests {
         statement: &Statement,
         secret: [u8; 32],
     ) -> CheckedEntry {
-        let entry = change(phrase, statement, secret);
+        follow_entry(
+            conn,
+            n,
+            phrase,
+            statement,
+            secret,
+            change(phrase, statement, secret),
+        )
+    }
+
+    /// [`follow`], with `entry` the change entry of `statement`.
+    fn follow_entry(
+        conn: &Connection,
+        n: u16,
+        phrase: &Phrase,
+        statement: &Statement,
+        secret: [u8; 32],
+        entry: CheckedEntry,
+    ) -> CheckedEntry {
         let (following, signed) = (following(phrase), sign(statement, phrase));
         let change = Change {
             following: &following,
@@ -3942,6 +3960,31 @@ mod tests {
             false,
             content,
         )
+    }
+
+    /// The change entry of `statement` as the version before
+    /// (`v0.2.0-alpha.17` and earlier) made it: the same part for the
+    /// devices, the part for the phrase in the last 4096 bytes, and no
+    /// lineage, so no time (decision 2026-10-24 (removal), rule 13).
+    fn made_before(phrase: &Phrase, statement: &Statement, secret: [u8; 32]) -> CheckedEntry {
+        use cordelia_core::protocol::{CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES, LABEL_CHANGE_PHRASE};
+        let entry = change(phrase, statement, secret);
+        // The secret, and a count of no earlier secrets.
+        let mut said = secret.to_vec();
+        said.extend_from_slice(&0u16.to_be_bytes());
+        said.resize(
+            CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES - ITEM_SEAL_OVERHEAD_BYTES,
+            0,
+        );
+        let mut bound = LABEL_CHANGE_PHRASE.to_vec();
+        bound.extend_from_slice(&entry.rev.to_be_bytes());
+        bound.extend_from_slice(&phrase.public_key().unwrap());
+        let mut content = entry.content[..CHANGE_ENTRY_DEVICES_PART_BYTES].to_vec();
+        content
+            .extend_from_slice(&item_encrypt(&phrase.seal_key().unwrap(), &said, &bound).unwrap());
+        let before = change_with(phrase, entry.rev, content);
+        assert_eq!(change_entry::lineage(&before.content).unwrap(), None);
+        before
     }
 
     /// The content of a change entry whose part for the devices says the
@@ -9966,7 +10009,21 @@ mod tests {
     /// of what it keeps, and judges once.
     #[test]
     fn test_at_its_first_start_a_device_in_a_fork_judges_what_it_kept() {
+        for before in [false, true] {
+            judges_what_it_kept(before);
+        }
+    }
+
+    /// The test above, with each change entry in this version's layout,
+    /// or, where `before`, as `v0.2.0-alpha.17` made it (the review of the
+    /// removal build into main, its M7): the same outcomes, and the change
+    /// it follows has no time.
+    fn judges_what_it_kept(before: bool) {
         let phrase = phrase();
+        let entry_of = |statement: &Statement, of: u8| match before {
+            true => made_before(&phrase, statement, secret(of)),
+            false => change(&phrase, statement, secret(of)),
+        };
         let [_, two, three, _] = statements(&phrase);
         let mark = |conn: &Connection| {
             cordelia_storage::meta::set(conn, cordelia_storage::meta::PERSON_JUDGE_KEPT, "1")
@@ -9976,8 +10033,15 @@ mod tests {
         // fork: its state, the entry kept apart set aside, and the mark.
         let in_a_fork = |follows: &Statement, of: u8, apart: &Statement, apart_of: u8| {
             let conn = db::open_in_memory().unwrap();
-            follow(&conn, 0, &phrase, follows, secret(of));
-            let entry = change(&phrase, apart, secret(apart_of));
+            follow_entry(
+                &conn,
+                0,
+                &phrase,
+                follows,
+                secret(of),
+                entry_of(follows, of),
+            );
+            let entry = entry_of(apart, apart_of);
             held_rows::set_aside(&conn, &entry, NOW).unwrap();
             held_rows::set_state(&conn, State::Fork).unwrap();
             mark(&conn);
@@ -9994,9 +10058,14 @@ mod tests {
         assert_eq!(state(&conn), State::Applied);
         assert_eq!(held_rows::set_aside_entries(&conn).unwrap().len(), 1);
         let link = apart[0].link().unwrap();
+        let time = match before {
+            true => None,
+            false => Some(NOW),
+        };
         assert_eq!(
             held_rows::change_time(&conn, link.number, &link.hash).unwrap(),
-            Some(Some(NOW))
+            Some(time),
+            "{before}"
         );
         // Once: the mark went with it.
         assert!(!held_rows::to_judge_kept(&conn).unwrap());
