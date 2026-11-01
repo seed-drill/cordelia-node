@@ -307,11 +307,14 @@ Then it asks you to type yes, and then for the phrase.
   device writes. `cordelia devices` shows which devices have not applied
   the change. A device that is on reads the removal within 90 seconds of a
   relay it is connected to having it. A relay has it within 5 seconds of
-  being connected to a relay it works with that has it.
+  being connected to a relay it works with that has it, where no backlog
+  of other changes waits ahead of it there; anyone who can write entries,
+  a stranger included, can build such a backlog, and delay it between
+  relays for as long as the backlog takes to pass on.
 - **You keep what the removed device wrote before the removal,** wherever
   one of your other devices had received it. `cordelia history` shows what
   this device received from which device. `cordelia restore` puts a
-  version back.
+  version back, but for a file that a removal cut (below).
 - **What it wrote after the removal is set aside.** Say your laptop took an
   edit from the removed tablet before the laptop knew of the removal. When
   the laptop applies the removal, it takes that edit, and anything written
@@ -320,11 +323,25 @@ Then it asks you to type yes, and then for the phrase.
   does the same for what the tablet wrote under a change made apart from
   the removal. `cordelia status` says how many edits were set aside, for
   seven days, and `cordelia history` lists them. With local history off,
-  they are gone. `cordelia restore` does not put one back, nor any older
-  version of that file: no program on the device, an agent included, can
-  bring them back that way. What the removed device wrote comes back only
-  at a terminal, with the recovery phrase: `cordelia sync carry <name>
-  --from <its label>`.
+  they are gone. From then on `cordelia restore` puts back no version of
+  that file, older or newer, but what this device wrote itself after the
+  removal: no program on the device, an agent included, can bring them
+  back that way. `cordelia history show` prints each, to copy back by
+  hand. What the removed device wrote comes back at a terminal, with the
+  recovery phrase: `cordelia sync carry <name> --from <its label>`.
+  - Some honest edits are set aside too. A file's history names only who
+    wrote each text, not when, so where it cannot show that nothing of the
+    removed device's is behind a version, the version is set aside: every
+    version of `MEMORY.md`, the index, that another of your devices wrote,
+    and a version of a busy file with 100 edits or more of history, each
+    received in the ten minutes before the removal or later, until the
+    device knew. Anything this device wrote over such a version in that
+    file goes with it. Agents write the index with nearly every memory, so
+    most removals set some aside. Another device's version comes back
+    from that device itself, when it applies the removal. What this device
+    wrote over it comes back only by hand, from `cordelia history show`.
+    A conflict copy of the index stays on the device that made it, and is
+    never sent.
   - A limit: what your devices wrote themselves is kept. If an agent on the
     laptop read the tablet's late text before the laptop knew of the
     removal, and wrote it, or what it said, into another file, the laptop
