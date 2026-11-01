@@ -244,7 +244,7 @@ fn judge(
         OfferIs::Fault(Fault::Held)
     } else if removed.contains(&offer.maker) {
         OfferIs::Fault(Fault::MakerRemoved)
-    } else if seals_removed(&removed, offer) {
+    } else if seals_removed(removed, offer) {
         OfferIs::Fault(Fault::SealsRemoved)
     } else if offer.sealed_to.contains(&own) {
         match opened(identity, row, offer) {
