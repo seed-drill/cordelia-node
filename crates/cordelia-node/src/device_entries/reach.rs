@@ -553,15 +553,18 @@ impl Reach {
         self.dial_ended(relay, false, true);
     }
 
+    /// Which of several dials in flight ended is not known (an address
+    /// that moved has one at each), so a timeout is credited with the
+    /// earliest beginning in flight, and the latest is taken out (the
+    /// review of the removal build into main, its low on the wake): the
+    /// beginning credited is never later than that of the dial that
+    /// ended, so a dial from before the wake never counts as one since.
     fn dial_ended(&self, relay: &RelayId, connected: bool, timed_out: bool) {
         self.with(relay, |of, _, now| {
-            let began = match of.dials.is_empty() {
-                true => {
-                    of.last_begun = Some(now.at);
-                    None
-                }
-                false => Some(of.dials.remove(0)),
-            };
+            let began = of.dials.first().copied();
+            if of.dials.pop().is_none() {
+                of.last_begun = Some(now.at);
+            }
             if connected {
                 of.awaiting = Some(now.at);
                 of.timed_out = None;
