@@ -920,7 +920,15 @@ impl World {
             .unwrap();
         match taken {
             take::Taken::Shown(person::Shown::Applied(applied)) => {
-                let all = applied.no_version.is_empty() && applied.not_carried.is_empty();
+                // A device that hears late may have taken another device's
+                // index in the removal's window, and sets it aside: the
+                // index rule's cost (decision 2026-10-24 (removal), rule
+                // 7). Every other file is carried.
+                let all = applied.no_version.is_empty()
+                    && applied
+                        .not_carried
+                        .iter()
+                        .all(|(_, file)| file == INDEX_FILE);
                 assert!(all, "device {d}: {applied:?}");
                 self.carried_by(d);
             }
