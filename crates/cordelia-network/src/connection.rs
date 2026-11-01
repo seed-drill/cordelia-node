@@ -563,26 +563,29 @@ async fn outbound_on(
         return Err(ConnectionError::NotTheRelay(node_id));
     }
 
-    let (mut send, mut recv) = conn
-        .open_bi()
+    // The first stream is opened within the handshake's time: a host that
+    // gives no streams, and acknowledges keepalives, would otherwise hold
+    // the dial, and its address, for ever.
+    let handshake_result =
+        tokio::time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS), async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
+            let mut stream = tokio::io::join(&mut recv, &mut send);
+            handshake::initiate_handshake(
+                &mut stream,
+                &ctx.public_key,
+                &ctx.channel_ids,
+                &ctx.roles,
+                &peer_node_id,
+                ctx.p2p_port,
+            )
+            .await
+            .map_err(ConnectionError::from)
+        })
         .await
-        .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
-
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-
-    let handshake_result = tokio::time::timeout(
-        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        handshake::initiate_handshake(
-            &mut stream,
-            &ctx.public_key,
-            &ctx.channel_ids,
-            &ctx.roles,
-            &peer_node_id,
-            ctx.p2p_port,
-        ),
-    )
-    .await
-    .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))??;
+        .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))??;
 
     info!(
         peer = %node_id,
@@ -784,6 +787,46 @@ mod tests {
         )));
         assert!(!closed_for_another(&quinn::ConnectionError::TimedOut));
         assert!(!closed_for_another(&quinn::ConnectionError::Reset));
+    }
+
+    /// A host that finishes QUIC and gives no streams, while it
+    /// acknowledges keepalives, ends a dial within HANDSHAKE_TIMEOUT_SECS,
+    /// as a timeout (the review of the removal build into main, its low
+    /// 2): the first stream is opened within the handshake's time.
+    #[tokio::test]
+    async fn a_dial_of_a_host_that_gives_no_streams_times_out() {
+        let (id_a, id_b) = (make_test_identity(), make_test_identity());
+        let ep_b = make_endpoint(&id_b);
+        let b_addr = ep_b.local_addr().unwrap();
+        let mut no_streams = transport::server_config(&id_b).unwrap();
+        let mut settings = quinn::TransportConfig::default();
+        settings.max_concurrent_bidi_streams(0u32.into());
+        settings.keep_alive_interval(Some(Duration::from_secs(1)));
+        no_streams.transport_config(Arc::new(settings));
+        let held = tokio::spawn(async move {
+            let incoming = ep_b.accept().await.unwrap();
+            let conn = incoming
+                .accept_with(Arc::new(no_streams))
+                .unwrap()
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            drop(conn);
+        });
+        let mgr_a = ConnectionManager::new(id_a.clone(), make_endpoint(&id_a), vec![], vec![], 0);
+        let began = std::time::Instant::now();
+        let dialled = tokio::time::timeout(
+            Duration::from_secs(HANDSHAKE_TIMEOUT_SECS + 10),
+            outbound_connect(&mgr_a.connect_context(), b_addr),
+        )
+        .await
+        .expect("the dial of a host that gives no streams did not end");
+        match dialled {
+            Err(e) => assert!(e.timed_out(), "{e}"),
+            Ok(outcome) => panic!("the dial connected to {}", outcome.node_id),
+        }
+        assert!(began.elapsed() < Duration::from_secs(HANDSHAKE_TIMEOUT_SECS + 5));
+        held.abort();
     }
 
     #[tokio::test]
