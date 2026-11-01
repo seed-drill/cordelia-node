@@ -1083,11 +1083,17 @@ pub fn note_set_aside(
     Ok(())
 }
 
-/// What the status says of the edits a carry set aside: what a removed
-/// device wrote, or what was written over it (rule 7). No word says that
-/// `cordelia restore` puts one back: it does not (the review of the whole
-/// build, its H1). `--from` brings in what the removed device wrote, at a
-/// terminal with the recovery phrase.
+/// What the status says of the edits a carry set aside (rule 7): what a
+/// removed device wrote, what was written over it, and what no chain can
+/// show was not (the review of the removal build into main, its M3 and
+/// M4): another device's version of the index, a version of a busy file
+/// whose chain is full, each taken in a removal's window, and every
+/// version stored after one in that file, this device's own included. No
+/// word says that `cordelia restore` puts one back: it does not (the
+/// review of the whole build, its H1). An honest device's version comes
+/// back from that device's own carry; any of them by hand, copied from
+/// `cordelia history show`; and `--from` brings in what a removed device
+/// wrote, at a terminal with the recovery phrase.
 fn set_aside_line(noted: &SetAsideNoted) -> String {
     let one = noted.edits == 1;
     let them = if one { "it" } else { "them" };
@@ -1096,8 +1102,11 @@ fn set_aside_line(noted: &SetAsideNoted) -> String {
         n => format!("{n} edits were"),
     };
     let what = format!(
-        "{edits_were} set aside at a change: a removed device wrote {them}, or {} written over \
-         what one wrote",
+        "{edits_were} set aside at a change: a removed device wrote {them}, {} written over what \
+         one wrote, or {} taken in a removal's window where no chain can show otherwise (the \
+         index that another device wrote, a busy file with a full chain, and any later edit of \
+         that file, this device's own included)",
+        if one { "it was" } else { "they were" },
         if one { "it was" } else { "they were" },
     );
     let kept = noted.edits.saturating_sub(noted.gone);
@@ -1110,8 +1119,10 @@ fn set_aside_line(noted: &SetAsideNoted) -> String {
         ),
     };
     format!(
-        "{what}. {history}; what a removed device wrote comes back only at a terminal, with the \
-         recovery phrase: `cordelia sync carry <name> --from <its label>`"
+        "{what}. {history}. Another device's edit comes back from that device's own carry, and \
+         any edit by hand, copied from `cordelia history show <id>`; what a removed device wrote \
+         also comes back at a terminal, with the recovery phrase: `cordelia sync carry <name> \
+         --from <its label>`"
     )
 }
 
@@ -2182,6 +2193,13 @@ mod tests {
         assert_eq!(removed.len(), 1, "{:?}", look.says);
         assert!(removed[0].contains("`cordelia history` lists them"));
         assert!(removed[0].contains("--from <its label>"));
+        // An honest device's version of the index, and this device's own
+        // edits after it, are named, with the ways back that work for
+        // them (the review of the removal build into main, M3 and M4).
+        assert!(removed[0].contains("the index that another device wrote"));
+        assert!(removed[0].contains("this device's own included"));
+        assert!(removed[0].contains("from that device's own carry"));
+        assert!(removed[0].contains("by hand, copied from `cordelia history show <id>`"));
         assert!(
             look.says
                 .iter()
