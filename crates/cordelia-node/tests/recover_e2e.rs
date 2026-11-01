@@ -177,14 +177,6 @@ const ON_THE_LAPTOP: &str = "written on the laptop\n";
 const ON_THE_DESKTOP: &str = "written on the desktop\n";
 
 fn two_devices(relays: &[&Node], words: Option<String>) -> Two {
-    two_devices_in_order(relays, words, false)
-}
-
-/// [`two_devices`], where `desktop_first` says that the desktop's file is
-/// written, and reaches the laptop, before the laptop writes its own: so
-/// the desktop wrote it before it took any writing of the laptop's in the
-/// name.
-fn two_devices_in_order(relays: &[&Node], words: Option<String>, desktop_first: bool) -> Two {
     let laptop = device_at("laptop", relays);
     let desktop = device_at("desktop", relays);
     let words = match words {
@@ -209,15 +201,10 @@ fn two_devices_in_order(relays: &[&Node], words: Option<String>, desktop_first: 
     adds(&laptop, &desktop, "desktop");
     let laptop_memory = syncs_lab(&laptop);
     let desktop_memory = syncs_lab(&desktop);
+    std::fs::write(laptop_memory.join("a.md"), ON_THE_LAPTOP).unwrap();
+    std::fs::write(desktop_memory.join("b.md"), ON_THE_DESKTOP).unwrap();
     let mut all: Vec<&Node> = relays.to_vec();
     all.extend([&laptop, &desktop]);
-    std::fs::write(desktop_memory.join("b.md"), ON_THE_DESKTOP).unwrap();
-    if desktop_first {
-        wait_for("the laptop has the desktop's file", &all, 180, || {
-            (read(&laptop_memory.join("b.md"))? == ON_THE_DESKTOP).then_some(())
-        });
-    }
-    std::fs::write(laptop_memory.join("a.md"), ON_THE_LAPTOP).unwrap();
     wait_for("each device has the other's file", &all, 180, || {
         let there = read(&desktop_memory.join("a.md"))? == ON_THE_LAPTOP
             && read(&laptop_memory.join("b.md"))? == ON_THE_DESKTOP;
@@ -682,16 +669,12 @@ fn nothing_of_a_device_in_someone_elses_hands_comes_in_but_by_from() {
 /// answered with the change, stops, and says that it is not in a change
 /// made on the new machine and is to be added again from there. The new
 /// machine shows it as not in the last change. Added again by the two
-/// commands, it carries what it holds; its unsent edit, stored after it
-/// took the laptop's writing of the minutes before the recovery and before
-/// it knew, is set aside by rule 27 of decision 2026-10-24 (removal). Its
-/// `b.md`, which it wrote before the laptop's writing came, is kept in its
-/// folder and reaches the new machine.
+/// commands, it carries what it holds, and its unsent edit arrives.
 #[test]
 fn a_device_that_the_person_still_has_stops_and_is_added_again() {
     let mut first = relay_named("relay-one");
     let mut second = relay_named("relay-two");
-    let mut two = two_devices_in_order(&[&first, &second], None, true);
+    let mut two = two_devices(&[&first, &second], None);
     two.laptop.stop();
     two.desktop.stop();
     std::fs::write(two.desktop_memory.join("late.md"), "not sent yet\n").unwrap();
@@ -796,42 +779,14 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
         let seen = person_of(&two.desktop);
         (seen["state"] == "applied" && seen["change"] == 2).then_some(())
     });
-    // Its unsent edit was stored after it took the laptop's writing, which
-    // came within ten minutes of the recovery and so is late by rule 7's
-    // margin, and before it knew: rule 27 sets it aside, to its local
-    // history, and the new machine never has it (decision 2026-10-24
-    // (removal), rule 27, the person's ruling of 30 October, which
-    // reverses what this test held before it).
-    wait_for("the desktop's unsent edit is set aside", &all, 180, || {
-        read(&two.desktop_memory.join("late.md"))
-            .is_none()
-            .then_some(())
-    });
-    let history = two.desktop.cli(&["history", "lab"]);
-    assert!(history.contains("late.md"), "{history}");
-    assert!(history.contains("set aside"), "{history}");
     wait_for(
-        "the new machine has what the look brought",
+        "the desktop's unsent edit reaches the new machine",
         &all,
-        60,
-        || (text_of(&new, "b.md")? == ON_THE_DESKTOP).then_some(()),
+        180,
+        || (text_of(&new, "late.md")? == "not sent yet\n").then_some(()),
     );
     assert_eq!(text_of(&new, "a.md").as_deref(), Some(ON_THE_LAPTOP));
-    assert_eq!(text_of(&new, "late.md"), None);
-    // What it wrote before the laptop's writing came is not set aside: its
-    // folder still holds it, and its history (a record's file on one line,
-    // and what was done on the next) does not say it was.
-    assert_eq!(
-        read(&two.desktop_memory.join("b.md")).as_deref(),
-        Some(ON_THE_DESKTOP)
-    );
-    let lines: Vec<&str> = history.lines().collect();
-    assert!(
-        !lines
-            .windows(2)
-            .any(|pair| pair[0].contains(" b.md ") && pair[1].contains("set aside")),
-        "{history}"
-    );
+    assert_eq!(text_of(&new, "b.md").as_deref(), Some(ON_THE_DESKTOP));
 }
 
 /// Put in the store of `device`, which is stopped, `count` records of

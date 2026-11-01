@@ -1844,7 +1844,12 @@ removal.
 before its removal is set aside, to local history alone. Across two
 relays their own difference adds to the skew, and a device whose clock is
 behind the maker's by more than the margin carries what reached it in that
-excess: the limit of rule 7, stated in the record.
+excess: the limit of rule 7, stated in the record. The margin applies to
+what the removed device wrote, and to nothing a remaining device wrote
+itself: what an agent there wrote after it read the late text, before its
+device knew of the removal, is that device's own writing and is carried
+(the record's section 8; its rule 27, which set such writing aside, was
+taken out on 31 October).
 
 #### MAX_FILE_ARRIVALS = 1,024
 

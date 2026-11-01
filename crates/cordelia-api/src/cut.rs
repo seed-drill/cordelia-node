@@ -297,19 +297,6 @@ impl Cuts {
         false
     }
 
-    /// Whether what `cut`'s key wrote, taken at `at` in a generation known
-    /// only by its statement's number (a message's, decision 2026-10-24
-    /// (removal), rule 27): it is cut where it is cut in any noted change
-    /// of that number, or where none is noted (as a generation not known).
-    pub(crate) fn cuts_numbered(&self, cut: &KeyCut, number: u64, at: i64) -> bool {
-        let mut numbered = self
-            .chains
-            .keys()
-            .filter(|change| change.0 == number)
-            .peekable();
-        numbered.peek().is_none() || numbered.any(|change| self.cuts(cut, change, at))
-    }
-
     /// Whether what `key` wrote or added, taken at `at` in `generation`,
     /// is cut: `false` for a key this device does not know to be removed.
     pub(crate) fn cuts_key(&self, key: &[u8; 32], generation: &Change, at: i64) -> bool {

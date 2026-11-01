@@ -206,32 +206,25 @@ pub fn save(
 /// back to none): the next cycle puts that version into the file, whatever
 /// is there, and keeps what was there in local history alone. A record
 /// saved after ([`save`]) is put back no more.
-///
-/// `own` says why: the device wrote what is left out itself, after it took
-/// a removed device's late writing and before it knew of the removal
-/// (decision 2026-10-24 (removal), rule 27), and not a removed device, nor
-/// over what one wrote (rule 7). What is said of it, and how it may come
-/// back, differ (the review of the whole build, its M4).
 pub fn save_put_back(
     conn: &Connection,
     folder: &str,
     channel_id: &str,
     key: &str,
     agreed: &Agreed,
-    own: bool,
 ) -> Result<(), CordeliaError> {
     save(conn, folder, channel_id, key, agreed)?;
     conn.execute(
-        "INSERT INTO file_put_back (folder, channel_id, key, own) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT DO UPDATE SET own = excluded.own",
-        params![folder, channel_id, key, i64::from(own)],
+        "INSERT INTO file_put_back (folder, channel_id, key) VALUES (?1, ?2, ?3)
+         ON CONFLICT DO NOTHING",
+        params![folder, channel_id, key],
     )
     .map_err(storage)?;
     note_cut(conn, folder, key)
 }
 
 /// Note that a carry cut `file` of `folder` (decision 2026-10-24
-/// (removal), rules 7 and 27), whether or not it changes what the folder
+/// (removal), rule 7), whether or not it changes what the folder
 /// holds: `cordelia restore` then puts back no version of it but one this
 /// device writes itself from now on ([`restore_refused`]; the review of
 /// the fixes of the whole build, its H1 and M2). What it wrote before is
@@ -302,25 +295,21 @@ pub fn restore_refused(
 }
 
 /// The files of `folder` in `channel_id` that a carry left out, and that
-/// the folder is to take back ([`save_put_back`]), each with whether the
-/// device wrote what is left out itself (rule 27).
+/// the folder is to take back ([`save_put_back`]).
 pub fn put_back(
     conn: &Connection,
     folder: &str,
     channel_id: &str,
-) -> Result<std::collections::HashMap<String, bool>, CordeliaError> {
+) -> Result<std::collections::HashSet<String>, CordeliaError> {
     let mut stmt = conn
         .prepare(
-            "SELECT p.key, p.own FROM file_put_back p JOIN sync_files f
+            "SELECT p.key FROM file_put_back p JOIN sync_files f
                  ON f.folder = p.folder AND f.channel_id = p.channel_id AND f.key = p.key
              WHERE p.folder = ?1 AND p.channel_id = ?2",
         )
         .map_err(storage)?;
     let rows = stmt
-        .query_map(params![folder, channel_id], |row| {
-            let own: i64 = row.get(1)?;
-            Ok((row.get(0)?, own == 1))
-        })
+        .query_map(params![folder, channel_id], |row| row.get(0))
         .map_err(storage)?;
     rows.collect::<Result<_, _>>().map_err(storage)
 }

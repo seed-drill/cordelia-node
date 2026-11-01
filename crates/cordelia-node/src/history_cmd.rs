@@ -326,10 +326,6 @@ fn change(record: &Value) -> (String, String) {
             "set aside: a removed device wrote it, or it was written over what one wrote. \
              `cordelia restore` does not put it back"
         }
-        "set_aside_own" => {
-            "set aside: this device wrote it after it took a removed device's late writing, \
-             and before it knew of the removal. No command puts it back"
-        }
         other => other,
     };
     let interrupted = if record["interrupted"] == true {

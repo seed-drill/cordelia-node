@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 28;
+pub const SCHEMA_VERSION: u32 = 26;
 
 /// The schema version of the released version of the program
 /// (0.2.0-alpha.8): the last before the entries of a channel from its
@@ -1356,65 +1356,11 @@ ALTER TABLE file_arrivals_stored ADD COLUMN unknown INTEGER NOT NULL DEFAULT 0
 UPDATE file_arrivals_stored SET unknown = 1 WHERE full_signers IS NOT NULL;
 "#;
 
-/// Migration v26: what a device wrote itself, beside the arrivals (decision
-/// 2026-10-24 (removal), rule 27, the person's ruling of 30 October).
-///
-/// - `file_arrivals_stored.own`: 1 on an event that is a version this device
-///   wrote itself in the channel of a name (a publish, a conflict copy's
-///   first version, a version a carry by command brought), with no
-///   arrivals: its generation, when it was stored and the version current
-///   before it. At a carry, every one stored from the first arrival that
-///   rule 7 leaves out in its generation, in any name, to the device's
-///   knowing of the removal is set aside, and the file goes back to before
-///   it. Counted apart from the arrivals, so that the device's own writing
-///   pushes no arrival past the bound; every event kept before the step is
-///   an arrival, 0.
-/// - `file_own_dropped`: for each file and generation, the oldest and the
-///   newest time of a version of the device's own whose event went past
-///   its bound (`MAX_FILE_ARRIVALS` of them a file), and the newest place
-///   among them: where they may be inside a window, the file goes back to
-///   none.
-/// - `file_own_set_aside`: each generation in which a carry set aside what
-///   the device wrote itself: a carry by command on this device leaves out
-///   what it wrote there, which is at the relays.
-const MIGRATION_V26: &str = r#"
-ALTER TABLE file_arrivals_stored ADD COLUMN own INTEGER NOT NULL DEFAULT 0
-    CHECK(typeof(own) = 'integer' AND own IN (0, 1));
-CREATE TABLE file_own_dropped (
-    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
-    slot        BLOB NOT NULL CHECK(length(slot) = 32),
-    number      INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
-    hash        BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
-    newest_at   INTEGER NOT NULL CHECK(typeof(newest_at) = 'integer'),
-    oldest_at   INTEGER NOT NULL CHECK(typeof(oldest_at) = 'integer'),
-    newest_place INTEGER NOT NULL CHECK(typeof(newest_place) = 'integer'),
-    PRIMARY KEY (channel_id, slot, number, hash)
-);
-CREATE TABLE file_own_set_aside (
-    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
-    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
-    PRIMARY KEY (number, hash)
-);
-"#;
-
-/// Step 27: why a carry left out what a folder holds of a file (the review
-/// of the whole build, its M4).
-///
-/// - `file_put_back.own`: 1 where the device wrote what is left out itself,
-///   after it took a removed device's late writing and before it knew of
-///   the removal (decision 2026-10-24 (removal), rule 27); 0 where a
-///   removed device wrote it, or it was written over what one wrote (rule
-///   7). Every row kept before the step is 0: the two were not told apart.
-const MIGRATION_V27: &str = r#"
-ALTER TABLE file_put_back ADD COLUMN own INTEGER NOT NULL DEFAULT 0
-    CHECK(typeof(own) = 'integer' AND own IN (0, 1));
-"#;
-
-/// Step 28: what a cut touched, which `cordelia restore` asks (the review
+/// Step 26: what a cut touched, which `cordelia restore` asks (the review
 /// of the fixes of the whole build, its H1 and M2).
 ///
 /// - `file_cut`: a file of a folder that a carry cut (decision 2026-10-24
-///   (removal), rules 7 and 27), by the folder and the file's name, whether
+///   (removal), rule 7), by the folder and the file's name, whether
 ///   or not the carry changed what the folder holds. Kept for as long as
 ///   the database is: `cordelia restore` puts back no version of it but
 ///   one this device wrote itself after the cut.
@@ -1423,7 +1369,16 @@ ALTER TABLE file_put_back ADD COLUMN own INTEGER NOT NULL DEFAULT 0
 ///   latest cut, with when (the device's clock, used only to let a row go
 ///   once local history keeps nothing so old). A cut of the file again
 ///   clears them.
-const MIGRATION_V28: &str = r#"
+///
+/// It was step 28 while rule 27 of that record was built: steps 26 and 27
+/// held that rule's columns and tables, and went with it. No released
+/// version had any step after 20, and a database of an unreleased build at
+/// step 27 or 28 is refused as one from a later version. One at that
+/// build's step 26 (rule 27's columns and tables, and no `file_cut`) is
+/// taken as current: a carry that would cut a file fails at the missing
+/// table, so nothing is applied, and every restore is refused. It fails
+/// closed, and no such build was released.
+const MIGRATION_V26: &str = r#"
 CREATE TABLE file_cut (
     folder  TEXT NOT NULL,
     file    TEXT NOT NULL,
@@ -1682,18 +1637,8 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     }
 
     if current < 26 {
-        tracing::info!("applying migration v26 (what a device wrote itself)");
+        tracing::info!("applying migration v26 (what a cut touched)");
         migrate_in_one(conn, MIGRATION_V26, 26)?;
-    }
-
-    if current < 27 {
-        tracing::info!("applying migration v27 (why a file was put back)");
-        migrate_in_one(conn, MIGRATION_V27, 27)?;
-    }
-
-    if current < 28 {
-        tracing::info!("applying migration v28 (what a cut touched)");
-        migrate_in_one(conn, MIGRATION_V28, 28)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -5688,16 +5633,10 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            // What a later step makes is no older object: step 26's tables
-            // and step 28's.
+            // What a later step makes is no older object: step 26's tables.
             if NEW_IN_V24
                 .iter()
-                .chain(&[
-                    "file_own_dropped",
-                    "file_own_set_aside",
-                    "file_cut",
-                    "file_cut_written",
-                ])
+                .chain(&["file_cut", "file_cut_written"])
                 .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
             {
                 continue;
@@ -5914,14 +5853,14 @@ mod tests {
         }
     }
 
-    /// The step to version 26 adds `file_arrivals_stored.own`, 0 on every
-    /// event kept before it (each was an arrival), and the tables of what
-    /// went past the bound of the device's own versions and of the
-    /// generations where a carry set them aside (decision 2026-10-24
-    /// (removal), rule 27); `own` takes no value but 0 or 1; it is made in
-    /// one step with its version, and asked for twice it is run once.
+    /// Step 26 (the review of the fixes of the whole build, its H1 and M2):
+    /// it makes the two tables of what a cut touched in one step with its
+    /// version, and asked for twice it is run once; a text's hash is 64
+    /// characters of text, and its time an integer. A file cut is refused a
+    /// restore of any text but one written after the cut, which a cut
+    /// again takes back.
     #[test]
-    fn step_26_marks_no_event_kept_before_it_as_the_devices_own() {
+    fn step_26_records_what_a_cut_touched() {
         let conn = at_v21();
         for (sql, version) in [
             (MIGRATION_V22, 22),
@@ -5931,11 +5870,6 @@ mod tests {
         ] {
             migrate_in_one(&conn, sql, version).unwrap();
         }
-        conn.execute_batch(
-            "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
-             VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9);",
-        )
-        .unwrap();
         let version = |conn: &Connection| -> u32 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap()
@@ -5943,125 +5877,9 @@ mod tests {
         let failing = format!("{MIGRATION_V26} SELECT no_such_function();");
         assert!(migrate_in_one(&conn, &failing, 26).is_err());
         assert_eq!(version(&conn), 25);
-        migrate_in_one(&conn, MIGRATION_V26, 26).unwrap();
+        init_db(&conn).unwrap();
         assert_eq!(version(&conn), 26);
         migrate_in_one(&conn, MIGRATION_V26, 26).unwrap();
-        let own: i64 = conn
-            .query_row("SELECT own FROM file_arrivals_stored", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(own, 0);
-        for (value, taken) in [("0", true), ("1", true), ("2", false), ("'one'", false)] {
-            let sql = format!(
-                "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at, own)
-                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 10, {value})"
-            );
-            conn.execute_batch("SAVEPOINT one").unwrap();
-            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
-            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
-        }
-        for (sql, taken) in [
-            (
-                "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at,
-                     oldest_at, newest_place)
-                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9, 8, 7)",
-                true,
-            ),
-            (
-                "INSERT INTO file_own_dropped (channel_id, slot, number, hash, newest_at,
-                     oldest_at, newest_place)
-                 VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(15), 9, 8, 7)",
-                false,
-            ),
-            (
-                "INSERT INTO file_own_set_aside (number, hash) VALUES (1, zeroblob(16))",
-                true,
-            ),
-            (
-                "INSERT INTO file_own_set_aside (number, hash) VALUES (0, zeroblob(16))",
-                false,
-            ),
-        ] {
-            conn.execute_batch("SAVEPOINT one").unwrap();
-            assert_eq!(conn.execute_batch(sql).is_ok(), taken, "{sql}");
-            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
-        }
-    }
-
-    /// Step 27 (the review of the whole build, its M4): each file a carry
-    /// left out before it is one that a removed device wrote, or that was
-    /// written over what one wrote (`own` 0); `own` takes no value but 0 or
-    /// 1; it is made in one step with its version, and asked for twice it
-    /// is run once.
-    #[test]
-    fn step_27_takes_every_file_put_back_before_it_as_not_the_devices_own() {
-        let conn = at_v21();
-        for (sql, version) in [
-            (MIGRATION_V22, 22),
-            (MIGRATION_V23, 23),
-            (MIGRATION_V24, 24),
-            (MIGRATION_V25, 25),
-            (MIGRATION_V26, 26),
-        ] {
-            migrate_in_one(&conn, sql, version).unwrap();
-        }
-        conn.execute_batch(
-            "INSERT INTO file_put_back (folder, channel_id, key) VALUES ('f', 'c', 'a.md');",
-        )
-        .unwrap();
-        let version = |conn: &Connection| -> u32 {
-            conn.pragma_query_value(None, "user_version", |row| row.get(0))
-                .unwrap()
-        };
-        let failing = format!("{MIGRATION_V27} SELECT no_such_function();");
-        assert!(migrate_in_one(&conn, &failing, 27).is_err());
-        assert_eq!(version(&conn), 26);
-        init_db(&conn).unwrap();
-        assert_eq!(version(&conn), SCHEMA_VERSION);
-        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
-        let own: i64 = conn
-            .query_row("SELECT own FROM file_put_back", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(own, 0);
-        for (value, taken) in [("0", true), ("1", true), ("2", false), ("'one'", false)] {
-            let sql = format!(
-                "INSERT INTO file_put_back (folder, channel_id, key, own)
-                 VALUES ('f', 'c', 'b.md', {value})"
-            );
-            conn.execute_batch("SAVEPOINT one").unwrap();
-            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
-            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
-        }
-    }
-
-    /// Step 28 (the review of the fixes of the whole build, its H1 and M2):
-    /// it makes the two tables of what a cut touched in one step with its
-    /// version, and asked for twice it is run once; a text's hash is 64
-    /// characters of text, and its time an integer. A file cut is refused a
-    /// restore of any text but one written after the cut, which a cut
-    /// again takes back.
-    #[test]
-    fn step_28_records_what_a_cut_touched() {
-        let conn = at_v21();
-        for (sql, version) in [
-            (MIGRATION_V22, 22),
-            (MIGRATION_V23, 23),
-            (MIGRATION_V24, 24),
-            (MIGRATION_V25, 25),
-            (MIGRATION_V26, 26),
-            (MIGRATION_V27, 27),
-        ] {
-            migrate_in_one(&conn, sql, version).unwrap();
-        }
-        let version = |conn: &Connection| -> u32 {
-            conn.pragma_query_value(None, "user_version", |row| row.get(0))
-                .unwrap()
-        };
-        let failing = format!("{MIGRATION_V28} SELECT no_such_function();");
-        assert!(migrate_in_one(&conn, &failing, 28).is_err());
-        assert_eq!(version(&conn), 27);
-        init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 28);
-        migrate_in_one(&conn, MIGRATION_V28, 28).unwrap();
         let sha = "ab".repeat(32);
         for (sql, taken) in [
             (
@@ -6280,6 +6098,27 @@ mod tests {
             assert_eq!(new_in_v22(&conn), NEW_IN_V22, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
+            // Steps 24 to 26: the arrivals, a conflict copy kept here, and
+            // what a cut touched; and nothing of rule 27 of decision
+            // 2026-10-24 (removal), which was taken out with its steps.
+            assert_eq!(new_in_v24(&conn), NEW_IN_V24, "from version {at}");
+            assert!(
+                conn.prepare("SELECT held FROM file_copies").is_ok()
+                    && conn
+                        .prepare("SELECT unknown FROM file_arrivals_stored")
+                        .is_ok(),
+                "from version {at}"
+            );
+            assert!(table_of(&conn, "file_cut"), "from version {at}");
+            assert!(table_of(&conn, "file_cut_written"), "from version {at}");
+            for gone in [
+                "SELECT own FROM file_arrivals_stored",
+                "SELECT own FROM file_put_back",
+                "SELECT * FROM file_own_dropped",
+                "SELECT * FROM file_own_set_aside",
+            ] {
+                assert!(conn.prepare(gone).is_err(), "from version {at}: {gone}");
+            }
         }
     }
 

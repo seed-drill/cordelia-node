@@ -62,12 +62,6 @@ pub const PERSON_NOT_CARRIED: &str = "person.not_carried";
 /// history, where it was on.
 pub const PERSON_EDITS_SET_ASIDE: &str = "person.edits_set_aside";
 
-/// The same, of what a carry set aside that this device wrote itself after
-/// it took a removed device's late writing and before it knew of the
-/// removal (decision 2026-10-24 (removal), rule 27): counted apart, since
-/// what is said of it differs (the review of the whole build, its M4).
-pub const PERSON_OWN_EDITS_SET_ASIDE: &str = "person.own_edits_set_aside";
-
 /// Present where the statement that this device has applied removes a key
 /// that the statement it held before did not (decision 2026-10-04
 /// §10.1), as the device found it at the moment it applied the

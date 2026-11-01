@@ -106,20 +106,6 @@ pub enum Change {
     /// `cordelia restore` does not put it back (the review of the whole
     /// build, its H1).
     SetAside,
-    /// A carry left out what this device wrote itself after it took a
-    /// removed device's late writing, and before it knew of the removal
-    /// (decision 2026-10-24 (removal), rule 27). The file went back to the
-    /// version before, and the text is kept here alone. No command puts
-    /// it back.
-    SetAsideOwn,
-}
-
-impl Change {
-    /// Whether a carry left out the text this record keeps (rules 7 and
-    /// 27): `cordelia restore` does not put it back.
-    pub fn is_set_aside(self) -> bool {
-        matches!(self, Change::SetAside | Change::SetAsideOwn)
-    }
 }
 
 /// A device's entry for a file: who wrote it, and at which revision.

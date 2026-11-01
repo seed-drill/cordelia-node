@@ -325,27 +325,13 @@ Then it asks you to type yes, and then for the phrase.
   bring them back that way. What the removed device wrote comes back only
   at a terminal, with the recovery phrase: `cordelia sync carry <name>
   --from <its label>`.
-- **What your device wrote after it took the late edit is set aside too.**
-  An agent that read the tablet's late text may have written it, or what it
-  said, into another file. So from the first late edit it took to its
-  knowing of the removal, the laptop sets aside everything it wrote itself,
-  in every file and name, into local history. `cordelia status` counts
-  these apart. No command puts them back: `cordelia history show` prints
-  each, to copy by hand. This window is short in an ordinary removal (some
-  minutes), and as long as the laptop could not reach a relay that had the
-  removal.
-  - A limit of this version: the laptop sets aside only its own copy.
-    Another of your devices that took the laptop's writing from that window
-    before it knew of the removal carries it on, as the laptop's, and the
-    laptop gets it back from there. So does `cordelia sync carry` on any
-    device that held that change. If you remove a device that was still in
-    use, expect this: each device's window can be up to about eleven and a
-    half minutes, and your other devices hold copies of most of it. The
-    removed device cannot read the copies carried into the new change. It
-    can read what the laptop sent in that window, before it knew, at the
-    relays, as it can anything sent before a device knows. The agent's own
-    context also still holds what it read.
-  - The limits. Each device goes by its own clock. If its clock is more
+  - A limit: what your devices wrote themselves is kept. If an agent on the
+    laptop read the tablet's late text before the laptop knew of the
+    removal, and wrote it, or what it said, into another file, the laptop
+    keeps that file and carries it into the new change, as the laptop's own
+    writing. The tablet's own edit is still set aside, and the tablet cannot
+    read the new change. The agent's context also still holds what it read.
+  - Other limits. Each device goes by its own clock. If its clock is more
     than ten minutes behind the clock of the device that made the change,
     it keeps what reached it in the time past those ten minutes. If its
     clock is ahead, it can set aside edits that were not late. A device

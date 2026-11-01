@@ -112,11 +112,6 @@ pub struct FolderReport {
     /// it held is in local history alone.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub set_aside: usize,
-    /// Files whose text a carry left out in this cycle because this device
-    /// wrote it itself, after it took a removed device's late writing and
-    /// before it knew of the removal (rule 27): counted apart.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub set_aside_own: usize,
     /// Conflict files in the folder now, full paths: each holds a version of
     /// a memory that lost to a concurrent edit, until someone merges it
     /// and deletes the file.
@@ -1599,8 +1594,8 @@ fn sync_folder_with(
         let actions = match agreed.get(key) {
             // A file that a carry left out goes back, whatever it holds
             // (decision 2026-10-24 (removal), rule 7).
-            Some(record) if let Some(own) = put_back.get(key) => {
-                plan::put_back(local.get(key), remote.get(key), record, *own)
+            Some(record) if put_back.contains(key) => {
+                plan::put_back(local.get(key), remote.get(key), record)
             }
             _ => (hooks.plan)(
                 key,
@@ -2728,7 +2723,7 @@ fn apply(
             record(made.agreed(Some(Content::new(text).hash), me))?;
         }
         Action::Record(agreed) => record(agreed)?,
-        Action::PutBack { text, agreed, own } => {
+        Action::PutBack { text, agreed } => {
             // What the file holds was left out by a carry (decision
             // 2026-10-24 (removal), rule 7): it is kept in local history
             // alone, never beside the file, and the file takes the version
@@ -2737,16 +2732,8 @@ fn apply(
                 (Some(version), Some(_)) => history::Replacement::Entry(written_by(ctx, version)),
                 _ => history::Replacement::Nothing,
             };
-            // What this device wrote itself in a window of rule 27 is kept
-            // apart from what a removed device wrote: what is said of it,
-            // and how it may come back, differ (the review of the whole
-            // build, its M4).
-            let change = match own {
-                true => history::Change::SetAsideOwn,
-                false => history::Change::SetAside,
-            };
             let kept = ctx.state.history.store().is_some();
-            let ahead = match keep_here(ctx, key, seen, change, replaced_by)? {
+            let ahead = match keep_here(ctx, key, seen, history::Change::SetAside, replaced_by)? {
                 KeptHere::Ahead(ahead) => ahead,
                 KeptHere::Changed => {
                     deferred();
@@ -2769,11 +2756,8 @@ fn apply(
             settle(ctx, ahead);
             // Every put-back sets an edit aside: a delete of the file here
             // that went back too (the review of the whole build, its L2).
-            match own {
-                true => report.set_aside_own += 1,
-                false => report.set_aside += 1,
-            }
-            note_set_aside(state, own, kept);
+            report.set_aside += 1;
+            note_set_aside(state, kept);
             forget_kept(ctx, key);
             record(agreed)?;
         }
@@ -2832,13 +2816,13 @@ fn written_here(db: &rusqlite::Connection, folder: &str, key: &str, text: &str) 
 }
 
 /// Count an edit that a carry set aside (decision 2026-10-24 (removal),
-/// rule 7, or rule 27 where `own`), for the status to say, with whether
+/// rule 7), for the status to say, with whether
 /// local history kept its text (`kept`). A count that cannot be written is
 /// said in the log: the text is in local history either way, where it is
 /// on.
-fn note_set_aside(state: &AppState, own: bool, kept: bool) {
+fn note_set_aside(state: &AppState, kept: bool) {
     let noted = lock(state).and_then(|db| {
-        cordelia_api::look::note_set_aside(&db, 1, chrono::Utc::now().timestamp(), own, kept)
+        cordelia_api::look::note_set_aside(&db, 1, chrono::Utc::now().timestamp(), kept)
             .map_err(of_person)
     });
     if let Err(error) = noted {
@@ -3552,7 +3536,7 @@ mod tests {
                 .unwrap()
                 .records
                 .iter()
-                .all(|record| !record.about.change.is_set_aside())
+                .all(|record| record.about.change != history::Change::SetAside)
         );
 
         let restore = |id: &history::Id| {
