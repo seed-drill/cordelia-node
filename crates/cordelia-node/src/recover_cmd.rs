@@ -1539,7 +1539,12 @@ fn at_a_row(
 }
 
 /// The keys that the node is handed with the label of each (decision
-/// 2026-10-04 §9, step 4): `gone`, each that the person said is gone;
+/// 2026-10-04 §9, step 4): `gone`, each that the person said is gone, and
+/// each device of the change recovered from that another change the
+/// recovery read removed, which is removed whatever is said (decision
+/// 2026-10-24 (removal), rule 22): it held the seed of every shared channel
+/// that the lists recovered from file, so the recovery makes each anew
+/// without it as without a device said to be gone (rule 24);
 /// `still_have`, each that they still have; and `not_shown`, each row
 /// that could not be shown. **Each label is the one that its row was
 /// shown by** ([`recover::label_shown`], decision 2026-10-17 §2.4): the
@@ -1554,17 +1559,22 @@ fn labels_for_the_node(generation: &Generation, answers: &[Answer], own: &[u8; 3
         let label = recover::label_shown(rows, answers, row);
         json!({ "key": hex::encode(row.key), "label": label })
     };
-    let labelled = |answer: fn(&Answer) -> bool| -> Vec<Value> {
+    let labelled = |answer: fn(&Row, &Answer) -> bool| -> Vec<Value> {
         rows.iter()
             .zip(answers)
-            .filter(|(row, said)| answer(said) && row.key != *own)
+            .filter(|(row, said)| answer(row, said) && row.key != *own)
             .map(|(row, _)| key_and_label(row))
             .collect()
     };
     let not_shown: Vec<Value> = generation.not_shown.iter().map(key_and_label).collect();
     json!({
-        "gone": labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
-        "still_have": labelled(|said| *said == Answer::Have),
+        // A row that counts is not asked about only where another change
+        // removed it (`at_a_row`).
+        "gone": labelled(|row, said| {
+            matches!(said, Answer::Lost | Answer::OtherHands)
+                || (row.counts && *said == Answer::NotAsked)
+        }),
+        "still_have": labelled(|_, said| *said == Answer::Have),
         "not_shown": not_shown,
     })
 }
@@ -3341,7 +3351,8 @@ mod tests {
     /// third branch, made apart from change 2, removes it; the recovery
     /// recovers from change 2 and reads that branch. Were the desktop
     /// asked, `have` would bring back what it wrote after its removal,
-    /// and the recovery's statement would remove it all the same.
+    /// and the recovery's statement would remove it all the same. The node
+    /// is handed it as gone (rule 24).
     #[test]
     fn test_a_device_that_another_change_read_removed_is_not_asked_and_nothing_is_taken() {
         let rows = rows();
@@ -3373,6 +3384,20 @@ mod tests {
         assert!(!takes.contains(&desktop), "{takes:?}");
         assert!(takes.contains(&[1; 32]) && takes.contains(&[3; 32]));
         assert!(!recover::gone(&rows, &answers).contains(&desktop));
+        // The node is handed it as gone all the same, with its label: it
+        // held the seed of every shared channel the lists recovered from
+        // file, which the recovery makes anew without it (rule 24).
+        let generation = Generation {
+            rows: rows.clone(),
+            ..Default::default()
+        };
+        let labels = labels_for_the_node(&generation, &answers, &[9; 32]);
+        let gone = labels["gone"].as_array().unwrap();
+        assert!(
+            gone.iter().any(|one| one["key"] == hex::encode(desktop)),
+            "{labels}"
+        );
+        assert_eq!(gone.len(), 1, "{labels}");
         // The control: where no other change removed it, it is asked.
         assert!(matches!(
             at_a_row(&rows, &answers[..1], 1, 2, &[9; 32], &room, &|_| false),
