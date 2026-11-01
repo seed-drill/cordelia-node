@@ -1070,15 +1070,66 @@ pub const CHANGE_ENTRY_BYTES: usize = 32 * 1024;
 const _: () = assert!(CHANGE_ENTRY_BYTES.is_power_of_two());
 const _: () = assert!(CHANGE_ENTRY_BYTES <= MAX_ITEM_BYTES);
 
-/// How much of a change entry's content is the part for the phrase, sealed:
-/// the last 4 KB. The rest is the part for the devices.
-pub const CHANGE_ENTRY_PHRASE_PART_BYTES: usize = 4096;
-
 /// How much of a change entry's content is the part for the devices,
-/// sealed.
-/// Derived: what the part for the phrase leaves.
-pub const CHANGE_ENTRY_DEVICES_PART_BYTES: usize =
-    CHANGE_ENTRY_BYTES - CHANGE_ENTRY_PHRASE_PART_BYTES;
+/// sealed: the first 28 KB (decision 2026-10-04 §4.6). **Fixed, and never
+/// derived** (decision 2026-10-24 rule 13): a device of the version before
+/// (v0.2.0-alpha.17 and earlier) opens this part at this place and of
+/// this size, so it does not move or grow when the parts after it change.
+pub const CHANGE_ENTRY_DEVICES_PART_BYTES: usize = 28_672;
+
+/// How much of a change entry's content is the part for the phrase, sealed:
+/// 1 KB after the part for the devices (decision 2026-10-24 rule 13). At
+/// every bound it says 354 bytes, and is 382 sealed.
+pub const CHANGE_ENTRY_PHRASE_PART_BYTES: usize = 1024;
+
+/// How much of a change entry's content is the lineage, in the clear: the
+/// last 3 KB (decision 2026-10-24 rule 13). A relay reads it.
+/// Derived: what the two parts leave of CHANGE_ENTRY_BYTES.
+pub const CHANGE_ENTRY_LINEAGE_BYTES: usize =
+    CHANGE_ENTRY_BYTES - CHANGE_ENTRY_DEVICES_PART_BYTES - CHANGE_ENTRY_PHRASE_PART_BYTES;
+
+/// How much of a change entry's content was the part for the phrase in the
+/// layout of the version before (v0.2.0-alpha.17 and earlier), which had
+/// no lineage: the last 4 KB (decision 2026-10-04 §4.6). A change entry made there is
+/// opened for the phrase with it (decision 2026-10-24 rule 13).
+/// Derived: what the part for the devices leaves of CHANGE_ENTRY_BYTES.
+pub const CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES: usize =
+    CHANGE_ENTRY_BYTES - CHANGE_ENTRY_DEVICES_PART_BYTES;
+
+/// How much of a statement's hash names it in a lineage: its first 8
+/// bytes (decision 2026-10-24 rule 13). A relay uses them only to tell
+/// apart the statements of one phrase, and only the phrase makes one: two
+/// of 256 share 8 bytes with a chance of about 2^-49.
+pub const LINEAGE_HASH_BYTES: usize = 8;
+
+/// How much of SHA-256 of LABEL_CHANGE_LINEAGE opens a lineage, as its
+/// mark: the first 8 bytes (decision 2026-10-24 rule 13). An entry of the
+/// version before has the ciphertext of its part for the phrase there, which
+/// is the mark with a chance of 2^-64.
+pub const LINEAGE_MARK_BYTES: usize = 8;
+
+/// The most a lineage says: its mark, the time its change was made (8
+/// bytes, in seconds), the hash of its statement, a count, and the hash of
+/// each statement on a chain at its bound (decision 2026-10-24 rule 13).
+/// Derived: 2,074 bytes.
+pub const MAX_LINEAGE_BYTES: usize =
+    LINEAGE_MARK_BYTES + 8 + LINEAGE_HASH_BYTES + 2 + MAX_STATEMENT_CHAIN * LINEAGE_HASH_BYTES;
+
+// Checked at compile time (decision 2026-10-24 rule 13): the part for the
+// devices is where and as large as the version before has it; the three
+// parts are the whole content; and the lineage of a chain at its bound
+// fits its share. A lineage's hash is no longer than the statement's own.
+const _: () = assert!(CHANGE_ENTRY_DEVICES_PART_BYTES == 28 * 1024);
+const _: () = assert!(CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES == 4096);
+const _: () = assert!(
+    CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BYTES + CHANGE_ENTRY_LINEAGE_BYTES
+        == CHANGE_ENTRY_BYTES
+);
+const _: () = assert!(CHANGE_ENTRY_LINEAGE_BYTES == 3072);
+const _: () = assert!(MAX_LINEAGE_BYTES == 2074);
+const _: () = assert!(MAX_LINEAGE_BYTES <= CHANGE_ENTRY_LINEAGE_BYTES);
+const _: () = assert!(LINEAGE_HASH_BYTES <= STATEMENT_HASH_BYTES);
+const _: () = assert!(LINEAGE_MARK_BYTES <= 32);
 
 /// The size of a secret sealed to one device's key, as the node seals to a
 /// key: an ephemeral key, a nonce, the 32 bytes and a tag.
@@ -1105,6 +1156,7 @@ const _: () = assert!(
     ITEM_SEAL_OVERHEAD_BYTES + 32 + 2 + MAX_EARLIER_SECRETS * (8 + 32)
         <= CHANGE_ENTRY_PHRASE_PART_BYTES
 );
+const _: () = assert!(ITEM_SEAL_OVERHEAD_BYTES + 32 + 2 + MAX_EARLIER_SECRETS * (8 + 32) == 382);
 
 /// The smallest an entry's content may be: 256 bytes (decision 2026-10-04
 /// §2.3). A content is a nonce, a ciphertext and a tag, and its length is
@@ -1273,6 +1325,11 @@ pub const LABEL_CHANGE_PHRASE: &[u8] = b"cordelia v2 change phrase";
 /// statement, does not open as that statement's secret.
 pub const LABEL_CHANGE_SECRET: &[u8] = b"cordelia v2 change secret";
 
+/// The label whose SHA-256 opens a change entry's lineage: its first
+/// LINEAGE_MARK_BYTES are the lineage's mark (decision 2026-10-24 rule
+/// 13). It begins no other label, and none begins it.
+pub const LABEL_CHANGE_LINEAGE: &[u8] = b"cordelia v2 lineage";
+
 /// The label an entry's author signs it under: the author's key signs this
 /// label and what is signed of the entry (decision 2026-10-04 §2.3).
 pub const LABEL_ENTRY_AUTHOR: &[u8] = b"cordelia v2 author";
@@ -1408,6 +1465,76 @@ pub const KEPT_OUT_PER_ADDER: usize = {
 // Checked at compile time: each adder that may add keeps at least one key
 // that the 64 kept out, in both bounds.
 const _: () = assert!(KEPT_OUT_PER_ADDER >= 1);
+
+/// The heads of a person's changes that a device keeps, and that a relay
+/// keeps in a slot (decision 2026-10-24 (removal), rules 1 and 14): the
+/// change a device follows and up to seven set aside. Only the phrase
+/// makes a head, and an honest person has two at most, now and then. A
+/// ninth closes the device, which fails closed. It bounds what a device
+/// knows of removals too ([`MAX_KNOWN_REMOVED`]).
+pub const MAX_CHANGE_HEADS: usize = 8;
+
+/// The heads that a relay keeps room for in a slot whose entry carries a
+/// lineage, where it has the room (decision 2026-10-24 (removal), rule
+/// 15): from when it takes the first such entry there, it counts the slot
+/// at this many of that entry's size. So a second head made apart from the
+/// first, a removal among them, always has room, and a removed device that
+/// fills the relay with the old channels it holds cannot keep a removal
+/// out. The relay makes no room for it: where it has none, the share is
+/// not counted, and a second head is refused for room as any new entry is.
+pub const CHANGE_HEADS_ROOM: usize = 2;
+
+// Checked at compile time: the room kept is for heads that a relay keeps.
+const _: () = assert!(CHANGE_HEADS_ROOM >= 2 && CHANGE_HEADS_ROOM <= MAX_CHANGE_HEADS);
+
+/// The role that a relay of this version names in its handshake, beside
+/// "relay" (decision 2026-10-24 (removal), rule 18): it keeps every head
+/// in a slot, and hands each before it says that it holds the entry shown
+/// (rules 14 and 16). A device shows such a relay every head it keeps; at
+/// a relay that does not name it, none numbered above the change it
+/// follows, since a relay of the version before takes an entry of a
+/// higher revision in place of the one it holds, a removal included. A
+/// node of the version before reads only "relay" and "bootnode" among the
+/// roles, and takes up to MAX_HANDSHAKE_ROLES of them, so it passes this
+/// one over.
+pub const RELAY_ROLE_HEADS: &str = "heads";
+
+/// The most keys a device keeps as removed (decision 2026-10-24
+/// (removal), rule 2): every key that a change it has seen and checked
+/// lists as removed, on any branch. They only grow. Past the bound the
+/// device is closed: it seals nothing and sends nothing, which fails
+/// closed.
+/// Derived: MAX_STATEMENT_REMOVED x MAX_CHANGE_HEADS, the removed keys of
+/// every head a device keeps, each at its bound.
+pub const MAX_KNOWN_REMOVED: usize = MAX_STATEMENT_REMOVED * MAX_CHANGE_HEADS;
+
+/// The most keys a device keeps as holding the secret of one change
+/// because a record of an addition under it adds them (decision
+/// 2026-10-24 (removal), rule 3), apart from the records themselves and
+/// their bound of MAX_NOT_COUNTED_RECORDS. Past it the change is not
+/// clear, which fails closed. Only a key that counts under the change
+/// writes a record that a device keeps, but any key that counts can push
+/// past it, a stolen device among them before its removal is known.
+pub const MAX_KNOWN_HOLDERS: usize = 2048;
+
+/// The margin of a removed key's cut time (decision 2026-10-24 (removal),
+/// rule 2): the time of the change that first removes the key, by its
+/// maker's clock, less this. What of that key's reached a device at or
+/// after the cut time, in a generation the removal was made after, is not
+/// carried (rule 7), and a record it signed then counts for nothing (rule
+/// 6). A handshake allows MAX_CLOCK_SKEW_SECS of skew at each end, so two
+/// nodes that one relay accepts are within twice that of each other.
+/// Derived: 2 x MAX_CLOCK_SKEW_SECS.
+pub const REMOVAL_TAKEN_MARGIN_SECS: u64 = 2 * MAX_CLOCK_SKEW_SECS;
+
+/// The arrivals a device keeps for one file (decision 2026-10-24
+/// (removal), rule 7): each version another key signed that it stored,
+/// and each link that stands in a stored chain more times than in any
+/// chain of the file stored before, with its key, generation and time.
+/// The oldest go first past it, and a cut time before the oldest kept
+/// takes the file back to the version before the first event that went,
+/// which fails safe.
+pub const MAX_FILE_ARRIVALS: usize = 1024;
 
 /// How long a device keeps the secret of a generation it left (decision
 /// 2026-10-04 §3): 90 days by its own clock, and then the secret is
@@ -2597,7 +2724,7 @@ const _: () = {
 };
 
 /// Every label above, for the tests that set one against another.
-pub const LABELS: [&[u8]; 28] = [
+pub const LABELS: [&[u8]; 29] = [
     LABEL_ENTRY_KEY,
     LABEL_SLOT_KEY,
     LABEL_CHANNEL_SIGN,
@@ -2614,6 +2741,7 @@ pub const LABELS: [&[u8]; 28] = [
     LABEL_CHANGE_DEVICES,
     LABEL_CHANGE_PHRASE,
     LABEL_CHANGE_SECRET,
+    LABEL_CHANGE_LINEAGE,
     LABEL_ENTRY_AUTHOR,
     LABEL_ENTRY_CHANNEL,
     LABEL_ENTRY_CONTENT,
@@ -3229,8 +3357,12 @@ mod tests {
     #[test]
     fn test_change_entry_decision_2026_10_04_4_6() {
         assert_eq!(CHANGE_ENTRY_BYTES, 32_768);
+        // The two sealed parts, and the lineage of decision 2026-10-24
+        // rule 13.
         assert_eq!(
-            CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BYTES,
+            CHANGE_ENTRY_DEVICES_PART_BYTES
+                + CHANGE_ENTRY_PHRASE_PART_BYTES
+                + CHANGE_ENTRY_LINEAGE_BYTES,
             CHANGE_ENTRY_BYTES
         );
         assert_eq!(SEALED_SECRET_BYTES, 92);
@@ -3240,6 +3372,37 @@ mod tests {
         assert_eq!(LABEL_CHANGE_DEVICES, b"cordelia v2 change devices");
         assert_eq!(LABEL_CHANGE_PHRASE, b"cordelia v2 change phrase");
         assert_eq!(LABEL_CHANGE_SECRET, b"cordelia v2 change secret");
+    }
+
+    /// The layout of a change entry with its lineage (decision 2026-10-24
+    /// rule 13, unit test 14): the part for the devices where the version
+    /// before has it, 1 KB for the phrase, and the lineage in the 3 KB
+    /// left, which holds a chain at its bound.
+    #[test]
+    fn test_change_entry_lineage_decision_2026_10_24_13() {
+        assert_eq!(CHANGE_ENTRY_DEVICES_PART_BYTES, 28_672);
+        assert_eq!(CHANGE_ENTRY_PHRASE_PART_BYTES, 1024);
+        assert_eq!(CHANGE_ENTRY_LINEAGE_BYTES, 3072);
+        assert_eq!(CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES, 4096);
+        assert_eq!(
+            CHANGE_ENTRY_DEVICES_PART_BYTES
+                + CHANGE_ENTRY_PHRASE_PART_BYTES
+                + CHANGE_ENTRY_LINEAGE_BYTES,
+            CHANGE_ENTRY_BYTES
+        );
+        assert_eq!(
+            CHANGE_ENTRY_DEVICES_PART_BYTES + CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES,
+            CHANGE_ENTRY_BYTES
+        );
+        assert_eq!(LINEAGE_HASH_BYTES, 8);
+        assert_eq!(LINEAGE_MARK_BYTES, 8);
+        // A mark, a time, the statement's hash, a count, and 256 hashes.
+        assert_eq!(MAX_LINEAGE_BYTES, 8 + 8 + 8 + 2 + 256 * 8);
+        assert_eq!(MAX_LINEAGE_BYTES, 2074);
+        // The part for the phrase at its bound: a nonce, a tag, the
+        // secret, a count, and eight earlier secrets with their numbers.
+        assert_eq!(12 + 16 + 32 + 2 + 8 * (8 + 32), 382);
+        assert_eq!(LABEL_CHANGE_LINEAGE, b"cordelia v2 lineage");
     }
 
     /// The bounds of an entry, and the room that is kept in every entry
@@ -3338,6 +3501,31 @@ mod tests {
         assert_eq!(MAX_COUNTED_DEVICES, MAX_STATEMENT_DEVICES);
     }
 
+    /// What a device keeps of removals (decision 2026-10-24 (removal),
+    /// rules 2 and 3, section 11): eight heads, the removed keys of every
+    /// head at its bound, and 2,048 keys that records add under one change.
+    #[test]
+    fn test_what_a_device_keeps_of_removals_decision_2026_10_24_removal_11() {
+        assert_eq!(MAX_CHANGE_HEADS, 8);
+        assert_eq!(MAX_KNOWN_REMOVED, 2_048);
+        assert_eq!(MAX_KNOWN_REMOVED, MAX_STATEMENT_REMOVED * MAX_CHANGE_HEADS);
+        assert_eq!(MAX_KNOWN_HOLDERS, 2_048);
+        // What a device took before it knew (rules 2, 6 and 7): a margin of
+        // twice the skew a handshake allows, and 1,024 arrivals a file.
+        assert_eq!(REMOVAL_TAKEN_MARGIN_SECS, 600);
+        assert_eq!(REMOVAL_TAKEN_MARGIN_SECS, 2 * MAX_CLOCK_SKEW_SECS);
+        assert_eq!(MAX_FILE_ARRIVALS, 1_024);
+        assert_eq!(CHANGE_HEADS_ROOM, 2);
+        // The role a relay of this version names (rule 18): one of the
+        // eight a handshake carries, and neither of the two a node of the
+        // version before reads.
+        assert_eq!(RELAY_ROLE_HEADS, "heads");
+        const { assert!(MAX_HANDSHAKE_ROLES >= 2) };
+        // The holders of one change are never fewer than the records it
+        // keeps of them, so the bound of records drops no holder first.
+        const { assert!(MAX_KNOWN_HOLDERS > MAX_NOT_COUNTED_RECORDS + MAX_COUNTED_DEVICES) };
+    }
+
     /// Each adder that may add keeps its first three keys that the 64
     /// kept out (decision 2026-10-17 §2.2): the lesser of what is left of
     /// each bound of 256, shared among 64 adders.
@@ -3394,7 +3582,7 @@ mod tests {
         assert_eq!(LABEL_CHANNEL_PROOF, b"cordelia v2 proof");
         assert_eq!(SESSION_VALUE_BYTES, 32);
         assert!(LABELS.contains(&LABEL_CHANNEL_PROOF));
-        assert_eq!(LABELS.len(), 28);
+        assert_eq!(LABELS.len(), 29);
     }
 
     /// What the commands a person types go by: the place of a device's

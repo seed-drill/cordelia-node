@@ -73,6 +73,7 @@ fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
         let stands = match crate::at_relays::stands(&db) {
             Ok(crate::at_relays::Stands::NoPhrase) => "no_phrase",
             Ok(crate::at_relays::Stands::Applied) => "applied",
+            Ok(crate::at_relays::Stands::Closed) => "closed",
             Ok(crate::at_relays::Stands::Stopped(State::Fork)) => "fork",
             Ok(crate::at_relays::Stands::Stopped(State::Removed)) => "removed",
             Ok(crate::at_relays::Stands::Stopped(State::NotListed)) => "not_listed",

@@ -73,6 +73,73 @@
 >   `message_kept_numbers` and `message_kept_taken`. It changes no older
 >   row.
 >
+> Step 21, per the decision record of 2026-10-24 (removal) (set out in
+> §10.3):
+>
+> - **v21:** what a device knows of removals: `person_removed_keys`,
+>   `person_holders` and `person_holders_past`; and `person_clear_mark`,
+>   with the triggers `person_clear_on_*` that make its mark anew at every
+>   write of what says whether the change followed is clear. It fills none
+>   of the first three, writes the mark's one row, and changes no older
+>   row. **A limit of the step:** a record of an addition that the bound of
+>   256 records not counted dropped before it is no holder, since its key
+>   was kept nowhere apart and the step has nothing to fill the holders
+>   from. Only what a device sees from the step on is kept apart.
+>
+> Step 22, per the same record (set out in §10.3):
+>
+> - **v22:** `person_change_entries` made again, to keep the change a device
+>   follows and up to seven heads set aside, each with when it was set
+>   aside; every row carried, the latest as the change followed and the one
+>   made apart as a head set aside at the step's time. `person_change_times`,
+>   empty: the time of each change a device applies or keeps. And
+>   `person.judge_kept` in `node_meta` on a device that follows a phrase: at
+>   its first start on this version it notes the time of each entry it kept,
+>   and a device in a fork judges the one it kept apart by rule 8 (rule 12).
+>
+> Step 23, per the same record (set out in §10.1 and §10.2):
+>
+> - **v23:** a relay keeps every head. `entries` made again, with a column
+>   `head` in its key: empty for the row kept by the store's rule (every
+>   row a device keeps, and every row at the step), and the entry's ID for
+>   a head that a relay keeps beside it by its lineage. Every row carried
+>   with its places. `relay_head_rooms`, empty: each author's slot whose
+>   room for a second head a relay counts.
+>
+> Step 24, per the same record (set out in §10.3 and §10.6):
+>
+> - **v24:** what a device took before it knew of a removal (decision
+>   2026-10-24 (removal), rules 2, 6 and 7). `person_change_times_lists`:
+>   beside the time of each change noted, the keys its statement lists as
+>   removed, its chain and its devices, from which each removed key's cut
+>   time is worked out. `person_removed_keys_by`: for a key that rule 6
+>   removed, the removed key whose record added it. `person_removed_keys_spared`:
+>   a key that the person said, at a recovery made on this device, is a
+>   device they still have, which rule 6 does not remove. `file_arrivals_stored`,
+>   `file_arrivals` and `file_arrivals_dropped`: the arrivals of each file,
+>   by channel and slot, kept across carries. `file_put_back`, beside
+>   `sync_files`: a folder's file that a carry left out, which the next
+>   cycle takes back. `file_line_from`, beside `index_lines`: the keys that
+>   signed the version a line was removed from. All empty at the step,
+>   which changes no older table or row.
+>
+> - **v26:** what a cut touched (the review of the fixes of the removal
+>   build, its H1 and M2). `file_cut (folder, file)`: a file of a folder
+>   that a carry cut (rule 7), whether or not the carry changed
+>   what the folder holds; kept for as long as the database is.
+>   `file_cut_written (folder, file, sha256, at)`: each text (SHA-256 in
+>   hex) the device published itself of such a file after its latest cut,
+>   with when by its clock; a row older than 30 days goes, and a cut of the
+>   file again clears them. `cordelia restore` puts back no version of a
+>   file cut but one of these texts. It was step 28 while rule 27 of that
+>   record was built; steps 26 and 27 held that rule's columns and tables,
+>   and went with it, unreleased. A database of such a build at step 27 or
+>   28 is refused as one from a later version. One at that build's step 26
+>   (rule 27's columns and tables, and no `file_cut`) is taken as current:
+>   a carry that would cut a file fails at the missing table, so nothing is
+>   applied, and every restore is refused. It fails closed, and no such
+>   build was released.
+>
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
 > (§5.2).
@@ -788,14 +855,25 @@ phrase's channel and each has to know the change entry's slot from any other.
 It is signed by the phrase's key and by the key of the phrase's channel, as
 every entry is by its author and its channel.
 
-**Its content is always 32,768 bytes,** in two parts. Each part is a nonce
+**Its content is always 32,768 bytes,** in two sealed parts and a lineage
+in the clear (decision 2026-10-24 (removal), rule 13). Each part is a nonce
 (12), a ciphertext and a tag (16), and is one size whatever it says: what it
 says is filled up with zeros inside the encryption.
 
 ```text
-the part for the devices   28672 bytes, under the statement key
-the part for the phrase     4096 bytes, under the phrase's sealing key
+offset     0  the part for the devices  28672 bytes, under the statement key
+offset 28672  the part for the phrase    1024 bytes, under the phrase's sealing key
+offset 29696  the lineage                3072 bytes, in the clear
 ```
+
+**The part for the devices does not move or grow** (`CHANGE_ENTRY_DEVICES_PART_BYTES`
+is fixed, not derived). In the layout of `v0.2.0-alpha.17` and earlier the part for
+the phrase was the last 4,096 bytes, and there was no lineage. A device of
+those versions opens the part for the devices of an entry of this layout as it
+opens its own, and applies the change. Its commands open the part for the
+phrase at its old place, find that it does not open, and refuse: a change
+made over an entry of this layout is made on a device of this version.
+`change-entry-test-vectors.json` pins the three sizes.
 
 The associated data of the part for the devices is
 `cordelia v2 change devices`, the statement's number and the phrase's public
@@ -809,7 +887,30 @@ for the devices   the signed statement's length, the signed statement,
 for the phrase    the secret (32), a count from 0 to 8, and for each
                   earlier generation its number (8) and its secret (32),
                   the newest first
+the lineage       a mark (8: the first bytes of SHA-256 of the label
+                  `cordelia v2 lineage`), the time the change was made by
+                  its maker's clock (8, in seconds), the first 8 bytes of
+                  the statement's hash, a count (2), and the first 8 bytes
+                  of the hash of each statement on its chain, in the
+                  chain's order; then zeros
 ```
+
+A count or a length is two bytes and a number eight, the higher byte
+first. At every bound the part for the phrase needs 382 bytes, and the
+lineage of a chain of 256 needs 2,074 (`MAX_LINEAGE_BYTES`).
+
+- **The lineage is in the clear,** and a relay reads it: it keeps every head
+  of the phrase's channel by it (decision 2026-10-24 (removal), rule 14).
+  The entry's two signatures cover it, so only the phrase writes one. It
+  tells a relay how the person's statements follow each other, when two
+  were made apart, and when each was made.
+- **An entry whose lineage region does not open with the mark has no
+  lineage:** it was made on `v0.2.0-alpha.17` or earlier, and is judged by its statement
+  alone. A device refuses an entry whose lineage does not match its
+  statement (another statement's hash, or another chain), or is not in its
+  form. A relay cannot open the statement, so it cannot tell whether a
+  lineage matches: it keeps an entry whose lineage is not in its form as
+  one with no lineage, by the store's rule.
 
 - **A secret sealed to a device** is 92 bytes: an ephemeral X25519 key (32),
   a nonce (12), the 32 bytes and a tag (16), as the node seals to a key
@@ -896,11 +997,14 @@ Times are in seconds, in UTC, by the clock of the node that writes them. A
 key, a channel's ID and a slot are each 32 bytes, and a signature 64: in the
 tables of §10.1 to §10.5 each such column is checked for its length.
 
-### 10.1 entries (v11, v13; decision §2.3, §2.4)
+### 10.1 entries (v11, v13, v23; decision §2.3, §2.4)
 
 One row for each author in each slot of each channel: the newest revision
 that author signed there. A relay holds here what it carries, and a device
-what it holds of its own channels.
+what it holds of its own channels. **A relay also keeps every head** where
+entries carry a lineage (decision 2026-10-24 (removal), rule 14): up to
+eight (`MAX_CHANGE_HEADS`) for an author in a slot, each with its ID in
+`head`.
 
 ```sql
 CREATE TABLE entries (
@@ -915,7 +1019,9 @@ CREATE TABLE entries (
     seq          INTEGER NOT NULL,
     stored_at    INTEGER NOT NULL,
     channel_place INTEGER NOT NULL DEFAULT 0,      -- v13
-    PRIMARY KEY (channel_id, slot, author)
+    head         BLOB NOT NULL DEFAULT x''         -- v23
+                 CHECK(typeof(head) = 'blob' AND length(head) IN (0, 32)),
+    PRIMARY KEY (channel_id, slot, author, head)   -- v23: was (channel_id, slot, author)
 );
 
 CREATE UNIQUE INDEX idx_entries_channel_seq   ON entries(channel_id, seq);
@@ -925,8 +1031,35 @@ CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_pla
 - The table refers to no other: an entry is stored with no list of members
   and no state of the channel.
 - **A row is replaced only by a higher revision** from that author in that
-  slot. An entry at the revision of the one held is not stored. Nothing
+  slot. An entry at the revision of the one held is not stored, except
+  as a head at a relay (below): two heads can share a number. Nothing
   compares one author's entries with another's.
+- **A head** (`head` holds its ID) is kept by a relay where the entry
+  carries a lineage (§9.6): one that no other entry it keeps there was made
+  after. An entry that one it keeps was made after is not stored; one made
+  after some that it keeps replaces them; one made apart from all is kept
+  beside them; the highest numbers are kept first. An entry with no lineage
+  is kept as before, only where every entry of that author in the slot has
+  a lower revision, and it replaces the row of the store's rule, never a
+  head. A device's rows all have `head` empty.
+- **`relay_head_rooms`** (v23) names each author's slot where a relay counts
+  the entry with a lineage at twice its size, so that a second head always
+  has room (rule 15). In a slot that is new, the first entry with a lineage
+  is taken only with room for both, and is otherwise refused for room
+  itself. Where it replaces an entry of the version before, it is taken as
+  a replacement that is no larger, and the share is counted only where the
+  relay has the room; where it had none, it counts the share at a later
+  entry with a lineage taken there, if it then has the room. A relay makes
+  no room by dropping channels.
+
+  ```sql
+  CREATE TABLE relay_head_rooms (
+      channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+      slot        BLOB NOT NULL CHECK(length(slot) = 32),
+      author      BLOB NOT NULL CHECK(length(author) = 32),
+      PRIMARY KEY (channel_id, slot, author)
+  );
+  ```
 - `seq` is the order in which this node stored all of its entries, from the
   counter `entry_seq`, which never goes backwards.
 - `channel_place` is the entry's place in its channel alone: a count from 1.
@@ -973,7 +1106,9 @@ CREATE INDEX idx_relay_channels_used ON relay_channels(used_at);
   shown that the relay holds. It is written at most once an hour, and never
   an earlier time than the one kept. What nobody uses for 90 days is dropped.
 - `bytes`: what the channel holds, as entries are counted (content and 1 KB
-  each), and not as the database's pages count it.
+  each), and not as the database's pages count it. From step 23 it also
+  counts, in each slot that `relay_head_rooms` names and that holds one
+  head, the room kept for a second (§10.1).
 - `mark`: 8 random bytes that are this holding's own. A channel that is
   dropped loses its row and its entries, and is taken again under another
   mark: a place in a channel means something only with its mark.
@@ -981,7 +1116,7 @@ CREATE INDEX idx_relay_channels_used ON relay_channels(used_at);
 A device keeps nothing here. The functions that write or drop here refuse a
 database in which a device follows a phrase.
 
-### 10.3 What a Device Holds of Its Person (v12, v13, v17; decision §3 to §6)
+### 10.3 What a Device Holds of Its Person (v12, v13, v17, v21; decision §3 to §6, and decision 2026-10-24 (removal))
 
 They are in the node's database so that they change in one transaction with
 a statement. A relay keeps nothing in any of them.
@@ -1006,16 +1141,21 @@ CREATE TABLE person_secrets (
 CREATE UNIQUE INDEX idx_person_secrets_applied ON person_secrets((left_at IS NULL))
     WHERE left_at IS NULL;
 
-CREATE TABLE person_change_entries (
-    kept            TEXT PRIMARY KEY CHECK(kept IN ('latest', 'apart')),
-    channel         BLOB NOT NULL CHECK(length(channel) = 32),
-    slot            BLOB NOT NULL CHECK(length(slot) = 32),
-    author          BLOB NOT NULL CHECK(length(author) = 32),
-    rev             INTEGER NOT NULL CHECK(rev BETWEEN 1 AND 256),
-    content         BLOB NOT NULL,
-    author_sig      BLOB NOT NULL CHECK(length(author_sig) = 64),
-    channel_sig     BLOB NOT NULL CHECK(length(channel_sig) = 64)
+CREATE TABLE person_change_entries (               -- made again by v22
+    place         INTEGER PRIMARY KEY,
+    followed      INTEGER NOT NULL CHECK(followed IN (0, 1)),
+    set_aside_at  INTEGER CHECK(set_aside_at IS NULL OR typeof(set_aside_at) = 'integer'),
+    channel       BLOB NOT NULL CHECK(length(channel) = 32),
+    slot          BLOB NOT NULL CHECK(length(slot) = 32),
+    author        BLOB NOT NULL CHECK(length(author) = 32),
+    rev           INTEGER NOT NULL CHECK(rev BETWEEN 1 AND 256),
+    content       BLOB NOT NULL,
+    author_sig    BLOB NOT NULL CHECK(length(author_sig) = 64),
+    channel_sig   BLOB NOT NULL CHECK(length(channel_sig) = 64),
+    CHECK((followed = 1) = (set_aside_at IS NULL))
 );
+CREATE UNIQUE INDEX idx_person_change_entries_followed
+    ON person_change_entries(followed) WHERE followed = 1;
 
 CREATE TABLE person_additions (
     seen     INTEGER PRIMARY KEY,
@@ -1046,17 +1186,123 @@ CREATE TABLE person_names_before (                  -- v17
     left_at  INTEGER NOT NULL,
     PRIMARY KEY (name, said_by)
 );
+
+CREATE TABLE person_removed_keys (                  -- v21
+    key      BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    seen_at  INTEGER NOT NULL CHECK(typeof(seen_at) = 'integer')
+);
+
+CREATE TABLE person_holders (                       -- v21
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    key     BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    PRIMARY KEY (number, hash, key)
+);
+
+CREATE TABLE person_holders_past (                  -- v21
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    PRIMARY KEY (number, hash)
+);
+
+CREATE TABLE person_change_times (                  -- v22
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
+    hash     BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    made_at  INTEGER CHECK(made_at IS NULL OR typeof(made_at) = 'integer'),
+    PRIMARY KEY (number, hash)
+);
+
+CREATE TABLE person_change_times_lists (            -- v24
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
+    hash     BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    removed  BLOB NOT NULL CHECK(typeof(removed) = 'blob' AND length(removed) % 32 = 0),
+    chain    BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 24 = 0),
+    devices  BLOB NOT NULL CHECK(typeof(devices) = 'blob' AND length(devices) % 32 = 0),
+    PRIMARY KEY (number, hash)
+);
+
+CREATE TABLE person_removed_keys_by (               -- v24
+    key       BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    added_by  BLOB NOT NULL CHECK(typeof(added_by) = 'blob' AND length(added_by) = 32)
+);
+
+CREATE TABLE person_removed_keys_spared (                -- v24
+    key     BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256)
+);
+
+CREATE TABLE file_arrivals_stored (                 -- v24
+    place               INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot                BLOB NOT NULL CHECK(length(slot) = 32),
+    number              INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash                BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    stored_at           INTEGER NOT NULL CHECK(typeof(stored_at) = 'integer'),
+    full_signers        BLOB CHECK(full_signers IS NULL OR length(full_signers) % 16 = 0),
+    before_author       BLOB CHECK(before_author IS NULL OR length(before_author) = 32),
+    before_rev          INTEGER,
+    before_delete       INTEGER,
+    before_content      BLOB,
+    before_author_sig   BLOB,
+    before_channel_sig  BLOB
+);
+CREATE INDEX file_arrivals_stored_by_file ON file_arrivals_stored(channel_id, slot, place);
+
+CREATE TABLE file_arrivals (                        -- v24
+    stored     INTEGER NOT NULL,
+    signer     BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 16),
+    link_hash  BLOB CHECK(link_hash IS NULL OR length(link_hash) = 16),
+    times      INTEGER NOT NULL DEFAULT 1 CHECK(typeof(times) = 'integer' AND times >= 1)
+);
+CREATE INDEX file_arrivals_by_stored ON file_arrivals(stored);
+
+CREATE TABLE file_arrivals_dropped (                -- v24
+    channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot                BLOB NOT NULL CHECK(length(slot) = 32),
+    number              INTEGER NOT NULL,
+    hash                BLOB NOT NULL CHECK(length(hash) = 16),
+    newest_at           INTEGER NOT NULL,
+    first_place         INTEGER NOT NULL,
+    before_author       BLOB CHECK(before_author IS NULL OR length(before_author) = 32),
+    before_rev          INTEGER,
+    before_delete       INTEGER,
+    before_content      BLOB,
+    before_author_sig   BLOB,
+    before_channel_sig  BLOB,
+    PRIMARY KEY (channel_id, slot, number, hash)
+);
+
+CREATE TABLE person_clear_mark (                    -- v21
+    one   INTEGER PRIMARY KEY CHECK(one = 1),
+    mark  BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 16)
+);
+-- One row, written by the step with randomblob(16). A trigger after each
+-- insert, update and delete of person, person_additions,
+-- person_removed_keys, person_holders and person_holders_past, and of the
+-- row of node_meta whose key is person.removed_past_bound, sets the mark
+-- to randomblob(16): eighteen in all, person_clear_on_<table>_<write>.
 ```
 
 | Table | What it holds | Decision |
 |---|---|---|
-| `person` | One row, or none where the device follows no phrase. What it follows: the phrase's public key, the statement key and the ID of the phrase's channel, never the words. The statement it has applied, as its signed bytes. And its state: `applied`; `fork` (it has seen a statement made apart from the one applied); `removed`; `not_listed` (a later statement has its key in neither list); `not_opened` (a later statement lists it, and the secret that came with it did not open) | §4.2 to §4.5, §5 |
-| `person_secrets` | The person secret it has applied (`left_at` is NULL: at most one such row), and each one it left, with when it left it. A secret that was left is kept 90 days by the device's own clock and then forgotten. Two generations can have one number, after a fork. A machine that recovers is handed the secret of the generation it recovered from, and of those before it that the change entry gave the phrase (nine in all at most), and keeps each as a secret it left then | §3, §9 |
-| `person_change_entries` | The latest change entry it has seen (`latest`), whole, to show to a relay; and, in a fork, the one made apart (`apart`) | §4.5, §4.6 |
+| `person` | One row, or none where the device follows no phrase. What it follows: the phrase's public key, the statement key and the ID of the phrase's channel, never the words. The statement it has applied, as its signed bytes. And its state: `applied`; `fork` (it is closed: it follows no clear change, decision 2026-10-24 (removal), rule 10; stored under the old name `fork`); `removed`; `not_listed` (a later statement has its key in neither list); `not_opened` (a later statement lists it, and the secret that came with it did not open) | §4.2 to §4.5, §5 |
+| `person_secrets` | The person secret it has applied (`left_at` is NULL: at most one such row), and each one it left, with when it left it. A secret that was left is kept 90 days by the device's own clock and then forgotten. Two generations can have one number, after two changes made apart. A machine that recovers is handed the secret of the generation it recovered from, and of those before it that the change entry gave the phrase (nine in all at most), and keeps each as a secret it left then | §3, §9 |
+| `person_change_entries` | The change entry of the change it follows (`followed` 1), whole, to show to a relay: on a device that stopped, the one that stopped it. And up to seven heads it sets aside (`followed` 0), each with when it set it aside: eight in all (`MAX_CHANGE_HEADS`). Step 22 made it again: the latest entry was carried as the change followed, and the one made apart as a head set aside at the step's time | §4.5, §4.6; decision 2026-10-24 (removal), rule 1 |
+| `person_change_times` | For each change it applied or kept, by its statement's number and hash, the time its lineage says it was made, or none for a change made on the version before. Kept after the change goes, until the device leaves its phrase, for the cut time of rule 2 | decision 2026-10-24 (removal), rule 2 |
+| `person_change_times_lists` | Beside a change's time, the keys its statement lists as removed, its chain (each link its number in 8 bytes, big-endian, then its hash) and the keys it lists as devices. A removed key's cut time is worked out from them: the time of the change that first removes it, where it and the change before it are noted, and otherwise of the newest earlier change noted, less ten minutes; a key that a change on the chain of its adder's removal lists is not removed by rule 6 | decision 2026-10-24 (removal), rules 2 and 6 |
+| `person_removed_keys_by` | For a key that rule 6 removed, the removed key whose record added it after that key's cut time, or in a generation made apart from its removal. Its cut is that key's | decision 2026-10-24 (removal), rule 6 |
+| `person_removed_keys_spared` | A key that the person said, at the terminal of a recovery made on this device, is a device they still have, with that change's number. Rule 6 does not remove it: it is added again (decision 2026-10-04 §9, step 6) | decision 2026-10-24 (removal), rule 6 |
+| `file_arrivals_stored`, `file_arrivals` | For each file, by its channel and slot, each entry the door stored that made arrivals: the generation it came in (the change followed, by number and hash), when it was stored, the version current before it as one entry (sealed again as this device's own at each carry), and, where its chain was full, the other keys its links name; and each arrival, a key's first 16 bytes and, for a link, its hash and how many times it stands. A carry goes back to the version before the first arrival it cuts, and leaves out that arrival and everything after it. At most 1,024 arrivals a file (`MAX_FILE_ARRIVALS`), the oldest going first | decision 2026-10-24 (removal), rule 7 |
+| `file_arrivals_dropped` | For each file and generation, the newest time an event went past the bound, judged as an arrival of every removed key, and the place of the first event of it that went with the version current before that event (sealed again at each carry, as the events' are): where what went is cut, the file goes back to that version, and not to before the oldest event kept, which a removed key may have written | decision 2026-10-24 (removal), rule 7 |
+| `file_cut`, `file_cut_written` | Each file of a folder that a carry cut, whether or not it changed what the folder holds, kept for as long as the database is; and each text the device published itself of it after its latest cut, for 30 days. `cordelia restore` puts back no version of such a file but one of those texts | decision 2026-10-24 (removal), rule 7; the review of the fixes of the removal build, H1 and M2 |
 | `person_additions` | The records of additions it has seen under the applied statement, in the order it saw them, each counted or not. At most 64 devices count in all, and at most 256 records are kept as not counted | §6 |
 | `person_names` | The names it holds in the generation it has applied, each with its channel's ID, so that either is found from the other: the names its folders are mapped to, and those that a carry by command or a recovery brought in (`person.names_carried`, §11.1) | §2.2, §7.3 |
 | `person_hand_overs` | For each key it made a hand-over for, the last one: its pair channel, its revision there (the next is above it), when it says it was made, and whether the store still holds it. Never the hand-over, which holds the secret | §6 |
 | `person_names_before` | Each name that a key had said it syncs, in the personal channel of a generation the device left, with when it left it. Written in the transaction that applies a statement. It is what a device shows of the names that no device lists yet in the new generation | §7.3, §8 |
+| `person_removed_keys` | Every key that a change the device has seen and checked lists as removed, on any branch, with when it was first kept. They only grow, and go only where the device leaves its phrase. At most 2,048 (`MAX_KNOWN_REMOVED`); past them the device is closed (`person.removed_past_bound`) | decision 2026-10-24 (removal), rule 2 |
+| `person_holders` | For the change it follows, and each it keeps as a head set aside, by its statement's number and hash, each key that a record of an addition under it adds, counted or not, kept apart from `person_additions` and its bound. A change's rows, and its row in `person_holders_past`, go when the device keeps it no more: at a move the change left keeps them, with the keys of its records. At most 2,048 a change (`MAX_KNOWN_HOLDERS`) | decision 2026-10-24 (removal), rule 3 |
+| `person_holders_past` | Each change that a record would have given more holders than are kept. Such a change is not clear | decision 2026-10-24 (removal), rule 3 |
+| `person_clear_mark` | One mark of 16 random bytes, made anew by a trigger at every write of the tables above that say whether the change followed is clear: the row of `person`, `person_additions`, the three before this one, and `person.removed_past_bound`. The node works out whether the change it follows is clear once for each mark, and reads the mark alone after that: a write undone puts back its mark with it, and a mark is never made twice | decision 2026-10-24 (removal), rules 3 and 5 |
 
 **The person secret is in the database,** which its owner alone can read
 (mode 0600), and not in a file beside it: it changes in one transaction with
@@ -1183,6 +1429,23 @@ CREATE TABLE sync_files (
   is.
 - At a personal node's first start on this version both tables are emptied:
   every folder forgets what it had agreed (§12).
+- **Beside them (v24, decision 2026-10-24 (removal), rule 7):**
+  `file_put_back (folder, channel_id, key)` marks a file that a carry left
+  out: the record names the version the carry went back to (a NULL hash and
+  revision 0 for none), and the next cycle puts that version into the file,
+  whatever it holds, with what it held kept in local history alone; the
+  mark goes when the record is saved again. Local history keeps what it
+  held as a record set aside (`set_aside`), which `cordelia restore` does
+  not put back. Step 26 adds `file_cut (folder,
+  file)`, written with each mark, which stays when the mark goes: restore
+  puts back no version of such a file but a text the device published
+  itself after the cut (`file_cut_written`). `file_line_from (folder,
+  channel_id, file, from_signers)` holds, for a record of `index_lines`, the
+  keys (32 bytes each) that signed the version its line was removed from:
+  no line is put back from a version that a removed key signed, where the
+  cut would leave out what that key wrote in the generation the device
+  follows, judged at the time of the put-back. Both move
+  with the folder's records, and go with them.
 
 ### 10.7 Messages Between the Person's Own Agents (v19; decision 2026-10-09 §2.3, §2.5, §6, §7, §9.2)
 
@@ -1444,6 +1707,7 @@ nothing in any of these tables.
 | `messages.list_again` | How many times in a row the device's list of what its agents read was written again because a relay answered that it holds another at the revision pushed, since a list was last written for a mark it lacked. A list's marks go under at most four revisions (`AGENT_MESSAGE_SENDS_MAX`), as a message's do | Decision 2026-10-09 §2.4 |
 | `messages.listed_seq` | The highest `seq` of the device's table of what its agents read when it last wrote its list, as an integer in text. A mark above it was made since and is not yet said. A merge of the device's own later list puts what the table lacked just above it, moving the marks made since up, and raises it to the highest of the marks merged. Absent where the device never wrote a list from this store; a mark made later is always above it | Decision 2026-10-09 §2.4, §7.2 |
 | `person.removed_labels` | JSON object of what the device called each key that a statement it applied removed, by the key in hex. A statement lists removed keys bare, and a person names one by its label at `cordelia sync carry --from`. A key that the device never knew by a label is not in it | Decision §7.3 |
+| `person.moved_from` | JSON array of the moves the device made (decision 2026-10-24 (removal), rule 9), the latest last, up to eight (`MAX_CHANGE_HEADS`): each the change entry of the change it left, in hex (`from`), and what a command that waits after that change says of the move (`says`). The look gives it as `moved`, and `cordelia change-made` ends with status 3 where it names the change that the command made. It goes when the device leaves its phrase | Decision 2026-10-24 (removal), rule 9 |
 | `usage.sighting_secret` | The secret a node hashes peer keys with for its usage counts. It never leaves the node | Kept |
 
 Four keys are of the older kind, and a personal node's first start removes

@@ -377,10 +377,33 @@ fn a_removed_devices_later_edit_reaches_nobody_and_the_others_go_on_syncing() {
         },
     );
 
-    // Every file is as it was, on both that remain: what the removed
-    // device wrote before is theirs, and nothing was kept beside it.
-    assert_eq!(files(&a_mem), before);
-    assert_eq!(files(&b_mem), before);
+    // The tablet's edit reached the others within ten minutes of the
+    // removal, after its cut time (decision 2026-10-24 (removal), rules 2
+    // and 7: the stated cost of the margin): at the carry each leaves it
+    // out, and the file goes back to the version before it, the edit in
+    // local history alone. Nothing is kept beside the file.
+    let put_back: Vec<(String, String)> = before
+        .iter()
+        .map(|(file, text)| {
+            if file == "first.md" {
+                (
+                    file.clone(),
+                    "the first, as the desktop wrote it\n".to_string(),
+                )
+            } else {
+                (file.clone(), text.clone())
+            }
+        })
+        .collect();
+    for memory in [&a_mem, &b_mem] {
+        wait_for("the tablet's edit is put back", &all, 90, || {
+            (files(memory) == put_back).then_some(())
+        });
+        assert!(conflict_files(memory).is_empty());
+    }
+    let history = a.cli(&["history", "lab"]);
+    assert!(history.contains("set aside"), "{history}");
+    let before = put_back;
 
     // The removed device edits a file, and writes a new one.
     std::fs::write(
@@ -841,12 +864,13 @@ fn a_device_that_was_off_during_a_removal_applies_it_before_it_takes_a_late_writ
 /// one that the change has not reached (decision 2026-10-04 §7.4, and
 /// property 2): it cannot tell "nothing has changed" from "this relay
 /// has not been told". It takes what the removed device wrote late, as
-/// it takes any device's. When it hears of the removal it keeps that: it
-/// carries each version as its own. A device that had applied the removal
-/// takes each from there, and where a version differs from what its own
-/// file held, its own text is kept beside the file.
+/// it takes any device's. When it hears of the removal it carries none
+/// of it (decision 2026-10-24 (removal), rule 7): each file goes back to
+/// the version before, the late writing in local history alone, and the
+/// status says edits were set aside. A device that had applied the
+/// removal takes none of it.
 #[test]
-fn a_device_that_reaches_only_a_relay_without_the_change_takes_a_late_write_and_keeps_it() {
+fn a_device_that_reaches_only_a_relay_without_the_change_takes_a_late_write_and_sets_it_aside() {
     let LateWrite {
         mut has,
         lacks,
@@ -883,7 +907,10 @@ fn a_device_that_reaches_only_a_relay_without_the_change_takes_a_late_write_and_
     }
 
     // The other relay is back: the laptop hears of the removal, applies
-    // it, and keeps what it took.
+    // it, and at the carry leaves out what the tablet wrote after the
+    // removal was made (decision 2026-10-24 (removal), rules 2 and 7):
+    // each file goes back to the version before it, and what it took is
+    // in its local history alone.
     has.start();
     {
         let all = [&has, &lacks, &laptop, &tablet];
@@ -892,49 +919,55 @@ fn a_device_that_reaches_only_a_relay_without_the_change_takes_a_late_write_and_
         wait_for("the laptop has sent what it carried", &all, 150, || {
             has_sent_everything(&laptop)
         });
+        wait_for("the late writing is put back", &all, 90, || {
+            (files(&laptop_memory) == before).then_some(())
+        });
     }
     let carried = held(&laptop);
     let text_of = |name: &str| {
         let entry = carried.iter().find(|(key, _, _)| key == name);
         entry.and_then(|(_, _, text)| text.clone())
     };
-    assert_eq!(text_of("second.md").as_deref(), Some(LATE_EDIT));
-    assert_eq!(text_of("late.md").as_deref(), Some(LATE_FILE));
     assert_eq!(
-        read(&laptop_memory.join("second.md")).as_deref(),
-        Some(LATE_EDIT)
+        text_of("second.md").as_deref(),
+        Some(AS_THE_DESKTOP_WROTE_IT)
     );
+    assert_eq!(text_of("late.md"), None);
     assert!(conflict_files(&laptop_memory).is_empty());
+    let history = laptop.cli(&["history", "lab"]);
+    assert!(history.contains("set aside"), "{history}");
+    let status = laptop.cli(&["status"]);
+    assert!(status.contains("set aside"), "{status}");
 
     // The desktop, which had applied the removal and never took what the
-    // tablet wrote late, takes each version from the laptop's carry: the
-    // new file as a new file, and the edit with its own text beside it.
+    // tablet wrote late, takes none of it from the laptop's carry: the two
+    // go on syncing, and nothing is beside a file.
     desktop.start();
     let all = [&has, &lacks, &desktop, &laptop, &tablet];
     wait_for("the desktop is healthy", &all, 30, || healthy(&desktop));
+    std::fs::write(
+        laptop_memory.join("after.md"),
+        "new on the laptop after the removal\n",
+    )
+    .unwrap();
     wait_for(
-        "the desktop takes what the laptop carried",
+        "the laptop's new file reaches the desktop",
         &all,
         180,
-        || {
-            let edit = read(&desktop_memory.join("second.md"));
-            let late = read(&desktop_memory.join("late.md"));
-            (edit.as_deref() == Some(LATE_EDIT) && late.as_deref() == Some(LATE_FILE)).then_some(())
-        },
+        || desktop_memory.join("after.md").exists().then_some(()),
     );
-    let copies = conflict_files(&desktop_memory);
-    assert_eq!(copies.len(), 1, "{copies:?}");
-    assert!(copies[0].starts_with("second.conflict-"), "{copies:?}");
-    assert_eq!(
-        read(&desktop_memory.join(&copies[0])).as_deref(),
-        Some(AS_THE_DESKTOP_WROTE_IT)
-    );
-    // The copy is a file like any other, and reaches the laptop: the two
-    // folders hold the same files, and one more than before but for it.
     wait_for("the two folders hold the same files", &all, 150, || {
         (files(&desktop_memory) == files(&laptop_memory)).then_some(())
     });
-    assert_eq!(files(&desktop_memory).len(), before.len() + 2);
+    for memory in [&desktop_memory, &laptop_memory] {
+        assert!(!memory.join("late.md").exists());
+        assert_eq!(
+            read(&memory.join("second.md")).as_deref(),
+            Some(AS_THE_DESKTOP_WROTE_IT)
+        );
+        assert!(conflict_files(memory).is_empty());
+    }
+    assert_eq!(files(&desktop_memory).len(), before.len() + 1);
 }
 
 /// After a change, the command says that this machine may be closed only
@@ -1582,26 +1615,38 @@ fn edits_arrive_as_fast_while_one_of_two_relays_is_down() {
 ///
 /// The device reached no relay, and reaches one again: it wakes, and
 /// takes nothing until every relay has answered or WAKE_WAIT_SECS have
-/// gone by. The second relay never answers, so the wait is the whole of
-/// it, and that is the rule's cost. **What it must not add is a pass:**
-/// once the wait is over a whole pass is made at once, and the edit
-/// arrives within a few seconds of the wait. Without that, nothing
-/// pulled until the next whole pass on the node's timer, up to ten
-/// seconds later: 31.4 to 39.4 s after the connection was made again,
-/// where with it 30.8 to 32.0 s.
+/// gone by, **but for a relay whose dial has failed since the wake
+/// began** (decision 2026-10-24 (removal), section 8). The wake has the
+/// second relay dialled at once; that dial times out
+/// (STREAM_TIMEOUT_SECS: a stopped relay gives no answer), the wake is
+/// over, and a whole pass is made at once. So the edit arrives within a
+/// few seconds of that timeout, well within the wait. **Where a dial of
+/// the second relay is in flight as the device wakes,** begun before the
+/// wake, that dial says nothing of the wake: the device waits for it to
+/// time out, and for the wake's own dial after it. Before the wake read a
+/// failed dial, it was 30.8 to 32.1 s after the connection was made again
+/// (with #263's pass at the wait's end), and 31.4 to 39.4 s before that;
+/// with it, some 12 s, and some 21 to 22 s in a round that finds a dial in
+/// flight (often the first, when the relay has only just stopped and is
+/// dialled every few seconds).
 #[test]
 fn a_device_closed_by_warm_churn_takes_what_waits_as_soon_as_its_wake_is_over() {
-    use cordelia_core::protocol::WAKE_WAIT_SECS;
+    use cordelia_core::protocol::{STREAM_TIMEOUT_SECS, WAKE_WAIT_SECS};
     use std::time::Duration;
-    // A pass of the send timer to begin the wake (2 s), the wait, and
-    // then the pull, the cycle and the write.
-    let most = Duration::from_secs(WAKE_WAIT_SECS + 5);
+    // A pass of the send timer to begin the wake (2 s), a tick of the
+    // dial loop (1 s), what is left of a dial in flight from before the
+    // wake, the wake's own dial's timeout, and then the pull, the cycle
+    // and the write. Under the wait: a wake that waited for it would take
+    // 30 s and more.
+    let most = Duration::from_secs(2 * STREAM_TIMEOUT_SECS + 8);
+    assert!(most < Duration::from_secs(WAKE_WAIT_SECS));
     for (round, after) in closed_by_warm_churn(true).iter().enumerate() {
         assert!(
             *after <= most,
             "round {round}: the edit arrived {after:?} after the connection was made again, \
-             above the wake's {WAKE_WAIT_SECS} s and the {:?} after it",
-            most - Duration::from_secs(WAKE_WAIT_SECS),
+             above two dials of {STREAM_TIMEOUT_SECS} s and the {:?} after them: the wake \
+             waited for a relay whose dial had failed",
+            most - Duration::from_secs(2 * STREAM_TIMEOUT_SECS),
         );
     }
 }

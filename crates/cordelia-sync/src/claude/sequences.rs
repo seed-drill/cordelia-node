@@ -89,6 +89,7 @@ use cordelia_storage::person as held_rows;
 
 use super::*;
 use crate::memory_md::INDEX_FILE;
+use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
 
 /// The name that every folder of a sequence syncs.
 const NAME: &str = "x";
@@ -247,6 +248,13 @@ enum Step {
     /// A minute of looks on the device: thirteen cycles, five seconds
     /// apart by its clock.
     Minute(usize),
+    /// A change made apart (decision 2026-10-24 (removal), unit test 17):
+    /// the first device removes the third, and the second, which has not
+    /// heard, renews; neither change was made after the other. Every
+    /// device is then shown both, the removal first where the flag says
+    /// so: each that remains comes to follow the removal, by a move where
+    /// it applied the renewal first, and the third stops.
+    Apart(usize, usize, usize, bool),
 }
 
 impl Step {
@@ -270,7 +278,8 @@ impl Step {
             | Step::MergeCopy(d)
             | Step::Listed(d, _)
             | Step::Unlist(d, _)
-            | Step::Minute(d) => *d,
+            | Step::Minute(d)
+            | Step::Apart(d, _, _, _) => *d,
         }
     }
 }
@@ -394,6 +403,14 @@ struct World {
     /// Each tie that a publish made: the file, and whether the version
     /// published later won it.
     ties: BTreeSet<(String, bool)>,
+    /// The device that a change made apart removed, where one did
+    /// ([`Step::Apart`]).
+    apart_removed: Option<usize>,
+    /// For each device that has come to know of that removal, every entry
+    /// it had signed by then, in any store, by what each is named by: what
+    /// it seals after is held to the check of unit test 17
+    /// ([`World::sealed_where_the_removed_reads`]).
+    knew: BTreeMap<usize, BTreeSet<[u8; 32]>>,
     _tmp: tempfile::TempDir,
 }
 
@@ -552,7 +569,7 @@ impl World {
             .collect();
         let change = {
             let db = devices[0].st.db.lock().unwrap();
-            let kept = held_rows::change_entry(&db, held_rows::Kept::Latest);
+            let kept = held_rows::followed_entry(&db);
             kept.unwrap().unwrap().check().unwrap()
         };
         Self {
@@ -573,6 +590,8 @@ impl World {
             deleted: BTreeSet::new(),
             put_back: 0,
             ties: BTreeSet::new(),
+            apart_removed: None,
+            knew: BTreeMap::new(),
             _tmp: tmp,
         }
     }
@@ -816,6 +835,9 @@ impl World {
                 self.change(*by, None);
             }
             Step::Hear(d) => self.hear(*d),
+            Step::Apart(by, other, who, removal_first) => {
+                self.apart(*by, *other, *who, *removal_first);
+            }
             Step::DropCopy(d) => {
                 if let Some(copy) = self.first_copy(*d) {
                     self.put(*d, &copy, None);
@@ -886,7 +908,7 @@ impl World {
         let st = &self.devices[d].st;
         let kept = {
             let db = st.db.lock().unwrap();
-            let kept = held_rows::change_entry(&db, held_rows::Kept::Latest);
+            let kept = held_rows::followed_entry(&db);
             kept.unwrap().unwrap().id()
         };
         if kept == self.change.id() {
@@ -898,7 +920,15 @@ impl World {
             .unwrap();
         match taken {
             take::Taken::Shown(person::Shown::Applied(applied)) => {
-                let all = applied.no_version.is_empty() && applied.not_carried.is_empty();
+                // A device that hears late may have taken another device's
+                // index in the removal's window, and sets it aside: the
+                // index rule's cost (decision 2026-10-24 (removal), rule
+                // 7). Every other file is carried.
+                let all = applied.no_version.is_empty()
+                    && applied
+                        .not_carried
+                        .iter()
+                        .all(|(_, file)| file == INDEX_FILE);
                 assert!(all, "device {d}: {applied:?}");
                 self.carried_by(d);
             }
@@ -916,6 +946,12 @@ impl World {
     /// change was made: none is made on a device that has stopped, and no
     /// device is removed twice, or by itself.
     fn change(&mut self, by: usize, gone: Option<usize>) -> bool {
+        // A change is made more than ten minutes after every step before
+        // it, by every device's clock (decision 2026-10-24 (removal), rule
+        // 2): what a device took before it is carried, and what a removed
+        // device writes after it is cut where a device that took it carries
+        // it (rule 7).
+        self.now += REMOVAL_TAKEN_MARGIN_SECS as i64 + 1;
         self.hear(by);
         let cannot = |who: usize| who == by || self.removed.contains_key(&who);
         if self.stopped(by) || gone.is_some_and(cannot) {
@@ -926,7 +962,7 @@ impl World {
         let (entry, over) = {
             let db = st.db.lock().unwrap();
             let held = person::held(&db).unwrap().unwrap();
-            let latest = held_rows::change_entry(&db, held_rows::Kept::Latest);
+            let latest = held_rows::followed_entry(&db);
             let latest = latest.unwrap().unwrap().check().unwrap();
             let stay = person::who_counts(&db)
                 .unwrap()
@@ -937,13 +973,20 @@ impl World {
                 .collect();
             let removed: Vec<[u8; 32]> = gone_key.into_iter().collect();
             let own = st.identity.public_key();
-            let entry =
-                change::make_change(&self.phrase, &held.statement, &latest, &own, stay, &removed);
+            let entry = change::make_change_at(
+                &self.phrase,
+                &held.statement,
+                &latest,
+                &own,
+                stay,
+                &removed,
+                self.now as u64,
+            );
             (entry.unwrap(), latest.id())
         };
         let now = self.now;
         let applied = st
-            .as_a_change(|db| person::apply_made(db, &st.identity, &entry, &over, None, now))
+            .as_a_change(|db| person::apply_made(db, &st.identity, &entry, &over, &[], now))
             .unwrap();
         let all = applied.no_version.is_empty() && applied.not_carried.is_empty();
         assert!(all, "device {by}: {applied:?}");
@@ -953,6 +996,188 @@ impl World {
         self.change = entry;
         self.carried_by(by);
         true
+    }
+
+    /// A change made apart ([`Step::Apart`]): `by` removes `who` while
+    /// `other`, which has not heard, renews, both from the latest change;
+    /// then every device is shown both, the removal first where
+    /// `removal_first` says so. Nothing is done where the three are not
+    /// three devices that are still the person's.
+    fn apart(&mut self, by: usize, other: usize, who: usize, removal_first: bool) {
+        let three = by != other && by != who && other != who;
+        if !three
+            || [by, other, who]
+                .iter()
+                .any(|d| self.removed.contains_key(d))
+        {
+            return;
+        }
+        self.hear(by);
+        self.hear(other);
+        self.hear(who);
+        if [by, other, who].iter().any(|d| self.stopped(*d)) {
+            return;
+        }
+        self.now += REMOVAL_TAKEN_MARGIN_SECS as i64 + 1;
+        let renewal = self.made_on(other, None);
+        self.knows(by);
+        let removal = self.made_on(by, Some(who));
+        let number = self.number(by);
+        self.removed.insert(who, number);
+        self.apart_removed = Some(who);
+        self.change = removal.clone();
+        for d in 0..self.devices.len() {
+            let order: Vec<&CheckedEntry> = match (d == by, d == other, removal_first) {
+                (true, _, _) => vec![&renewal],
+                (_, true, _) => vec![&removal],
+                (_, _, true) => vec![&removal, &renewal],
+                (_, _, false) => vec![&renewal, &removal],
+            };
+            for entry in order {
+                self.shown(d, entry, who);
+                if d != who && entry.id() == removal.id() {
+                    self.knows(d);
+                }
+            }
+        }
+    }
+
+    /// The device makes a change with the phrase from the change it
+    /// follows, by the world's clock, removing `gone` or nobody, and
+    /// applies it: as [`World::change`] does, with nothing shown to it
+    /// first. Returns the change entry.
+    fn made_on(&mut self, by: usize, gone: Option<usize>) -> CheckedEntry {
+        let st = &self.devices[by].st;
+        let gone_key = gone.map(|who| self.key(who));
+        let (entry, over) = {
+            let db = st.db.lock().unwrap();
+            let held = person::held(&db).unwrap().unwrap();
+            let latest = held_rows::followed_entry(&db);
+            let latest = latest.unwrap().unwrap().check().unwrap();
+            let stay = person::who_counts(&db)
+                .unwrap()
+                .keys()
+                .into_iter()
+                .filter(|key| Some(*key) != gone_key)
+                .map(|key| cordelia_crypto::statement::Device::new(key, "device").unwrap())
+                .collect();
+            let removed: Vec<[u8; 32]> = gone_key.into_iter().collect();
+            let own = st.identity.public_key();
+            let entry = change::make_change_at(
+                &self.phrase,
+                &held.statement,
+                &latest,
+                &own,
+                stay,
+                &removed,
+                self.now as u64,
+            );
+            (entry.unwrap(), latest.id())
+        };
+        let now = self.now;
+        st.as_a_change(|db| person::apply_made(db, &st.identity, &entry, &over, &[], now))
+            .unwrap();
+        self.carried_by(by);
+        entry
+    }
+
+    /// The device is shown `entry`, a change of a change made apart, and
+    /// does what rule 8 has it do (decision 2026-10-24 (removal)): it
+    /// applies it, moves to it, sets it aside, or, where it removes `who`,
+    /// stops.
+    fn shown(&mut self, d: usize, entry: &CheckedEntry, who: usize) {
+        let st = &self.devices[d].st;
+        let now = self.now;
+        let taken = st
+            .as_a_change(|db| take::take(db, &st.identity, entry, now))
+            .unwrap();
+        use person::Shown;
+        match taken {
+            take::Taken::Shown(Shown::Applied(_) | Shown::Moved(_)) => self.carried_by(d),
+            take::Taken::Shown(Shown::Removed) => assert_eq!(d, who, "device {d} stopped"),
+            take::Taken::Shown(Shown::SetAside | Shown::Behind | Shown::Held) => {}
+            take::Taken::Shown(Shown::Refused(person::Refused::Stopped)) => assert_eq!(d, who),
+            other => panic!("device {d} was shown a change made apart: {other:?}"),
+        }
+    }
+
+    /// The device knows of the removal of a change made apart from now:
+    /// every entry it has signed, in any store, is noted, once.
+    fn knows(&mut self, d: usize) {
+        if self.knew.contains_key(&d) {
+            return;
+        }
+        let ids = self.signed_by(d);
+        self.knew.insert(d, ids);
+    }
+
+    /// Every entry that device `d` signed, in the store of any device, by
+    /// what it is named by.
+    fn signed_by(&self, d: usize) -> BTreeSet<[u8; 32]> {
+        let key = self.key(d);
+        let mut ids = BTreeSet::new();
+        for device in &self.devices {
+            let db = device.st.db.lock().unwrap();
+            let channels: Vec<[u8; 32]> = db
+                .prepare("SELECT DISTINCT channel_id FROM entries")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for channel in channels {
+                for held in stored::channel_entries_after(&db, &channel, 0, 100_000).unwrap() {
+                    if held.entry.author == key {
+                        ids.insert(held.entry.id());
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// The check of unit test 17 (decision 2026-10-24 (removal)): no entry
+    /// that a device sealed after it knew of the removal of a change made
+    /// apart, in the store of any device, is of a channel that a secret the
+    /// removed device holds gives (its personal channel, its messages
+    /// channel or the name's). Each such entry, said.
+    fn sealed_where_the_removed_reads(&self) -> Vec<String> {
+        let Some(who) = self.apart_removed else {
+            return Vec::new();
+        };
+        let mut channels: BTreeSet<[u8; 32]> = BTreeSet::new();
+        {
+            let db = self.devices[who].st.db.lock().unwrap();
+            for held in held_rows::secrets(&db).unwrap() {
+                let secret = held.secret;
+                for derived in [
+                    derive::personal_secret(&secret).unwrap(),
+                    derive::messages_secret(&secret).unwrap(),
+                    derive::own_secret(&secret, NAME).unwrap(),
+                ] {
+                    channels.insert(derive::channel_id(&derived).unwrap());
+                }
+            }
+        }
+        let mut sealed = Vec::new();
+        for (d, knew) in &self.knew {
+            let key = self.key(*d);
+            for (e, device) in self.devices.iter().enumerate() {
+                let db = device.st.db.lock().unwrap();
+                for channel in &channels {
+                    for held in stored::channel_entries_after(&db, channel, 0, 100_000).unwrap() {
+                        let id = held.entry.id();
+                        if held.entry.author == key && !knew.contains(&id) {
+                            sealed.push(format!(
+                                "device {d} sealed {} after it knew, held by device {e}",
+                                hex::encode(&id[..4])
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        sealed
     }
 
     /// The device has just applied a change: what it holds of the name's
@@ -1034,6 +1259,29 @@ impl World {
             before_hold: &|| {},
         };
         device.st.sync_control.set_now(Some(self.now));
+        // What a carry left out of the folder is let go of by the cycle
+        // that puts the file back (decision 2026-10-24 (removal), rule 7):
+        // it is in local history alone.
+        let set_aside: Vec<String> = {
+            let db = device.st.db.lock().unwrap();
+            let folder = device.mem.display().to_string();
+            sync_state::put_back(&db, &folder, &channel)
+                .unwrap()
+                .into_iter()
+                .collect()
+        };
+        // A conflict copy that a carry left out is let go of by its root,
+        // as every copy is looked for.
+        for file in set_aside {
+            if let Some(text) = self.read(d, &file) {
+                let root = root_of(&file);
+                if root == INDEX_FILE {
+                    self.let_go_lines.extend(text.lines().map(String::from));
+                }
+                self.let_go.insert((root, text));
+            }
+        }
+        let device = &self.devices[d];
         let (records, counted) = self.line_records(d);
         let generation = device.st.sync_control.generation();
         let report = sync_folder_with(
@@ -1136,10 +1384,11 @@ impl World {
         }
         let own = self.key(d);
         let (slots, counting) = (self.slots(d), self.counting(d));
-        let agreed = {
+        let (agreed, put_back) = {
             let db = device.st.db.lock().unwrap();
             let folder = device.mem.display().to_string();
-            sync_state::load(&db, &folder, channel).unwrap()
+            let agreed = sync_state::load(&db, &folder, channel).unwrap();
+            (agreed, sync_state::put_back(&db, &folder, channel).unwrap())
         };
         let carried = |version: &Version| -> usize {
             let entries = version.entries.iter();
@@ -1152,6 +1401,12 @@ impl World {
                 continue;
             };
             let file = &version.name;
+            // A file that the carry left out goes back by a rule of its own
+            // (decision 2026-10-24 (removal), rule 7), and meets none of
+            // the five.
+            if put_back.contains(file) {
+                continue;
+            }
             let (Some(a), Some(held)) = (agreed.get(file), device.carried.get(file)) else {
                 continue;
             };
@@ -1906,6 +2161,67 @@ fn written() -> Vec<(&'static str, usize, Vec<Step>)> {
     ]
 }
 
+/// The written sequences with a change made apart ([`Step::Apart`], unit
+/// test 17): device 0 removes device 2 while device 1 renews, with three
+/// devices and with four, the two shown in either order. Each edits before
+/// and after, and the removed device writes late, before and after it is
+/// shown the removal.
+fn written_apart() -> Vec<(String, usize, Vec<Step>)> {
+    let mut all = Vec::new();
+    for n in [3, 4] {
+        for removal_first in [true, false] {
+            let mut steps = vec![Edit(0, "a.md"), Edit(1, "b"), Line(0), Cycle(0), Cycle(1)];
+            steps.extend(sync(n));
+            steps.extend([Edit(2, "a.md"), Cycle(2)]);
+            steps.push(Apart(0, 1, 2, removal_first));
+            steps.extend([Edit(2, "b"), Cycle(2)]);
+            steps.extend([Edit(0, "a.md"), Edit(1, "b"), Line(1), Cycle(0), Cycle(1)]);
+            steps.extend([Pass(0, 1), Pass(1, 0), Cycle(0), Cycle(1)]);
+            if n == 4 {
+                steps.extend([Edit(3, "a.md"), Cycle(3), Pass(3, 0), Cycle(0)]);
+            }
+            let order = if removal_first {
+                "removal first"
+            } else {
+                "renewal first"
+            };
+            all.push((
+                format!("a change made apart, {n} devices, {order}"),
+                n,
+                steps,
+            ));
+        }
+    }
+    all
+}
+
+/// Unit test 17 (decision 2026-10-24 (removal)): through a change made
+/// apart, shown in either order, no entry that a device sealed after it
+/// knew of the removal opens with a secret that the removed device holds;
+/// each device that remains comes to follow the removal; and, when every
+/// device has met, no text is lost that nobody let go of.
+#[test]
+fn a_change_made_apart_seals_nothing_where_the_removed_device_reads() {
+    for (name, n, steps) in written_apart() {
+        let mut world = World::new(&vec![Built; n], 1);
+        for step in &steps {
+            world.run(step);
+            let sealed = world.sealed_where_the_removed_reads();
+            assert!(sealed.is_empty(), "{name}, after {step:?}: {sealed:?}");
+        }
+        let removal = world.change.id();
+        world.rest();
+        assert!(world.sealed_where_the_removed_reads().is_empty(), "{name}");
+        for d in world.remaining() {
+            let db = world.devices[d].st.db.lock().unwrap();
+            let followed = held_rows::followed_entry(&db).unwrap().unwrap();
+            assert_eq!(followed.id(), removal, "{name}: device {d}");
+        }
+        assert!(world.stopped(2), "{name}");
+        assert_eq!(world.lost(), Vec::<String>::new(), "{name}");
+    }
+}
+
 /// The names of the written sequences through a change that a test asks
 /// more of.
 const NOTHING_TO_DO: &str = "a change with nothing to do";
@@ -2376,10 +2692,11 @@ fn a_removal_can_cost_a_copy_that_was_not_needed() {
 /// What a removed device writes once the others have applied its removal
 /// reaches none of them: each refuses it, and their files stay as they
 /// are. A device that has not heard of the removal still takes it, as it
-/// takes any device's. When that device hears, it carries the version as
-/// its own, with the removed device's key first in its chain: every
-/// device that had not taken that version keeps what its file held
-/// beside it.
+/// takes any device's. When that device hears, it carries none of it
+/// (decision 2026-10-24 (removal), rule 7): the version arrived after the
+/// removal's cut time, so its file goes back to the version before, with
+/// what it held in local history alone, and no device keeps the removed
+/// device's text, beside a file or in a channel.
 #[test]
 fn what_a_removed_device_writes_later_reaches_only_a_device_that_has_not_heard() {
     let mut steps = vec![Edit(0, "a.md"), Cycle(0)];
@@ -2400,19 +2717,25 @@ fn what_a_removed_device_writes_later_reaches_only_a_device_that_has_not_heard()
     assert_eq!(world.first_copy(1), None);
     assert_eq!(world.first_copy(2), None);
 
-    // Device 2 hears, and carries the version: device 1 takes it, with
-    // its own text kept beside the file.
-    let was = file(1);
+    // Device 2 hears, and carries the version as it was before the late
+    // write: its file goes back, and device 1 takes nothing new.
+    let (was, theirs) = (file(1), file(0));
     for step in [Hear(2), Cycle(2), Pass(2, 1), Cycle(1)] {
         world.run(&step);
     }
-    let theirs = world.read(0, "a.md").unwrap();
-    assert_eq!(world.read(1, "a.md").unwrap(), theirs);
-    let copies = world.has(1).copies;
-    assert!(copies.contains(&("a.md".to_string(), was)), "{copies:?}");
-    let version = world.slot(2, "a.md").unwrap().current.unwrap();
-    let chain = version.entries[0].chain.clone().unwrap();
-    assert_eq!(chain[0], Link::of(&Value::Text(theirs), world.key(0)));
+    assert_eq!(world.read(2, "a.md").unwrap(), was);
+    assert_eq!(world.read(1, "a.md").unwrap(), was);
+    assert_eq!(world.first_copy(1), None);
+    assert_eq!(world.first_copy(2), None);
+    for d in [1, 2] {
+        let held = world.held(d);
+        let secret = derive::own_secret(&world.secret(d), NAME).unwrap();
+        let channel = derive::channel_id(&secret).unwrap();
+        for entry in held.iter().filter(|entry| entry.channel == channel) {
+            let inside = entry.open(&secret).unwrap();
+            assert_ne!(inside.value, Value::Text(theirs.clone()), "device {d}");
+        }
+    }
     world.rest();
     assert_eq!(world.lost(), Vec::<String>::new());
 }

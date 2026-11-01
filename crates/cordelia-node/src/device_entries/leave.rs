@@ -5,21 +5,38 @@
 //! build keeps it as a rule of time, and calls it leave:
 //!
 //! - **A device has leave on a connection for SHOW_LEAVE_SECS from an
-//!   answer there which says that the relay holds no later change than the
-//!   one the device keeps**: that it holds the entry shown; that it took
-//!   it; or that it would have taken it and did not, for room or for the
-//!   address's allowance. No other answer gives leave: not another entry,
-//!   or word of one; not "show it whole"; not a stream that is reset or
-//!   that times out.
-//! - **A device in a fork has no leave anywhere, nor has one that has
-//!   stopped,** nor one that follows no phrase: it has nothing to show.
+//!   answer there to the show of the change it follows which says that the
+//!   relay holds no later change than that one**: that it holds the entry
+//!   shown; that it took it; or that it would have taken it and did not,
+//!   for room or for the address's allowance. No other answer gives leave:
+//!   not another entry, or word of one; not "show it whole"; not a stream
+//!   that is reset or that times out. **The show of a head set aside
+//!   neither gives leave nor takes it away** (decision 2026-10-24
+//!   (removal), rule 18). **And a relay that does not name the role
+//!   RELAY_ROLE_HEADS, and hands one head that the device keeps twice in a
+//!   round, gives leave** ([`Leave::grant`]): a relay of the version
+//!   before does that, and holds that head alone.
+//! - **A closed device has no leave anywhere, nor has one that has
+//!   stopped,** nor one that follows no phrase: it has nothing to show. A
+//!   closed device sends the delete it wrote over a hand-over, through a
+//!   door of its own, and nothing else ([`Leave::withdraw`]).
 //! - **Leave ends at once, at every relay, when the entry that the device
 //!   keeps changes.** It is given for the entry that was shown, and what
 //!   the device keeps is read from its database each time leave is asked.
 //! - **A device that wakes asks every relay first.** When the node starts,
 //!   or reaches a relay after having reached none, there is no leave
-//!   anywhere until each relay it is set up with has answered a show, or
-//!   WAKE_WAIT_SECS have gone by.
+//!   anywhere until each relay it is set up with has answered a show and
+//!   its answer is judged ([`Leave::heard`], decision 2026-10-24 (removal),
+//!   rule 5), or WAKE_WAIT_SECS have gone by. **A relay whose dial has
+//!   failed since the wake began is waited for no more,** once another
+//!   has answered ([`Reach::dial_failed_since`], section 8 of that
+//!   record): a dial begun since the wake that timed out, for every
+//!   relay of its name. One that may still answer is waited for, up to
+//!   the wait: one refused, or answered by another key, among them.
+//! - **A push open at the commit after which the device may use the
+//!   connection no more, and not yet answered, is reset** (rule 5): the
+//!   commit that closes it, or has it apply a change. The node's database
+//!   counts its commits ([`Leave::watch_commits`]).
 //! - **A device that was answered with a change and could not apply it**
 //!   has no leave anywhere until it has: whatever becomes of the
 //!   connection that the change came on.
@@ -112,8 +129,8 @@ use cordelia_core::load::DeviceCounts;
 use cordelia_core::lock::{LockWhole, TimedLock};
 use cordelia_core::protocol::{
     BAN_THRESHOLD, BAN_WINDOW_SECS, ENTRY_PAGE_MAX_ENTRIES, ERR_RATE_LIMIT, FRAME_LENGTH_BYTES,
-    OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SHOW_LEAVE_SECS,
-    WAKE_WAIT_SECS,
+    OWN_ENTRY_REQUESTS_PER_MINUTE, RELAY_ENTRY_PULL_PAGES, RELAY_ROLE_HEADS, SESSION_VALUE_BYTES,
+    SHOW_LEAVE_SECS, WAKE_WAIT_SECS,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_crypto::{derive, proof};
@@ -127,6 +144,8 @@ use cordelia_storage::acts::TypedKey;
 use cordelia_storage::person::State;
 use cordelia_storage::relay::NO_MARK;
 use rusqlite::Connection;
+
+use super::reach::Reach;
 
 /// How long a leave lasts.
 const LEAVE: Duration = Duration::from_secs(SHOW_LEAVE_SECS);
@@ -239,6 +258,10 @@ pub struct Link {
     /// The value of the connection's TLS session, where it gives one.
     session: Option<[u8; SESSION_VALUE_BYTES]>,
     id: LinkId,
+    /// Whether the relay named the role RELAY_ROLE_HEADS in its handshake
+    /// (decision 2026-10-24 (removal), rule 18): it keeps every head, and
+    /// hands each before it says that it holds the entry shown.
+    heads: bool,
 }
 
 impl Link {
@@ -262,7 +285,25 @@ impl Link {
             conn,
             session,
             id,
+            heads: false,
         }
+    }
+
+    /// The same connection, to a relay that said `roles` in its handshake:
+    /// whether it names the role RELAY_ROLE_HEADS is kept (decision
+    /// 2026-10-24 (removal), rule 18). A connection made with
+    /// [`Self::new`] alone is to a relay that names none.
+    pub fn naming(mut self, roles: &[String]) -> Self {
+        self.heads = roles.iter().any(|role| role == RELAY_ROLE_HEADS);
+        self
+    }
+
+    /// Whether the relay named the role RELAY_ROLE_HEADS in its handshake:
+    /// a relay of decision 2026-10-24 (removal), which keeps every head. A
+    /// device shows such a relay every head it keeps, and takes no leave
+    /// from a head that it hands twice in a round (rule 18).
+    pub fn keeps_heads(&self) -> bool {
+        self.heads
     }
 
     /// What the device's configuration calls the relay.
@@ -292,6 +333,22 @@ impl Link {
     pub fn is_open(&self) -> bool {
         self.conn.close_reason().is_none()
     }
+
+    /// A show on this connection failed: it was not answered, or not as a
+    /// show is. At a relay that names the role RELAY_ROLE_HEADS the
+    /// connection is dropped, and the node makes another (the review of
+    /// the whole build, its H2). The relay remembers, for a connection,
+    /// each head it handed there, and hands none of them again on it: an
+    /// answer that handed a removal and was lost on the way, after the
+    /// relay wrote it, would leave the device to be told "held" at its next
+    /// show there, and to have leave without the removal. A new connection
+    /// is handed every head again. At a relay that does not name the role,
+    /// nothing is remembered of what it handed, and the connection stays.
+    pub fn drop_after_a_failed_show(&self) {
+        if self.heads {
+            self.conn.close(0u32.into(), b"a show failed");
+        }
+    }
 }
 
 impl std::fmt::Debug for Link {
@@ -312,6 +369,9 @@ pub enum NoLeave {
     NoPhrase,
     /// The device has stopped, or is in a fork.
     Stopped(State),
+    /// The device is closed: the change it follows is not clear
+    /// (decision 2026-10-24 (removal), rules 5 and 10).
+    Closed,
     /// The device was answered with a change that it could not apply.
     NotApplied,
     /// No answer on this connection gives leave now: none was had, or the
@@ -497,8 +557,11 @@ impl Inner {
             .check_and_record()
     }
 
-    /// Whether the node is still waking at `now`.
-    fn is_waking(&mut self, now: Instant) -> bool {
+    /// Whether the node is still waking at `now`. `reach` says which
+    /// relays a dial has failed for since the wake began: once one relay
+    /// has answered, those are waited for no more (decision 2026-10-24
+    /// (removal), section 8).
+    fn is_waking(&mut self, now: Instant, reach: Option<&Reach>) -> bool {
         let Some(woke) = &mut self.woke else {
             // It reaches no relay: there is nothing to have leave on.
             return true;
@@ -508,7 +571,14 @@ impl Inner {
                 .set_up_with
                 .iter()
                 .all(|relay| woke.heard.contains(relay));
-            woke.awake = all_heard || now.saturating_duration_since(woke.at) >= WAKE_WAIT;
+            let all_answered_or_failed = !woke.heard.is_empty()
+                && self.set_up_with.iter().all(|relay| {
+                    woke.heard.contains(relay)
+                        || reach.is_some_and(|reach| reach.dial_failed_since(relay, woke.at))
+                });
+            woke.awake = all_heard
+                || all_answered_or_failed
+                || now.saturating_duration_since(woke.at) >= WAKE_WAIT;
         }
         !woke.awake
     }
@@ -520,10 +590,20 @@ impl Inner {
 pub struct Leave {
     clock: Clock,
     inner: Mutex<Inner>,
+    /// How many transactions the node's database has committed, as its
+    /// commit hook counts them ([`Self::watch_commits`]): a push that is
+    /// open watches it, and is reset at the commit after which the device
+    /// may use the connection no more (decision 2026-10-24 (removal), rule
+    /// 5).
+    commits: tokio::sync::watch::Sender<u64>,
     /// What the device asked of each relay, held back and was refused for
     /// now: counted, and read by nothing here (decision 2026-10-22 §1.2,
     /// §7.3).
     counts: Arc<DeviceCounts>,
+    /// What is known of each relay's dials ([`Self::reading_dials_in`]):
+    /// a wake waits no more for a relay whose dial has failed since it
+    /// began. `None`: every relay is waited for, up to the wait.
+    reach: Option<Arc<Reach>>,
 }
 
 impl Leave {
@@ -533,8 +613,41 @@ impl Leave {
         Self {
             clock,
             inner: Mutex::default(),
+            commits: tokio::sync::watch::Sender::new(0),
             counts: Arc::default(),
+            reach: None,
         }
+    }
+
+    /// The same leave, reading in `reach` which relays a dial has failed
+    /// for since the node woke: those a wake waits for no more, once
+    /// another relay has answered (decision 2026-10-24 (removal), section
+    /// 8). It tells `reach` when the node wakes, so that the dial loop
+    /// dials each relay that it does not reach at once.
+    pub fn reading_dials_in(mut self, reach: Arc<Reach>) -> Self {
+        self.reach = Some(reach);
+        self
+    }
+
+    /// Whether the node is still waking at `now`, under `inner`.
+    fn waking(&self, inner: &mut Inner, now: Instant) -> bool {
+        inner.is_waking(now, self.reach.as_deref())
+    }
+
+    /// Count each transaction that `conn` commits, so that a push open at
+    /// the commit that closes the device, or has it apply a change, is
+    /// reset (decision 2026-10-24 (removal), rule 5): `conn` is the node's
+    /// database, which every such commit is made on. The count moves as
+    /// the commit is made, under the database's lock: whoever then reads
+    /// where the device stands waits for that lock, and reads what was
+    /// committed. A connection has one commit hook: the node's one leave
+    /// watches its database.
+    pub fn watch_commits(&self, conn: &Connection) {
+        let commits = self.commits.clone();
+        conn.commit_hook(Some(move || {
+            commits.send_modify(|count| *count = count.wrapping_add(1));
+            false
+        }));
     }
 
     /// The same leave, counting what the device asks in `counts`: the
@@ -617,26 +730,38 @@ impl Leave {
                 inner.unwoken_since = Some(wall);
             }
         } else if inner.woke.is_none() {
-            inner.woke = Some(Woke {
-                at: now,
-                wall,
-                heard: HashSet::new(),
-                awake: false,
-            });
+            self.wakes(&mut inner, (now, wall));
         }
         slept
     }
 
+    /// The node wakes at `at` (by its clock, and by the time of day in
+    /// seconds): it reached a relay after having reached none, or its
+    /// machine slept. `reach`, where it is read, is told, so that the dial
+    /// loop dials each relay that it does not reach at once (decision
+    /// 2026-10-24 (removal), section 8).
+    fn wakes(&self, inner: &mut Inner, (at, wall): (Instant, i64)) {
+        inner.woke = Some(Woke {
+            at,
+            wall,
+            heard: HashSet::new(),
+            awake: false,
+        });
+        if let Some(reach) = &self.reach {
+            reach.woke();
+        }
+    }
+
     /// Whether the node is still waking.
     pub fn is_waking(&self) -> bool {
-        lock(&self.inner).is_waking(self.clock.now())
+        self.waking(&mut lock(&self.inner), self.clock.now())
     }
 
     /// When the wait of a node that is waking ends, by its clock: `None`
     /// where it is awake, or reaches no relay and so has no wait begun.
     pub fn wake_ends(&self) -> Option<Instant> {
         let mut inner = lock(&self.inner);
-        if !inner.is_waking(self.clock.now()) {
+        if !self.waking(&mut inner, self.clock.now()) {
             return None;
         }
         inner.woke.as_ref().map(|woke| woke.at + WAKE_WAIT)
@@ -686,18 +811,13 @@ impl Leave {
     pub fn has(&self, conn: &Connection, link: &Link) -> Result<(), NoLeave> {
         let now = self.clock.now();
         let mut inner = lock(&self.inner);
-        if inner.is_waking(now) {
+        if self.waking(&mut inner, now) {
             return Err(NoLeave::Waking);
         }
         if inner.not_applied {
             return Err(NoLeave::NotApplied);
         }
-        match at_relays::stands(conn) {
-            Ok(Stands::Applied) => {}
-            Ok(Stands::NoPhrase) => return Err(NoLeave::NoPhrase),
-            Ok(Stands::Stopped(state)) => return Err(NoLeave::Stopped(state)),
-            Err(_) => return Err(NoLeave::NotGiven),
-        }
+        stands_applied(conn)?;
         let Some(given) = inner.given.get(&link.id()) else {
             return Err(NoLeave::NotGiven);
         };
@@ -716,15 +836,22 @@ impl Leave {
     /// what it is named by. Returns what the relay answered, and how many
     /// bytes the show was.
     ///
-    /// No leave is asked: this is what gives it. An answer that says the
-    /// relay holds no later change than the entry gives leave on the
-    /// connection from now, for that entry. Any other answer ends what
-    /// leave there was. A stream that is not answered changes nothing.
+    /// No leave is asked: this is what gives it. `followed` says that the
+    /// entry is that of the change the device follows: **only its answer
+    /// gives leave, or ends it** (decision 2026-10-24 (removal), rule 18).
+    /// An answer that says the relay holds no later change than that entry
+    /// gives leave on the connection from now, for that entry. Any other
+    /// answer to it ends what leave there was. The show of a head set
+    /// aside does neither. A stream that is not answered changes nothing.
+    ///
+    /// **The relay is not heard here** while the device wakes: it is heard
+    /// once its answer is judged ([`Self::heard`]).
     pub async fn show(
         &self,
         link: &Link,
         entry: &CheckedEntry,
         short: bool,
+        followed: bool,
     ) -> Result<ShowAnswered, String> {
         let request = if short {
             WireMessage::EntryShowShort(EntryShowShort {
@@ -740,30 +867,63 @@ impl Leave {
             })
         };
         let bytes = codec::encode_message(&request).map_or(0, |bytes| bytes.len());
-        let answer = match self
-            .ask_counted(link, Protocol::EntryShow, &request)
-            .await?
-        {
-            WireMessage::EntryShown(shown) => shown.answer,
-            _ => return Err("a show was not answered as one".into()),
+        // A show that fails at a relay that keeps every head drops the
+        // connection ([`Link::drop_after_a_failed_show`]): it may have
+        // handed a head that was lost on the way. One refused for now
+        // does not: a relay refuses so (ERR_RATE_LIMIT) before it hands
+        // anything, and a drop would only cost the device its open
+        // streams and its proofs again, against the same rates (the
+        // review of the fixes of the whole build, its M3).
+        let answer = match self.ask_counted(link, Protocol::EntryShow, &request).await {
+            Ok(WireMessage::EntryShown(shown)) => shown.answer,
+            Ok(_) => {
+                link.drop_after_a_failed_show();
+                return Err("a show was not answered as one".into());
+            }
+            Err(failed) => {
+                if !failed.refused_for_now {
+                    link.drop_after_a_failed_show();
+                }
+                return Err(failed.why);
+            }
         };
-        let now = self.clock.now();
-        let mut inner = lock(&self.inner);
-        if let Some(woke) = &mut inner.woke {
-            woke.heard.insert(link.name.clone());
-        }
-        if gives_leave(&answer) {
-            inner.given.insert(
-                link.id(),
-                Given {
-                    at: now,
-                    entry: entry.id(),
-                },
-            );
-        } else {
-            inner.given.remove(&link.id());
+        if followed {
+            match gives_leave(&answer) {
+                true => self.grant(link, entry),
+                false => {
+                    lock(&self.inner).given.remove(&link.id());
+                }
+            }
         }
         Ok(ShowAnswered { answer, bytes })
+    }
+
+    /// Leave on `link` from now, for `entry`, the change entry of the
+    /// change the device follows: given by an answer to its show that says
+    /// the relay holds no later change ([`Self::show`]), or by a relay
+    /// that does not name the role RELAY_ROLE_HEADS and hands one head the
+    /// device keeps twice in a round (decision 2026-10-24 (removal), rule
+    /// 18).
+    pub fn grant(&self, link: &Link, entry: &CheckedEntry) {
+        let now = self.clock.now();
+        lock(&self.inner).given.insert(
+            link.id(),
+            Given {
+                at: now,
+                entry: entry.id(),
+            },
+        );
+    }
+
+    /// The relay called `name` answered a show, and its answer has been
+    /// judged: while the node wakes, it is heard from then (decision
+    /// 2026-10-24 (removal), rule 5). So a device that wakes goes on at no
+    /// relay while the answer of another, which may hold a removal, waits
+    /// to be judged.
+    pub fn heard(&self, name: &str) {
+        if let Some(woke) = &mut lock(&self.inner).woke {
+            woke.heard.insert(name.to_string());
+        }
     }
 
     /// Open a stream for a channel of the device's own on `link`, ask
@@ -832,6 +992,10 @@ impl Leave {
         let (mut send, mut recv) = open_stream(&link.conn)
             .await
             .map_err(Refused::NotAnswered)?;
+        // The commits are watched from before the check below: one made
+        // after it is seen.
+        let mut commits = self.commits.subscribe();
+        commits.mark_unchanged();
         // The stream is open, which may have taken the relay a while:
         // the request is written only where the device still keeps the
         // entry that it was built under.
@@ -843,14 +1007,32 @@ impl Leave {
         }
         // A request that the relay refused for now is said so, and
         // counted for the relay; any other failure is said as it was.
-        let answer = exchange(
-            send,
-            recv,
-            protocol,
-            request,
-            self.counts_as_sent(link, protocol, request),
-        )
-        .await
+        let sent = self.counts_as_sent(link, protocol, request);
+        let answer = match protocol {
+            // **A push open at the commit after which the device may use
+            // the connection no more, and not yet answered, is reset**
+            // (decision 2026-10-24 (removal), rule 5): the commit that
+            // closes it, or has it apply a change. Only what the relay
+            // already had whole can be stored.
+            Protocol::EntryPush => {
+                let exchanged = {
+                    let exchange = exchange(&mut send, &mut recv, protocol, request, sent);
+                    tokio::select! {
+                        answer = exchange => Ok(answer),
+                        refused = self.may_no_longer(db, under, &mut commits) => Err(refused),
+                    }
+                };
+                match exchanged {
+                    Ok(answer) => answer,
+                    Err(refused) => {
+                        let _ = send.reset(0u32.into());
+                        let _ = recv.stop(0u32.into());
+                        return Err(refused);
+                    }
+                }
+            }
+            _ => exchange(&mut send, &mut recv, protocol, request, sent).await,
+        }
         .map_err(|e| self.refused(link, &e))?;
         let answer = read(answer);
         let conn = lock(db);
@@ -895,7 +1077,11 @@ impl Leave {
     /// ([`AppState::as_a_change_where`], decision 2026-10-04 §4.2):
     /// where one is taken, it waits for a sync cycle that is running to
     /// stop, and counts as a change of settings. One that is refused
-    /// counts as none.
+    /// counts as none. **What it says of removals commits first**
+    /// ([`adding::know_what_is_handed`]): the keys its change removes, and
+    /// the close where the change followed is then not clear, so that a
+    /// move that waits for the cycle waits with the device closed
+    /// (decision 2026-10-24 (removal), rule 5).
     pub async fn pair(
         &self,
         state: &AppState,
@@ -968,6 +1154,15 @@ impl Leave {
                 .collect();
             for entry in &handed {
                 let now = unix();
+                // What the hand-over says of removals commits first, with
+                // the close it brings: a move waits for the cycle's turn
+                // below, and the device sends nothing meanwhile under a
+                // change it knows not to be clear (decision 2026-10-24
+                // (removal), rule 5).
+                let known = adding::know_what_is_handed(&lock(db), identity, typed, entry, now);
+                if let Err(e) = known {
+                    return Err(not(&format!("could not judge a hand-over: {e}")));
+                }
                 // It is a change of settings only where the hand-over was
                 // taken: a statement was applied, or the device's state
                 // changed. A device that is moved has left the phrase it
@@ -984,6 +1179,13 @@ impl Leave {
                     },
                     |(accepted, changed)| match accepted {
                         Ok(Some(Accepted::Moved(_))) => Came::Left,
+                        // A head set aside, a close, or a refusal that
+                        // kept a removed key, commits at once: a closed
+                        // device seals nothing from that commit (decision
+                        // 2026-10-24 (removal), rules 5 and 10).
+                        Ok(Some(Accepted::SetAside | Accepted::Closed | Accepted::Refused(_))) => {
+                            Came::Nothing
+                        }
                         _ if *changed => Came::Changed,
                         _ => Came::Nothing,
                     },
@@ -1117,6 +1319,104 @@ impl Leave {
         })
     }
 
+    /// Wait for the commit after which a request built under the change
+    /// entry named `under` may use a connection no more ([`Self::keeps`]),
+    /// as `commits` counts them: what it is refused with then. It never
+    /// ends where no such commit is made.
+    async fn may_no_longer(
+        &self,
+        db: &TimedLock<Connection>,
+        under: &[u8; 32],
+        commits: &mut tokio::sync::watch::Receiver<u64>,
+    ) -> Refused {
+        loop {
+            if commits.changed().await.is_err() {
+                return std::future::pending().await;
+            }
+            if let Err(refused) = self.keeps(&lock(db), under) {
+                return refused;
+            }
+        }
+    }
+
+    /// The one door of a closed device (decision 2026-10-24 (removal),
+    /// rules 4, 5 and 10): push on `link` the delete that it wrote over a
+    /// hand-over that a relay was sent, which withdraws the hand-over
+    /// there. A closed device has no leave anywhere, and sends nothing
+    /// else: no entry under the secret it follows, and no hand-over that
+    /// carries it.
+    ///
+    /// It does that and nothing else:
+    ///
+    /// - Under the database's lock, the device stands closed (closed, or
+    ///   stored so, as `fork`), and every entry of `request`, a push, is a
+    ///   delete that this device signed, in a pair channel in which it
+    ///   wrote over a hand-over ([`at_relays::withdrawals`]). Anything
+    ///   else is refused, and nothing is sent.
+    /// - It counts against what the device asks of a relay in a minute.
+    /// - `opened` is called under that lock as the stream is about to be
+    ///   opened, `read` with the answer, and `take` with what `read` made,
+    ///   under the lock again, where the device stands closed still: what
+    ///   a delete hands on is nothing, and a device that goes on sends
+    ///   what waits through the one way in.
+    pub async fn withdraw<R, T>(
+        &self,
+        state: &AppState,
+        link: &Link,
+        request: &WireMessage,
+        opened: impl FnOnce(&Connection),
+        read: impl FnOnce(WireMessage) -> R,
+        take: impl FnOnce(&Connection, R) -> T,
+    ) -> Result<T, Refused> {
+        let (db, identity) = (&state.db, &state.identity);
+        let WireMessage::EntryPush(push) = request else {
+            return Err(Refused::NotARequest);
+        };
+        let closed = |conn: &Connection| -> Result<(), Refused> {
+            match at_relays::stands(conn) {
+                Ok(Stands::Closed | Stands::Stopped(State::Fork)) => Ok(()),
+                Ok(Stands::Applied) => Err(Refused::NoLeave(NoLeave::NotGiven)),
+                Ok(Stands::NoPhrase) => Err(Refused::NoLeave(NoLeave::NoPhrase)),
+                Ok(Stands::Stopped(state)) => Err(Refused::NoLeave(NoLeave::Stopped(state))),
+                Err(_) => Err(Refused::NoLeave(NoLeave::NotGiven)),
+            }
+        };
+        {
+            let conn = lock(db);
+            closed(&conn)?;
+            let pairs = at_relays::withdrawals(&conn, identity)
+                .map_err(|_| Refused::NoLeave(NoLeave::NotGiven))?;
+            let own = identity.public_key();
+            let each_a_withdrawal = !push.entries.is_empty()
+                && push.entries.iter().all(|bytes| {
+                    Entry::from_wire(bytes).is_ok_and(|entry| {
+                        entry.delete
+                            && entry.author == own
+                            && pairs.iter().any(|pair| pair.id == entry.channel)
+                    })
+                });
+            if !each_a_withdrawal {
+                return Err(Refused::NotARequest);
+            }
+            if !self.may_ask_of(link) {
+                return Err(Refused::AskedEnough);
+            }
+            opened(&conn);
+        }
+        let protocol = Protocol::EntryPush;
+        let (mut send, mut recv) = open_stream(&link.conn)
+            .await
+            .map_err(Refused::NotAnswered)?;
+        let sent = self.counts_as_sent(link, protocol, request);
+        let answer = exchange(&mut send, &mut recv, protocol, request, sent)
+            .await
+            .map_err(|e| self.refused(link, &e))?;
+        let answer = read(answer);
+        let conn = lock(db);
+        closed(&conn)?;
+        Ok(take(&conn, answer))
+    }
+
     /// Ask `request` of the relay at `link` on a stream of `protocol`,
     /// for the pair channel of a typed key, or for a channel of a
     /// generation that was left, where the device has not asked as much
@@ -1132,12 +1432,12 @@ impl Leave {
         if !self.may_ask_of(link) {
             return Err(Refused::AskedEnough);
         }
-        let (send, recv) = open_stream(&link.conn)
+        let (mut send, mut recv) = open_stream(&link.conn)
             .await
             .map_err(Refused::NotAnswered)?;
         let answer = exchange(
-            send,
-            recv,
+            &mut send,
+            &mut recv,
             protocol,
             request,
             self.counts_as_sent(link, protocol, request),
@@ -1164,22 +1464,30 @@ impl Leave {
     /// `protocol`, and read its answer: every step has the codec's one
     /// timeout. Where the relay refuses it for now, that is counted for
     /// the relay ([`Self::refused_for_now`]). What failed is said as it
-    /// was.
+    /// was, with whether the relay refused it for now: it reset the stream
+    /// with ERR_RATE_LIMIT, which it does before it hands anything.
     async fn ask_counted(
         &self,
         link: &Link,
         protocol: Protocol,
         request: &WireMessage,
-    ) -> Result<WireMessage, String> {
-        let (send, recv) = open_stream(&link.conn).await?;
+    ) -> Result<WireMessage, Failed> {
+        let (mut send, mut recv) = open_stream(&link.conn).await.map_err(|why| Failed {
+            why,
+            refused_for_now: false,
+        })?;
         let sent = self.counts_as_sent(link, protocol, request);
-        exchange(send, recv, protocol, request, sent)
+        exchange(&mut send, &mut recv, protocol, request, sent)
             .await
             .map_err(|e| {
-                if refused_for_now(&e) {
+                let refused = refused_for_now(&e);
+                if refused {
                     self.refused_at(link);
                 }
-                e.to_string()
+                Failed {
+                    why: e.to_string(),
+                    refused_for_now: refused,
+                }
             })
     }
 
@@ -1233,12 +1541,31 @@ impl Leave {
     }
 
     /// Whether the device still keeps the change entry named `under` as
-    /// the latest: the one that a request was built under.
+    /// the latest, the one that a request was built under, and still
+    /// stands where it may use a connection: what [`Self::has`] asks of
+    /// where it stands, and not the entry's ID alone. So a request built
+    /// before the commit that closed the device is not written once its
+    /// stream is open (decision 2026-10-24 (removal), rule 5).
     fn keeps(&self, conn: &Connection, under: &[u8; 32]) -> Result<(), Refused> {
+        stands_applied(conn).map_err(Refused::NoLeave)?;
         match at_relays::kept_id(conn) {
             Ok(Some(kept)) if kept == *under => Ok(()),
             _ => Err(Refused::KeptAnother),
         }
+    }
+}
+
+/// Whether the device stands where it may use a connection for a channel
+/// of its own: it has applied a statement, has not stopped, and the change
+/// it follows is clear (decision 2026-10-24 (removal), rules 5 and 10).
+/// Where its database cannot be read, it is taken not to.
+fn stands_applied(conn: &Connection) -> Result<(), NoLeave> {
+    match at_relays::stands(conn) {
+        Ok(Stands::Applied) => Ok(()),
+        Ok(Stands::NoPhrase) => Err(NoLeave::NoPhrase),
+        Ok(Stands::Stopped(state)) => Err(NoLeave::Stopped(state)),
+        Ok(Stands::Closed) => Err(NoLeave::Closed),
+        Err(_) => Err(NoLeave::NotGiven),
     }
 }
 
@@ -1273,13 +1600,13 @@ async fn open_stream(
 /// request is written, with the bytes of its frame (decision 2026-10-22
 /// §1.2). The bytes on the wire are the same.
 async fn exchange(
-    mut send: quinn::SendStream,
-    mut recv: quinn::RecvStream,
+    send: &mut quinn::SendStream,
+    recv: &mut quinn::RecvStream,
     protocol: Protocol,
     request: &WireMessage,
     sent: impl FnOnce(usize),
 ) -> Result<WireMessage, codec::CodecError> {
-    let mut stream = tokio::io::join(&mut recv, &mut send);
+    let mut stream = tokio::io::join(&mut *recv, &mut *send);
     let answer = async {
         let frame = codec::encode_message(request)?;
         codec::write_protocol_byte(&mut stream, protocol).await?;
@@ -1290,6 +1617,13 @@ async fn exchange(
     .await;
     let _ = send.finish();
     answer
+}
+
+/// Why a request of a relay failed.
+struct Failed {
+    why: String,
+    /// The relay refused it for now ([`refused_for_now`]).
+    refused_for_now: bool,
 }
 
 /// Whether a request failed because the relay reset its stream with
@@ -1330,6 +1664,36 @@ fn refusals_within(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The check once a stream is open asks where the device stands, as
+    /// `has` asks it, and not only which change entry it keeps (decision
+    /// 2026-10-24 (removal), rule 5): from the commit that closes the
+    /// device, a request built before it is not written, though the device
+    /// keeps the same entry.
+    #[test]
+    fn a_request_built_before_the_device_closed_is_not_written() {
+        let conn = cordelia_storage::db::open_in_memory().unwrap();
+        let identity = cordelia_crypto::identity::NodeIdentity::from_seed([0x44; 32]).unwrap();
+        let phrase = cordelia_crypto::phrase::Phrase::parse(
+            "legal winner thank year wave sausage worth useful legal winner thank yellow",
+        )
+        .unwrap();
+        cordelia_api::person::first_statement(&conn, &identity, &phrase, "laptop", 1).unwrap();
+        let under = at_relays::kept_id(&conn).unwrap().unwrap();
+        let leave = Leave::new(Clock::system());
+        assert_eq!(stands_applied(&conn), Ok(()));
+        assert_eq!(leave.keeps(&conn, &under), Ok(()));
+
+        // Its own key is kept as removed, set so by hand: the change it
+        // follows is not clear, and the entry it keeps is the same.
+        cordelia_storage::person::keep_removed(&conn, &[identity.public_key()], 2).unwrap();
+        assert_eq!(at_relays::kept_id(&conn).unwrap(), Some(under));
+        assert_eq!(stands_applied(&conn), Err(NoLeave::Closed));
+        assert_eq!(
+            leave.keeps(&conn, &under),
+            Err(Refused::NoLeave(NoLeave::Closed))
+        );
+    }
 
     /// What a relay refused for now before the window is forgotten as it
     /// refuses again: a relay that refuses request after request, and is
@@ -1533,8 +1897,8 @@ mod tests {
             ..Inner::default()
         };
         // It reaches none.
-        assert!(inner.is_waking(now));
-        assert!(inner.is_waking(now + Duration::from_secs(3600)));
+        assert!(inner.is_waking(now, None));
+        assert!(inner.is_waking(now + Duration::from_secs(3600), None));
 
         let woke = |heard: &[&str]| Woke {
             at: now,
@@ -1544,23 +1908,175 @@ mod tests {
         };
         // One of two has answered: waking, up to the wait.
         inner.woke = Some(woke(&["one"]));
-        assert!(inner.is_waking(now));
-        assert!(inner.is_waking(now + Duration::from_millis(29_999)));
-        assert!(!inner.is_waking(now + Duration::from_secs(30)));
+        assert!(inner.is_waking(now, None));
+        assert!(inner.is_waking(now + Duration::from_millis(29_999), None));
+        assert!(!inner.is_waking(now + Duration::from_secs(30), None));
         // And awake from then, whatever the time says later.
-        assert!(!inner.is_waking(now));
+        assert!(!inner.is_waking(now, None));
 
         // Both have answered: awake at once.
         inner.woke = Some(woke(&["one", "two"]));
-        assert!(!inner.is_waking(now));
+        assert!(!inner.is_waking(now, None));
         // A relay that it is not set up with does not stand for one that
         // it is.
         inner.woke = Some(woke(&["one", "three"]));
-        assert!(inner.is_waking(now));
+        assert!(inner.is_waking(now, None));
         // Set up with none, there is nobody to wait for.
         inner.set_up_with.clear();
         inner.woke = Some(woke(&[]));
-        assert!(!inner.is_waking(now));
+        assert!(!inner.is_waking(now, None));
+    }
+
+    /// A wake waits no more for a relay whose dial has failed since it
+    /// began, once another relay has answered (decision 2026-10-24
+    /// (removal), section 8): **a dial that began at or after the wake and
+    /// timed out.** It waits for a relay whose dial is in flight, whose
+    /// dial connected and has not been answered, that is reached, whose
+    /// dial was refused or answered by another key, or whose dial began
+    /// before the wake; for a name of two relays where one of them may
+    /// still answer; and, with no relay heard, whatever failed.
+    #[test]
+    fn a_wake_waits_no_more_for_a_relay_whose_dial_failed_since_it_began() {
+        use super::super::reach::Said;
+        use cordelia_api::at_relays::known::RelayId;
+        use cordelia_api::state::Holds;
+        let clock = Clock::system();
+        let tick = || clock.run_ahead(Duration::from_millis(1));
+        let fresh = || Reach::new(clock.clone());
+        let two = RelayId {
+            name: "two".into(),
+            key: None,
+        };
+        let woke = |heard: &[&str]| Woke {
+            at: clock.now(),
+            wall: 0,
+            heard: heard.iter().map(|name| name.to_string()).collect(),
+            awake: false,
+        };
+        let waking = |woke: &Woke, reach: &Reach| {
+            let mut inner = Inner {
+                set_up_with: vec!["one".to_string(), "two".to_string()],
+                woke: Some(woke.clone()),
+                ..Inner::default()
+            };
+            inner.is_waking(clock.now(), Some(reach))
+        };
+
+        // A dial that timed out before the wake began says nothing of now.
+        let reach = fresh();
+        reach.dial_begins(&two);
+        reach.dial_timed_out(&two);
+        tick();
+        let began = woke(&["one"]);
+        assert!(waking(&began, &reach));
+        // A dial in flight: the relay may still answer.
+        reach.dial_begins(&two);
+        assert!(waking(&began, &reach));
+        // It timed out: the wake is over, as the other has answered.
+        reach.dial_timed_out(&two);
+        assert!(!waking(&began, &reach));
+        // With no relay heard, it is not.
+        let none_heard = Woke {
+            heard: HashSet::new(),
+            ..began.clone()
+        };
+        assert!(waking(&none_heard, &reach));
+        // Another dial in flight, and then a connection: waited for again,
+        // until it answers or the wait has gone by.
+        reach.dial_begins(&two);
+        assert!(waking(&began, &reach));
+        reach.dial_ends(&two, true);
+        assert!(waking(&began, &reach));
+        // Connected and not yet answered, a later dial that times out
+        // does not stand for it: the connection may still answer.
+        reach.dial_begins(&two);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+        // Answered, and so reached: a dial that times out (one made at its
+        // address for another) does not stand for it either.
+        reach.show_ends(&two, [7; 32], Said::Holds, Holds::Holds);
+        reach.dial_begins(&two);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+
+        // A refusal, another key answering, an address that moved: one
+        // round trip of anyone on the path. They do not end the wait.
+        let reach = fresh();
+        let began = woke(&["one"]);
+        reach.dial_begins(&two);
+        reach.dial_ends(&two, false);
+        assert!(waking(&began, &reach));
+
+        // A dial begun before the wake that times out after it: it is not
+        // the wake's dial, and the wake waits for the dial it is owed.
+        let reach = fresh();
+        reach.dial_begins(&two);
+        tick();
+        let began = woke(&["one"]);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+        reach.dial_begins(&two);
+        reach.dial_timed_out(&two);
+        assert!(!waking(&began, &reach));
+        // Two dials in flight, one begun before the wake and one since (its
+        // address moved between): which ended is not known, so a timeout
+        // is credited with the earlier beginning. The one since is
+        // refused, and the one from before times out: waited for.
+        let reach = fresh();
+        reach.dial_begins(&two);
+        tick();
+        let began = woke(&["one"]);
+        reach.dial_begins(&two);
+        reach.dial_ends(&two, false);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+        // A timeout of a dial that this relay did not begin, one made at its
+        // address for another, has no beginning known: not read.
+        let reach = fresh();
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+
+        // Two relays of one name, a keyed one and one given no key: the
+        // keyed one connects and waits for its show, the other's dial times
+        // out. The name may still answer.
+        let reach = fresh();
+        let began = woke(&["one"]);
+        let keyed = RelayId {
+            name: "two".into(),
+            key: Some([2; 32]),
+        };
+        reach.dial_begins(&keyed);
+        reach.dial_begins(&two);
+        reach.dial_ends(&keyed, true);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
+        // Both timed out: the name is waited for no more.
+        reach.show_ends(&keyed, [8; 32], Said::Neither, Holds::Neither);
+        reach.dial_begins(&keyed);
+        reach.dial_timed_out(&keyed);
+        assert!(!waking(&began, &reach));
+        // A name that no relay of is known: waited for.
+        let reach = fresh();
+        assert!(waking(&began, &reach));
+
+        clock.run_ahead(WAKE_WAIT);
+        assert!(!waking(&began, &reach));
+
+        // A leave that reads the dials tells them when the node wakes, so
+        // that the dial loop dials each relay it does not reach at once;
+        // the flag is read once.
+        let reach = fresh();
+        let leave = Leave::new(clock.clone()).reading_dials_in(reach.clone());
+        assert!(!leave.reaches(&["one".to_string()], &[]));
+        assert!(!reach.dials_at_wake(), "no relay reached, no wake");
+        leave.wakes(&mut lock(&leave.inner), (clock.now(), 0));
+        assert!(reach.dials_at_wake(), "the wake has every relay dialled");
+        assert!(!reach.dials_at_wake());
+        // A leave that does not read them tells nobody.
+        let reach = fresh();
+        let leave = Leave::new(clock.clone());
+        leave.wakes(&mut lock(&leave.inner), (clock.now(), 0));
+        assert!(!reach.dials_at_wake());
     }
     /// A request held back by the device's own pace is counted for its
     /// relay, and a request that may be asked is not (decision 2026-10-22

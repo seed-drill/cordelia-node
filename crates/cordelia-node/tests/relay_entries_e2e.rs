@@ -811,8 +811,9 @@ async fn a_peer_that_shows_an_earlier_entry_again_and_again_is_handed_only_its_b
     );
 }
 
-/// A short show is only ever of the entry that the connection last showed
-/// whole in that slot. Of that entry the relay answers held (which is use
+/// A short show is only ever of an entry that the connection showed whole
+/// in that slot, or was handed whole there (decision 2026-10-24 (removal),
+/// rule 16). Of such an entry the relay answers held (which is use
 /// of the channel), "show it whole", or the revision and ID of another:
 /// never an entry. A connection that is told of another shows its own
 /// whole, and is answered with the entry. A short show of anything else is
@@ -825,7 +826,7 @@ async fn a_peer_that_shows_an_earlier_entry_again_and_again_is_handed_only_its_b
 /// connection shows a large entry in short many more times in a minute
 /// than it could show it whole.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_short_show_is_only_ever_of_the_entry_that_the_connection_showed_whole() {
+async fn a_short_show_is_only_ever_of_an_entry_the_connection_showed_or_was_handed_whole() {
     let mut relay = relay_started(None);
     let holder = client_of(&relay).await.expect("the holder connects");
     let first = holder.made(1, 5, "change", "the first");
@@ -887,16 +888,16 @@ async fn a_short_show_is_only_ever_of_the_entry_that_the_connection_showed_whole
         holder.show(first.to_wire()).await.unwrap(),
         ShowAnswer::Another(later.to_wire())
     );
-    // What it was answered with is not what it showed: the later one is
-    // to be shown whole, once, and is then held in short. The first is
-    // remembered no more.
-    assert_eq!(holder.show_short(&later).await.unwrap(), ShowAnswer::Whole);
+    // What it was handed whole is remembered beside what it showed
+    // (decision 2026-10-24 (removal), rule 16): the later one is held in
+    // short, and the first is still told of the later one.
+    assert_eq!(holder.show_short(&later).await.unwrap(), ShowAnswer::Held);
     assert_eq!(
         holder.show(later.to_wire()).await.unwrap(),
         ShowAnswer::Held
     );
     assert_eq!(holder.show_short(&later).await.unwrap(), ShowAnswer::Held);
-    assert_eq!(holder.show_short(&first).await.unwrap(), ShowAnswer::Whole);
+    assert_eq!(holder.show_short(&first).await.unwrap(), word);
     // One the relay would take, shown whole and refused nowhere, is
     // taken; in short, before that, nothing is stored.
     let latest = holder.made(1, 7, "change", "the latest");

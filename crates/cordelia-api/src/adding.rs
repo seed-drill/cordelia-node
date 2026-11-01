@@ -71,7 +71,7 @@ use cordelia_core::protocol::{
 };
 use cordelia_core::revision::next_under;
 use cordelia_crypto::addition::{Addition, SignedAddition};
-use cordelia_crypto::change_entry;
+use cordelia_crypto::change_entry::{self, ChangeEntryError};
 use cordelia_crypto::derive::{self, DeriveError};
 use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::hand_over::{HandOver, HandOverError};
@@ -87,9 +87,9 @@ use cordelia_storage::sync_state;
 
 use crate::leaving::Among;
 use crate::person::{
-    AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Shown, added_name,
-    applied_secret, apply_added, apply_judged, drop_hand_overs, held, in_one, its_own_entry,
-    latest_entry, see_addition, shown,
+    AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Refused, Shown, added_name,
+    applied_secret, apply_added, apply_judged, drop_hand_overs, followed_entry, held, in_one,
+    its_own_entry, see_addition,
 };
 use crate::publish::Standing;
 
@@ -158,7 +158,9 @@ pub fn add_device(
         let own = identity.public_key();
         let statement = &standing.held.statement.statement;
         let pair = derive::pair_secret(identity, new)?;
-        if statement.removes(new) {
+        // A key removed on any branch this device knows is not added again
+        // (decision 2026-10-24 (removal), rule 6).
+        if standing.counting.is_removed(new) {
             return Err(PersonError::KeyRemoved);
         }
         if !standing.counting.may_add(&own) {
@@ -170,7 +172,7 @@ pub fn add_device(
             statement: standing.held.statement.clone(),
             secret: standing.secret,
             statement_key: standing.held.following.statement_key,
-            change_entry: latest_entry(conn)?.into_entry(),
+            change_entry: followed_entry(conn)?.into_entry(),
             addition: None,
             adders_own: None,
         };
@@ -231,7 +233,7 @@ pub fn would_add(
     let own = identity.public_key();
     let statement = &standing.held.statement.statement;
     derive::pair_secret(identity, new)?;
-    if statement.removes(new) {
+    if standing.counting.is_removed(new) {
         return Err(PersonError::KeyRemoved);
     }
     if !standing.counting.may_add(&own) {
@@ -401,6 +403,22 @@ pub fn drop_old_hand_overs(conn: &Connection, now: i64) -> Result<usize, PersonE
     })
 }
 
+/// Drop from this device's store every hand-over it made, where it is
+/// closed: the change it follows is not clear, closed or stored so, as
+/// `fork` (decision 2026-10-24 (removal), rules 5 and 10). Each carries
+/// that change's secret, which a key it knows to be removed holds: it is
+/// sent nowhere more, and [`write_over_dropped`] writes the delete over
+/// each that a relay was sent, which a closed device sends. Returns how
+/// many went. A device that is not closed drops none here.
+pub fn drop_hand_overs_not_clear(conn: &Connection) -> Result<usize, PersonError> {
+    in_one(conn, || match crate::at_relays::stands(conn)? {
+        crate::at_relays::Stands::Closed | crate::at_relays::Stands::Stopped(State::Fork) => {
+            drop_hand_overs(conn, |_| false)
+        }
+        _ => Ok(0),
+    })
+}
+
 /// Write a delete over each hand-over that this device made and that has
 /// gone from its store (decision 2026-10-04 §6): its own entry under the
 /// name `hand-over` in the pair channel, one revision above the
@@ -495,13 +513,15 @@ impl Row {
     }
 
     /// The row of a device that stands so among the devices of its
-    /// person. `None` for one that was removed or is in a fork: no key is
-    /// taken there.
+    /// person. `None` for one that was removed: no key is taken there. A
+    /// closed device is one of several: it takes a hand-over of a clear
+    /// change that counts it, under the phrase it follows, and nothing
+    /// else (decision 2026-10-24 (removal), rule 10).
     pub fn of(stands: Among) -> Option<Self> {
         match stands {
             Among::NoPhrase => Some(Self::NoPhrase),
             Among::Alone => Some(Self::Alone),
-            Among::Several(_) => Some(Self::Several),
+            Among::Several(_) | Among::Stopped(State::Fork) => Some(Self::Several),
             Among::Stopped(State::NotListed | State::NotOpened) => Some(Self::NotListed),
             Among::Stopped(_) => None,
         }
@@ -537,7 +557,8 @@ impl Row {
 ///
 /// - a key that has no pair channel with this device: its own, or no
 ///   usable public key;
-/// - on a device that was removed, or is in a fork;
+/// - on a device that was removed (a closed one takes a key: decision
+///   2026-10-24 (removal), rule 10);
 /// - on a device that is alone under a phrase with sync on;
 /// - where the device stands in another row now than the yes was for:
 ///   the command asks again ([`PersonError::ChangedSincePrompt`]);
@@ -556,8 +577,8 @@ pub fn type_key(
     in_one(conn, || {
         derive::pair_secret(identity, key)?;
         let stands = match crate::leaving::among(conn, identity)? {
-            Among::Stopped(state @ (State::Removed | State::Fork)) => {
-                return Err(PersonError::Stopped(state));
+            Among::Stopped(State::Removed) => {
+                return Err(PersonError::Stopped(State::Removed));
             }
             Among::Alone if sync_on => return Err(PersonError::SyncIsOn),
             stands => Row::of(stands),
@@ -596,10 +617,15 @@ pub enum Accepted {
     /// brought a change it could apply: it applied it, and carried what it
     /// held.
     Applied(Applied),
-    /// The hand-over's statement was made apart from the one the device
-    /// has applied: the device is in a fork, and keeps both change
-    /// entries, as where it is shown such an entry.
-    Fork,
+    /// The hand-over's change was made apart from the one the device
+    /// follows, and is clear: it is kept as a head set aside, and the
+    /// change followed is clear, so the device goes on (decision
+    /// 2026-10-24 (removal), rules 8 and 11).
+    SetAside,
+    /// The hand-over's change was kept as a head set aside, or was a ninth,
+    /// and the device is closed: the change it follows is not clear
+    /// (decision 2026-10-24 (removal), rules 8 and 10).
+    Closed,
     /// It was refused, and nothing changed.
     Refused(NotAccepted),
 }
@@ -651,8 +677,10 @@ pub enum NotAccepted {
     NotAfterTheChangeThatStoppedIt,
     /// This device was removed: it is given a new key first.
     Removed,
-    /// This device is in a fork: the fork is settled first.
-    InAFork,
+    /// The hand-over's change is not clear: a key that this device knows
+    /// to be removed holds its secret (decision 2026-10-24 (removal),
+    /// rule 8). Nothing is sealed under it here.
+    NotClear,
     /// The key was typed, and its yes said, where the device stood in
     /// another row of §5.1 than it stands in now. `typed` is that row,
     /// and `None` for a key typed before rows were kept; `now` is the row
@@ -701,6 +729,9 @@ pub fn accept(
     now: i64,
 ) -> Result<Accepted, PersonError> {
     drop_old_hand_overs(conn, now)?;
+    // The statement handed under the phrase this device follows: what it
+    // removes is kept whatever comes of it (below).
+    let handed = std::cell::RefCell::new(None);
     let accepted = in_one(conn, || {
         let hand_over = match hand_over_in(identity, typed, typed_at, entry, now)? {
             Ok(hand_over) => hand_over,
@@ -723,8 +754,16 @@ pub fn accept(
         let under_the_same = held.following.phrase_key == brought.following.phrase_key;
         match held.state {
             State::Removed => Ok(Accepted::Refused(NotAccepted::Removed)),
-            State::Fork => Ok(Accepted::Refused(NotAccepted::InAFork)),
-            _ if under_the_same => brought.taken_by(conn, identity, &held, now),
+            // A closed device takes, under its phrase, only a hand-over of a
+            // clear change that counts it (decision 2026-10-24 (removal),
+            // rule 10): rule 8 judges it, as any hand-over.
+            _ if under_the_same => {
+                *handed.borrow_mut() = Some((
+                    hand_over.statement.clone(),
+                    hand_over.change_entry.content.clone(),
+                ));
+                brought.taken_by(conn, identity, &held, now)
+            }
             State::Applied if is_alone(conn, &held, &identity.public_key())? => {
                 if sync_on {
                     return Ok(Accepted::Refused(NotAccepted::SyncIsOn));
@@ -743,13 +782,69 @@ pub fn accept(
             _ => Ok(Accepted::Refused(NotAccepted::AnotherPhrase)),
         }
     });
+    // The keys that a statement the phrase signed lists as removed are
+    // kept though it is refused, and in a transaction of their own: one
+    // refused as not clear is undone whole (decision 2026-10-24 (removal),
+    // rule 2).
+    if let Some((statement, content)) = handed.into_inner() {
+        in_one(conn, || {
+            crate::person::know_removed_if_signed(conn, identity, &statement, Some(&content), now)?;
+            // What it knows of removals grew: where the change it follows
+            // is no longer clear, it is closed (rule 8).
+            crate::person::close_if_not_clear(conn).map(|_| ())
+        })?;
+    }
     match accepted {
         // The statement was applied and then undone: rule 3 did not hold.
         Err(PersonError::RecordNotCounted(why)) => {
             Ok(Accepted::Refused(NotAccepted::RecordDoesNotCount(why)))
         }
+        // Its change is not clear, and nothing was applied (decision
+        // 2026-10-24 (removal), rules 4 and 8).
+        Err(PersonError::NotClear) => Ok(Accepted::Refused(NotAccepted::NotClear)),
+        // This device's own key is among those it knows to be removed: its
+        // way on is a new key.
+        Err(PersonError::RemovedAsKnown) => Ok(Accepted::Refused(NotAccepted::Removed)),
         accepted => accepted,
     }
+}
+
+/// What a hand-over read with the key `typed` says of removals, kept
+/// before the hand-over is judged, in a transaction of its own that
+/// commits at once (decision 2026-10-24 (removal), rule 5): the keys that
+/// its change lists as removed, where the phrase this device follows
+/// signed it, and the close, where the change it follows is then not
+/// clear. A move to the hand-over's change, or to a head, then waits for
+/// the sync cycle's turn with the device closed, and sends nothing under
+/// the change it leaves meanwhile. Says whether it closed the device.
+///
+/// A hand-over that is no hand-over for this key, or whose change removes
+/// this device, is left to [`accept_typed`]: no move follows the second,
+/// which [`accept`] refuses, and closes after.
+pub fn know_what_is_handed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    typed: &TypedKey,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<bool, PersonError> {
+    in_one(conn, || {
+        let Ok(hand_over) = hand_over_in(identity, &typed.key, typed.typed_at, entry, now)? else {
+            return Ok(false);
+        };
+        let statement = &hand_over.statement;
+        if statement.statement.removes(&identity.public_key()) {
+            return Ok(false);
+        }
+        crate::person::know_removed_if_signed(
+            conn,
+            identity,
+            statement,
+            Some(&hand_over.change_entry.content),
+            now,
+        )?;
+        crate::person::close_if_not_clear(conn)
+    })
 }
 
 /// Whether a key that was typed at `typed_at` still opens its pair
@@ -838,7 +933,11 @@ pub fn accept_typed(
         )?;
         let said = accepted.says();
         match &accepted {
-            Accepted::Joined(_) | Accepted::Moved(_) | Accepted::Applied(_) | Accepted::Fork => {
+            Accepted::Joined(_)
+            | Accepted::Moved(_)
+            | Accepted::Applied(_)
+            | Accepted::SetAside
+            | Accepted::Closed => {
                 acts::spend_typed_key(conn, &typed.key, typed.typed_at, now, &said)?;
             }
             Accepted::Refused(_) => {
@@ -880,10 +979,11 @@ impl Accepted {
                 "this device has applied change {}, which it was handed",
                 applied.number
             ),
-            Self::Fork => "what was handed over is a change made apart from the one this device \
-                           had applied: two changes were made apart, and are settled with the \
-                           phrase (`cordelia settle`)"
+            Self::SetAside => "what was handed over is a change made apart from the one this \
+                               device follows: it is set aside, and this device goes on. The two \
+                               are joined with the phrase (`cordelia settle`)"
                 .into(),
+            Self::Closed => crate::look::CLOSED_BY_HEADS_WHY.into(),
             Self::Refused(why) => why.says(),
         }
     }
@@ -946,8 +1046,10 @@ impl NotAccepted {
                                                      device that has that change"
                 .into(),
             Self::Removed => "this device was removed: `cordelia init --new-key` first".into(),
-            Self::InAFork => "this device has seen two changes made apart: the fork is settled \
-                              first (`cordelia settle`)"
+            Self::NotClear => "the change that was handed over lists a device that this device \
+                               knows was removed, or hands one its secret: it was not taken. \
+                               Add this device from a device whose last change lists no \
+                               removed device"
                 .into(),
             Self::StoodElsewhere { typed, now } => format!(
                 "that key was typed {}, and its yes was for that. This device {} now: what the \
@@ -1100,14 +1202,21 @@ impl<'a> Brought<'a> {
     }
 
     /// What a device does with a hand-over under the phrase it already
-    /// follows (decision 2026-10-04 §5.1): it takes one that brings a
-    /// change it can apply, and no other.
+    /// follows (decision 2026-10-04 §5.1): it is judged by rule 8 of
+    /// decision 2026-10-24 (removal), the one function that judges a
+    /// change shown ([`crate::person::decide`]), and a change that is not
+    /// clear is refused (`PersonError::NotClear`, which undoes everything).
     ///
-    /// The statement is judged beside the one applied (§4.2). One that
-    /// lists the device, or comes with a record of its addition, is
-    /// applied, and the device carries what it holds. One that was made
-    /// apart shows as a fork, on a device that has not stopped. Any other
-    /// moves nothing.
+    /// - One that is behind the change followed or a head set aside brings
+    ///   no change.
+    /// - One made after the change followed, that lists this device or
+    ///   comes with a record of its addition that counts, is applied, and
+    ///   the device carries what it holds.
+    /// - One made apart is kept as a head set aside: the device goes on
+    ///   where the change it follows is clear, and is closed where it is
+    ///   not (rules 8 and 10).
+    /// - One that removes this device is refused as not for it: a
+    ///   hand-over is for a device that it lists or adds.
     ///
     /// A device that has stopped, because it is in no list or could not
     /// open a change, takes only the statement that stopped it, or one
@@ -1145,36 +1254,69 @@ impl<'a> Brought<'a> {
             Ok(judgement) => judgement,
             Err(e) => return Ok(Accepted::Refused(NotAccepted::Statement(e))),
         };
-        match judgement {
-            Judgement::Behind => Ok(Accepted::Refused(NotAccepted::BringsNoChange)),
-            Judgement::Removed => Ok(Accepted::Refused(NotAccepted::NotForThisDevice)),
-            Judgement::Fork if held.state == State::Applied => {
-                // The entry was opened as this statement's own, and the
-                // statement judged, just above: shown to a device that
-                // has not stopped, it is a fork, and can be nothing
-                // else.
-                match shown(conn, identity, &self.entry, now)? {
-                    Shown::Fork => Ok(Accepted::Fork),
-                    other => Err(PersonError::Held(format!(
-                        "a statement made apart was shown, and was {other:?}"
-                    ))),
-                }
-            }
-            Judgement::Fork => Ok(Accepted::Refused(
-                NotAccepted::NotAfterTheChangeThatStoppedIt,
-            )),
-            Judgement::Applies | Judgement::NotListed => {
-                if held.state != State::Applied
-                    && !self.is_after_what_stopped(conn, identity, held)?
-                {
-                    return Ok(Accepted::Refused(
+        if judgement == Judgement::Behind {
+            return Ok(Accepted::Refused(NotAccepted::BringsNoChange));
+        }
+        if judgement == Judgement::Removed || self.statement().removes(&own) {
+            return Ok(Accepted::Refused(NotAccepted::NotForThisDevice));
+        }
+        match held.state {
+            State::Applied | State::Fork => {}
+            _ => {
+                return match judgement {
+                    Judgement::Applies | Judgement::NotListed => {
+                        if !self.is_after_what_stopped(conn, identity, held)? {
+                            return Ok(Accepted::Refused(
+                                NotAccepted::NotAfterTheChangeThatStoppedIt,
+                            ));
+                        }
+                        self.applied_on(conn, identity, Some(held), &held.following, now)
+                            .map(Accepted::Applied)
+                    }
+                    _ => Ok(Accepted::Refused(
                         NotAccepted::NotAfterTheChangeThatStoppedIt,
-                    ));
-                }
-                self.applied_on(conn, identity, Some(held), &held.following, now)
-                    .map(Accepted::Applied)
+                    )),
+                };
             }
         }
+        // A change that is not clear is refused at `cordelia accept`
+        // (decision 2026-10-24 (removal), rule 8): the keys it removes are
+        // kept by the caller, in a transaction of their own.
+        if !crate::person::is_clear(conn, self.statement(), false)? {
+            if held_rows::removed_keys(conn)?.contains(&own) {
+                return Err(PersonError::RemovedAsKnown);
+            }
+            return Err(PersonError::NotClear);
+        }
+        let mut apply = |held: &Held| {
+            self.applied_on(conn, identity, Some(held), &held.following, now)
+                .map(crate::person::Shown::Applied)
+        };
+        let shown = crate::person::decide(
+            conn,
+            identity,
+            held,
+            &self.entry,
+            &self.hand_over.statement,
+            self.hand_over.addition.is_some(),
+            &mut apply,
+            now,
+        )?;
+        Ok(match shown {
+            Shown::Held | Shown::Behind => Accepted::Refused(NotAccepted::BringsNoChange),
+            // A move is an apply (decision 2026-10-24 (removal), rule 9).
+            Shown::Applied(applied) | Shown::Moved(applied) => Accepted::Applied(applied),
+            Shown::SetAside => Accepted::SetAside,
+            Shown::Closed => Accepted::Closed,
+            Shown::Refused(Refused::NotAChangeEntry(ChangeEntryError::Statement(e))) => {
+                Accepted::Refused(NotAccepted::Statement(e))
+            }
+            other => {
+                return Err(PersonError::Held(format!(
+                    "a hand-over for this device was judged {other:?}"
+                )));
+            }
+        })
     }
 
     /// Whether the hand-over's statement is the one that stopped this
@@ -1188,7 +1330,7 @@ impl<'a> Brought<'a> {
     ) -> Result<bool, PersonError> {
         let following = &held.following;
         let stopped_by = change_entry::open_for_device(
-            &latest_entry(conn)?,
+            &followed_entry(conn)?,
             &following.phrase_key,
             &following.phrase_channel,
             &following.statement_key,
@@ -1265,6 +1407,16 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
         }
     }
     held_rows::forget_secrets(conn)?;
+    // What it knew of removals was of the phrase it leaves (decision
+    // 2026-10-24 (removal), rule 2): under another phrase they are another
+    // person's keys.
+    held_rows::forget_removals(conn)?;
+    // And what it kept of each file's arrivals (decision 2026-10-24
+    // (removal), rule 7): under another phrase they are another person's.
+    cordelia_storage::arrivals::forget_all(conn)?;
+    // Nor does it keep a head set aside of that phrase, or judge one.
+    held_rows::drop_all_set_aside(conn)?;
+    held_rows::judged_kept(conn)?;
     sync_state::forget_folders_except(conn, &[])?;
     held_rows::forget_names_before(conn, None)?;
     meta::remove(conn, meta::PERSON_NOT_CARRIED)?;
@@ -1275,6 +1427,7 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     meta::remove(conn, meta::PERSON_NOT_SHOWN)?;
     meta::remove(conn, meta::PERSON_WORDS_TAKEN)?;
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
+    meta::remove(conn, meta::PERSON_MOVED_FROM)?;
     // What it knew of which relay holds which change was of entries of
     // the phrase it leaves (decision 2026-10-19 §1).
     crate::at_relays::known::forget(conn)?;
@@ -1286,7 +1439,7 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::person::{first_statement, who_counts};
+    use crate::person::{first_statement, shown, who_counts};
     use crate::several::{
         Machine, OTHER_WORDS, Several, change_that_does_not_open_for, entry_by, listed_as,
         signed_in, text,
@@ -1571,6 +1724,25 @@ mod tests {
         assert_eq!(hand_over.statement.statement.number, 2);
         assert_eq!(hand_over.change_entry, change.clone().into_entry());
         assert!(hand_over.is_for(&listed.key()));
+    }
+
+    /// A device dropped from a list and added again by a record, before it
+    /// was shown the change that dropped it, accepts: the record counts it,
+    /// and rule 8 step 4 applies a change that counts this device
+    /// (decision 2026-10-24 (removal)).
+    #[test]
+    fn test_a_device_added_again_by_a_record_before_it_heard_accepts() {
+        let mut s = Several::of_one_person(3);
+        let dropped = s.change(0, &[0, 1], &[]);
+        let added = s.hand(0, 2);
+        assert_eq!(added.seen, Some(AdditionSeen::Counted));
+        match s.accept(2, 0, &added.hand_over) {
+            Accepted::Applied(applied) => assert_eq!(applied.number, 2),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(s[2].state(), State::Applied);
+        assert_eq!(s[2].latest(), dropped);
+        assert!(s[2].counts(&s.key(2)));
     }
 
     /// A device that was itself added since the statement hands over the
@@ -2039,9 +2211,10 @@ mod tests {
         for stopped in [State::NotListed, State::NotOpened] {
             assert_eq!(Row::of(Among::Stopped(stopped)), Some(Row::NotListed));
         }
-        for stopped in [State::Removed, State::Fork] {
-            assert_eq!(Row::of(Among::Stopped(stopped)), None);
-        }
+        assert_eq!(Row::of(Among::Stopped(State::Removed)), None);
+        // A closed device is one of several (decision 2026-10-24
+        // (removal), rule 10).
+        assert_eq!(Row::of(Among::Stopped(State::Fork)), Some(Row::Several));
     }
 
     /// A key typed under one row's yes is not spent under another row's
@@ -2375,7 +2548,7 @@ mod tests {
             NotAccepted::Statement(StatementError::UndoesARemoval),
             NotAccepted::NotAfterTheChangeThatStoppedIt,
             NotAccepted::Removed,
-            NotAccepted::InAFork,
+            NotAccepted::NotClear,
         ];
         let mut said: Vec<String> = refusals.iter().map(NotAccepted::says).collect();
         let applied = first();
@@ -2383,7 +2556,8 @@ mod tests {
             Accepted::Joined(applied.clone()).says(),
             Accepted::Moved(applied.clone()).says(),
             Accepted::Applied(applied).says(),
-            Accepted::Fork.says(),
+            Accepted::SetAside.says(),
+            Accepted::Closed.says(),
         ]);
         for (n, one) in said.iter().enumerate() {
             assert!(!one.is_empty());
@@ -2396,9 +2570,9 @@ mod tests {
                 .says()
                 .contains("`cordelia init --new-key`")
         );
-        assert!(NotAccepted::InAFork.says().contains("`cordelia settle`"));
         assert!(NotAccepted::AnotherPhrase.says().contains("nothing moved"));
-        assert!(Accepted::Fork.says().contains("`cordelia settle`"));
+        assert!(Accepted::SetAside.says().contains("`cordelia settle`"));
+        assert!(Accepted::Closed.says().contains("`cordelia settle`"));
         assert_eq!(
             Accepted::Refused(NotAccepted::Removed).says(),
             NotAccepted::Removed.says()
@@ -3735,14 +3909,88 @@ mod tests {
         );
 
         // Device 2 has made a change of its own, apart. Handed the other,
-        // it is in a fork, as where it is shown that entry.
+        // it sets it aside, as where it is shown that entry, and goes on:
+        // both are clear (decision 2026-10-24 (removal), rule 8).
         let its_own = s.change(2, &[0, 1, 2], &[]);
         let told = s.hand(0, 2);
-        assert_eq!(s.accept(2, 0, &told.hand_over), Accepted::Fork);
-        assert_eq!(s[2].state(), State::Fork);
+        assert_eq!(s.accept(2, 0, &told.hand_over), Accepted::SetAside);
+        assert_eq!(s[2].state(), State::Applied);
         assert_eq!(s[2].latest(), its_own);
         assert_eq!(s[2].apart(), Some(change));
         assert_eq!(s[2].number(), 2);
+    }
+
+    /// `cordelia accept` refuses a hand-over whose change is not clear on
+    /// this device (decision 2026-10-24 (removal), rules 4 and 8): its
+    /// statement lists a key that the device knows to be removed. Nothing
+    /// changes but what it knows of removals: the keys the change removes,
+    /// signed by the phrase, are kept though its transaction is undone
+    /// (rule 2). A hand-over whose change lists this device's own key, as
+    /// one it knows to be removed, is refused as for a removed device.
+    #[test]
+    fn test_accept_refuses_a_hand_over_whose_change_is_not_clear() {
+        let mut s = Several::of_one_person(4);
+        s.hold(&[0, 1, 2, 3], "notes");
+        s.write(1, "notes", "a.md", "one");
+        // Device 1 knows device 2 to be removed, on a branch it has seen
+        // (set so by hand: the test keeps no branch).
+        held_rows::keep_removed(&s[1].conn, &[s.key(2)], s.now).unwrap();
+        let before = s[1].everything();
+        let removed_before = held_rows::removed_keys(&s[1].conn).unwrap();
+        assert_eq!(removed_before, vec![s.key(2)]);
+
+        // Device 0 removes device 3, and lists device 2, and hands device 1
+        // the change.
+        s.change(0, &[0, 1, 2], &[3]);
+        let told = s.hand(0, 1);
+        assert_eq!(
+            s.accept(1, 0, &told.hand_over),
+            Accepted::Refused(NotAccepted::NotClear)
+        );
+        // Nothing changed but where it stands: the change it follows lists
+        // device 2 too, and rule 8 closes it (decision 2026-10-24
+        // (removal), rules 8 and 10).
+        let but_its_state = |rows: Vec<String>| -> Vec<String> {
+            rows.into_iter()
+                .filter(|row| !row.starts_with("person:") && !row.starts_with("person_clear_mark:"))
+                .collect()
+        };
+        assert_eq!(but_its_state(s[1].everything()), but_its_state(before));
+        assert_eq!(s[1].state(), State::Fork);
+        assert_eq!(s[1].number(), 1);
+        let mut known = vec![s.key(2), s.key(3)];
+        known.sort_unstable();
+        assert_eq!(held_rows::removed_keys(&s[1].conn).unwrap(), known);
+
+        // Device 2 knows its own key to be removed: the same hand-over is
+        // refused as for a removed device, whose way on is a new key.
+        let told = s.hand(0, 2);
+        held_rows::keep_removed(&s[2].conn, &[s.key(2)], s.now).unwrap();
+        let before = s[2].everything();
+        assert_eq!(
+            s.accept(2, 0, &told.hand_over),
+            Accepted::Refused(NotAccepted::Removed)
+        );
+        assert_eq!(but_its_state(s[2].everything()), but_its_state(before));
+        assert_eq!(s[2].state(), State::Fork);
+    }
+
+    /// A closed device takes a hand-over of a clear change, made after the
+    /// one it follows, that lists it: it is how a closed device is added
+    /// again (decision 2026-10-24 (removal), rules 8 and 10). It stands
+    /// applied after it.
+    #[test]
+    fn test_a_closed_device_takes_a_hand_over_of_a_clear_change_that_lists_it() {
+        let mut s = Several::of_one_person(3);
+        held_rows::set_state(&s[1].conn, State::Fork).unwrap();
+        s.change(0, &[0, 1, 2], &[]);
+        let told = s.hand(0, 1);
+        assert!(matches!(
+            s.accept(1, 0, &told.hand_over),
+            Accepted::Applied(Applied { number: 2, .. })
+        ));
+        assert_eq!(s[1].state(), State::Applied);
+        assert_eq!(s[1].number(), 2);
     }
 
     /// The fourth row: a device that is in no list takes only a hand-over
@@ -3887,7 +4135,9 @@ mod tests {
     /// `secret`, with its change entry as the phrase makes it.
     fn handing(s: &Several, statement: Statement, secret: [u8; 32]) -> HandOver {
         let signed = statement.sign(&s.phrase.signing_key().unwrap()).unwrap();
-        let entry = change_entry::entry_of(&s.phrase, &signed, &ForPhrase::first(secret)).unwrap();
+        let entry =
+            change_entry::entry_of(&s.phrase, &signed, &ForPhrase::first(secret), s.now as u64)
+                .unwrap();
         HandOver {
             made_at: s.now as u64,
             statement: signed,
@@ -4044,17 +4294,19 @@ mod tests {
         ));
     }
 
-    /// The last two rows: a device that was removed accepts nothing, and
-    /// nor does one that is in a fork.
+    /// A device that was removed accepts nothing. One that sets a head
+    /// aside takes no hand-over of the head it keeps, which brings no
+    /// change, and none under another phrase (decision 2026-10-24
+    /// (removal), rules 8 and 11).
     #[test]
-    fn test_a_device_that_was_removed_or_is_in_a_fork_accepts_nothing() {
+    fn test_a_device_that_was_removed_accepts_nothing_and_a_head_kept_brings_no_change() {
         let mut s = Several::of_one_person(3);
         s.change(0, &[0, 1], &[2]);
         assert_eq!(s.pass(0, 2)[0], Taken::Shown(Shown::Removed));
         // Device 1 has not heard, and makes a change of its own. Shown
-        // the other, it is in a fork.
+        // the other, it sets it aside: both are clear.
         s.change(1, &[0, 1], &[2]);
-        assert_eq!(s.pass(0, 1)[0], Taken::Shown(Shown::Fork));
+        assert_eq!(s.pass(0, 1)[0], Taken::Shown(Shown::SetAside));
 
         let (stranger, for_the_removed) = handed_by_a_stranger(&s[2], s.now);
         let (_, for_the_forked) = handed_by_a_stranger(&s[1], s.now);
@@ -4069,14 +4321,17 @@ mod tests {
             );
             assert_eq!(
                 accepted(&s, 1, &stranger.key(), sync_on, &for_the_forked),
-                Accepted::Refused(NotAccepted::InAFork)
+                Accepted::Refused(NotAccepted::AnotherPhrase)
             );
             assert_eq!(
                 accepted(&s, 1, &s.key(0), sync_on, &told.hand_over),
-                Accepted::Refused(NotAccepted::InAFork)
+                Accepted::Refused(NotAccepted::BringsNoChange)
             );
         }
         assert_eq!((s[1].everything(), s[2].everything()), before);
-        assert_eq!((s[1].state(), s[2].state()), (State::Fork, State::Removed));
+        assert_eq!(
+            (s[1].state(), s[2].state()),
+            (State::Applied, State::Removed)
+        );
     }
 }

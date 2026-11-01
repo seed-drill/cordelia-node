@@ -530,7 +530,8 @@ pub fn stopped_says(name: &str, state: held_rows::State, not_held: usize) -> Str
         State::Removed => "it was removed",
         State::NotListed => "it is in no list of the last change",
         State::NotOpened => "it could not open the last change",
-        State::Fork | State::Applied => "two changes were made apart",
+        // Closed (decision 2026-10-24 (removal), rule 10).
+        State::Fork | State::Applied => "it is closed: no change that lists it is clear",
     };
     let versions = match not_held {
         1 => "1 version".to_string(),
@@ -811,7 +812,10 @@ mod tests {
         assert!(opened.contains("it sent 1 version of lab,") && opened.contains("added again"));
         for (state, why) in [
             (State::Removed, "(it was removed)"),
-            (State::Fork, "(two changes were made apart)"),
+            (
+                State::Fork,
+                "(it is closed: no change that lists it is clear)",
+            ),
         ] {
             let said = stopped_says("lab", state, 2);
             assert!(
