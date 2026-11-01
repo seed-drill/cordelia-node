@@ -378,6 +378,19 @@ pub(crate) fn no_longer_stands(seen: &Value) -> Option<String> {
     ))
 }
 
+/// Where the device moved from the change whose entry `made` names, in hex
+/// (decision 2026-10-24 (removal), rule 9), what the wait after it says
+/// before it ends with status 3: "a change made apart on <label> removed
+/// <label>, which this change lists: this device follows that change
+/// now", as the node noted it at the move.
+pub(crate) fn moved_from(seen: &Value, made: &str) -> Option<String> {
+    list(seen, "moved")
+        .filter(|moved| moved["from"].as_str() == Some(made))
+        .filter_map(|moved| moved["says"].as_str())
+        .last()
+        .map(crate::history_cmd::printable)
+}
+
 /// R0: what a recovery says where a relay does not hold the change when
 /// its look has ended (decision 2026-10-19 §5), and that each line after
 /// it has its time (decision 2026-10-24, rule 3).
@@ -933,7 +946,7 @@ pub(crate) mod tests {
     use std::time::Duration;
 
     /// The change entry that the device keeps: the change just made.
-    const KEPT: [u8; 32] = [1; 32];
+    pub(crate) const KEPT: [u8; 32] = [1; 32];
     /// The change entry that the device kept before it.
     const BEFORE: [u8; 32] = [2; 32];
     /// The key that a relay answers with.

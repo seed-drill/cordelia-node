@@ -50,7 +50,9 @@ cordelia-node/
                          #   the share), shared (forms 6 and 5, and the anew seal),
                          #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 26). entries; person and acts (what a
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 32: the removal's 21 to 26, the shared
+                         #   channels' 27 to 32). entries; arrivals (the arrivals of
+                         #   each file, decision 2026-10-24 rule 7); person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
                          #   (where a device stands at each relay); sync_state, index_lines,
@@ -59,20 +61,20 @@ cordelia-node/
                          #   of messages between its agents, a generation being a messages
                          #   channel it held; H and the live numbers, the index, places
                          #   and the shown time; a row overwritten before it goes, in the
-                         #   caller's write); shared_lists (step 21: what a device keeps
-                         #   beside its list of shared channels); shared (step 22: the
+                         #   caller's write); shared_lists (step 27: what a device keeps
+                         #   beside its list of shared channels); shared (step 28: the
                          #   shared channels a device holds, the table of keys of each
                          #   with its room, and the index of shared messages);
-                         #   shared_pass (step 23: the places at each relay of a
+                         #   shared_pass (step 29: the places at each relay of a
                          #   shared channel, what each relay answered of a push,
                          #   and the take-outs begun and not ended); shared_sharing
-                         #   (step 24: the keys typed for a channel and what became of
+                         #   (step 30: the keys typed for a channel and what became of
                          #   each, the shares this device wrote and what each relay
-                         #   answered of them); shared_messages (step 25:
+                         #   answered of them); shared_messages (step 31:
                          #   subscriptions' starts, the table of shared marks and
                          #   the other devices' sread/ lists, a person's reads of
                          #   shared messages, the channel's hour, the kept values);
-                         #   shared_anew (step 26: the offers read in each
+                         #   shared_anew (step 32: the offers read in each
                          #   channel, the channels made anew here, those not
                          #   yet clean); db
                          #   (secure_delete, set
@@ -116,7 +118,9 @@ cordelia-node/
                          #   and the notice), first_start (a node that is held up), sync,
                          #   history; reader (what a device keeps of an entry of the
                          #   messages channel that the door stores, and the hourly task of
-                         #   messages); own_read (a read of a channel of the device's own
+                         #   messages); cut and arrivals (a removed key's cut time, and
+                         #   what a carry leaves out, decision 2026-10-24 rules 2, 6, 7);
+                         #   own_read (a read of a channel of the device's own
                          #   with places of its own, kept in memory under its ID: the read
                          #   before a carried name is let go); let_go (what that read
                          #   finds: the entries this device signed, each held where a
@@ -160,8 +164,9 @@ cordelia-node/
     specs/               # Protocol and component specs + TLA+ model
     decisions/           # ADRs; 2026-10-04-a-persons-devices.md and
                          #   2026-09-30-agent-memory-sync.md are the current design
-    reference/           # Test vectors (step4-test-vectors.json: the derivations),
-                         #   network model, risk model
+    reference/           # Test vectors (step4-test-vectors.json: the derivations;
+                         #   change-entry-test-vectors.json: the change entry's
+                         #   layout with its lineage), network model, risk model
     archive/             # Pre-v1 documents, kept for history
     vision.md            # Direction after v1
   tests/                 # Integration tests
@@ -189,7 +194,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it; making anew, moving, a removal and a recovery; the status's `shared` object), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `removal_e2e.rs` (a removal fails safe, decision 2026-10-24 (removal), section 7; the window's test is ignored for its length), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it; making anew, moving, a removal and a recovery; the status's `shared` object), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
@@ -258,7 +263,9 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_DEVICE_LABEL_BYTES`, `STATEMENT_HASH_BYTES` | 64, 16 | parameter-rationale.md §12.2 |
 | `MAX_STATEMENT_BYTES` | 20,784 (derived) | parameter-rationale.md §12.2 |
 | `CHANGE_ENTRY_BYTES` | 32KB, always | parameter-rationale.md §12.3 |
-| `CHANGE_ENTRY_PHRASE_PART_BYTES`, `CHANGE_ENTRY_DEVICES_PART_BYTES` | 4KB, 28KB (derived) | parameter-rationale.md §12.3 |
+| `CHANGE_ENTRY_DEVICES_PART_BYTES`, `CHANGE_ENTRY_PHRASE_PART_BYTES`, `CHANGE_ENTRY_LINEAGE_BYTES` | 28,672 (fixed: where the version before opens it), 1KB, 3KB (derived) (decision 2026-10-24 rule 13) | parameter-rationale.md §12.3 |
+| `CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES` | 4KB (derived: the part for the phrase of the version before, opened for a change made over its entry) | parameter-rationale.md §12.3 |
+| `LINEAGE_HASH_BYTES`, `LINEAGE_MARK_BYTES`, `MAX_LINEAGE_BYTES` | 8, 8, 2,074 (derived: a lineage of a chain at its bound) | parameter-rationale.md §12.3 |
 | `SEALED_SECRET_BYTES`, `MAX_EARLIER_SECRETS` | 92, 8 | parameter-rationale.md §12.3 |
 | `MIN_ENTRY_CONTENT_BYTES` | 256 (a content is a power of two from this to `MAX_ITEM_BYTES`) | parameter-rationale.md §12.4 |
 | `MAX_ENTRY_LINKS`, `ENTRY_LINK_HASH_BYTES`, `ENTRY_LINK_SIGNER_BYTES` | 100, 16, 16 | parameter-rationale.md §12.4 |
@@ -268,7 +275,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
 | `PHRASE_TYPED_BACK_MISSES`, `PHRASE_MISS_PAUSE_SECS` | 3 (the third word typed back that is not the word shown stops `cordelia phrase`), 2s (before the first miss is said, and twice as long before the second) | parameter-rationale.md §12.5 |
 | `PHRASE_QUIET_AFTER_CROSS_SECS` | 1s (after a cross, what is typed is dropped until nothing has been typed for this long; then the same number is asked) | parameter-rationale.md §12.5 |
-| `LABEL_*` (34 of them, all in `LABELS`; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, the three of messages and the six of a shared channel below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
+| `LABEL_*` (35 of them, all in `LABELS`; `LABEL_CHANGE_LINEAGE` among them; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, the three of messages and the six of a shared channel below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
 | `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
@@ -278,6 +285,11 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `MAX_COUNTED_DEVICES`, `MAX_NOT_COUNTED_RECORDS` | 64 (derived), 256 | parameter-rationale.md §12.6 |
 | `KEPT_OUT_PER_ADDER` | 3 (derived: the keys that the 64 kept out that each adder that may add keeps, in both bounds of 256) | parameter-rationale.md §12.6 |
 | `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
+| `MAX_CHANGE_HEADS` | 8 (the heads a device and a relay keep, decision 2026-10-24 (removal)) | parameter-rationale.md §12.6 |
+| `REMOVAL_TAKEN_MARGIN_SECS`, `MAX_FILE_ARRIVALS` | 600s (derived: 2 x `MAX_CLOCK_SKEW_SECS`; a removed key's cut time is the time of the change that first removes it less this), 1,024 (the arrivals a device keeps for a file, decision 2026-10-24 (removal), rules 2 and 7) | parameter-rationale.md §12.6 |
+| `CHANGE_HEADS_ROOM` | 2 (the heads a relay keeps room for in a slot whose entry carries a lineage, where it has the room; it makes none, decision 2026-10-24 (removal) rule 15) | parameter-rationale.md §12.7 |
+| `RELAY_ROLE_HEADS` | `heads` (the role a relay of this version names in its handshake: it keeps every head, and a device shows it each; at a relay that does not name it, none above the change followed, decision 2026-10-24 (removal) rule 18) | parameter-rationale.md §12.7 |
+| `MAX_KNOWN_REMOVED`, `MAX_KNOWN_HOLDERS` | 2,048 (derived: `MAX_STATEMENT_REMOVED` x `MAX_CHANGE_HEADS`), 2,048 (the keys a device keeps as removed, and as holding one change's secret by its records; past either it is closed) | parameter-rationale.md §12.6 |
 | `PERSONAL_NAME_PREFIX`, `PERSONAL_ADDED_PREFIX`, `PERSONAL_APPLIED_PREFIX`, `PERSONAL_LEFT_PREFIX`, `PERSONAL_APPLIED_SENT` | `name/`, `added/`, `applied/`, `left/`, ` sent` | parameter-rationale.md §12.6 |
 | `PERSONAL_REACHED_PREFIX` | `reached/` (the carried word: what a device carried is at the relays it reaches, decision 2026-10-19 rule 4) | parameter-rationale.md §12.6 |
 | `REACHED_WORD_MAX_RELAYS`, `REACHED_WORD_MAX_COUNT` | 8 (keys the carried word names; at its bound one content of 512 bytes), 256 (either count) | parameter-rationale.md §12.6 |

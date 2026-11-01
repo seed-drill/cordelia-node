@@ -2032,3 +2032,171 @@ fn folders_that_synced_unmapped_stop_and_sync_again_once_they_are_mapped() {
 fn folders_of_an_install_from_before_mappings_stop_and_sync_again_once_mapped() {
     folders_that_stopped_sync_again_once_they_are_mapped(None, true);
 }
+
+/// Leave `node`'s database, which is stopped, as the version before the
+/// one that keeps every head left a device in a fork (decision
+/// 2026-10-24 (removal), schema step 21): its state `fork`, the change
+/// entry it follows kept as `latest` and the head it sets aside as
+/// `apart`, no time of any change, and schema version 21. What step 23
+/// adds goes too: the table of the room a relay keeps for heads; and the
+/// tables step 24 adds (decision 2026-10-24 (removal), rules 6 and 7), and
+/// those of step 26. (Step 23
+/// makes the table of entries again from the columns it had at step 22,
+/// so the one column more it finds there changes nothing.)
+fn as_a_fork_of_the_version_before(node: &Node) {
+    let conn = Connection::open(node.data_dir().join("cordelia.db")).unwrap();
+    conn.execute_batch(
+        "BEGIN;
+         CREATE TABLE person_change_entries_21 (
+             kept            TEXT PRIMARY KEY CHECK(kept IN ('latest', 'apart')),
+             channel         BLOB NOT NULL CHECK(length(channel) = 32),
+             slot            BLOB NOT NULL CHECK(length(slot) = 32),
+             author          BLOB NOT NULL CHECK(length(author) = 32),
+             rev             INTEGER NOT NULL CHECK(rev BETWEEN 1 AND 256),
+             content         BLOB NOT NULL,
+             author_sig      BLOB NOT NULL CHECK(length(author_sig) = 64),
+             channel_sig     BLOB NOT NULL CHECK(length(channel_sig) = 64)
+         );
+         INSERT INTO person_change_entries_21
+             SELECT CASE followed WHEN 1 THEN 'latest' ELSE 'apart' END,
+                    channel, slot, author, rev, content, author_sig, channel_sig
+             FROM person_change_entries;
+         DROP TABLE person_change_entries;
+         ALTER TABLE person_change_entries_21 RENAME TO person_change_entries;
+         DROP TABLE person_change_times;
+         DROP TABLE relay_head_rooms;
+         DROP TABLE person_change_times_lists;
+         DROP TABLE person_removed_keys_by;
+         DROP TABLE person_removed_keys_spared;
+         DROP TABLE file_put_back;
+         DROP TABLE file_line_from;
+         DROP TABLE file_arrivals;
+         DROP TABLE file_arrivals_stored;
+         DROP TABLE file_arrivals_dropped;
+         DROP TABLE file_copies;
+         DROP TABLE file_cut;
+         DROP TABLE file_cut_written;
+         DELETE FROM node_meta WHERE key = 'person.judge_kept';
+         UPDATE person SET state = 'fork';
+         COMMIT;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 21).unwrap();
+}
+
+/// A device that was in a fork on the version before judges, at its first
+/// start on this version, the entry it kept apart (decision 2026-10-24
+/// (removal), rule 12, schema step 22). The laptop and the desktop each
+/// make a change while the relay is out of reach; neither removes a
+/// device, so each is clear. The one that sees both is stopped, and its
+/// database is put back as the version before left a device in a fork.
+/// Started again, the step carries what it kept, and the device judges
+/// the entry it kept apart by rule 8: the change it follows is clear, so
+/// it goes on, with the other set aside (rule 11). The time of each change
+/// it keeps is noted, the step's mark is gone, and a second start judges
+/// nothing again.
+#[test]
+fn a_device_in_a_fork_judges_what_it_kept_at_its_first_start() {
+    let mut relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let mut desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    let mut at = renews(&laptop, &["stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    has_applied(&desktop, 2, &[&relay, &laptop, &desktop]);
+
+    // Each makes a change while the relay is out of reach.
+    relay.stop();
+    for device in [&laptop, &desktop] {
+        let mut at = renews(device, &[], &words);
+        at.says("The change is made (change 3).");
+        drop(at);
+    }
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    let sets_aside = |device: &Node| {
+        person_of(device)["set_aside"]
+            .as_array()
+            .is_some_and(|heads| !heads.is_empty())
+    };
+    wait_for(
+        "one device sees both changes",
+        &[&relay, &laptop, &desktop],
+        180,
+        || (sets_aside(&laptop) || sets_aside(&desktop)).then_some(()),
+    );
+    let forked = match sets_aside(&laptop) {
+        true => &mut laptop,
+        false => &mut desktop,
+    };
+    let kept_before = person_of(forked);
+    assert_eq!(kept_before["state"], "applied");
+
+    // As the version before left it: in a fork.
+    forked.stop();
+    as_a_fork_of_the_version_before(forked);
+    assert_eq!(schema_version(&database_of(forked)), 21);
+    forked.start();
+    wait_for("the device answers again", &[&relay], 60, || {
+        answers(forked)
+    });
+
+    // It judged the entry it kept apart, and goes on.
+    let seen = person_of(forked);
+    assert_eq!(seen["state"], "applied", "{seen}");
+    assert_eq!(seen["cannot_go_on"], serde_json::Value::Null, "{seen}");
+    assert_eq!(seen["latest"], kept_before["latest"]);
+    let heads = seen["set_aside"].as_array().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0]["number"], 3);
+    assert_eq!(heads[0]["clear"], true);
+    let log = std::fs::read_to_string(forked.log()).unwrap();
+    assert!(
+        log.contains("the change kept apart is judged by what this device knows of removals"),
+        "{}",
+        forked.log_tail()
+    );
+    let db = database_of(forked);
+    assert_eq!(
+        schema_version(&db),
+        cordelia_storage::schema::SCHEMA_VERSION
+    );
+    let marked: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM node_meta WHERE key = 'person.judge_kept'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marked, 0);
+    let times: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM person_change_times WHERE made_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(times >= 2, "{times}");
+    drop(db);
+
+    // A second start judges nothing again.
+    forked.stop();
+    forked.start();
+    wait_for("the device answers again", &[&relay], 60, || {
+        answers(forked)
+    });
+    // (The harness begins a node's log afresh at each start.)
+    let log = std::fs::read_to_string(forked.log()).unwrap();
+    assert!(
+        !log.contains("the change kept apart is judged"),
+        "{}",
+        forked.log_tail()
+    );
+    assert_eq!(person_of(forked)["state"], "applied");
+    assert_eq!(
+        person_of(forked)["set_aside"].as_array().map(Vec::len),
+        Some(1)
+    );
+}

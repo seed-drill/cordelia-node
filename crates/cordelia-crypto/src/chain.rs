@@ -78,7 +78,11 @@ pub fn carried_from(
 ///   link first, and then its chain.
 /// - **Where the other's hash is already in that chain, nothing is
 ///   added.** The channel's version descends from it, and every link
-///   between the two stays between them.
+///   between the two stays between them. So a merge's chain may be
+///   exactly an edit's, and nothing tells the two apart by their chains:
+///   at a removal every index version another device wrote is set aside
+///   in its window, edit or merge (decision 2026-10-24 (removal), rule 7,
+///   the index rule).
 /// - **Where it is not,** the two were written apart. The other's link
 ///   comes second, and after it the links of the two chains, one from
 ///   each in turn, the channel's first.

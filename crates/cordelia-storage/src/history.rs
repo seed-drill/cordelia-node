@@ -99,6 +99,13 @@ pub enum Change {
     Restored,
     /// A file arrived that was not here. No text is kept.
     Arrived,
+    /// A carry left out what the file held (decision 2026-10-24 (removal),
+    /// rule 7): a removed device wrote it after its removal, or in a branch
+    /// made apart from it, or it was stored over such writing. The file went
+    /// back to the version before, and the text is kept here alone.
+    /// `cordelia restore` does not put it back (the review of the whole
+    /// build, its H1).
+    SetAside,
 }
 
 /// A device's entry for a file: who wrote it, and at which revision.
@@ -457,6 +464,20 @@ impl Store {
                         found.left.push(Stuck { id, about });
                     }
                 }
+            }
+        }
+        Ok(found)
+    }
+
+    /// The pending records as they are, with nothing marked: what one who
+    /// holds no turn can see of those [`Store::recover`] marks or leaves.
+    /// Some may belong to a change in hand.
+    pub fn pending(&self) -> std::io::Result<Vec<Stuck>> {
+        let mut found = Vec::new();
+        for name in self.names()? {
+            if let Some((id, PENDING)) = record_name(&name) {
+                let about = read_about(&self.dir.join(&name));
+                found.push(Stuck { id, about });
             }
         }
         Ok(found)

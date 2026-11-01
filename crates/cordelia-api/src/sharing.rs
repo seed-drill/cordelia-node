@@ -202,6 +202,7 @@ fn why_not_applied(conn: &Connection) -> Result<&'static str, PersonError> {
     Ok(match stands(conn)? {
         Stands::NoPhrase => "this device follows no recovery phrase yet",
         Stands::Stopped(state) => crate::look::short_why(state),
+        Stands::Closed => crate::look::CLOSED_SHORT,
         Stands::Applied => crate::look::short_why(cordelia_storage::person::State::Applied),
     })
 }
@@ -316,10 +317,11 @@ pub fn sender_form(
     if key == own {
         return Ok("this device".into());
     }
-    let counting = crate::person::Counting::of(
+    let counting = crate::person::counting(
+        conn,
         &held.statement.statement,
         &cordelia_storage::person::additions(conn)?,
-    );
+    )?;
     if counting.counts(key) {
         let label = crate::reader::label_of(conn, &held.statement.statement, key)?;
         return Ok(format!(
@@ -353,7 +355,7 @@ fn another_persons(
         );
     }
     let counting =
-        crate::person::Counting::of(statement, &cordelia_storage::person::additions(conn)?);
+        crate::person::counting(conn, statement, &cordelia_storage::person::additions(conn)?)?;
     if key == own || counting.counts(key) {
         let form = sender_form(conn, held, own, key)?;
         let line = match what {

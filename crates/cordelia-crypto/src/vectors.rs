@@ -34,10 +34,11 @@ const PUBLISHED: &str = concat!(
 
 /// The twelve words of the phrase in the vectors: one of the vectors of
 /// BIP39's reference implementation.
-const WORDS: &str = "legal winner thank year wave sausage worth useful legal winner thank yellow";
+pub(crate) const WORDS: &str =
+    "legal winner thank year wave sausage worth useful legal winner thank yellow";
 
 /// 32 bytes that count up from `first`.
-fn counting(first: u8) -> [u8; 32] {
+pub(crate) fn counting(first: u8) -> [u8; 32] {
     std::array::from_fn(|i| first + i as u8)
 }
 
@@ -229,7 +230,7 @@ fn vectors() -> Value {
 }
 
 /// The paths at which two documents differ, for a failure that says where.
-fn differences(path: &str, made: &Value, published: &Value, out: &mut Vec<String>) {
+pub(crate) fn differences(path: &str, made: &Value, published: &Value, out: &mut Vec<String>) {
     match (made, published) {
         (Value::Object(made), Value::Object(published)) => {
             for name in made.keys().chain(published.keys()) {
@@ -253,7 +254,7 @@ fn differences(path: &str, made: &Value, published: &Value, out: &mut Vec<String
 
 /// The file as the helper writes it: its content, set out one value to a
 /// line.
-fn as_written(vectors: &Value) -> String {
+pub(crate) fn as_written(vectors: &Value) -> String {
     format!("{}\n", serde_json::to_string_pretty(vectors).unwrap())
 }
 

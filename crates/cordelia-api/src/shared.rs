@@ -155,7 +155,7 @@ impl Knows {
     pub(crate) fn of(conn: &Connection, held: &Held) -> Result<Self, PersonError> {
         let statement = &held.statement.statement;
         let additions = held_rows::additions(conn)?;
-        let counting = Counting::of(statement, &additions);
+        let counting = crate::person::counting(conn, statement, &additions)?;
         let mut devices: Vec<[u8; 32]> = Vec::new();
         let listed = statement.devices.iter().map(|device| device.key);
         for key in listed.chain(additions.iter().map(|record| record.key)) {

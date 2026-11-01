@@ -33,6 +33,10 @@ pub struct Record {
     pub line: String,
     /// How many times the line has been put back.
     pub put_back: u32,
+    /// The keys that signed the version the line was removed from, where
+    /// that was written down (decision 2026-10-24 (removal), rule 7): no
+    /// line is put back from a version that a removed key signed.
+    pub from: Vec<[u8; 32]>,
 }
 
 fn storage(e: rusqlite::Error) -> CordeliaError {
@@ -75,10 +79,31 @@ pub fn lines_removed(
     lines: &[(&str, &str)],
     now: i64,
 ) -> Result<(), CordeliaError> {
+    lines_removed_from(conn, folder, channel_id, lines, &[], now)
+}
+
+/// [`lines_removed`], where `from` are the keys that signed the version
+/// the lines were removed from (decision 2026-10-24 (removal), rule 7).
+pub fn lines_removed_from(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+    lines: &[(&str, &str)],
+    from: &[[u8; 32]],
+    now: i64,
+) -> Result<(), CordeliaError> {
     conn.execute_batch("SAVEPOINT index_lines")
         .map_err(storage)?;
     let written = lines.iter().try_for_each(|(file, line)| {
-        written(conn, folder, channel_id, file, Half::Line(line), now)
+        written(conn, folder, channel_id, file, Half::Line(line), now)?;
+        conn.execute(
+            "INSERT INTO file_line_from (folder, channel_id, file, from_signers)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(folder, channel_id, file) DO UPDATE SET from_signers = excluded.from_signers",
+            params![folder, channel_id, file, from.concat()],
+        )
+        .map(|_| ())
+        .map_err(storage)
     });
     let end = match written {
         Ok(()) => "RELEASE index_lines",
@@ -267,7 +292,11 @@ pub fn whole(
     .map_err(storage)?;
     let mut stmt = conn
         .prepare(&format!(
-            "SELECT file, line, put_back FROM index_lines
+            "SELECT file, line, put_back,
+                    (SELECT from_signers FROM file_line_from f
+                     WHERE f.folder = index_lines.folder
+                       AND f.channel_id = index_lines.channel_id AND f.file = index_lines.file)
+             FROM index_lines
              WHERE {of_folder} AND whole = 1 AND line IS NOT NULL ORDER BY file"
         ))
         .map_err(storage)?;
@@ -277,6 +306,10 @@ pub fn whole(
                 file: row.get(0)?,
                 line: row.get(1)?,
                 put_back: row.get::<_, i64>(2)?.try_into().unwrap_or(u32::MAX),
+                from: row
+                    .get::<_, Option<Vec<u8>>>(3)?
+                    .map(|keys| keys.as_chunks::<32>().0.to_vec())
+                    .unwrap_or_default(),
             })
         })
         .map_err(storage)?
@@ -318,12 +351,31 @@ pub fn drop_record(
     channel_id: &str,
     file: &str,
 ) -> Result<(), CordeliaError> {
-    conn.execute(
-        "DELETE FROM index_lines WHERE folder = ?1 AND channel_id = ?2 AND file = ?3",
-        params![folder, channel_id, file],
-    )
-    .map_err(storage)?;
+    for table in ["index_lines", "file_line_from"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE folder = ?1 AND channel_id = ?2 AND file = ?3"),
+            params![folder, channel_id, file],
+        )
+        .map_err(storage)?;
+    }
     Ok(())
+}
+
+/// Drop each record of the folder whose line was removed at `at` or after
+/// it: a carry left out the index's versions stored from then (decision
+/// 2026-10-24 (removal), rule 7), and such a line may be of one of them.
+/// Returns how many went.
+pub fn drop_lines_removed_since(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+    at: i64,
+) -> Result<usize, CordeliaError> {
+    conn.execute(
+        "DELETE FROM index_lines WHERE folder = ?1 AND channel_id = ?2 AND line_at >= ?3",
+        params![folder, channel_id, at],
+    )
+    .map_err(storage)
 }
 
 #[cfg(test)]

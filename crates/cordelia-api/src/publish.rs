@@ -45,7 +45,9 @@
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::{ENTRY_LINK_HASH_BYTES, MAX_ENTRY_NAME_AND_VALUE_BYTES};
+use cordelia_core::protocol::{
+    ENTRY_LINK_HASH_BYTES, MAX_ENTRY_LINKS, MAX_ENTRY_NAME_AND_VALUE_BYTES,
+};
 use cordelia_core::revision::band;
 use cordelia_crypto::chain;
 use cordelia_crypto::derive;
@@ -206,6 +208,12 @@ pub enum Published {
     /// (decision 2026-10-04 §2.3): the name is out of reach. Nothing was
     /// written.
     OutOfReach,
+    /// The file is a conflict copy whose text's history was not known when
+    /// a folder made it ([`copy_made`] with no chain): it is kept on this
+    /// device, and never published (decision 2026-10-24 (removal), rule 7;
+    /// the third read of slice 8, its second low finding). Nothing was
+    /// written.
+    KeptHere,
 }
 
 /// Publish a value under a file's name in a name that this device holds,
@@ -227,6 +235,11 @@ pub fn publish(
         let slot = standing.slot(conn, &channel, write.file)?;
         if !write.planned.is_still(slot.current.as_ref()) {
             return Ok(Published::Changed);
+        }
+        let id = derive::channel_id(&channel)?;
+        let file = slot_id(&derive::slot_key(&channel)?, write.file);
+        if cordelia_storage::arrivals::copy_held(conn, &id, &file)? {
+            return Ok(Published::KeptHere);
         }
         let over = Over {
             channel: &channel,
@@ -408,7 +421,11 @@ impl Standing {
     pub(crate) fn of(conn: &Connection) -> Result<Self, PersonError> {
         let held = held(conn)?.ok_or(PersonError::FollowsNoPhrase)?;
         let secret = applied_secret(conn, &held.statement.statement)?;
-        let counting = Counting::of(&held.statement.statement, &held_rows::additions(conn)?);
+        let counting = crate::person::counting(
+            conn,
+            &held.statement.statement,
+            &held_rows::additions(conn)?,
+        )?;
         Ok(Self {
             held,
             secret,
@@ -418,11 +435,18 @@ impl Standing {
 
     /// Where this device stands, as one that may write in its own
     /// channels: it has applied a statement, and has not stopped since
-    /// (decision 2026-10-04 §4.3, §4.5).
+    /// (decision 2026-10-04 §4.3, §4.5); and the change it follows is
+    /// clear (decision 2026-10-24 (removal), rule 4). Every seal outside an
+    /// apply takes its secret here: an entry in a channel of its own, a
+    /// record of an addition and its hand-over, a name's word, a word that
+    /// it left, the carried word, a message, and what an agent read.
     pub(crate) fn to_write(conn: &Connection) -> Result<Self, PersonError> {
         let standing = Self::of(conn)?;
         if standing.held.state != State::Applied {
             return Err(PersonError::Stopped(standing.held.state));
+        }
+        if !crate::person::follows_a_clear_change(conn)? {
+            return Err(PersonError::NotClear);
         }
         Ok(standing)
     }
@@ -497,7 +521,32 @@ fn written_over(
     now: i64,
 ) -> Result<Option<CheckedEntry>, PersonError> {
     let current = over.slot.current.as_ref();
-    let chain = chain_over(current, &identity.public_key(), over.merge)?;
+    let mut chain = chain_over(current, &identity.public_key(), over.merge)?;
+    // A conflict copy's first version is written after the text it keeps
+    // (decision 2026-10-24 (removal), rule 7; the second read of slice 8, its
+    // first finding): a device that takes it then makes an arrival of each
+    // key that wrote that text, as it would of the file it was copied from.
+    // **Whatever its slot held before** (the third read of slice 8, its
+    // first finding): a copy's name is fixed for its file and device, so a
+    // copy made again after a person deleted the last one is written over
+    // that delete. The links of the text it keeps come first, and then what
+    // its slot held.
+    let channel = derive::channel_id(over.channel)?;
+    let slot = slot_id(&derive::slot_key(over.channel)?, file);
+    let copy = match over.merge {
+        None => cordelia_storage::arrivals::copy_chain(conn, &channel, &slot)?,
+        Some(_) => None,
+    };
+    if let Some(kept) = &copy {
+        let kept = kept.iter().map(|link| {
+            let (hash, signer) = link.split_at(16);
+            Link {
+                hash: hash.try_into().unwrap_or_default(),
+                signer: signer.try_into().unwrap_or_default(),
+            }
+        });
+        chain = kept.chain(chain).take(MAX_ENTRY_LINKS).collect();
+    }
     let Some(rev) = over.slot.next else {
         return Ok(None);
     };
@@ -512,7 +561,63 @@ fn written_over(
             "the store holds an entry of this device's at or above the slot's next revision".into(),
         ));
     }
+    if copy.is_some() {
+        cordelia_storage::arrivals::copy_done(conn, &channel, &slot)?;
+    }
     Ok(Some(entry))
+}
+
+/// A folder (`folder`) is about to make `copy` a conflict copy of `file`,
+/// in the name `name`, keeping a text written after `chain` (decision
+/// 2026-10-24 (removal), rule 7; the second read of slice 8, its first
+/// finding). The copy is a new name, published as this device's own, and
+/// this device's own versions make no arrivals: so every event of `file`
+/// becomes the copy's too, and the copy's first version is written after
+/// `chain`. A carry before it is published judges it as any file
+/// (`person::move_records`). Called before the copy is written: a copy that
+/// is then not written leaves events that cut nothing honest.
+///
+/// **`None`: the folder does not know what the text was written after**
+/// (its record names no signer, or no chain; the third read of slice 8,
+/// its second low finding). Its first version would name nothing, so a
+/// device that took it would make no arrival of a removed key whose text
+/// it keeps, and a carry made before this device knew of the removal
+/// judges nothing of it either. So it is never published
+/// ([`Published::KeptHere`]): it stays in the folder, on this device alone,
+/// and a carry that leaves it out puts it back to none.
+pub fn copy_made(
+    conn: &Connection,
+    name: &str,
+    folder: &str,
+    file: &str,
+    copy: &str,
+    chain: Option<&[Link]>,
+) -> Result<(), PersonError> {
+    let standing = Standing::of(conn)?;
+    let secret = standing.name_secret(conn, name)?;
+    let channel = derive::channel_id(&secret)?;
+    let slot_key = derive::slot_key(&secret)?;
+    let links: Option<Vec<[u8; 32]>> = chain.map(|chain| {
+        chain
+            .iter()
+            .take(MAX_ENTRY_LINKS)
+            .map(|link| {
+                let mut both = [0u8; 32];
+                both[..16].copy_from_slice(&link.hash);
+                both[16..].copy_from_slice(&link.signer);
+                both
+            })
+            .collect()
+    });
+    Ok(cordelia_storage::arrivals::copy_file(
+        conn,
+        &channel,
+        &slot_id(&slot_key, file),
+        &slot_id(&slot_key, copy),
+        folder,
+        copy,
+        links.as_deref(),
+    )?)
 }
 
 /// The chain of an entry that the device whose key is `own` writes over

@@ -86,7 +86,8 @@ After that:
 - If two machines edit the same memory before hearing from each other, one
   version stays in the file and the other is kept beside it as
   `<name>.conflict-<device>.md`, on every machine. The memory index
-  (`MEMORY.md`) is merged line by line instead. (The decision records list
+  (`MEMORY.md`) is merged line by line instead; where it is not, its copy
+  stays on the machine that made it. (The decision records list
   the limits.)
 - `cordelia sync status` lists what was found on the machine and is not
   syncing, with the command that maps it, and what the person's other
@@ -135,7 +136,10 @@ secret. Only the phrase's key signs one. A device applies a statement only if
 the phrase it follows signed it, it was made after the one the device has
 applied, it undoes no removal, it lists the device, and the secret that comes
 with it opens to the commitment. It applies it in one step, for every
-channel, or not at all.
+channel, or not at all. The one other change a device applies is one made
+apart from its own, where a key it knows to be removed holds the secret of
+its own, and the other lists it and is clear of every such key: it moves to
+it, with no phrase (§3.6).
 
 **Adding a device** takes two commands, each at a terminal with its yes: the
 new device's key is typed on a device that is in (`add-device`), and that
@@ -175,7 +179,7 @@ Where each channel's secret comes from:
 | Personal | The person secret | Every device of the person. It holds what the devices tell each other: which names each syncs, the devices added since the last statement, and which statement each has applied |
 | A name's (memory) | The person secret and the name | Every device of the person, for every name |
 | Pair | The two devices' keys (X25519) | Those two devices. It is used for one thing: handing a device what it needs when it is added |
-| The phrase's | The phrase | Whoever has the phrase. It holds one entry: the latest statement, as it travels (§3.4) |
+| The phrase's | The phrase | Whoever has the phrase. It holds, as it travels (§3.4), each statement that no later one was made after: one, or more where changes were made apart |
 
 A channel has no key ring, no list of members and no owner, and a node has
 no inbox. The channels derived from one person secret are a *generation*:
@@ -254,7 +258,8 @@ key they do not hold. Two roles matter in v1:
   relay stores and hands over only what belongs to a channel, with no key of
   its own:
   - it stores an entry only if both of its signatures hold and it is within
-    the limits, and keeps the newest revision for each author in each slot;
+    the limits, and keeps the newest revision for each author in each slot,
+    or, for a change entry, every change made apart (§3.6);
   - it hands a channel's entries only to a connection that has **proved** it
     holds the channel's key: a signature by that key over a value of the one
     TLS session and the prover's own node key, which holds on no other
@@ -277,11 +282,17 @@ Three things happen between a device and a relay:
 - **The show.** Each statement travels as one entry in the phrase's channel,
   the *change entry*, always 32 KB: the statement, the new secret sealed to
   each device it lists, and, sealed for the phrase alone, the new secret and
-  up to eight before it. Every device keeps the latest it has seen and shows
-  it to each relay on every pass. A relay that holds none, or an earlier one,
-  takes it; a relay that holds a later one answers with it. So a change
-  reaches every relay that any device with it reaches, and every device that
-  reaches such a relay.
+  up to eight before it; and, in the clear, its **lineage**: when it was
+  made, and the hash of its statement and of each statement it was made
+  after. Every device shows each relay, on every pass, the change entry of
+  the change it follows, and then each change made apart that it keeps. A
+  relay keeps every change that no other it keeps was made after, up to
+  eight, by their lineages. Before it says that it holds the entry shown, it
+  hands the device each one that the connection has not yet had, the lowest
+  number first. Relays that work together pass each on, and offer it again
+  until it is taken. So a change reaches every relay that any device with it
+  reaches, and every device that reaches such a relay, whatever else either
+  holds.
 - **The show comes first.** On a connection to a relay, until a device has
   shown its change entry there and applied what it was answered with, it
   sends nothing in a channel of its own and takes nothing from one. A device
@@ -349,7 +360,10 @@ between relays that work together, and nowhere else.
    an edit or a delete made there, the channel's version. A text that cannot
    be kept is not replaced. `cordelia history` lists what is kept and
    `cordelia restore` puts a version back; where the folder syncs, every
-   device follows. History is kept for 30 days and up to 256 MB, on the
+   device follows. Once a removal's carry has cut a file, `cordelia
+   restore` refuses every version of it from then on, but what this
+   device wrote itself after the cut; `cordelia history show` prints each,
+   to copy back by hand. History is kept for 30 days and up to 256 MB, on the
    device and in the clear, and is not a backup. It does not notice a
    mistake: a person has to. (Section 4.5b of the decision record of
    2026-09-30.)
@@ -369,28 +383,61 @@ removed key among the keys removed, and a commitment to a new person secret.
   version's chain and a first link for the key that signed it. Every folder's
   record of every file means in the new channel what it meant in the old, so
   the ordinary cycle goes on from where it was, and no file changes.
-- **What the removed device loses.** It reads nothing that a device which has
-  applied the removal writes afterwards, and it writes nothing into the new
-  channels: every entry there is signed by a device that the statement lists,
-  or by one added since. What it wrote before is kept where a remaining
-  device had taken it. What it had sent to a relay, and no remaining device
+- **What the removed device loses.** It reads nothing that a device which
+  knows of the removal writes afterwards, on any branch: a device seals only
+  under a secret that no key it knows to be removed holds. It writes nothing
+  into the new channels: every entry there is signed by a device that the
+  statement lists, or by one added since. A device that knows of the removal
+  takes nothing it sends from then on, and a key it added after its removal
+  is removed too. What it wrote before is kept where a remaining device had
+  taken it. What it wrote after the removal was made (by the time in the
+  change entry, less ten minutes), or under a change made apart from it, a
+  device that took it before it knew leaves out at the removal, with
+  anything written over it: those go from the folders into local history,
+  whichever device carried them there. A chain names only a text's hash
+  and its signer, so where it cannot show that nothing of a removed key's
+  stood behind a version, the version is left out too: every version of
+  the index (`MEMORY.md`) that another device wrote, and a version of a
+  busy file whose chain is full (100 links), each taken after the cut time
+  and before the device knew, with every version stored after it in that
+  file, the device's own included. An honest device's version comes back
+  from that device's own carry; the device's own edits stored after it
+  come back only by hand, from local history. What it had sent to a relay, and no remaining device
   had taken, stays at the relay unless a person asks for it:
   `cordelia sync carry <name> --from <device>`, at a terminal, says what it
   found, asks a yes, and then asks for the phrase.
 - **A removal can always be made, sent and seen.** The change entry replaces
   the one before it, at the same size, in a channel a relay already holds: a
-  relay at its cap still stores it. The command stays until every relay it
-  is set up with holds the change and the device has sent what it carried,
-  and says which is missing until then.
-- **The limit.** A device that has not heard of the removal still writes
-  where the removed device can read, and takes what the removed device
-  writes. When it hears, it carries what it holds, and every other device
-  keeps its own text beside what arrives. `cordelia devices` shows which
-  devices have not applied the change.
+  relay at its cap still stores it. A relay keeps room for a second change
+  made apart from the first, from when it takes the first, where it has the
+  room; it makes none by dropping channels. The command stays until every
+  relay it is set up with holds the change and the device has sent what it
+  carried, and says which is missing until then.
+- **The limit.** A device that has not read the removal still writes where
+  the removed device can read, and takes what the removed device writes. It
+  reads the removal within 90 seconds of any relay it is connected to
+  holding it, and a relay holds it within 5 seconds of being connected to a
+  relay that holds it, where no backlog of heads waits ahead of it (anyone
+  who can write entries can build one, and delay it between relays by as
+  long as the backlog takes to offer). A device that reaches no relay which
+  holds it writes
+  so for as long as that lasts. `cordelia devices` shows which devices have
+  not applied the change. A device whose clock is behind the maker's by
+  more than ten minutes carries what reached it in that excess, and a
+  device of `v0.2.0-alpha.17` or earlier carries the removed device's late
+  writing into the removal's change, as before.
 - **Only the phrase changes who is removed,** and nothing undoes a removal.
-  Two changes made apart, by two devices that had not met, stop every device
-  that sees both until `cordelia settle`, with the phrase, makes one
-  statement over the two.
+  Where two changes are made apart, by two devices that had not met, each
+  device follows a change that lists it and is **clear**: no key it knows to
+  be removed holds its secret. It moves to such a change by itself, with no
+  phrase, and keeps the other set aside. A device for which no change is
+  clear is **closed**: it seals nothing, sends nothing, keeps new content on
+  the device, and asks for a change made with the phrase: `cordelia
+  settle` where it keeps a change made apart, and `cordelia renew`
+  otherwise. Devices on two clear changes made apart do not sync with each
+  other until a change joins them. The next change made on a
+  device that keeps both, with the phrase, joins them, and lists every key
+  that device knows to be removed.
 - `cordelia renew` makes a statement that removes nobody: it lists the
   devices, with those added since, and commits to a new secret.
 
@@ -426,9 +473,10 @@ keys of the devices that connect and author entries; slots and revisions,
 and so which entries are revisions of the same slot; which entries are
 deletes; sizes by class, and timing; which connection proved which channel;
 each pair of devices that meet when one is added; each time a recovery
-phrase is used; and the ID of the phrase's channel, which stays the same for
+phrase is used; the ID of the phrase's channel, which stays the same for
 a person for as long as the phrase does and which each of their devices
-presents.
+presents; and each change entry's lineage: how a person's statements follow
+each other, when two were made apart, and when each was made.
 
 **What they cannot see:** content, file names, project names, the labels of
 devices, the list of a person's devices, or any key. No relay holds a key in
@@ -441,12 +489,14 @@ person's text there would act with the agent's authority (decision record of
 2026-09-30, §4.7).
 
 **A removed device** keeps what it already had. It reads nothing that a
-device which has applied the removal writes afterwards, and writes nothing
-into the channels that follow the removal. A device that has not heard of the
-removal still writes where the removed device can read, and still takes what
-it writes (§3.6). A removed device can still read each later statement: who
-the person's devices are, by key and label, and which of them made each
-change. It cannot open the secret in it.
+device which knows of the removal writes afterwards, on any branch, and
+writes nothing into the channels that follow the removal. A device that has
+not read the removal still writes where the removed device can read, and
+still takes what it writes, for at most 90 seconds after a relay it is
+connected to holds the removal, and for as long as it reaches none (§3.6).
+A removed device can still read each later statement: who the person's
+devices are, by key and label, and which of them made each change. It
+cannot open the secret in it. That is a known limit of this version.
 
 **The recovery phrase is one more thing to keep.** Whoever holds a copy of it
 reads everything from then on, through every removal, with no sign. Without
@@ -474,10 +524,10 @@ only a yes. What it cannot do is anything that asks for the recovery phrase.
 | Someone answers for a relay's name, or claims another node's key | A node's identity is the key its certificate carries. Devices know their relays by key and refuse any other. |
 | Stranger writes to a channel, or fetches it | A relay stores an entry only if the channel's own key signed it, and hands a channel only to a connection that proved it holds that key. A device stores an entry only if its signer counts. |
 | Stranger tries to take a device over | A device follows only a phrase that a person gave it, at a terminal. It reads what another device hands it only with a key that a person typed on it within the hour. |
-| Lost or stolen device | `remove-device` on a device that remains, with the recovery phrase: one statement, a new secret for every channel at once. A device that has applied it writes nothing the removed device can read. One that has not heard still does, and `cordelia devices` shows which those are (§3.6). |
+| Lost or stolen device | `remove-device` on a device that remains, with the recovery phrase: one statement, a new secret for every channel at once. A device that has read it writes nothing the removed device can read, and takes nothing it sends. One that has not read it still does, for at most 90 seconds once a relay it reaches holds it, and `cordelia devices` shows which those are (§3.6). |
 | No device left | `recover` on a new machine, with the phrase, brings back what the relays hold, and stops every other device until it is added again (§3.7). |
 | A device of yours that has been taken over adds a device | Made visible, not prevented: every device shows the addition until a person clears it, and the next statement asks whether it stays. It cannot remove a device: that takes the phrase. |
-| Two removals made apart, or an old statement shown again | A statement names every statement it was made after. One that is behind is ignored; two made apart stop every device that sees both until they are settled with the phrase. No statement brings a removed key back. |
+| Two removals made apart, or an old statement shown again | A statement names every statement it was made after, and its change entry says so in the clear. A relay of this version keeps every change made apart, and one that is behind pushes none out; a relay of `v0.2.0-alpha.17` or earlier keeps one, and a removed device can push a removal out of it with a head of the other branch numbered above it, until it takes this version. Each device follows a change that lists it and that no key it knows to be removed can open, moving to it with no phrase; one for which there is none is closed until a change made with the phrase joins them. No statement brings a removed key back. |
 | Malicious file names | Only plain names are written, only inside the memory folder. |
 | Burst writes, floods | One size for every entry (64 KB), checked at every hop. Limits for a connection and for its address; a peer that keeps going over is cut off. A storage cap at relays that keeps what was there first. |
 
@@ -508,6 +558,24 @@ version more, so that a device that has not been upgraded is not cut off.
 The upgrade is a new start: each device takes the version, the phrase is
 made on one, and each other is added again (decision record of 2026-10-04,
 section 10).
+
+**A removal fails safe** (decision record of 2026-10-24, removal): a
+device that knows of a removal, on any branch, seals nothing that the
+removed device can open and takes nothing it sends; relays keep and hand on
+every change made apart; and what reached a device from the removed device
+after its removal is set aside into local history. Its known limits: a
+removed device still reads each later statement; a device that reaches no
+relay which holds the removal writes where the removed device can read for
+as long as that lasts; a device whose clock is more than ten minutes behind
+carries what reached it in that excess; what a remaining device wrote
+itself after an agent there read the removed device's late text, before
+the device knew of the removal, is kept and carried, though the late text
+itself is set aside, and the agent's context keeps what it read; and
+until every device of a person's has this
+version, a device of `v0.2.0-alpha.17` or earlier carries
+the removed device's late writing on, and cannot make a change over one made
+on this version. Shared channels are not built, so the record's rules for them are
+not either.
 
 **Not in this version:** replacing a recovery phrase; a passphrase that locks
 a device's own store; adding a device by a code that the new device shows;
@@ -562,6 +630,9 @@ settlement layer is chosen), is in [`docs/vision.md`](docs/vision.md).
 | Largest synced memory file, with its name | 60 KB | `MAX_ENTRY_NAME_AND_VALUE_BYTES` |
 | An entry's chain | 100 links | `MAX_ENTRY_LINKS` |
 | A change entry | 32 KB, always | `CHANGE_ENTRY_BYTES` |
+| Changes made apart that a relay, and a device, keep | 8 | `MAX_CHANGE_HEADS` |
+| Keys a device keeps as removed | 2,048 | `MAX_KNOWN_REMOVED` |
+| What a removed device wrote is cut from | the change's time, less 10 minutes | `REMOVAL_TAKEN_MARGIN_SECS` |
 | One channel at a relay | 16 MB | `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` |
 | A relay in total, for each kind of channel | 1 GiB unless its operator sets it | `max_storage_bytes` |
 | New channels from one address | 256 an hour | `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR` |

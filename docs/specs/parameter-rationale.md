@@ -454,7 +454,7 @@ each: of those, the first are kept and the rest passed over.
 
 | List | Bound | Why |
 |------|-------|-----|
-| A handshake's roles | `MAX_HANDSHAKE_ROLES` = 8 | A node says one, the role it is configured with |
+| A handshake's roles | `MAX_HANDSHAKE_ROLES` = 8 | A node says one, the role it is configured with; a relay of decision 2026-10-24 (removal) says two, with `RELAY_ROLE_HEADS` (§12.7) |
 | Peers shared | `DEFAULT_MAX_PEERS_SHARE` = 20 | The most a node asks for |
 | Addresses of one peer shared | `MAX_SHARED_PEER_ADDRS` = 8 | A node tells one, where the peer listens |
 | Channel descriptors listed | `MAX_CHANNELS_ASKED_OF_A_PEER` = 1024 | The most channels of a peer a node keeps a place for |
@@ -1409,13 +1409,73 @@ Whole each time, that is some 280 MB a day from each idle device to each
 relay, and a tenth of what a connection may push in a minute. That is why a
 show is short after the first on a connection (decision §2.4, item 5).
 
-#### CHANGE_ENTRY_PHRASE_PART_BYTES = 4 KB, CHANGE_ENTRY_DEVICES_PART_BYTES = 28 KB
+#### CHANGE_ENTRY_DEVICES_PART_BYTES = 28,672, CHANGE_ENTRY_PHRASE_PART_BYTES = 1,024, CHANGE_ENTRY_LINEAGE_BYTES = 3,072
 
-**Rationale:** The last 4 KB is the part for the phrase, and the rest is
-the part for the devices. Each part is one size whatever it says.
+**Rationale:** A change entry's content is the part for the devices (the
+first 28,672 bytes), the part for the phrase (1,024 bytes after it), and
+the lineage in the clear (the last 3,072), which a relay reads to tell
+which change was made after which (decision 2026-10-24 rule 13). Each
+sealed part is one size whatever it says.
 
-**Why 4 KB:** chosen with `MAX_EARLIER_SECRETS`: at its bound the part says
-382 bytes. No measurement behind it yet. The other part is what it leaves.
+**Why the part for the devices is fixed, and not derived:** a device of
+the version before (`v0.2.0-alpha.17` or earlier) opens that part at this place and of
+this size. It was derived there as what the part for the phrase leaves;
+left so, it would grow to 31,744 bytes when the part for the phrase
+shrinks, and every device of the version before would refuse every new
+entry as no change entry, with no leave at that relay (decision
+2026-10-24, the first review, item 10). `protocol.rs` checks at compile
+time that it is 28,672, and unit test 14 pins it in
+`docs/reference/change-entry-test-vectors.json`.
+
+**Why 1,024 for the phrase:** at every bound it needs 382 bytes sealed (a
+nonce, a tag, the secret, a count, and eight earlier secrets with their
+numbers). 1,024 holds that with room, and leaves the lineage the 3,072
+that a chain at its bound needs with room too. Chosen with the record
+(decision 2026-10-24 §11); no measurement behind it. It was 4,096.
+
+**The lineage** is what the two parts leave: 3,072 bytes, of which a
+chain of 256 takes 2,074 (`MAX_LINEAGE_BYTES`).
+
+#### CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES = 4,096
+
+**Derivation:** `CHANGE_ENTRY_BYTES - CHANGE_ENTRY_DEVICES_PART_BYTES`: the
+part for the phrase in the layout of the version before, which had no
+lineage. A command of this version opens the part for the phrase of an
+entry of either layout, so that a change is made over a change entry made
+there; an entry whose lineage region does not open with the mark is of
+that layout (decision 2026-10-24 rule 13).
+
+#### LINEAGE_HASH_BYTES = 8
+
+**Rationale:** How much of a statement's hash names it in a lineage: the
+statement's own hash, and each hash on its chain. A relay uses them only
+to tell apart the statements of one phrase, and only the phrase makes
+one: two of 256 share 8 bytes with a chance of about 2^-49 (decision
+2026-10-24 rule 13).
+
+**Why the whole chain:** a relay can then tell that one entry is behind
+another without having seen those between.
+
+#### LINEAGE_MARK_BYTES = 8, LABEL_CHANGE_LINEAGE = `cordelia v2 lineage`
+
+**Rationale:** A lineage opens with the first 8 bytes of SHA-256 of
+`LABEL_CHANGE_LINEAGE`, its mark. An entry of the version before has the
+ciphertext of its part for the phrase there, which is the mark with a
+chance of 2^-64; an entry with the mark, and not then a lineage in its
+form followed by zeros, is refused. The label begins no other label, and
+none begins it.
+
+#### MAX_LINEAGE_BYTES = 2,074
+
+**Derivation:** the mark (8), the time the change was made by its maker's
+clock (8, in seconds), the statement's hash (8), a count (2), and 256
+hashes of 8: a chain at its bound (`MAX_STATEMENT_CHAIN`). It fits the
+3,072 of `CHANGE_ENTRY_LINEAGE_BYTES`, which `protocol.rs` checks when it is
+compiled.
+
+**What the time is:** the maker's word. Nothing checks it against another
+clock; the entry's two signatures cover it, so only the phrase writes it.
+A maker's clock that is wrong is the limit of decision 2026-10-24 rule 7.
 
 #### SEALED_SECRET_BYTES = 92
 
@@ -1434,7 +1494,9 @@ reads back as far as these go.
 eight earlier generations for 90 days, which no other device holds for a
 generation it was never in (decision §12).
 
-**Why 8:** chosen with the part's 4 KB; no measurement behind it yet.
+**Why 8:** chosen with the part's first 4 KB; at its bound the part says
+354 bytes, which its 1,024 hold (decision 2026-10-24 rule 13). No
+measurement behind it yet.
 
 ### 12.4 An Entry
 
@@ -1628,8 +1690,9 @@ with a label at its longest and the signature.
 
 #### CHANGE_ENTRY_NAME = "change", HAND_OVER_NAME = "hand-over"
 
-**Rationale:** The phrase's channel holds one entry, and a pair channel is
-read for one. Each has one name, so that nothing else there is read. The
+**Rationale:** The phrase's channel holds the change entry (one, or one for
+each head a relay keeps, decision 2026-10-24 (removal), rule 14), and a
+pair channel is read for one. Each has one name, so that nothing else there is read. The
 change entry's slot is under the channel's ID and not under a key of the
 channel: a device holds no key of the phrase's channel, and has to know the
 change entry's slot from any other.
@@ -1717,6 +1780,100 @@ record that counts is never dropped for room.
 
 **Why 256:** chosen with the other bounds of 256 here; no measurement
 behind it yet.
+
+#### MAX_CHANGE_HEADS = 8
+
+**Rationale:** The heads of a person's changes that a device keeps (the
+change it follows and up to seven set aside), and that a relay keeps in a
+slot (decision 2026-10-24 (removal), rules 1 and 14). Only the phrase makes
+a head, and an honest person has two at most, now and then: eight is room
+for a phrase used on several devices that had not met, and a ninth closes
+the device, which fails closed.
+
+**Why 8:** chosen as room to spare over two; no measurement behind it yet.
+
+#### MAX_KNOWN_REMOVED = 2,048
+
+**Derivation:** `MAX_STATEMENT_REMOVED` x `MAX_CHANGE_HEADS`: the removed
+keys of every head a device keeps, each at its bound.
+
+**Rationale:** A device keeps every key that any change it has seen and
+checked lists as removed, on any branch, and never takes one out (decision
+2026-10-24 (removal), rule 2). It seals only under a secret that none of
+them holds, and takes nothing that one of them signs. Each statement
+already lists every key removed on its own chain, so the keys of the heads
+are all there are. Past the bound the device is closed: it seals and sends
+nothing, which fails closed.
+
+#### MAX_KNOWN_HOLDERS = 2,048
+
+**Rationale:** The keys that a device keeps as holding the secret of one
+change because a record of an addition under that change adds them
+(decision 2026-10-24 (removal), rule 3). They are kept apart from the
+records: the bound of `MAX_NOT_COUNTED_RECORDS` drops a record, and never
+its key from here, since a key whose record went still holds the secret
+it was handed. A change whose holders include a removed key is not clear,
+and nothing is sealed under it. Past the bound the change is not clear,
+which fails closed.
+
+**What it costs:** only a key that counts under a change writes a record
+that a device keeps, but any such key can sign records for 2,049 keys and
+close every device that follows that change, a stolen device among them
+before its removal is known. The way on is a change made with the phrase.
+
+**Why 2,048:** as `MAX_KNOWN_REMOVED`, and eight times the records a
+device keeps as not counted; no measurement behind it yet.
+
+#### REMOVAL_TAKEN_MARGIN_SECS = 600
+
+**Derivation:** 2 x `MAX_CLOCK_SKEW_SECS`.
+
+**Rationale:** A removed key's cut time is the time, by its maker's clock,
+of the change that first removes it, where the device has seen it and the
+change before it, and otherwise of the newest earlier change it has seen,
+less this margin (decision 2026-10-24 (removal), rule 2). What of that
+key's a device took at or after its cut time, in a generation that the
+removal was made after, is not carried at the next carry (rule 7), and a
+record of an addition that it signed then counts for nothing (rule 6).
+A handshake allows `MAX_CLOCK_SKEW_SECS` of skew at each end, so two nodes
+that one relay accepts are within twice that of each other: a device whose
+clock is behind the maker's by up to that still cuts what came after the
+removal.
+
+**What it costs:** honest writing of the removed device in the ten minutes
+before its removal is set aside, to local history alone. Across two
+relays their own difference adds to the skew, and a device whose clock is
+behind the maker's by more than the margin carries what reached it in that
+excess: the limit of rule 7, stated in the record. The margin applies to
+what the removed device wrote, and to nothing a remaining device wrote
+itself: what an agent there wrote after it read the late text, before its
+device knew of the removal, is that device's own writing and is carried
+(the record's section 8; its rule 27, which set such writing aside, was
+taken out on 31 October).
+
+#### MAX_FILE_ARRIVALS = 1,024
+
+**Rationale:** The arrivals a device keeps for one file (decision
+2026-10-24 (removal), rule 7): each version of the file that another key
+signed, and each link that stands in a stored chain more times than in any
+chain of the file stored before, with its key, the generation and the time
+the device stored it, and the version current before it, to go back to.
+Kept per file across carries. Past the bound the oldest go first, and the
+newest time of what went is kept for each generation, with the version
+before the first event of it that went: where what went is cut, the file
+goes back to that version, which fails safe. Not to before the oldest
+event kept: the bound counts arrivals, and a removed key chooses its own
+chain, so one version with 100 links of its own is 101 arrivals, and a
+dozen late versions push its first one out; the oldest kept would then go
+back to its own late version.
+
+**What it costs:** a busy file that other devices write fills it faster,
+each version of theirs being one or two arrivals; the device's own versions
+make none. Each event keeps the version before it, so a file at its bound
+holds up to that many versions of itself in the store.
+
+**Why 1,024:** chosen as room to spare over the arrivals of a file between
+two changes of an honest person; no measurement behind it yet.
 
 #### KEPT_OUT_PER_ADDER = 3
 
@@ -1826,9 +1983,13 @@ new one starts with none (decision 2026-10-17 §4).
 #### MAX_SLOTS_SHOWN_ON_A_CONNECTION = 8
 
 **Rationale:** The most slots for which a relay remembers, for one
-connection, the last entry it was shown whole there. A device shows one
-entry, the change entry of the phrase it follows, so 8 is room to spare. A
-ninth is not remembered, and is shown whole each time.
+connection, the entries it was shown whole or handed whole there. In each
+slot it remembers up to 16: twice `MAX_CHANGE_HEADS`, for the 8 heads a
+relay can keep there and the 8 a device can keep. That 16 has no constant
+of its own. A device shows the entries of one slot, the change
+entries of the phrase it follows, so 8 slots is room to spare. A ninth slot
+is not remembered: a short show there is answered `whole`, so the device
+shows whole each time.
 
 #### CHANNEL_MARK_BYTES = 8
 
@@ -1880,6 +2041,61 @@ more than about half of a channel's cap in text may not fit (decision §10).
 **What is derived from it:** the line past which a device warns that its
 personal channel nears this cap, `PERSONAL_CHANNEL_WARN_BYTES` (§12.10,
 decision 2026-10-19).
+
+#### CHANGE_HEADS_ROOM = 2
+
+**Rationale:** The heads that a relay keeps room for in an author's slot
+whose entry carries a lineage (decision 2026-10-24 (removal), rule 15).
+From when it takes the first such entry there it counts the slot at two
+heads' size, where it has the room: so a second change made apart from
+the first, a removal among them, always has room, and a removed device
+that fills a relay with the old channels it holds cannot keep a removal
+out of it. In a slot that is new the room for both is asked as for any
+new entry; where the first such entry replaces one of the version before
+(a person's first change made on this version), it is taken as a
+replacement that is no larger, and the second share is counted only where
+the relay has the room. The relay drops nothing to make room for a head:
+it cannot tell a change entry from any entry that ends with the mark, and
+a way to make room would be a stranger's way to push out its newest
+channels.
+
+**Why 2:** an honest person has two heads at most, now and then (see
+`MAX_CHANGE_HEADS`). A third head, and those after it, take room as any
+new entry does.
+
+**What it costs:** 32 KB more for each person at each relay, from the
+person's first change made on this version (the record's section 9).
+
+#### RELAY_ROLE_HEADS = `heads`
+
+**Rationale:** The role that a relay of this version names in its
+handshake, beside "relay" (decision 2026-10-24 (removal), rule 18). It
+says that the relay keeps every head in a slot by the lineages and hands
+each before it says that it holds the entry shown (rules 14 and 16). A
+device shows such a relay the change it follows first, then every head it
+sets aside. A relay that does not name it is taken for one of the version
+before, which takes an entry of a higher revision in place of the one it
+holds: shown a head numbered above the change a device follows, it would
+drop a removal for it. So a device shows such a relay no head numbered
+above the change it follows, and takes leave there where it hands one
+head that the device keeps twice in a round (it holds that head alone); at
+a relay that names the role, the same hand twice ends the round with no
+leave, since such a relay hands a head twice only where it lacks the
+change.
+
+**Why a role, and not the protocol's version:** a node of the version
+before reads only "relay" and "bootnode" among the roles, and takes up to
+`MAX_HANDSHAKE_ROLES` of them, so it passes this one over. Each end of a
+handshake offers and accepts only its own protocol version: raising it
+would need both ends changed first, or the two versions would refuse each
+other (the record's section 10).
+
+**What is derived from it:** nothing. Beside it, a device's round of shows
+at one relay has room for `3 x MAX_CHANGE_HEADS - 1` = 23 shows
+(`SHOWS_IN_A_PASS`, in `device_entries.rs`, as the record's section 11
+keeps it): a short show and a whole show for each of the eight heads a
+relay can hand, and a show of each of the seven heads the device sets
+aside.
 
 #### NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR = 256
 
@@ -2186,8 +2402,16 @@ come up one at a time: without the wait a device would take what the first
 relay held, and send it what waited, before a second, which had a change,
 had answered.
 
-**What it costs:** with one relay out of reach a device waits this long
-before it syncs.
+**What it costs:** with one relay slow but still answering, refusing,
+answering with another key, or whose name does not resolve, a device
+waits this long before it syncs. A relay whose dial, begun since the wake
+began, timed out is waited for no more once another has answered
+(decision 2026-10-24 (removal), section 8): with one relay down, the wait
+is that relay's dial, which the wake begins at once, some 10 to 13
+seconds where it gives no answer (`STREAM_TIMEOUT_SECS` and a tick or
+two), and up to some 23 where QUIC's handshake is done and Cordelia's
+stalls (`HANDSHAKE_TIMEOUT_SECS` more). Only a timeout counts: a refusal
+or another key is had in one round trip by anyone on the path.
 
 **Why 30:** chosen with that cost; no measurement behind it yet.
 
@@ -2260,6 +2484,12 @@ change.
 most (decision §7.3): the fetch of the new channel, and then the name's
 channel in each generation that the device left. What was not read to its
 end by then is said, and the command can be run again.
+
+A recovery reads the channels of all the names of its look in the
+generations before within one such time, before its change is shown to any
+relay (decision 2026-10-24 (removal), the third read of slice 8, its third
+finding), and `cordelia recover` waits for it and 60 seconds more, the wait
+it had for the apply alone. The change is shown no later for it than that.
 
 #### CARRY_FIRST_MAX_SECS = 180
 

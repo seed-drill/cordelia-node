@@ -11,7 +11,7 @@ use crate::several::Several;
 use crate::take::take;
 use cordelia_crypto::acts::Came;
 use cordelia_crypto::share::{Card, Relays};
-use cordelia_storage::person::{self as held_rows, Kept as KeptEntry};
+use cordelia_storage::person as held_rows;
 
 const DAY: i64 = 24 * 60 * 60;
 
@@ -1602,9 +1602,10 @@ fn refused(s: &Several, n: usize, what: Do, now: i64) -> Refused {
 }
 
 /// Device `to` is given, at `now`, everything device `from` holds: the
-/// change entry it keeps, and then every entry of its store.
+/// change entry of the change it follows, and then every entry of its
+/// store.
 fn give(s: &Several, from: usize, to: usize, now: i64) {
-    let kept = held_rows::change_entry(&s[from].conn, KeptEntry::Latest).unwrap();
+    let kept = held_rows::followed_entry(&s[from].conn).unwrap();
     let entries = kept.map(|entry| entry.check().unwrap()).into_iter();
     for entry in entries.chain(s[from].stored()) {
         take(&s[to].conn, &s[to].identity, &entry, now).unwrap();

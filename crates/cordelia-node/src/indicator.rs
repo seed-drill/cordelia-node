@@ -75,7 +75,7 @@ pub struct Facts {
     pub projects_waiting: usize,
     /// Where the device stands under a recovery phrase, as the node says
     /// it: `no_phrase`, `applied`, or why it has stopped (`fork`,
-    /// `removed`, `not_listed`, `not_opened`). Empty where the node did
+    /// `removed`, `not_listed`, `not_opened`, `closed`). Empty where the node did
     /// not say.
     pub stands: String,
     /// Folders the last cycle synced or is waiting to sync.
@@ -204,6 +204,10 @@ pub struct Devices {
     /// in seconds, since this device applied it. `None` where none does,
     /// or where this device does not know since when.
     pub removal_not_applied_secs: Option<u64>,
+    /// The device goes on with a head set aside (decision 2026-10-24
+    /// (removal), rule 11): how long ago, in seconds, it set aside the
+    /// newest. `None` where it sets none aside, or is closed.
+    pub set_aside_secs: Option<u64>,
     /// How many devices were added since the last change and are not
     /// cleared.
     pub added_not_cleared: usize,
@@ -416,10 +420,14 @@ fn stalled(f: &Facts) -> bool {
 /// stopped.
 fn stopped_says(stands: &str) -> Option<&'static str> {
     Some(match stands {
-        "fork" => "memory not syncing: two changes made apart",
+        // Decision 2026-10-24 (removal), rule 10: closed, stored as a
+        // fork was.
+        "fork" => "memory not syncing: no change that lists this device is clear",
         "removed" => "memory not syncing: this device was removed",
         "not_listed" => "memory not syncing: not in the last change",
         "not_opened" => "memory not syncing: a change could not be opened",
+        // Decision 2026-10-24 (removal), rule 10.
+        "closed" => "memory not syncing: a removed device holds this change's secret",
         _ => return None,
     })
 }
@@ -483,10 +491,12 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 /// 2. entries that relays keep refusing;
 /// 3. a running node that is not the version this command is;
 /// 4. a removal that some device has not applied, for seven days from
-///    when this device applied it; and after it, a removed device that
-///    still holds a shared channel the person has not made anew, for seven
-///    days from when this device applied that removal (decision 2026-10-10
-///    §9): the one fact of a shared channel that sets a level;
+///    when this device applied it; a head set aside by a device that goes
+///    on, for seven days from when it was set aside (decision 2026-10-24
+///    (removal), rule 11); and after them, a removed device that still
+///    holds a shared channel the person has not made anew, for seven days
+///    from when this device applied that removal (decision 2026-10-10 §9):
+///    the one fact of a shared channel that sets a level;
 /// 5. a device added since the last change that nobody has cleared;
 /// 6. a device that has said it left;
 /// 7. names that a recovery, or a carry by command, holds with no folder
@@ -619,6 +629,14 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
             amber(
                 "removal_not_applied",
                 "memory: a removal not yet applied by every device".into(),
+            );
+        }
+        if d.set_aside_secs
+            .is_some_and(|secs| secs <= REMOVAL_SHOWN_SECS)
+        {
+            amber(
+                "set_aside",
+                "memory: a change made apart is set aside".into(),
             );
         }
         // The one fact of a shared channel that sets a level (decision
@@ -1151,7 +1169,7 @@ mod tests {
         (
             &|f| f.stands = "fork".into(),
             "stopped",
-            "memory not syncing: two changes made apart",
+            "memory not syncing: no change that lists this device is clear",
         ),
         (
             &|f| f.stands = "not_opened".into(),
@@ -1959,7 +1977,7 @@ mod tests {
         );
         assert_eq!(
             not_applied(&|f| f.stands = "fork".into()).1,
-            "memory not syncing: two changes made apart"
+            "memory not syncing: no change that lists this device is clear"
         );
         assert_eq!(
             not_applied(&|f| f.held = Some("first_start".into())).1,
@@ -2509,6 +2527,25 @@ mod tests {
         assert_eq!(removal(7 * day), amber);
         assert_eq!(removal(7 * day + 1), None);
 
+        // A head set aside by a device that goes on: amber for seven days
+        // from when it was set aside (decision 2026-10-24 (removal), rule
+        // 11), and said so.
+        let set_aside = |secs: u64| level(&|f| f.devices.set_aside_secs = Some(secs));
+        assert_eq!(set_aside(0), amber);
+        assert_eq!(set_aside(7 * day), amber);
+        assert_eq!(set_aside(7 * day + 1), None);
+        let aside = with(&|f| f.devices.set_aside_secs = Some(60));
+        assert_eq!(whats(&aside), ["set_aside"]);
+        assert_eq!(aside.summary, "memory: a change made apart is set aside");
+        // After a removal not yet applied by every device, and before a
+        // device added since.
+        let three = with(&|f| {
+            f.devices.set_aside_secs = Some(60);
+            f.devices.removal_not_applied_secs = Some(60);
+            f.devices.added_not_cleared = 1;
+        });
+        assert_eq!(whats(&three), ["removal_not_applied", "set_aside", "added"]);
+
         let no_room = |ago: u64| level(&|f| f.devices.no_room_secs = vec![ago]);
         assert_eq!(no_room(0), amber);
         assert_eq!(no_room(NO_ROOM_STANDS_SECS), amber);
@@ -2819,10 +2856,11 @@ mod tests {
         moved_on.stands = "applied".into();
         assert_eq!(state(&moved_on), (State::Synced, "memory synced".into()));
         for (stopped, says) in [
-            ("fork", "two changes made apart"),
+            ("fork", "no change that lists this device is clear"),
             ("removed", "this device was removed"),
             ("not_listed", "not in the last change"),
             ("not_opened", "a change could not be opened"),
+            ("closed", "a removed device holds this change's secret"),
         ] {
             assert_eq!(
                 stands(stopped),

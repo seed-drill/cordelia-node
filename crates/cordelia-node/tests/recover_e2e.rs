@@ -308,7 +308,10 @@ fn a_person_who_lost_both_devices_recovers_what_either_had_sent() {
     let through = PassesOn::to(new.http);
     let mut at = recovers(&new, Some(through.port), &words, &["lost", "lost"]);
     at.says("The change is made (change 2)")
-        .says("It is shown to every relay first, before anything is carried.")
+        .says(
+            "It is shown to every relay first, before anything is carried, and the look brings \
+             only what was read before it was shown.",
+        )
         .says("The look is made: 1 name read, and 2 versions carried, in 1 name.");
     let said = at.done();
     println!("{said}");
@@ -631,13 +634,17 @@ fn nothing_of_a_device_in_someone_elses_hands_comes_in_but_by_from() {
         [("a.md".to_string(), 1, Some(ON_THE_LAPTOP.to_string()))]
     );
 
-    // The command that names the key, with the phrase: what it found,
-    // and that the version above another is not brought in where the
-    // name has no folder.
+    // The command that names the key, with the phrase: what it found.
+    // The desktop's `a.md` is written over what the laptop wrote, a removed
+    // key the person did not name here, so the cut leaves it out (decision
+    // 2026-10-24 (removal), the third read of slice 8, its first low
+    // finding): naming the laptop too brings it.
     let mut at = new.at_terminal(&["sync", "carry", "lab", "--from", "desktop"]);
     at.says("1 version would go into a slot where the new channel holds nothing.")
-        .says("1 version stands above a version that the new channel holds: a.md.")
-        .says("Those are not brought in: no folder of this device's is mapped to lab")
+        .says(
+            "1 version is left out: another removed device wrote it, or what it was written \
+             over. Name that device too to bring it.",
+        )
         .says("say no unless you know it was not.")
         .says("Bring in 1 version into the slot where the new channel holds nothing?")
         .types("yes");

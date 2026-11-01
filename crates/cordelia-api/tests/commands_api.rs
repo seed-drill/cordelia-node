@@ -232,7 +232,7 @@ async fn test_a_phrase_an_addition_and_a_change_each_wake_the_node() {
     let phrase = Phrase::parse(WORDS).unwrap();
     let entry = prepare_change(&applied, &own, stay, &[])
         .unwrap()
-        .sign(&phrase, &held, None)
+        .sign(&phrase, &held, &[])
         .unwrap();
     assert_eq!(woken(&state).await, (false, false));
     let body = json!({ "entry": hex::encode(entry.to_wire()), "over": handed["over"] });
@@ -545,7 +545,7 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     let phrase = Phrase::parse(WORDS).unwrap();
     let entry = prepare_change(&applied, &own, applied.statement.devices.clone(), &[])
         .unwrap()
-        .sign(&phrase, &kept, None)
+        .sign(&phrase, &kept, &[])
         .unwrap();
     let body = json!({ "entry": hex::encode(entry.to_wire()), "over": handed["over"] });
     let (status, made) = asks!(app, "/api/v1/change/make", body);
@@ -808,9 +808,9 @@ async fn test_a_recovery_is_made_at_the_route_and_its_look_is_begun() {
     let (statement, for_phrase) = read_with(&phrase, &first.entry).unwrap();
     let own = state.identity.public_key();
     let maker = Device::new(own, "new").unwrap();
-    let entry = prepare_recovery(&statement, None, maker, &[gone])
+    let entry = prepare_recovery(&statement, None, &[&statement.statement], maker, &[gone])
         .unwrap()
-        .sign(&phrase, &first.entry, None)
+        .sign(&phrase, &first.entry, &[])
         .unwrap();
     let allows = Allows::Look {
         names: vec!["lab".into()],

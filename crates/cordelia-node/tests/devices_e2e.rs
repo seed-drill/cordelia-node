@@ -3531,6 +3531,13 @@ fn entry_as_an_earlier_version_wrote_it(n: &Node, channel: &str) -> String {
     let entry = entry_in(&own, channel, vec![9; 40]);
     let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
     db.busy_timeout(Duration::from_secs(10)).unwrap();
+    // The node runs beside this connection and writes now and then.
+    // insert_item reads before it writes, and a transaction that has read
+    // cannot wait for a write: where the node commits between its read and
+    // its write, SQLite refuses it at once with BUSY, whatever the busy
+    // timeout. A transaction that takes the write lock first waits for the
+    // node's write as long as the busy timeout allows.
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
     let stored = cordelia_storage::items::insert_item(
         &db,
         &cordelia_storage::items::NewItem {
@@ -3550,6 +3557,7 @@ fn entry_as_an_earlier_version_wrote_it(n: &Node, channel: &str) -> String {
         },
     )
     .unwrap();
+    db.execute_batch("COMMIT").unwrap();
     assert!(stored, "the entry was not stored");
     entry.item_id
 }
