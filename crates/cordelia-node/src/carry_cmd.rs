@@ -509,7 +509,8 @@ impl Found {
         if self.cut > 0 {
             lines.push(format!(
                 "  {} out: another removed device wrote {}, or what {} written over. Name that \
-                 device too to bring {}.",
+                 device too to bring {}. A version of the index, or one with a full chain, names \
+                 every removed key, so each removed key cut there must be named.",
                 match self.cut {
                     1 => "1 version is left".to_string(),
                     n => format!("{n} versions are left"),
@@ -1129,13 +1130,17 @@ fn add_to(total: &mut Value, done: &Value) {
 }
 
 /// What is said of the versions a carry left out because a removed device
-/// wrote them, or wrote what they were written over (decision 2026-10-24
-/// (removal), rule 7): only `--from` brings in what a removed device wrote.
+/// wrote them, wrote what they were written over, or no chain can show
+/// otherwise (decision 2026-10-24 (removal), rule 7; the review of the
+/// removal build into main, its M3): an honest device's version comes in
+/// with that device's own carry, and `--from` brings in what a removed
+/// device wrote.
 pub(crate) fn left_out_line(how_many: usize, name: &str) -> String {
     format!(
-        "  {} left out: a removed device wrote {}, or what {} written over. What a removed \
-         device wrote comes in only with the recovery phrase: `cordelia sync carry {name} \
-         --from <its label>`.",
+        "  {} left out: a removed device wrote {}, or what {} written over, or no chain can \
+         show otherwise (the index, and a busy file with a full chain). Another device's version \
+         comes in with that device's own carry; what a removed device wrote, with the recovery \
+         phrase: `cordelia sync carry {name} --from <its label>`.",
         counted(how_many, "version"),
         match how_many {
             1 => "it",
@@ -2024,8 +2029,10 @@ mod tests {
         assert!(
             all.contains(
                 "  2 versions left out: a removed device wrote them, or what they were written \
-                 over. What a removed device wrote comes in only with the recovery phrase: \
-                 `cordelia sync carry lab --from <its label>`."
+                 over, or no chain can show otherwise (the index, and a busy file with a full \
+                 chain). Another device's version comes in with that device's own carry; what a \
+                 removed device wrote, with the recovery phrase: `cordelia sync carry lab --from \
+                 <its label>`."
             ),
             "{all}"
         );

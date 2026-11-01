@@ -19,7 +19,9 @@ use cordelia_core::claude_code::is_safe_file_name;
 use cordelia_core::protocol::HISTORY_TURN_WAIT_SECS;
 use cordelia_crypto::entry::Value;
 use cordelia_storage::atomic::write_atomic;
-use cordelia_storage::history::{About, Change, Id, Record, Replacement, Store, Whose, kept};
+use cordelia_storage::history::{
+    About, Change, Id, Listing, Record, Replacement, Store, Stuck, Whose, kept,
+};
 use cordelia_storage::meta;
 
 use crate::auth;
@@ -66,6 +68,12 @@ pub struct Line {
     pub replaced_by: Replacement,
     pub behind: bool,
     pub interrupted: bool,
+    /// Why `cordelia restore` would refuse this record, where it is asked
+    /// and would: `history show` and `--removed` then offer no restore
+    /// of it (the review of the removal build into main, its low on
+    /// history). Restore asks again, with the turn held.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 impl Line {
@@ -82,6 +90,16 @@ impl Line {
             replaced_by: about.replaced_by.clone(),
             behind: about.behind,
             interrupted: record.interrupted,
+            refused: None,
+        }
+    }
+
+    /// The line, with why restore would refuse it as history says now
+    /// ([`refusal_now`]).
+    fn asked(state: &AppState, record: &Record, listing: &Listing, pending: &[Stuck]) -> Self {
+        Self {
+            refused: refusal_now(state, &record.about, listing, pending),
+            ..Self::of(record)
         }
     }
 }
@@ -334,10 +352,17 @@ pub fn list(state: &AppState, request: &ListRequest) -> Result<ListResponse, Api
             .filter(|r| !Path::new(&r.about.folder).join(&r.about.file).exists())
             .collect();
     }
+    let pending = match request.removed {
+        true => store.pending().map_err(io("cannot be read"))?,
+        false => Vec::new(),
+    };
     response.records = records
         .into_iter()
         .filter(|r| written_since(&r.about))
-        .map(Line::of)
+        .map(|r| match request.removed {
+            true => Line::asked(state, r, &listing, &pending),
+            false => Line::of(r),
+        })
         .collect();
     Ok(response)
 }
@@ -367,10 +392,19 @@ pub fn show(state: &AppState, request: &ShowRequest) -> Result<ShowResponse, Api
             _ => io("cannot be read")(e),
         })?
         .ok_or_else(|| ApiError::NotFound(format!("no record {id} in history")))?;
-    Ok(ShowResponse {
-        record: Line::of(&record),
-        text,
-    })
+    let seen = store
+        .list()
+        .and_then(|listing| Ok((listing, store.pending()?)));
+    let line = match &seen {
+        Ok((listing, pending)) => Line::asked(state, &record, listing, pending),
+        Err(e) => Line {
+            refused: Some(format!(
+                "history cannot be read to say whether a change set this version aside ({e})"
+            )),
+            ..Line::of(&record)
+        },
+    };
+    Ok(ShowResponse { record: line, text })
 }
 
 // ── Restoring ──────────────────────────────────────────────────────
@@ -484,42 +518,16 @@ fn text_now(path: &Path) -> Result<Option<String>, String> {
 /// device wrote of it afterwards is not restored either, nor a text this
 /// device wrote after the cut that has been more than `HISTORY_DAYS` in
 /// the database. `cordelia history show` still prints each, and the
-/// person may copy it into the file by hand. What a removed device wrote
-/// comes back only by `cordelia sync carry --from`, at a terminal, with
-/// the recovery phrase. Where the database or history cannot be read, or
+/// person may copy it into the file by hand; another device's edit comes
+/// back from that device's own carry (the review of the removal build
+/// into main, its M3). What a removed device wrote also comes back by
+/// `cordelia sync carry --from`, at a terminal, with the recovery phrase. Where the database or history cannot be read, or
 /// history holds a record that cannot be read, nothing is put back. It is
 /// asked with the turn held, so the pending records are marked first, and
 /// asked with the rest.
 fn set_aside_refusal(state: &AppState, store: &Store, about: &About) -> Option<String> {
-    let from = "What a removed device wrote comes back only at a terminal, with the recovery \
-                phrase: `cordelia sync carry <name> --from <its label>`";
-    if about.change == Change::SetAside {
-        return Some(format!(
-            "this version was set aside at a change: a removed device wrote it, or it was \
-             written over what one wrote. `cordelia restore` does not put it back. {from}"
-        ));
-    }
-    let sha = about.kept.as_ref().map(|kept| kept.sha256.as_str());
-    let refused = state.db.lock().map_err(|e| e.to_string()).and_then(|db| {
-        cordelia_storage::sync_state::restore_refused(&db, &about.folder, &about.file, sha)
-            .map_err(|e| e.to_string())
-    });
-    match refused {
-        Ok(false) => {}
-        Ok(true) => {
-            return Some(format!(
-                "{} was cut at a change, so this version may hold what a removed device \
-                 wrote: `cordelia restore` puts back only what this device wrote itself after \
-                 the change. `cordelia history show` prints it. {from}",
-                about.file
-            ));
-        }
-        Err(e) => {
-            return Some(format!(
-                "the database cannot be read to say whether a change cut this file ({e}): \
-                 nothing was put back"
-            ));
-        }
+    if let Some(why) = refusal_of(state, about) {
+        return Some(why);
     }
     let cannot = |e: std::io::Error| {
         Some(format!(
@@ -535,24 +543,102 @@ fn set_aside_refusal(state: &AppState, store: &Store, about: &About) -> Option<S
         Ok(listing) => listing,
         Err(e) => return cannot(e),
     };
-    if !listing.unreadable.is_empty() || stuck.iter().any(|s| s.about.is_none()) {
+    refused_by_history(about, &listing, &stuck)
+}
+
+/// Why restore refuses `about` by what history holds: the records of
+/// `listing`, and `pending`, the records left pending. A record that
+/// cannot be read may be one set aside.
+fn refused_by_history(about: &About, listing: &Listing, pending: &[Stuck]) -> Option<String> {
+    if !listing.unreadable.is_empty() || pending.iter().any(|s| s.about.is_none()) {
         return Some(
             "history holds a record that cannot be read, and it may be one a change set aside: \
              nothing was put back. `cordelia history drop --all` removes every record"
                 .to_string(),
         );
     }
-    let set_aside = listing
+    let abouts = listing
         .records
         .iter()
         .map(|r| &r.about)
-        .chain(stuck.iter().filter_map(|s| s.about.as_ref()))
-        .filter(|about| about.change == Change::SetAside);
-    for set in set_aside {
-        if sha.is_some() && set.kept.as_ref().map(|kept| kept.sha256.as_str()) == sha {
-            return Some(format!(
+        .chain(pending.iter().filter_map(|s| s.about.as_ref()));
+    holds_a_text_set_aside(about, abouts)
+}
+
+/// Why restore would refuse `about`, as history says now, with no turn
+/// held and nothing marked: what `history show` and `--removed` ask, so
+/// that they offer no restore that restore refuses. Restore asks again
+/// ([`set_aside_refusal`]). `pending` is every record pending now
+/// ([`Store::pending`]), of which restore asks those that the marking
+/// leaves pending, and those it marks with the rest: so a record pending
+/// for a change in hand, which then fails, may make this refuse what
+/// restore would not. That is the side that fails safe.
+fn refusal_now(
+    state: &AppState,
+    about: &About,
+    listing: &Listing,
+    pending: &[Stuck],
+) -> Option<String> {
+    refusal_of(state, about).or_else(|| refused_by_history(about, listing, pending))
+}
+
+/// Where a version of `abouts` set aside holds the very text of `about`.
+fn holds_a_text_set_aside<'a>(
+    about: &About,
+    mut abouts: impl Iterator<Item = &'a About>,
+) -> Option<String> {
+    let sha = about.kept.as_ref().map(|kept| kept.sha256.as_str())?;
+    abouts
+        .any(|set| {
+            set.change == Change::SetAside
+                && set.kept.as_ref().map(|kept| kept.sha256.as_str()) == Some(sha)
+        })
+        .then(|| {
+            format!(
                 "this version holds a text that was set aside at a change: `cordelia restore` \
-                 does not put it back. {from}"
+                 does not put it back. {FROM}"
+            )
+        })
+}
+
+/// The ways back from what a carry set aside (the review of the removal
+/// build into main, its M3).
+const FROM: &str = "Another device's edit comes back from that device's own carry, and any \
+                    version by hand, copied from `cordelia history show <id>`; what a removed \
+                    device wrote also comes back at a terminal, with the recovery phrase: \
+                    `cordelia sync carry <name> --from <its label>`";
+
+/// Why restore refuses `about` by its record and the database alone: a
+/// record set aside, or a file a carry cut.
+fn refusal_of(state: &AppState, about: &About) -> Option<String> {
+    if about.change == Change::SetAside {
+        return Some(format!(
+            "this version was set aside at a change: a removed device wrote it, it was written \
+             over what one wrote, or it was taken in a removal's window where no chain can show \
+             otherwise (the index that another device wrote, a busy file with a full chain, and \
+             any later edit of that file, this device's own included). `cordelia restore` does \
+             not put it back. {FROM}"
+        ));
+    }
+    let sha = about.kept.as_ref().map(|kept| kept.sha256.as_str());
+    let refused = state.db.lock().map_err(|e| e.to_string()).and_then(|db| {
+        cordelia_storage::sync_state::restore_refused(&db, &about.folder, &about.file, sha)
+            .map_err(|e| e.to_string())
+    });
+    match refused {
+        Ok(false) => {}
+        Ok(true) => {
+            return Some(format!(
+                "{} was cut at a change, so this version may hold what a removed device \
+                 wrote: from then on `cordelia restore` puts back no version of it but what this \
+                 device wrote itself after the change. {FROM}",
+                about.file
+            ));
+        }
+        Err(e) => {
+            return Some(format!(
+                "the database cannot be read to say whether a change cut this file ({e}): \
+                 nothing was put back"
             ));
         }
     }
@@ -1217,6 +1303,10 @@ mod tests {
             let done = n.restore(&[id]);
             assert!(!done[0].done, "{id}: {done:?}");
             assert!(done[0].message.contains("--from <its label>"), "{done:?}");
+            // `history show` says so, and offers no restore of it (the
+            // review of the removal build into main, its low on history).
+            let shown = show(&n.state, &ShowRequest { id: id.to_string() }).unwrap();
+            assert!(shown.record.refused.is_some(), "{id}");
         }
         assert_eq!(n.read("notes.md").as_deref(), Some("gone back to\n"));
 
@@ -1237,8 +1327,39 @@ mod tests {
             cordelia_storage::sync_state::note_cut(&db, &folder, "notes.md").unwrap();
         }
         assert!(!n.restore(&[&own])[0].done);
+        // `--removed` says so too, of a removed file a carry cut, and of
+        // no other (the review of the removal build into main, its low 4).
+        let gone = n.kept("gone.md", Change::Removed, Some("was here\n"), 40);
+        let freed = n.kept("freed.md", Change::Removed, Some("free\n"), 41);
+        {
+            let db = n.state.db.lock().unwrap();
+            cordelia_storage::sync_state::note_cut(&db, &folder, "gone.md").unwrap();
+        }
+        let removed = ListRequest {
+            of: Some("lab".into()),
+            removed: true,
+            ..Default::default()
+        };
+        let listed = list(&n.state, &removed).unwrap().records;
+        let refused = |id: &str| {
+            listed
+                .iter()
+                .find(|l| l.id == id)
+                .map(|l| l.refused.is_some())
+        };
+        assert_eq!(refused(&gone), Some(true), "{listed:?}");
+        assert_eq!(refused(&freed), Some(false), "{listed:?}");
+        assert!(!n.restore(&[&gone])[0].done);
         // Another file is restored as before.
         let other = n.kept("other.md", Change::Pulled, Some("other\n"), 30);
+        let shown = show(
+            &n.state,
+            &ShowRequest {
+                id: other.to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(shown.record.refused, None);
         assert!(n.restore(&[&other])[0].done);
     }
 
@@ -1261,6 +1382,12 @@ mod tests {
         let pending = store.keep(about, Some("the late text\n"), at(10)).unwrap();
         std::mem::forget(pending);
         let copy = n.kept("copy.md", Change::Pulled, Some("the late text\n"), 20);
+        // `history show`, which marks nothing, asks the pending record
+        // too, and offers no restore (the review of the removal build
+        // into main, its low 3).
+        let shown = |id: &str| show(&n.state, &ShowRequest { id: id.into() }).unwrap();
+        let refused = shown(&copy).record.refused.unwrap_or_default();
+        assert!(refused.contains("set aside"), "{refused:?}");
         let done = n.restore(&[&copy]);
         assert!(!done[0].done, "{done:?}");
         assert!(done[0].message.contains("set aside"), "{done:?}");
@@ -1270,10 +1397,13 @@ mod tests {
         let broken = n.kept("broken.md", Change::Pulled, Some("x\n"), 40);
         let path = n.state.home_dir.join("history").join(&broken);
         std::fs::write(&path, b"not a record").unwrap();
+        let refused = shown(&fine).record.refused.unwrap_or_default();
+        assert!(refused.contains("cannot be read"), "{refused:?}");
         let done = n.restore(&[&fine]);
         assert!(!done[0].done, "{done:?}");
         assert!(done[0].message.contains("cannot be read"), "{done:?}");
         std::fs::remove_file(&path).unwrap();
+        assert_eq!(shown(&fine).record.refused, None);
         assert!(n.restore(&[&fine])[0].done);
     }
 

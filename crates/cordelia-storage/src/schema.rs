@@ -9,9 +9,13 @@ use crate::StorageError;
 /// Current schema version (incremented per migration).
 pub const SCHEMA_VERSION: u32 = 26;
 
-/// The schema version of the released version of the program
-/// (0.2.0-alpha.8): the last before the entries of a channel from its
-/// secret.
+/// The schema version of 0.2.0-alpha.8, the last release before the
+/// entries of a channel from its secret: what the tests of the first start
+/// on v1 make a database as ([`init_db_as_released`],
+/// `first_start::released`). It is not the latest release's, and is not
+/// raised at a release: 0.2.0-alpha.10, which CI runs as the version
+/// before, is at step 18, and 0.2.0-alpha.17 at step 20 (the review of
+/// the removal build into main, its low on the upgrade).
 pub const RELEASED_SCHEMA_VERSION: u32 = 10;
 
 /// Migration v1: Phase 1 initial schema.
@@ -6098,6 +6102,14 @@ mod tests {
             assert_eq!(new_in_v22(&conn), NEW_IN_V22, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
+            // Step 23: a head for each entry, and the room a relay keeps
+            // for heads (the review of the removal build into main, its
+            // low on the upgrade).
+            assert!(
+                conn.prepare("SELECT head FROM entries").is_ok(),
+                "from version {at}"
+            );
+            assert!(table_of(&conn, "relay_head_rooms"), "from version {at}");
             // Steps 24 to 26: the arrivals, a conflict copy kept here, and
             // what a cut touched; and nothing of rule 27 of decision
             // 2026-10-24 (removal), which was taken out with its steps.

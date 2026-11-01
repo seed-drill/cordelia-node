@@ -2018,6 +2018,18 @@ mod tests {
         reach.dial_begins(&two);
         reach.dial_timed_out(&two);
         assert!(!waking(&began, &reach));
+        // Two dials in flight, one begun before the wake and one since (its
+        // address moved between): which ended is not known, so a timeout
+        // is credited with the earlier beginning. The one since is
+        // refused, and the one from before times out: waited for.
+        let reach = fresh();
+        reach.dial_begins(&two);
+        tick();
+        let began = woke(&["one"]);
+        reach.dial_begins(&two);
+        reach.dial_ends(&two, false);
+        reach.dial_timed_out(&two);
+        assert!(waking(&began, &reach));
         // A timeout of a dial that this relay did not begin, one made at its
         // address for another, has no beginning known: not read.
         let reach = fresh();

@@ -1537,7 +1537,11 @@ mod tests {
     /// the index in the window, before it takes anything late, and keeps
     /// it at the removal. When the desktop (0) then edits over the laptop's
     /// version and the laptop takes that in the window, the desktop's is
-    /// set aside and the index goes back to the laptop's own.
+    /// set aside and the index goes back to the laptop's own. **And what a
+    /// device wrote itself after another device's version it took in the
+    /// window is set aside with it** (the review of the removal build into
+    /// main, its M4): the laptop's line over the desktop's version, and the
+    /// desktop's own line over the laptop's, are carried by nobody.
     #[test]
     fn a_devices_own_index_version_in_the_window_is_carried() {
         for desktop_after in [false, true] {
@@ -1563,6 +1567,15 @@ mod tests {
                     s[1].text("notes", INDEX)
                         .is_some_and(|text| text.contains("desktop"))
                 );
+                // The laptop then adds a line of its own over the
+                // desktop's version, and the desktop takes it.
+                s.write(
+                    1,
+                    "notes",
+                    INDEX,
+                    "- one\n- the laptop's\n- the desktop's\n- the laptop's again\n",
+                );
+                s.pass(1, 0);
             }
 
             s.now = made - 1;
@@ -1576,6 +1589,24 @@ mod tests {
                 Some(mine),
                 "{desktop_after}"
             );
+            if desktop_after {
+                // The stated cost (the review of the removal build into
+                // main, its M4): the laptop's own line, stored after the
+                // desktop's version it took in the window, is set aside
+                // with it, and the desktop, which took the laptop's
+                // versions in the window, sets them aside too, its own
+                // line stored after the first of them with them: it goes
+                // back to `- one`. Neither carries the laptop's line: it
+                // is in the laptop's local history alone.
+                assert_eq!(s[0].text("notes", INDEX).as_deref(), Some("- one\n"));
+                for on in [0, 1] {
+                    assert!(
+                        texts(&s, on).iter().all(|text| !text.contains("again")),
+                        "{on}: {:?}",
+                        texts(&s, on)
+                    );
+                }
+            }
         }
     }
 

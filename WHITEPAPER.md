@@ -86,7 +86,8 @@ After that:
 - If two machines edit the same memory before hearing from each other, one
   version stays in the file and the other is kept beside it as
   `<name>.conflict-<device>.md`, on every machine. The memory index
-  (`MEMORY.md`) is merged line by line instead. (The decision records list
+  (`MEMORY.md`) is merged line by line instead; where it is not, its copy
+  stays on the machine that made it. (The decision records list
   the limits.)
 - `cordelia sync status` lists what was found on the machine and is not
   syncing, with the command that maps it, and what the person's other
@@ -359,7 +360,10 @@ between relays that work together, and nowhere else.
    an edit or a delete made there, the channel's version. A text that cannot
    be kept is not replaced. `cordelia history` lists what is kept and
    `cordelia restore` puts a version back; where the folder syncs, every
-   device follows. History is kept for 30 days and up to 256 MB, on the
+   device follows. Once a removal's carry has cut a file, `cordelia
+   restore` refuses every version of it from then on, but what this
+   device wrote itself after the cut; `cordelia history show` prints each,
+   to copy back by hand. History is kept for 30 days and up to 256 MB, on the
    device and in the clear, and is not a backup. It does not notice a
    mistake: a person has to. (Section 4.5b of the decision record of
    2026-09-30.)
@@ -390,7 +394,15 @@ removed key among the keys removed, and a commitment to a new person secret.
   change entry, less ten minutes), or under a change made apart from it, a
   device that took it before it knew leaves out at the removal, with
   anything written over it: those go from the folders into local history,
-  whichever device carried them there. What it had sent to a relay, and no remaining device
+  whichever device carried them there. A chain names only a text's hash
+  and its signer, so where it cannot show that nothing of a removed key's
+  stood behind a version, the version is left out too: every version of
+  the index (`MEMORY.md`) that another device wrote, and a version of a
+  busy file whose chain is full (100 links), each taken after the cut time
+  and before the device knew, with every version stored after it in that
+  file, the device's own included. An honest device's version comes back
+  from that device's own carry; the device's own edits stored after it
+  come back only by hand, from local history. What it had sent to a relay, and no remaining device
   had taken, stays at the relay unless a person asks for it:
   `cordelia sync carry <name> --from <device>`, at a terminal, says what it
   found, asks a yes, and then asks for the phrase.
@@ -515,7 +527,7 @@ only a yes. What it cannot do is anything that asks for the recovery phrase.
 | Lost or stolen device | `remove-device` on a device that remains, with the recovery phrase: one statement, a new secret for every channel at once. A device that has read it writes nothing the removed device can read, and takes nothing it sends. One that has not read it still does, for at most 90 seconds once a relay it reaches holds it, and `cordelia devices` shows which those are (§3.6). |
 | No device left | `recover` on a new machine, with the phrase, brings back what the relays hold, and stops every other device until it is added again (§3.7). |
 | A device of yours that has been taken over adds a device | Made visible, not prevented: every device shows the addition until a person clears it, and the next statement asks whether it stays. It cannot remove a device: that takes the phrase. |
-| Two removals made apart, or an old statement shown again | A statement names every statement it was made after, and its change entry says so in the clear. A relay keeps every change made apart, and one that is behind pushes none out. Each device follows a change that lists it and that no key it knows to be removed can open, moving to it with no phrase; one for which there is none is closed until a change made with the phrase joins them. No statement brings a removed key back. |
+| Two removals made apart, or an old statement shown again | A statement names every statement it was made after, and its change entry says so in the clear. A relay of this version keeps every change made apart, and one that is behind pushes none out; a relay of `v0.2.0-alpha.17` or earlier keeps one, and a removed device can push a removal out of it with a head of the other branch numbered above it, until it takes this version. Each device follows a change that lists it and that no key it knows to be removed can open, moving to it with no phrase; one for which there is none is closed until a change made with the phrase joins them. No statement brings a removed key back. |
 | Malicious file names | Only plain names are written, only inside the memory folder. |
 | Burst writes, floods | One size for every entry (64 KB), checked at every hop. Limits for a connection and for its address; a peer that keeps going over is cut off. A storage cap at relays that keeps what was there first. |
 

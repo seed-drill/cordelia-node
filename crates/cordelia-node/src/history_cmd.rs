@@ -323,8 +323,10 @@ fn change(record: &Value) -> (String, String) {
         "restored" => "replaced by a restore",
         "arrived" => "arrived",
         "set_aside" => {
-            "set aside: a removed device wrote it, or it was written over what one wrote. \
-             `cordelia restore` does not put it back"
+            "set aside at a change: a removed device wrote it, it was written over what one \
+             wrote, or no chain could show otherwise (the index that another device wrote, a \
+             busy file with a full chain, or a later edit of that file). `cordelia restore` \
+             does not put it back"
         }
         other => other,
     };
@@ -401,7 +403,10 @@ fn records(answer: &Value, of: &str, removed: bool, now: DateTime<Utc>) -> Strin
     }
     let mut out = String::new();
     if removed {
-        out.push_str("Removed, and still absent. Each id puts the file back as it was:\n\n");
+        out.push_str(
+            "Removed, and still absent. Each id puts the file back as it was, but one marked \
+             not restored:\n\n",
+        );
     }
     for record in &listed {
         let (what, whose) = change(record);
@@ -413,18 +418,26 @@ fn records(answer: &Value, of: &str, removed: bool, now: DateTime<Utc>) -> Strin
             what,
             whose,
         ));
+        if let Some(why) = record["refused"].as_str() {
+            out.push_str(&format!("      not restored: {}\n", printable(why)));
+        }
     }
+    // A restore that restore would refuse is not offered (the review of
+    // the removal build into main, its low on history).
     let ids: Vec<String> = listed
         .iter()
+        .filter(|r| r["refused"].is_null())
         .filter_map(|r| r["id"].as_str())
         .map(printable)
         .collect();
     out.push_str("\nTo see one: cordelia history show <id>\n");
     if removed {
-        out.push_str(&format!(
-            "To put them all back: cordelia restore {}\n",
-            ids.join(" ")
-        ));
+        if !ids.is_empty() {
+            out.push_str(&format!(
+                "To put them all back: cordelia restore {}\n",
+                ids.join(" ")
+            ));
+        }
     } else {
         out.push_str("To put one back: cordelia restore <id>\n");
     }
@@ -468,10 +481,14 @@ fn shown(answer: &Value, marker: &str, terminal: bool) -> String {
             if printed != text {
                 out.push_str(ESCAPED);
             }
-            out.push_str(&format!(
-                "\nTo put it back: cordelia restore {}\n",
-                printable(record["id"].as_str().unwrap_or_default())
-            ));
+            // A restore that restore would refuse is not offered.
+            match record["refused"].as_str() {
+                Some(why) => out.push_str(&format!("\nNot restored: {}\n", printable(why))),
+                None => out.push_str(&format!(
+                    "\nTo put it back: cordelia restore {}\n",
+                    printable(record["id"].as_str().unwrap_or_default())
+                )),
+            }
         }
         None => out.push_str("This record keeps no text.\n"),
     }
@@ -1024,6 +1041,28 @@ mod tests {
             out.ends_with("cordelia restore 68dfb3a4c91e07 68dfb3a4c91e08\n"),
             "{out}"
         );
+
+        // A record that restore would refuse (a file a carry cut) is not
+        // offered, and says why (the review of the removal build into
+        // main, its low on history).
+        let mut cut = some.clone();
+        cut["records"][1]["refused"] = json!("other.md was cut at a change");
+        let out = records(&cut, "~", true, now);
+        assert!(
+            out.contains("not restored: other.md was cut at a change"),
+            "{out}"
+        );
+        assert!(out.ends_with("cordelia restore 68dfb3a4c91e07\n"), "{out}");
+        cut["records"][0]["refused"] = json!("notes.md was cut at a change");
+        let out = records(&cut, "~", true, now);
+        assert!(!out.contains("cordelia restore"), "{out}");
+        let answer = json!({ "record": cut["records"][0], "text": "kept\n" });
+        let out = shown(&answer, "a1b2c3d4e5f6", false);
+        assert!(
+            out.contains("Not restored: notes.md was cut at a change"),
+            "{out}"
+        );
+        assert!(!out.contains("cordelia restore"), "{out}");
     }
 
     /// A restore says what became of each id, how to undo it, and what
