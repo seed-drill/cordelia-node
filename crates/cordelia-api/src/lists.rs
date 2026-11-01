@@ -1264,9 +1264,11 @@ pub fn follow(conn: &Connection, identity: &NodeIdentity, now: i64) -> Result<bo
         let own = identity.public_key();
         let standing = match Standing::to_write(conn) {
             Ok(standing) => standing,
-            Err(PersonError::FollowsNoPhrase | PersonError::Stopped(_)) => {
+            Err(PersonError::FollowsNoPhrase | PersonError::Stopped(_) | PersonError::NotClear) => {
                 // It writes nothing; the table of shared channels still
-                // follows who counts.
+                // follows who counts. A closed device too (decision
+                // 2026-10-24 (removal), rule 10): who is shown, and the
+                // labels, follow what it knows.
                 crate::shared::keep(conn, &own, now)?;
                 return Ok(false);
             }

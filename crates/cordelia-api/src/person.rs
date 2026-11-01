@@ -9177,8 +9177,28 @@ mod tests {
         // On the device whose key it is, its own key is not removed.
         assert!(!judge_records_by_their_cut(&conn, &key(6), made).unwrap());
         assert_eq!(counted(&conn), [true]);
+        // A shared channel held here is not clean once the key that the
+        // removed key added is removed by its cut (rule 23; the review of
+        // #277, low 1): that key held every seed the person held.
+        let filing = crate::lists::tests::filing(7, "review");
+        cordelia_storage::shared::hold(
+            &conn,
+            &filing.channel,
+            &filing.card.to_bytes(),
+            &filing.name,
+            cordelia_storage::shared::Came::Made,
+            made,
+        )
+        .unwrap();
+        let not_clean =
+            |conn: &Connection| crate::shared_anew::is_not_clean(conn, &filing.channel).unwrap();
+        assert!(
+            !not_clean(&conn),
+            "the key kept as removed by hand marks nothing"
+        );
         assert!(judge_records_by_their_cut(&conn, &key(0), made).unwrap());
         assert_eq!(counted(&conn), [false]);
+        assert!(not_clean(&conn), "rule 23, by rule 6");
         assert!(!judge_records_by_their_cut(&conn, &key(0), made).unwrap());
     }
 

@@ -1684,3 +1684,37 @@ fn a_recovery_takes_no_act_of_a_device_another_change_removed() {
             .owed
     );
 }
+
+/// A device that does not follow a clear change works its lists out
+/// again, closed or not yet closed (the review of #277, low 3; decision
+/// 2026-10-24 (removal), rules 4 and 10): it writes no list, and the table
+/// of shared channels still follows the lists it holds, as on a device
+/// that is stopped. The laptop drops "review", and the desktop stores its
+/// list; the desktop then knows the tablet, which its change lists, to be
+/// removed, and works its lists out before it is closed (`NotClear`): it
+/// holds "review" no more. Closed (`Stopped`), it does the same.
+#[test]
+fn a_device_on_a_change_not_clear_follows_the_lists_and_writes_none() {
+    for closed in [false, true] {
+        let mut s = bob(3);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 7, "review", now);
+        s.meet(&[0, 1]);
+        crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
+        assert_eq!(row(&s, 1, &channel).state, State::Held);
+        acts(&s, 0, Do::Drop(channel.id), now);
+        s.pass(0, 1);
+        assert_eq!(row(&s, 1, &channel).state, State::Held, "not yet followed");
+        let conn = &s[1].conn;
+        cordelia_storage::person::keep_removed(conn, &[s.key(2)], now).unwrap();
+        assert!(!crate::person::follows_a_clear_change(conn).unwrap());
+        if closed {
+            cordelia_storage::person::set_state(conn, cordelia_storage::person::State::Fork)
+                .unwrap();
+        }
+        let wrote = crate::lists::follow(conn, &s[1].identity, now).unwrap();
+        assert!(!wrote, "it writes no list");
+        out(&s, 1, now);
+        assert_ne!(row(&s, 1, &channel).state, State::Held, "closed: {closed}");
+    }
+}
