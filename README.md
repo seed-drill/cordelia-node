@@ -305,8 +305,8 @@ Then it asks you to type yes, and then for the phrase.
   command stays until every relay has the change and this device has sent
   what it has.
 - **A device that is off applies the removal later,** when it next reaches a
-  relay that has it. Until then, the removed device can still read what that
-  device writes. `cordelia devices` shows which devices have not applied
+  relay that has it. Until a device has read the removal, whether it is off
+  or on, the removed device can still read what that device writes. `cordelia devices` shows which devices have not applied
   the change. A device that is on reads the removal within 90 seconds of a
   relay it is connected to having it. A relay has it within 5 seconds of
   being connected to a relay it works with that has it, where no backlog
