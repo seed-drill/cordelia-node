@@ -1451,7 +1451,36 @@ pub fn write_recovered(
 ) -> Result<(), PersonError> {
     let (written, _) = recovered(lists, |key| gone.contains(key).then_some(Maker::Removed));
     let standing = Standing::to_write(conn)?;
-    write_list(conn, identity, &standing, &acts_of(&written), now)?;
+    let acts = acts_of(&written);
+    write_list(conn, identity, &standing, &acts, now)?;
+    // The person took these at the recovery's terminal, with the phrase,
+    // from the lists of the generation recovered from: a removed device's
+    // acts among them by the person's word, as the look takes what a lost
+    // device wrote (decision 2026-10-24 (removal), rule 6, "one way in is
+    // a person's"). So each is kept as taken in that generation, before
+    // any cut time, and the cut of the device the recovery removes does
+    // not take them back when this machine works its lists out.
+    let statement = &standing.held.statement.statement;
+    let recovered_from = statement.chain.iter().map(|link| link.number).max();
+    if let Some(generation) = recovered_from {
+        let rows: Vec<([u8; 64], TakenRow)> = acts
+            .iter()
+            .map(|act| {
+                let taken = Taken {
+                    generation,
+                    taken_at: 0,
+                };
+                (
+                    act.signature(),
+                    TakenRow {
+                        taken,
+                        carried_in: statement.number,
+                    },
+                )
+            })
+            .collect();
+        kept_rows::keep_taken(conn, &rows)?;
+    }
     crate::shared::keep(conn, &identity.public_key(), now)?;
     Ok(())
 }
