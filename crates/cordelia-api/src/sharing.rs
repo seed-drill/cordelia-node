@@ -334,7 +334,8 @@ pub fn sender_form(
 }
 
 /// The key is another person's device: not this device or one of the
-/// person's, and not one the person's statement lists as removed (§5.5).
+/// person's, and not one this device knows to be removed, on any branch
+/// (§5.5; decision 2026-10-24, rules 2 and 6).
 /// `what` is the command, for its line.
 fn another_persons(
     conn: &Connection,
@@ -344,7 +345,7 @@ fn another_persons(
     what: &str,
 ) -> Out<()> {
     let statement = &held.statement.statement;
-    if statement.removed.contains(key) {
+    if crate::person::removed_known(conn, statement)?.contains(key) {
         return refused(
             "removed_key",
             format!(

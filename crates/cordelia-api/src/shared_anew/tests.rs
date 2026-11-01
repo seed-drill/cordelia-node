@@ -1512,3 +1512,60 @@ fn a_recovery_makes_a_channel_anew_only_once_it_has_read_it() {
             .is_some()
     );
 }
+
+/// A device that comes to know of a removal before it applies it, on any
+/// branch, sends nothing in a shared channel from that moment, and leaves
+/// the removed key out of a channel it makes anew (decision 2026-10-24
+/// (removal), rules 2, 23 and 24): the laptop is shown a change that
+/// removes the tablet, and keeps the key as removed without applying the
+/// change. Each shared channel it holds is then not clean, and the key is
+/// no key that stays in the listing of `shared anew`, though the statement
+/// the laptop applies does not list it.
+#[test]
+fn a_removal_known_before_it_is_applied_makes_each_shared_channel_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for k in 0..3 {
+        crate::lists::follow(&s[k].conn, &s[k].identity, now).unwrap();
+        out(&s, k, now);
+    }
+    let tablet = crate::several::identity_of(2);
+    stores(&s, 0, &anew(&tablet, &channel, 1), now);
+    let conn = &s[0].conn;
+    let own = s[0].identity.public_key();
+    let held = crate::person::held(conn).unwrap().unwrap();
+    // The keys that stay with no question: the person's own devices, and
+    // those asked of.
+    let listed = |conn: &Connection| {
+        let held = crate::person::held(conn).unwrap().unwrap();
+        let listing = listing_of(conn, &held, &own, &row(&s, 0, &channel)).unwrap();
+        [listing.own_devices, listing.asked].concat()
+    };
+    assert!(!is_not_clean(conn, &channel.id).unwrap());
+    assert!(listed(conn).contains(&tablet.public_key()));
+
+    // A change made apart that removes the tablet, shown and not applied.
+    let mut apart = held.statement.statement.clone();
+    apart.removed.push(tablet.public_key());
+    crate::person::know_removed(conn, &apart, &own, now + 1, false).unwrap();
+    assert!(
+        !crate::person::held(conn)
+            .unwrap()
+            .unwrap()
+            .statement
+            .statement
+            .removes(&tablet.public_key()),
+        "the statement applied does not list it"
+    );
+    assert!(is_not_clean(conn, &channel.id).unwrap(), "rule 23");
+    assert!(
+        !listed(conn).contains(&tablet.public_key()),
+        "rule 24: a key known to be removed does not stay"
+    );
+    assert_eq!(
+        removed_at(conn, now + 1).unwrap(),
+        Some(vec![tablet.public_key()])
+    );
+}

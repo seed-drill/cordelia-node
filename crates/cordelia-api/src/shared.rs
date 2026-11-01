@@ -170,7 +170,7 @@ impl Knows {
             .map(|(act, _)| act)
             .collect();
         labels.sort_by_key(|act| (act.time, act.count, act.maker));
-        let removed = statement.removed.clone();
+        let removed = crate::person::removed_known(conn, statement)?;
         let labels = labels
             .into_iter()
             .map(|act| act.item.key)

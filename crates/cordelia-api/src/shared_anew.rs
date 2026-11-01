@@ -223,10 +223,11 @@ fn held_or_dropped(
 /// Judge `offer`, read in the channel of `row`, on the device of
 /// `identity` (§7). `held_channels` are the channels the person holds or
 /// held ([`held_or_dropped`]); `shown` the keys this device shows in the
-/// old channel.
+/// old channel; `removed` every key it knows to be removed
+/// ([`crate::person::removed_known`]).
 fn judge(
     identity: &NodeIdentity,
-    held: &Held,
+    removed: &[[u8; 32]],
     counting: &Counting,
     row: &Channel,
     offer: &OfferRow,
@@ -241,9 +242,9 @@ fn judge(
         .collect();
     let is = if offer.new_channel == row.channel || held_channels.contains(&offer.new_channel) {
         OfferIs::Fault(Fault::Held)
-    } else if held.statement.statement.removed.contains(&offer.maker) {
+    } else if removed.contains(&offer.maker) {
         OfferIs::Fault(Fault::MakerRemoved)
-    } else if seals_removed(held, offer) {
+    } else if seals_removed(&removed, offer) {
         OfferIs::Fault(Fault::SealsRemoved)
     } else if offer.sealed_to.contains(&own) {
         match opened(identity, row, offer) {
@@ -266,10 +267,10 @@ fn judge(
     }
 }
 
-/// Whether `offer` seals to a key this person's statement lists as removed
-/// (decision 2026-10-24, rules 4 and 23): a fault, whatever else it is.
-fn seals_removed(held: &Held, offer: &OfferRow) -> bool {
-    let removed = &held.statement.statement.removed;
+/// Whether `offer` seals to a key of `removed`, every key this device
+/// knows to be removed (decision 2026-10-24, rules 2, 4 and 23): a fault,
+/// whatever else it is.
+fn seals_removed(removed: &[[u8; 32]], offer: &OfferRow) -> bool {
     offer.sealed_to.iter().any(|key| removed.contains(key))
 }
 
@@ -308,16 +309,17 @@ pub fn judged(
     let shown = crate::shared::shown_keys(conn, &row.channel)?;
     let offers = st(rows::offers_in(conn, &row.channel))?;
     // An offer read while its maker was shown, and whose maker this
-    // person's statement removed since, is judged too: it is a fault, and
-    // named so with its maker (§7).
-    let removed = &held.statement.statement.removed;
+    // person's statement removed since, or that this device knows to be
+    // removed on any branch, is judged too: it is a fault, and named so
+    // with its maker (§7).
+    let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     Ok(offers
         .iter()
         .filter(|offer| shown.contains(&offer.maker) || removed.contains(&offer.maker))
         .map(|offer| {
             judge(
                 identity,
-                &held,
+                &removed,
                 &counting,
                 row,
                 offer,
@@ -1001,6 +1003,10 @@ fn listing_of(
 ) -> Result<Listing, PersonError> {
     let statement = &held.statement.statement;
     let counting = crate::person::who_counts(conn)?;
+    // Every key this device knows to be removed is left out, on any branch
+    // (decision 2026-10-24, rules 2 and 24), and not only those the
+    // statement applied lists.
+    let removed = crate::person::removed_known(conn, statement)?;
     let mut listing = Listing::default();
     // The person's own devices, in the order of the statement and then of
     // their additions.
@@ -1051,7 +1057,7 @@ fn listing_of(
             continue;
         }
         let form = sender_form(conn, held, own, &key.key)?;
-        if statement.removed.contains(&key.key) {
+        if removed.contains(&key.key) {
             listing
                 .lines
                 .push(format!("  {form}: left out, a device you removed"));
@@ -1235,10 +1241,7 @@ pub fn anew_plan(
         if listing.let_go > 0 { "up to " } else { "" },
         sharing::counted(
             (left_out
-                + held
-                    .statement
-                    .statement
-                    .removed
+                + crate::person::removed_known(conn, &held.statement.statement)?
                     .iter()
                     .filter(|key| st(kept::key(conn, row.id, key)).ok().flatten().is_some())
                     .count()) as u64
@@ -1668,6 +1671,7 @@ pub(crate) fn after_who_wrote(
     };
     if row.state == State::Held {
         let counting = crate::person::who_counts(conn)?;
+        let removed = crate::person::removed_known(conn, &held.statement.statement)?;
         let shown = crate::shared::shown_keys(conn, channel)?;
         let held_channels = held_or_dropped(conn, None)?;
         for offer in st(rows::offers_in(conn, channel))? {
@@ -1680,8 +1684,8 @@ pub(crate) fn after_who_wrote(
                 .any(|key| key == own || counting.counts(key));
             let fault = offer.new_channel == *channel
                 || held_channels.contains(&offer.new_channel)
-                || held.statement.statement.removed.contains(&offer.maker)
-                || seals_removed(held, &offer);
+                || removed.contains(&offer.maker)
+                || seals_removed(&removed, &offer);
             let left_out = shown
                 .iter()
                 .filter(|key| {
@@ -1727,6 +1731,7 @@ pub fn log_lines(
         return Ok(Vec::new());
     };
     let own = identity.public_key();
+    let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     let mut lines = Vec::new();
     if is_not_clean(conn, &row.channel)? {
         lines.push(format!("  {}", not_clean_line(&row.name)));
@@ -1759,10 +1764,7 @@ pub fn log_lines(
         ));
     }
     for signer in st(kept::index_signers(conn, row.id))? {
-        if !shown.contains(&signer)
-            && signer != own
-            && !held.statement.statement.removed.contains(&signer)
-        {
+        if !shown.contains(&signer) && signer != own && !removed.contains(&signer) {
             lines.push(format!(
                 "  {} is no longer shown here: 64 keys come before it",
                 sender_form(conn, &held, &own, &signer)?
