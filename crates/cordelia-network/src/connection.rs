@@ -67,7 +67,7 @@ pub enum ConnectionError {
     #[error("peer already connected: {0}")]
     AlreadyConnected(NodeId),
 
-    #[error("{0} connected from a listed relay's address, with another key")]
+    #[error("{0} answered at, or connected from, a configured relay's address, with another key")]
     NotTheRelay(NodeId),
 }
 
@@ -506,18 +506,26 @@ pub async fn outbound_connect(
         .endpoint
         .connect(addr, "cordelia")
         .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
-    outbound_on(ctx, connecting, addr, false).await
+    outbound_on(ctx, connecting, addr, false, None).await
 }
 
 /// Outbound connect to a relay configured by key, as [`outbound_connect`],
 /// with the transport settings of a connection between relays listed by
 /// key (decision 2026-10-22, memory across connections, rule 12): today's
 /// windows and 64 streams, where any other peer gets a small message's.
-/// Whether the key that answers is the relay's is the caller's question,
-/// as for any dial of a configured relay.
+///
+/// **`keys`: the keys configured at `addr`,** where every relay configured
+/// there has one. Once TLS gives the peer's key, a key that is not among
+/// them closes the connection and ends the dial as [`ConnectionError::NotTheRelay`],
+/// which is no timeout (decision 2026-10-24 (removal), section 8): a host
+/// at a relay's address with another key that then stalls Cordelia's
+/// handshake does not end a wake's wait. Which configured relay a key that
+/// is among them answers for is the caller's question, as for any dial of
+/// a configured relay. `None` asks nothing of the key here.
 pub async fn outbound_connect_to_listed(
     ctx: &ConnectContext,
     addr: SocketAddr,
+    keys: Option<&[[u8; 32]]>,
 ) -> Result<ConnectOutcome, ConnectionError> {
     let connecting = match &ctx.listed {
         Some(listed) => ctx
@@ -526,7 +534,7 @@ pub async fn outbound_connect_to_listed(
         None => ctx.endpoint.connect(addr, "cordelia"),
     }
     .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
-    outbound_on(ctx, connecting, addr, ctx.listed.is_some()).await
+    outbound_on(ctx, connecting, addr, ctx.listed.is_some(), keys).await
 }
 
 async fn outbound_on(
@@ -534,6 +542,7 @@ async fn outbound_on(
     connecting: quinn::Connecting,
     addr: SocketAddr,
     listed_settings: bool,
+    keys: Option<&[[u8; 32]]>,
 ) -> Result<ConnectOutcome, ConnectionError> {
     let conn = tokio::time::timeout(
         Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
@@ -545,6 +554,14 @@ async fn outbound_on(
 
     let peer_node_id = extract_node_id_from_conn(&conn)?;
     let node_id = NodeId(peer_node_id);
+
+    if let Some(keys) = keys
+        && !keys.contains(&peer_node_id)
+    {
+        tracing::warn!(peer = %node_id, %addr, "closing a dial of a configured relay that another key answered");
+        conn.close(0u32.into(), CLOSED_AS_NOT_THE_RELAY);
+        return Err(ConnectionError::NotTheRelay(node_id));
+    }
 
     let (mut send, mut recv) = conn
         .open_bi()
