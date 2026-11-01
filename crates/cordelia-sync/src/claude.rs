@@ -2649,12 +2649,12 @@ fn apply(
                     // this device's own, which makes no arrival, so a
                     // removed device's late text would otherwise come out
                     // of the cut in it. A copy not noted is not written.
-                    let chain = kept_after(ctx.agreed.get(key), &text, &me);
+                    let chain = kept_after(key, ctx.agreed.get(key), &text, &me);
                     if chain.is_none() {
                         tracing::info!(
                             file = %dir.join(&name).display(),
-                            "what this conflict copy's text was written after is not known: it is \
-                             kept on this device, and not published"
+                            "this conflict copy is of the index, or what its text was written \
+                             after is not known: it is kept on this device, and not published"
                         );
                     }
                     let noted = lock(state).and_then(|db| {
@@ -2779,7 +2779,18 @@ fn apply(
 /// after is not known, and an empty chain would name nothing of a removed
 /// key whose text it keeps. Such a copy is kept on this device, and never
 /// published ([`publish::copy_made`]).
-fn kept_after(agreed: Option<&Agreed>, text: &str, me: &[u8; 32]) -> Option<Vec<Link>> {
+///
+/// **`None` for every copy of the index** (`MEMORY.md`; the review of the
+/// removal build into main, its M1). Every chain of the index names every
+/// removed key at a carry (`cut::may_have_dropped_links`), since no chain
+/// of it can show what it was written over; a copy has another name, and
+/// would be judged by its chain alone at a device that took it. So a copy
+/// of the index stays on the device that made it. Its cost: the other
+/// devices never see that copy, and the person reads it on this device.
+fn kept_after(key: &str, agreed: Option<&Agreed>, text: &str, me: &[u8; 32]) -> Option<Vec<Link>> {
+    if key == memory_md::INDEX_FILE {
+        return None;
+    }
     let Some(agreed) = agreed else {
         return Some(Vec::new());
     };
@@ -3913,6 +3924,119 @@ mod tests {
                         "{lacks}: {inside:?}"
                     );
                 }
+            }
+        }
+    }
+
+    /// A conflict copy of the index is never published (the review of the
+    /// removal build into main, its M1). The laptop takes the phone's
+    /// index in the window: a merge whose chain dropped the tablet's link,
+    /// which the index rule exists for. The tablet then writes the index
+    /// again, naming nothing, and the laptop keeps the phone's version
+    /// beside it as a copy. A copy's name is not the index's, so a work
+    /// laptop that took it would judge it by its chain, which names only
+    /// the phone, and carry it at the removal. Kept on the laptop alone, it
+    /// reaches nobody, and the laptop's own carry puts it back to none.
+    #[test]
+    fn a_conflict_copy_of_the_index_is_kept_here_and_never_published() {
+        use crate::memory_md::INDEX_FILE;
+        let tmp = tempfile::tempdir().unwrap();
+        let st = state(tmp.path());
+        let (_, phrase) = person_of(&st, NAME);
+        let desktop = another_device(&st, &tmp.path().join("desktop"), NAME);
+        let tablet = another_device(&st, &tmp.path().join("tablet"), NAME);
+        let phone = another_device(&st, &tmp.path().join("phone"), NAME);
+        let work = another_device(&st, &tmp.path().join("work"), NAME);
+        for other in [&desktop, &tablet, &phone, &work] {
+            deliver(&st, other, NAME);
+        }
+        let mem = tmp.path().join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        let cycle = || {
+            let generation = st.sync_control.generation();
+            sync_folder(&st, &mem, &channel_now(&st), NAME, "abcd", generation).unwrap()
+        };
+        std::fs::write(mem.join(INDEX_FILE), "- [mine](mine.md)\n").unwrap();
+        assert_eq!(cycle().published, 1);
+
+        // The phone's index, which holds the tablet's late line, and whose
+        // chain names nothing of it.
+        deliver(&st, &phone, NAME);
+        let next = {
+            let db = phone.db.lock().unwrap();
+            publish::read(&db, NAME, INDEX_FILE)
+                .unwrap()
+                .slot
+                .next
+                .unwrap()
+        };
+        entry_at(
+            &phone,
+            NAME,
+            INDEX_FILE,
+            text("- [mine](mine.md)\n- [the tablet's late line](late.md)\n"),
+            next,
+            Some(Vec::new()),
+        );
+        deliver(&phone, &st, NAME);
+        assert_eq!(cycle().pulled, 1);
+        // The tablet writes the index again, higher, naming nothing.
+        deliver(&st, &tablet, NAME);
+        let next = {
+            let db = tablet.db.lock().unwrap();
+            publish::read(&db, NAME, INDEX_FILE)
+                .unwrap()
+                .slot
+                .next
+                .unwrap()
+        };
+        entry_at(
+            &tablet,
+            NAME,
+            INDEX_FILE,
+            text("- [the tablet again](again.md)\n"),
+            next,
+            Some(Vec::new()),
+        );
+        deliver(&tablet, &st, NAME);
+        let report = cycle();
+        assert_eq!(report.conflicts, 1, "{report:?}");
+        let copy = names::conflict_name(INDEX_FILE, "abcd");
+        assert!(mem.join(&copy).exists());
+        // Never published: the work laptop never has it.
+        for _ in 0..2 {
+            let report = cycle();
+            assert_eq!(
+                (report.published, report.failed.len()),
+                (0, 0),
+                "{report:?}"
+            );
+        }
+        deliver(&st, &work, NAME);
+        let secret = name_secret(&work, NAME);
+        let names: Vec<String> = held(&work, NAME)
+            .iter()
+            .map(|entry| entry.open(&secret).unwrap().name)
+            .collect();
+        assert!(!names.contains(&copy), "{names:?}");
+
+        // The desktop removes the tablet; nothing that names the tablet's
+        // late line is carried, on the laptop or the work laptop.
+        let removal = removes_at(&desktop, &phrase, &tablet.identity.public_key(), now());
+        for on in [&st, &work] {
+            let db = on.db.lock().unwrap();
+            take::take(&db, &on.identity, &removal, now()).unwrap();
+        }
+        assert_eq!(cycle().published, 0);
+        assert!(!mem.join(&copy).exists(), "the copy is put back to none");
+        for on in [&st, &work] {
+            let secret = name_secret(on, NAME);
+            for entry in held(on, NAME) {
+                let inside = entry.open(&secret).unwrap();
+                assert!(
+                    !matches!(&inside.value, Value::Text(t) if t.contains("tablet")),
+                    "{inside:?}"
+                );
             }
         }
     }
