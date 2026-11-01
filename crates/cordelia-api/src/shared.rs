@@ -155,7 +155,7 @@ impl Knows {
     pub(crate) fn of(conn: &Connection, held: &Held) -> Result<Self, PersonError> {
         let statement = &held.statement.statement;
         let additions = held_rows::additions(conn)?;
-        let counting = Counting::of(statement, &additions);
+        let counting = crate::person::counting(conn, statement, &additions)?;
         let mut devices: Vec<[u8; 32]> = Vec::new();
         let listed = statement.devices.iter().map(|device| device.key);
         for key in listed.chain(additions.iter().map(|record| record.key)) {
@@ -170,7 +170,7 @@ impl Knows {
             .map(|(act, _)| act)
             .collect();
         labels.sort_by_key(|act| (act.time, act.count, act.maker));
-        let removed = statement.removed.clone();
+        let removed = crate::person::removed_known(conn, statement)?;
         let labels = labels
             .into_iter()
             .map(|act| act.item.key)
@@ -483,16 +483,29 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
             anywhere.push(filing.item.channel);
         }
     }
-    for filing in &filed {
+    // Whether this device knows of any removal: a channel it first holds
+    // from then is not clean (decision 2026-10-24, rule 23), unless it
+    // made the act that files it, knowing, or the channel was made anew.
+    // A device of the person that had not yet heard of the removal may
+    // have filed it in a generation the removed key reads, and carried it
+    // since: the lists do not say which.
+    let removal_known = match held(conn)? {
+        Some(held) => !crate::person::removed_known(conn, &held.statement.statement)?.is_empty(),
+        None => false,
+    };
+    for (act, _) in &holds.filings {
+        let filing = &act.item;
         // A channel whose every entry is being taken out is held again
         // only once the take-out has ended: what the door stored meanwhile
         // would go with the rest.
-        let going = match kept::channel(conn, &filing.channel)? {
-            Some(row) => pass_rows::channel_out(conn, row.id)?.is_some(),
-            None => false,
+        let first = match kept::channel(conn, &filing.channel)? {
+            Some(row) if pass_rows::channel_out(conn, row.id)?.is_some() => continue,
+            Some(_) => false,
+            None => true,
         };
-        if going {
-            continue;
+        if first && removal_known && act.maker != *own && !matches!(filing.came, FiledAs::Moved(_))
+        {
+            cordelia_storage::shared_anew::not_clean(conn, &filing.channel, now, false)?;
         }
         let came = match filing.came {
             FiledAs::Made => Came::Made,

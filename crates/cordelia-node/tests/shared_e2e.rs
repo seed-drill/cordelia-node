@@ -1458,6 +1458,29 @@ fn starts_at(node: &Node) -> Vec<(String, i64)> {
         .unwrap()
 }
 
+/// What each of `devices` keeps of when it took each act of the person's
+/// lists is set back past the removal's margin (decision 2026-10-24
+/// (removal), rule 2, `REMOVAL_TAKEN_MARGIN_SECS`), as though the acts were
+/// taken long before a removal that follows: an act taken within the margin
+/// of its maker's removal counts for nothing (property 9 of decision
+/// 2026-10-10, by the person's ruling of 25 October), and a test cannot
+/// wait ten minutes. Written beside the running node, which reads the
+/// times from its store each time it works its lists out.
+fn acts_taken_long_ago(devices: &[&Node]) {
+    let back = cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS as i64 * 2;
+    for device in devices {
+        let db = rusqlite::Connection::open(device.data_dir().join("cordelia.db")).unwrap();
+        db.busy_timeout(Duration::from_secs(10)).unwrap();
+        let set = db
+            .execute(
+                "UPDATE shared_list_taken SET taken_at = taken_at - ?1",
+                [back],
+            )
+            .unwrap();
+        assert!(set > 0, "{}: no act taken", device.name);
+    }
+}
+
 /// A subscription and an unsubscription survive a statement and the
 /// removal of the device that made them (decision 2026-10-10 §3.4, §4.1,
 /// T16): Alice's tablet subscribes her `notes` folder to a channel shared
@@ -1522,7 +1545,8 @@ fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_t
         assert_eq!(starts[0].0, NOTES);
     }
 
-    // A statement, and then the tablet's removal.
+    // A statement, and then the tablet's removal, long after the acts.
+    acts_taken_long_ago(&[&laptop, &phone]);
     let mut at = renews(&laptop, &["stays", "stays"], &words);
     at.says("The change is made (change 2).");
     drop(at);
@@ -2353,9 +2377,10 @@ fn removed_device_holds_review(n: &Node, removed: &str) {
 /// channel from Alice's key, labels that key `alice` and subscribes an
 /// agent to the channel; Bob removes the laptop from his desktop:
 /// `remove-device` names each of the three with its undoing before its
-/// yes and at its end; `cordelia devices` on the desktop, and on a tablet
-/// added afterwards, names them; after `cordelia label <key> --none` that
-/// line is gone.
+/// yes and at its end; `cordelia devices` on the desktop names them; a
+/// tablet added afterwards, which takes them after the laptop's cut time,
+/// names none; after `cordelia label <key> --none` that line is gone. The
+/// desktop took the acts long before the removal (`acts_taken_long_ago`).
 #[test]
 fn a_removal_lists_what_the_removed_key_did_with_the_command_that_undoes_each() {
     let relay = relay_started();
@@ -2380,6 +2405,7 @@ fn a_removal_lists_what_the_removed_key_did_with_the_command_that_undoes_each() 
         let listed = listed(&desktop);
         (listed["subscriptions"].as_array()?.len() == 1).then_some(())
     });
+    acts_taken_long_ago(&[&desktop]);
     let lines = [
         "\"review\" filed (channel ".to_string(),
         format!(
@@ -2410,19 +2436,21 @@ fn a_removal_lists_what_the_removed_key_did_with_the_command_that_undoes_each() 
     let named = |n: &Node| n.cli(&["devices"]);
     let shown = named(&desktop);
     assert!(shown.contains(lines[0].as_str()), "{shown}");
-    // A tablet added afterwards names them too.
+    // A tablet added afterwards takes the laptop's act after the
+    // laptop's removal, past its cut time: it counts for nothing there,
+    // and is named nowhere on it (decision 2026-10-24 (removal), rule 6;
+    // decision 2026-10-10 property 9), once it holds the desktop's lists.
     let tablet = device_started_with_its_relays_key("tablet", &relay);
     let after = [&relay, &desktop, &alice, &tablet];
     adds(&desktop, &tablet, "tablet");
     has_applied(&tablet, 2, &after);
     sync_on(&tablet);
-    wait_for("the tablet names the laptop's acts", &after, 300, || {
-        let shown = named(&tablet);
-        lines
-            .iter()
-            .all(|line| shown.contains(line.as_str()))
-            .then_some(())
+    wait_for("the tablet holds the desktop's lists", &after, 300, || {
+        let listed = listed(&tablet);
+        (listed["subscriptions"].as_array()?.len() == 1).then_some(())
     });
+    let shown = named(&tablet);
+    assert!(!shown.contains(lines[0].as_str()), "{shown}");
     // Undone, it is named no more.
     let mut at = desktop.at_terminal(&["label", &alice_key, "--none"]);
     at.says("Type yes to go on").types("yes");

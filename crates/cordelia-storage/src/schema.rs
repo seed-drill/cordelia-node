@@ -7,11 +7,15 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 26;
+pub const SCHEMA_VERSION: u32 = 32;
 
-/// The schema version of the released version of the program
-/// (0.2.0-alpha.8): the last before the entries of a channel from its
-/// secret.
+/// The schema version of 0.2.0-alpha.8, the last release before the
+/// entries of a channel from its secret: what the tests of the first start
+/// on v1 make a database as ([`init_db_as_released`],
+/// `first_start::released`). It is not the latest release's, and is not
+/// raised at a release: 0.2.0-alpha.10, which CI runs as the version
+/// before, is at step 18, and 0.2.0-alpha.17 at step 20 (the review of
+/// the removal build into main, its low on the upgrade).
 pub const RELEASED_SCHEMA_VERSION: u32 = 10;
 
 /// Migration v1: Phase 1 initial schema.
@@ -950,7 +954,453 @@ CREATE TABLE message_bounds (
 );
 "#;
 
-/// Migration v21: what a device holds of the person's lists of shared
+/// Migration v21: what a device knows of removals (decision 2026-10-24
+/// (removal), rules 2 and 3), beside the tables of step 12.
+///
+/// - `person_removed_keys`: every key that a change the device has seen
+///   and checked lists as removed, on any branch, with when it was first
+///   kept here. A key is never taken out while the device follows its
+///   phrase, and at most 2,048 are kept; past that the device is closed
+///   (`meta::PERSON_REMOVED_PAST_BOUND`).
+/// - `person_holders`: for a change, by its statement's number and hash,
+///   each key that a record of an addition under it adds, counted or not.
+///   They are kept apart from the records (`person_additions`), whose
+///   bound of 256 drops a record and never its key from here. At most
+///   2,048 a change. A change's rows stay for as long as the device keeps
+///   it, followed or as a head set aside, with its row past the bound
+///   below: at a move the change left keeps them, with its records' keys.
+/// - `person_holders_past`: each change that a record would have given a
+///   2,049th holder. Such a change is not clear.
+///
+/// - `person_clear_mark`: one row, a mark of 16 random bytes that every
+///   write of what says whether the change followed is clear makes anew
+///   (the triggers `person_clear_on_*`): the row of the person, its
+///   records, the three tables above, and the mark past the bound of
+///   removed keys in `node_meta`. A device works out whether the change it
+///   follows is clear once for each mark, and not on every read: a mark is
+///   never made twice, and a write undone puts back the mark with what it
+///   undid, so what was worked out under a mark is what the database holds
+///   under it. It fails closed: no write of any of them, by any code,
+///   leaves the mark as it was.
+///
+/// A relay keeps nothing in any of them but the mark. The step fills none
+/// but the mark: what a device knew before it is read from what it holds
+/// (the statement it has applied, and its records) wherever a change is
+/// asked whether it is clear, and the rest it comes to know from then. So
+/// a record that the bound of 256 dropped before this step is no holder:
+/// its key was not kept apart, and is not known now.
+const MIGRATION_V21: &str = r#"
+CREATE TABLE person_removed_keys (
+    key      BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    seen_at  INTEGER NOT NULL CHECK(typeof(seen_at) = 'integer')
+);
+
+CREATE TABLE person_holders (
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    key     BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    PRIMARY KEY (number, hash, key)
+);
+
+CREATE TABLE person_holders_past (
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash    BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    PRIMARY KEY (number, hash)
+);
+
+CREATE TABLE person_clear_mark (
+    one   INTEGER PRIMARY KEY CHECK(one = 1),
+    mark  BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 16)
+);
+INSERT INTO person_clear_mark (one, mark) VALUES (1, randomblob(16));
+
+CREATE TRIGGER person_clear_on_person_insert AFTER INSERT ON person
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_person_update AFTER UPDATE ON person
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_person_delete AFTER DELETE ON person
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_additions_insert AFTER INSERT ON person_additions
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_additions_update AFTER UPDATE ON person_additions
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_additions_delete AFTER DELETE ON person_additions
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_removed_insert AFTER INSERT ON person_removed_keys
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_removed_update AFTER UPDATE ON person_removed_keys
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_removed_delete AFTER DELETE ON person_removed_keys
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_holders_insert AFTER INSERT ON person_holders
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_holders_update AFTER UPDATE ON person_holders
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_holders_delete AFTER DELETE ON person_holders
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_past_insert AFTER INSERT ON person_holders_past
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_past_update AFTER UPDATE ON person_holders_past
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_past_delete AFTER DELETE ON person_holders_past
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+
+CREATE TRIGGER person_clear_on_meta_insert AFTER INSERT ON node_meta
+WHEN NEW.key = 'person.removed_past_bound'
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_meta_update AFTER UPDATE ON node_meta
+WHEN NEW.key = 'person.removed_past_bound' OR OLD.key = 'person.removed_past_bound'
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+CREATE TRIGGER person_clear_on_meta_delete AFTER DELETE ON node_meta
+WHEN OLD.key = 'person.removed_past_bound'
+BEGIN UPDATE person_clear_mark SET mark = randomblob(16); END;
+"#;
+
+/// Migration v22: the change entries a device keeps, and the time of each
+/// change (decision 2026-10-24 (removal), rules 1, 2 and 12).
+///
+/// - `person_change_entries` is made again. It kept the latest entry and,
+///   in a fork, the one made apart (`kept`, `latest` or `apart`); it keeps
+///   now the change the device follows (`followed` 1) and the heads it
+///   sets aside (`followed` 0), each with when it was set aside, and one
+///   change followed at most. Every row is carried: the latest as the
+///   change followed, and the one made apart as a head set aside at the
+///   time of the step. How many a device keeps (eight) is its code's to
+///   keep to.
+/// - `person_change_times`: for each change the device has applied or
+///   kept, by its statement's number and hash, the time its lineage says
+///   it was made, or none for a change made on the version before. Kept
+///   after the change goes. The step fills none: the entries are sealed,
+///   and the device notes the times of what it kept when it judges it.
+/// - `person.judge_kept` in `node_meta`, on a device that follows a
+///   phrase: at its first start on this version it notes the time of each
+///   entry it kept, and a device in a fork applies rule 8 to the one it
+///   kept apart (rule 12). Then the mark goes.
+///
+/// A relay keeps nothing in either table.
+const MIGRATION_V22: &str = r#"
+CREATE TABLE person_change_entries_22 (
+    place         INTEGER PRIMARY KEY,
+    followed      INTEGER NOT NULL CHECK(followed IN (0, 1)),
+    set_aside_at  INTEGER CHECK(set_aside_at IS NULL OR typeof(set_aside_at) = 'integer'),
+    channel       BLOB NOT NULL CHECK(length(channel) = 32),
+    slot          BLOB NOT NULL CHECK(length(slot) = 32),
+    author        BLOB NOT NULL CHECK(length(author) = 32),
+    rev           INTEGER NOT NULL CHECK(rev BETWEEN 1 AND 256),
+    content       BLOB NOT NULL,
+    author_sig    BLOB NOT NULL CHECK(length(author_sig) = 64),
+    channel_sig   BLOB NOT NULL CHECK(length(channel_sig) = 64),
+    CHECK((followed = 1) = (set_aside_at IS NULL))
+);
+
+INSERT INTO person_change_entries_22
+    (followed, set_aside_at, channel, slot, author, rev, content, author_sig, channel_sig)
+SELECT kept = 'latest',
+       CASE kept WHEN 'latest' THEN NULL ELSE CAST(strftime('%s', 'now') AS INTEGER) END,
+       channel, slot, author, rev, content, author_sig, channel_sig
+FROM person_change_entries ORDER BY kept = 'apart';
+
+DROP TABLE person_change_entries;
+ALTER TABLE person_change_entries_22 RENAME TO person_change_entries;
+
+CREATE UNIQUE INDEX idx_person_change_entries_followed
+    ON person_change_entries(followed) WHERE followed = 1;
+
+CREATE TABLE person_change_times (
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
+    hash     BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    made_at  INTEGER CHECK(made_at IS NULL OR typeof(made_at) = 'integer'),
+    PRIMARY KEY (number, hash)
+);
+
+INSERT INTO node_meta (key, value) SELECT 'person.judge_kept', '1' FROM person;
+"#;
+
+/// Migration v23: a relay keeps every head (decision 2026-10-24
+/// (removal), rules 14 and 15).
+///
+/// - `entries` is made again, with a column `head`, which is part of its
+///   key in place of one row for each author in a slot. It is empty
+///   (`x''`) for a row kept by the store's rule, the newest revision of
+///   that author there, which is every row a device keeps and every row
+///   there is at the step; and the entry's ID for a row that a relay keeps
+///   as a head by its lineage, beside the others of that author in that
+///   slot. So a device keeps one row for each author in a slot, as before,
+///   and a relay up to `MAX_CHANGE_HEADS` heads more. Every row is carried
+///   as it was, with its places, and so are the two indexes of its orders.
+/// - `relay_head_rooms`: each slot of an author in which a relay counts
+///   room for `CHANGE_HEADS_ROOM` heads, from when it took the first entry
+///   with a lineage there, where it had the room. Empty at the step: a
+///   relay counts it from the next entry with a lineage it takes there.
+const MIGRATION_V23: &str = r#"
+DROP INDEX idx_entries_channel_seq;
+DROP INDEX idx_entries_channel_place;
+ALTER TABLE entries RENAME TO entries_22;
+
+CREATE TABLE entries (
+    channel_id     BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot           BLOB NOT NULL CHECK(length(slot) = 32),
+    author         BLOB NOT NULL CHECK(length(author) = 32),
+    rev            INTEGER NOT NULL CHECK(rev >= 1),
+    is_delete      INTEGER NOT NULL CHECK(is_delete IN (0, 1)),
+    content        BLOB NOT NULL,
+    author_sig     BLOB NOT NULL CHECK(length(author_sig) = 64),
+    channel_sig    BLOB NOT NULL CHECK(length(channel_sig) = 64),
+    seq            INTEGER NOT NULL,
+    stored_at      INTEGER NOT NULL,
+    channel_place  INTEGER NOT NULL DEFAULT 0,
+    head           BLOB NOT NULL DEFAULT x''
+                   CHECK(typeof(head) = 'blob' AND length(head) IN (0, 32)),
+    PRIMARY KEY (channel_id, slot, author, head)
+);
+
+INSERT INTO entries (channel_id, slot, author, rev, is_delete, content, author_sig,
+                     channel_sig, seq, stored_at, channel_place)
+SELECT channel_id, slot, author, rev, is_delete, content, author_sig, channel_sig, seq,
+       stored_at, channel_place
+FROM entries_22;
+
+DROP TABLE entries_22;
+
+CREATE UNIQUE INDEX idx_entries_channel_seq ON entries(channel_id, seq);
+CREATE UNIQUE INDEX idx_entries_channel_place ON entries(channel_id, channel_place);
+
+CREATE TABLE relay_head_rooms (
+    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot        BLOB NOT NULL CHECK(length(slot) = 32),
+    author      BLOB NOT NULL CHECK(length(author) = 32),
+    PRIMARY KEY (channel_id, slot, author)
+);
+"#;
+
+/// Migration v24: what a device took before it knew of a removal
+/// (decision 2026-10-24 (removal), rules 2, 6 and 7).
+///
+/// - `person_change_times_lists`: beside the time of a change
+///   (`person_change_times`), the keys its statement lists as removed
+///   (`removed`, 32 bytes each), its chain (`chain`, each link its number
+///   in 8 bytes, big-endian, then its hash) and the keys it lists as
+///   devices (`devices`, 32 bytes each): the cut time of a removed key is
+///   worked out from them (rule 2), and a key that rule 6 would remove is
+///   spared where every removal of its adder lists it. A change noted
+///   before the step has none, and is asked of nothing that needs them:
+///   that fails safe. With them its statement's commitment to its secret
+///   (`commitment`), by which a carry by command knows which change a
+///   generation it left is (the second read of slice 8, its second
+///   finding); where it is not noted, the generation is not known, and
+///   everything of a removed key read there is left out.
+/// - `person_removed_keys_by`: beside a removed key, for one that rule 6
+///   removes, the removed key whose record added it after that key's cut
+///   time. Its cut is that key's.
+/// - `person_removed_keys_spared`: a key that the person said, at the terminal
+///   of a recovery made on this device, is a device they still have, with
+///   the number of that recovery's change: rule 6 does not remove it.
+/// - `file_put_back`: beside a folder's record (`sync_files`), a file that a
+///   carry left out (rule 7): the next cycle takes the channel's version
+///   into the file, whatever is there, and keeps what was there in local
+///   history alone.
+/// - `file_line_from`: beside a record of an index line (`index_lines`),
+///   the keys that signed the version the line was removed from (32 bytes
+///   each), so that no line is put back from a version a removed key signed
+///   (rule 7).
+/// - `file_arrivals_stored` and `file_arrivals`: each entry the door stored
+///   in a file that another key signed, or whose chain holds a link more
+///   times than any chain of the file stored before, with the generation
+///   it came in, when it was stored, the version that was current before it
+///   (sealed as this device's own, to go back to), and, where its chain was
+///   full, the other keys its links name; and each arrival of it, a key
+///   (the first 16 bytes) and, for a link, its hash and how many times it
+///   stands. Kept per file, by its channel and slot, across carries; at
+///   most `MAX_FILE_ARRIVALS` a file. `stored_id` is the ID of the entry
+///   it stored, made anew at each carry where that version is sealed
+///   again: a version gone back to counts as brought, and judged when it
+///   came, only where it is the device's own writing or a kept event
+///   stored exactly it (the second read of slice 8, its medium finding).
+/// - `file_arrivals_dropped`: for each file and generation, the newest
+///   time of an arrival dropped past the bound, and the first event that
+///   went with the version current before it (sealed as this device's own)
+///   and the ID of the entry it stored (`first_stored_id`): where what
+///   went is cut, the file goes back to that version.
+/// - `file_copies`: a conflict copy that a folder made and has not yet
+///   published, by the channel and slot of its name, with the folder, the
+///   name and the chain of the text it keeps (each link its hash, then its
+///   signer, 16 bytes each). The copy's first version is written after
+///   that chain, and the arrivals of the file it was made from are kept
+///   with it from when it is made, so that no copy carries out of the cut
+///   what a removed device wrote (the second read of slice 8, its first
+///   finding). The row goes once the copy is published; a carry before
+///   that judges it, and puts the folder's file back where it is cut.
+const MIGRATION_V24: &str = r#"
+CREATE TABLE person_change_times_lists (
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256),
+    hash     BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    removed  BLOB NOT NULL CHECK(typeof(removed) = 'blob' AND length(removed) % 32 = 0),
+    chain    BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 24 = 0),
+    devices  BLOB NOT NULL CHECK(typeof(devices) = 'blob' AND length(devices) % 32 = 0),
+    commitment  BLOB CHECK(commitment IS NULL OR length(commitment) = 32),
+    PRIMARY KEY (number, hash)
+);
+
+CREATE TABLE person_removed_keys_by (
+    key       BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    added_by  BLOB NOT NULL CHECK(typeof(added_by) = 'blob' AND length(added_by) = 32)
+);
+
+CREATE TABLE person_removed_keys_spared (
+    key     BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    number  INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number BETWEEN 1 AND 256)
+);
+
+CREATE TABLE file_put_back (
+    folder      TEXT NOT NULL,
+    channel_id  TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    PRIMARY KEY (folder, channel_id, key)
+);
+
+CREATE TABLE file_line_from (
+    folder        TEXT NOT NULL,
+    channel_id    TEXT NOT NULL,
+    file          TEXT NOT NULL,
+    from_signers  BLOB NOT NULL CHECK(typeof(from_signers) = 'blob'
+                                      AND length(from_signers) % 32 = 0),
+    PRIMARY KEY (folder, channel_id, file)
+);
+
+CREATE TABLE file_arrivals_stored (
+    place               INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot                BLOB NOT NULL CHECK(length(slot) = 32),
+    number              INTEGER NOT NULL CHECK(typeof(number) = 'integer' AND number >= 1),
+    hash                BLOB NOT NULL CHECK(typeof(hash) = 'blob' AND length(hash) = 16),
+    stored_at           INTEGER NOT NULL CHECK(typeof(stored_at) = 'integer'),
+    full_signers        BLOB CHECK(full_signers IS NULL OR length(full_signers) % 16 = 0),
+    before_author       BLOB CHECK(before_author IS NULL OR length(before_author) = 32),
+    before_rev          INTEGER,
+    before_delete       INTEGER,
+    before_content      BLOB,
+    before_author_sig   BLOB,
+    before_channel_sig  BLOB,
+    stored_id           BLOB CHECK(stored_id IS NULL OR length(stored_id) = 32)
+);
+CREATE INDEX file_arrivals_stored_by_file ON file_arrivals_stored(channel_id, slot, place);
+
+CREATE TABLE file_arrivals (
+    stored     INTEGER NOT NULL,
+    signer     BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 16),
+    link_hash  BLOB CHECK(link_hash IS NULL OR length(link_hash) = 16),
+    times      INTEGER NOT NULL DEFAULT 1 CHECK(typeof(times) = 'integer' AND times >= 1)
+);
+CREATE INDEX file_arrivals_by_stored ON file_arrivals(stored);
+
+CREATE TABLE file_arrivals_dropped (
+    channel_id          BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot                BLOB NOT NULL CHECK(length(slot) = 32),
+    number              INTEGER NOT NULL,
+    hash                BLOB NOT NULL CHECK(length(hash) = 16),
+    newest_at           INTEGER NOT NULL,
+    first_place         INTEGER NOT NULL,
+    before_author       BLOB CHECK(before_author IS NULL OR length(before_author) = 32),
+    before_rev          INTEGER,
+    before_delete       INTEGER,
+    before_content      BLOB,
+    before_author_sig   BLOB,
+    before_channel_sig  BLOB,
+    first_stored_id     BLOB CHECK(first_stored_id IS NULL OR length(first_stored_id) = 32),
+    PRIMARY KEY (channel_id, slot, number, hash)
+);
+
+CREATE TABLE file_copies (
+    channel_id  BLOB NOT NULL CHECK(length(channel_id) = 32),
+    slot        BLOB NOT NULL CHECK(length(slot) = 32),
+    folder      TEXT NOT NULL,
+    key         TEXT NOT NULL,
+    chain       BLOB NOT NULL CHECK(typeof(chain) = 'blob' AND length(chain) % 32 = 0),
+    PRIMARY KEY (channel_id, slot)
+);
+"#;
+
+/// Migration v25: a conflict copy whose text's history is not known, and an
+/// arrival whose chain may have dropped links (decision 2026-10-24
+/// (removal), rule 7; the third read of slice 8).
+///
+/// - `file_copies.held`: 1 where the folder's record of the file the copy
+///   was made from names no signer, or no chain, so that what the copy's
+///   text was written after is not known: its first version would name
+///   nothing, and a device that took it would make no arrival of a removed
+///   key whose text it keeps. Such a copy is never published: a carry that
+///   leaves it out puts it back to none, and one that does not moves it,
+///   still held. Every copy noted before the step is 0, as it was: its
+///   chain was given when it was made.
+///
+/// - `file_arrivals_stored.unknown`: 1 where the entry's chain may have
+///   dropped what it was written after: it was missing, or held
+///   `MAX_ENTRY_LINKS` links, the most a chain keeps, or the file is the
+///   index, whose merges stop a chain short (the fourth read of slice 8
+///   dropped the trust once given to a full chain that named a version held
+///   here). A removed key's link may have fallen off it, so at a carry the
+///   event is judged as an arrival of every removed key (the extra look of
+///   the third read of slice 8). An event kept before the step whose chain
+///   was full is so too: that fails safe. An event of the index kept before
+///   it with a shorter chain is not, since an event keeps no name: step 24
+///   was never released (slice 8's notes).
+///
+/// A step of its own, and not step 24 changed again: step 24 was changed
+/// in place twice while unreleased, and no node or relay ran a build of it
+/// (slice 8's notes).
+const MIGRATION_V25: &str = r#"
+ALTER TABLE file_copies ADD COLUMN held INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(held) = 'integer' AND held IN (0, 1));
+ALTER TABLE file_arrivals_stored ADD COLUMN unknown INTEGER NOT NULL DEFAULT 0
+    CHECK(typeof(unknown) = 'integer' AND unknown IN (0, 1));
+UPDATE file_arrivals_stored SET unknown = 1 WHERE full_signers IS NOT NULL;
+"#;
+
+/// Step 26: what a cut touched, which `cordelia restore` asks (the review
+/// of the fixes of the whole build, its H1 and M2).
+///
+/// - `file_cut`: a file of a folder that a carry cut (decision 2026-10-24
+///   (removal), rule 7), by the folder and the file's name, whether
+///   or not the carry changed what the folder holds. Kept for as long as
+///   the database is: `cordelia restore` puts back no version of it but
+///   one this device wrote itself after the cut.
+/// - `file_cut_written`: each text (SHA-256 in hex, as local history names
+///   a text) that this device published itself of such a file after its
+///   latest cut, with when (the device's clock, used only to let a row go
+///   once local history keeps nothing so old). A cut of the file again
+///   clears them.
+///
+/// It was step 28 while rule 27 of that record was built: steps 26 and 27
+/// held that rule's columns and tables, and went with it. No released
+/// version had any step after 20, and a database of an unreleased build at
+/// step 27 or 28 is refused: the shared channels' steps are 27 to 32 now,
+/// and it holds none of them ([`refuse_steps_numbered_otherwise`]). One at
+/// that build's step 26 (rule 27's columns and tables, and no `file_cut`)
+/// is taken as at step 26, and is given the shared steps: a carry that
+/// would cut a file fails at the missing table, so nothing is applied, and
+/// every restore is refused. It fails closed, and no such build was
+/// released.
+const MIGRATION_V26: &str = r#"
+CREATE TABLE file_cut (
+    folder  TEXT NOT NULL,
+    file    TEXT NOT NULL,
+    PRIMARY KEY (folder, file)
+);
+
+CREATE TABLE file_cut_written (
+    folder  TEXT NOT NULL,
+    file    TEXT NOT NULL,
+    sha256  TEXT NOT NULL CHECK(typeof(sha256) = 'text' AND length(sha256) = 64),
+    at      INTEGER NOT NULL CHECK(typeof(at) = 'integer'),
+    PRIMARY KEY (folder, file, sha256)
+);
+"#;
+
+/// Migration v27: what a device holds of the person's lists of shared
 /// channels (decision 2026-10-10 §3.4, §14, §20). Its list itself is an
 /// entry of the personal channel, as every word of a device is; what is in
 /// force is worked out from the lists each time, and nothing of when the
@@ -973,7 +1423,7 @@ CREATE TABLE message_bounds (
 ///
 /// Each column takes only its type and its bound. A relay keeps nothing in
 /// either.
-const MIGRATION_V21: &str = r#"
+const MIGRATION_V27: &str = r#"
 CREATE TABLE shared_lists (
     one   INTEGER PRIMARY KEY CHECK(one = 1),
     list  BLOB NOT NULL CHECK(typeof(list) = 'blob'
@@ -992,7 +1442,7 @@ CREATE TABLE shared_list_taken (
 );
 "#;
 
-/// Migration v22: what a device keeps of the shared channels it holds
+/// Migration v28: what a device keeps of the shared channels it holds
 /// (decision 2026-10-10 §2.2, §2.3, §2.4, §6.3, §14). Each column takes
 /// only its type and its bound.
 ///
@@ -1020,7 +1470,7 @@ CREATE TABLE shared_list_taken (
 ///   its key's entries keeps its place, to be read again as it was.
 ///
 /// A relay keeps nothing in any of them.
-const MIGRATION_V22: &str = r#"
+const MIGRATION_V28: &str = r#"
 CREATE TABLE shared_channels (
     id          INTEGER PRIMARY KEY,
     channel     BLOB NOT NULL UNIQUE CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
@@ -1160,7 +1610,7 @@ CREATE TABLE shared_places (
 CREATE INDEX idx_shared_places ON shared_places(channel, signer, placed_at);
 "#;
 
-/// Migration v23: what the shared pass keeps (decision 2026-10-10 §8.4,
+/// Migration v29: what the shared pass keeps (decision 2026-10-10 §8.4,
 /// §6.3, §14, and §19, item 19). Each column takes only its type and its
 /// bound.
 ///
@@ -1178,7 +1628,7 @@ CREATE INDEX idx_shared_places ON shared_places(channel, signer, placed_at);
 ///   and one cut short by a stop goes on at the next start.
 ///
 /// A relay keeps nothing in any of them.
-const MIGRATION_V23: &str = r#"
+const MIGRATION_V29: &str = r#"
 CREATE TABLE shared_relay_places (
     channel  INTEGER NOT NULL REFERENCES shared_channels(id),
     relay    BLOB NOT NULL CHECK(typeof(relay) = 'blob' AND length(relay) = 32),
@@ -1210,7 +1660,7 @@ CREATE TABLE shared_take_out_keys (
 );
 "#;
 
-/// Migration v24: what a device keeps of making, sharing and taking a
+/// Migration v30: what a device keeps of making, sharing and taking a
 /// shared channel (decision 2026-10-10 §3.1, §3.2, §14). Each column takes
 /// only its type and its bound.
 ///
@@ -1227,7 +1677,7 @@ CREATE TABLE shared_take_out_keys (
 ///   the delete over it, at which revision.
 ///
 /// A relay keeps nothing in any of them.
-const MIGRATION_V24: &str = r#"
+const MIGRATION_V30: &str = r#"
 CREATE TABLE shared_typed_keys (
     key       BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
     name      TEXT NOT NULL CHECK(typeof(name) = 'text'
@@ -1266,7 +1716,7 @@ CREATE TABLE shared_share_sent (
 );
 "#;
 
-/// Migration v25: what a device keeps of subscribing and of messages in a
+/// Migration v31: what a device keeps of subscribing and of messages in a
 /// shared channel (decision 2026-10-10 §4.1, §6.1, §6.2, §6.4, §14). Each
 /// column takes only its type and its bound.
 ///
@@ -1290,7 +1740,7 @@ CREATE TABLE shared_share_sent (
 ///   waits to be sent again (§6.1, as step 19's `message_kept`).
 ///
 /// A relay keeps nothing in any of them.
-const MIGRATION_V25: &str = r#"
+const MIGRATION_V31: &str = r#"
 CREATE TABLE shared_msg_subscribed (
     channel  BLOB NOT NULL CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
     agent    TEXT NOT NULL CHECK(typeof(agent) = 'text'
@@ -1349,7 +1799,7 @@ CREATE TABLE shared_msg_kept_numbers (
 );
 "#;
 
-/// Migration v26: what a device keeps of channels made anew (decision
+/// Migration v32: what a device keeps of channels made anew (decision
 /// 2026-10-10 §3.5, §7; decision 2026-10-24, rules 23 to 26). Each column
 /// takes only its type and its bound.
 ///
@@ -1371,7 +1821,7 @@ CREATE TABLE shared_msg_kept_numbers (
 ///   left it so because this device does not reach its relays.
 ///
 /// A relay keeps nothing in any of them.
-const MIGRATION_V26: &str = r#"
+const MIGRATION_V32: &str = r#"
 CREATE TABLE shared_anew_offers (
     channel      BLOB NOT NULL CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
     maker        BLOB NOT NULL CHECK(typeof(maker) = 'blob' AND length(maker) = 32),
@@ -1453,9 +1903,45 @@ fn migrate_in_one(conn: &Connection, sql: &str, version: u32) -> Result<(), Stor
 /// done, and nothing is changed: no pragma is set, and no step is run.
 /// Whoever opens the database is told both versions
 /// ([`StorageError::LaterVersion`]).
+///
+/// **A database that an unreleased build numbered otherwise is refused**
+/// too ([`refuse_steps_numbered_otherwise`]).
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     refuse_a_later_version(conn, SCHEMA_VERSION)?;
+    refuse_steps_numbered_otherwise(conn)?;
     run_steps(conn, SCHEMA_VERSION)
+}
+
+/// Refuse a database that a build which no release made left at a step
+/// that this build numbers otherwise, before any pragma is set or any step
+/// is run; nothing of it is changed
+/// ([`StorageError::NumberedOtherwise`]). Each is told by the table of
+/// this build's step 27, `shared_lists`, which no step drops:
+///
+/// - **At 21 to 26, with `shared_lists`:** the shared channels' build
+///   before the removal build came first. It numbered its own steps 21 to
+///   26, which are 27 to 32 now. This build would read it as at one of the
+///   removal's steps, with none of the removal's tables, and would not run
+///   the shared steps it lacks.
+/// - **At 27 to 32, without `shared_lists`:** the removal build while its
+///   rule 27 stood, which reached steps 27 and 28 with that rule's tables.
+///   This build would read it as at one of the shared steps, which it never
+///   ran. (Before the shared steps came after the removal's, such a
+///   database was refused as one from a later version.)
+fn refuse_steps_numbered_otherwise(conn: &Connection) -> Result<(), StorageError> {
+    let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(21..=32).contains(&found) {
+        return Ok(());
+    }
+    let shared: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shared_lists')",
+        [],
+        |row| row.get(0),
+    )?;
+    if shared == (found <= 26) {
+        return Err(StorageError::NumberedOtherwise { found });
+    }
+    Ok(())
 }
 
 /// Refuse a database whose version is above `own`, as a schema at version
@@ -1632,36 +2118,66 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
         migrate_in_one(conn, MIGRATION_V20, 20)?;
     }
 
-    // The steps of the shared channels' record follow the hold's 20, from
-    // 21 (decision 2026-10-10 §14, "the upgrade").
     if current < 21 {
-        tracing::info!("applying migration v21 (the person's lists of shared channels)");
+        tracing::info!("applying migration v21 (what a device knows of removals)");
         migrate_in_one(conn, MIGRATION_V21, 21)?;
     }
 
     if current < 22 {
-        tracing::info!("applying migration v22 (the shared channels a device holds)");
+        tracing::info!("applying migration v22 (the change entries a device keeps)");
         migrate_in_one(conn, MIGRATION_V22, 22)?;
     }
 
     if current < 23 {
-        tracing::info!("applying migration v23 (what the shared pass keeps)");
+        tracing::info!("applying migration v23 (a relay keeps every head)");
         migrate_in_one(conn, MIGRATION_V23, 23)?;
     }
 
     if current < 24 {
-        tracing::info!("applying migration v24 (making, sharing and taking a shared channel)");
+        tracing::info!("applying migration v24 (what a device took before it knew)");
         migrate_in_one(conn, MIGRATION_V24, 24)?;
     }
 
     if current < 25 {
-        tracing::info!("applying migration v25 (subscribing, and messages in a shared channel)");
+        tracing::info!("applying migration v25 (a conflict copy kept on this device)");
         migrate_in_one(conn, MIGRATION_V25, 25)?;
     }
 
     if current < 26 {
-        tracing::info!("applying migration v26 (channels made anew)");
+        tracing::info!("applying migration v26 (what a cut touched)");
         migrate_in_one(conn, MIGRATION_V26, 26)?;
+    }
+
+    // The steps of the shared channels' record follow the removal's 26,
+    // from 27 (decision 2026-10-10 §14, "the upgrade").
+    if current < 27 {
+        tracing::info!("applying migration v27 (the person's lists of shared channels)");
+        migrate_in_one(conn, MIGRATION_V27, 27)?;
+    }
+
+    if current < 28 {
+        tracing::info!("applying migration v28 (the shared channels a device holds)");
+        migrate_in_one(conn, MIGRATION_V28, 28)?;
+    }
+
+    if current < 29 {
+        tracing::info!("applying migration v29 (what the shared pass keeps)");
+        migrate_in_one(conn, MIGRATION_V29, 29)?;
+    }
+
+    if current < 30 {
+        tracing::info!("applying migration v30 (making, sharing and taking a shared channel)");
+        migrate_in_one(conn, MIGRATION_V30, 30)?;
+    }
+
+    if current < 31 {
+        tracing::info!("applying migration v31 (subscribing, and messages in a shared channel)");
+        migrate_in_one(conn, MIGRATION_V31, 31)?;
+    }
+
+    if current < 32 {
+        tracing::info!("applying migration v32 (channels made anew)");
+        migrate_in_one(conn, MIGRATION_V32, 32)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -1703,6 +2219,7 @@ fn migrate_v4(conn: &Connection) -> Result<(), StorageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::OptionalExtension;
 
     #[test]
     fn test_init_fresh_db() {
@@ -2255,10 +2772,13 @@ mod tests {
                    AND name NOT LIKE 'sqlite_autoindex_entries%'
                    AND name NOT LIKE '%person%'
                    AND name NOT LIKE '%relay_channels%'
+                   AND name NOT LIKE '%relay_head_rooms%'
                    AND name NOT LIKE 'items_counted%'
                    AND name NOT LIKE '%at_relays%'
                    AND name NOT LIKE '%message%'
                    AND name NOT LIKE '%shared%'
+                   AND substr(name, 1, 5) != 'file_'
+                   AND name NOT LIKE 'sqlite_autoindex_file_%'
                  ORDER BY name",
             )
             .unwrap()
@@ -2459,6 +2979,45 @@ mod tests {
         held
     }
 
+    /// What a snapshot of a database holds, as it would be at version 22:
+    /// the step to version 23 makes the table of entries again with a
+    /// column more at its end, `head`, and adds a table of its own
+    /// (decision 2026-10-24 (removal), rules 14 and 15). Its rows are
+    /// compared without that column, its definition is read by itself
+    /// ([`definition_of`]), and what the step adds is left out, as each
+    /// step leaves out what later steps add. The step to version 23 has a
+    /// test of its own.
+    fn as_of_v22(held: Vec<String>) -> Vec<String> {
+        held.into_iter()
+            .filter(|row| !row.contains("relay_head_rooms") && !is_of_v24(row))
+            .map(|row| match row.strip_prefix("entries: ") {
+                Some(sql) if sql.starts_with("CREATE TABLE") => {
+                    "entries: (its definition, read by itself)".to_string()
+                }
+                Some(values)
+                    if values.ends_with(", Blob([])") && values.matches("Blob(").count() > 5 =>
+                {
+                    let cut = values.len() - ", Blob([])".len();
+                    format!("entries: {}", &values[..cut])
+                }
+                _ => row,
+            })
+            .collect()
+    }
+
+    /// Whether a row of what a database holds is of the step to version 24
+    /// (decision 2026-10-24 (removal), rules 2, 6 and 7): its tables are
+    /// left out of what each earlier step's test compares, and it has a
+    /// test of its own.
+    fn is_of_v24(row: &str) -> bool {
+        row.starts_with("file_")
+            || row.starts_with("sqlite_autoindex_file_")
+            || row.contains("file_arrivals")
+            || row.contains("person_removed_keys_by")
+            || row.contains("person_removed_keys_spared")
+            || row.contains("person_change_times_lists")
+    }
+
     /// How a table or an index is defined.
     fn definition_of(conn: &Connection, name: &str) -> String {
         conn.query_row(
@@ -2481,8 +3040,15 @@ mod tests {
                AND name NOT LIKE '%person_cleared%'
                AND name NOT LIKE '%person_names_before%'
                AND name NOT LIKE '%person_left%'
+               AND name NOT LIKE '%person_removed_keys%'
+               AND name NOT LIKE '%person_holders%'
+               AND name NOT LIKE '%person_clear%'
+               AND name NOT LIKE '%person_change_times%'
+               AND name NOT LIKE '%idx_person_change_entries_followed%'
                AND name NOT LIKE '%message%'
                AND name NOT LIKE '%shared%'
+               AND substr(name, 1, 5) != 'file_'
+                   AND name NOT LIKE 'sqlite_autoindex_file_%'
                AND name NOT LIKE 'sqlite_autoindex%'
              ORDER BY name",
         )
@@ -2691,8 +3257,14 @@ mod tests {
                    AND name NOT LIKE '%person_cleared%'
                    AND name NOT LIKE '%person_names_before%'
                    AND name NOT LIKE '%person_left%'
+                   AND name NOT LIKE '%person_removed_keys%'
+                   AND name NOT LIKE '%person_holders%'
+                   AND name NOT LIKE '%person_clear%'
+                   AND name NOT LIKE '%person_change%'
                    AND name NOT LIKE '%message%'
                    AND name NOT LIKE '%shared%'
+                   AND substr(name, 1, 5) != 'file_'
+                   AND name NOT LIKE 'sqlite_autoindex_file_%'
                  ORDER BY name",
             "SELECT state || hex(phrase_key) || hex(statement_key) || hex(phrase_channel)
                  || hex(statement) FROM person",
@@ -2709,7 +3281,7 @@ mod tests {
             assert!(!rows.is_empty());
             held.extend(rows);
         }
-        held
+        as_of_v22(held)
     }
 
     /// What a database holds of the step to version 13, by name.
@@ -2820,6 +3392,9 @@ mod tests {
         // The step by itself, and then a start, which has no more to do
         // for it.
         migrate_in_one(&conn, MIGRATION_V13, 13).unwrap();
+        // What the step makes of the table of entries; a later step makes
+        // it again (step 23).
+        let entries_at_13 = definition_of(&conn, "entries");
         assert_eq!(version(&conn), 13);
         assert_eq!(held_before_v13(&conn), before);
         init_db(&conn).unwrap();
@@ -2846,7 +3421,7 @@ mod tests {
         );
         // The table of entries has that one column more, and is as it
         // was otherwise.
-        let entries_after = definition_of(&conn, "entries");
+        let entries_after = entries_at_13;
         assert!(!entries_before.contains("channel_place"));
         assert_eq!(
             entries_after.replace(", channel_place INTEGER NOT NULL DEFAULT 0", ""),
@@ -2931,7 +3506,7 @@ mod tests {
             assert!(!rows.is_empty());
             held.extend(rows);
         }
-        held
+        as_of_v22(held)
     }
 
     /// The two tables of what a device keeps of each relay are made in
@@ -3082,7 +3657,7 @@ mod tests {
             assert!(!rows.is_empty());
             held.extend(rows);
         }
-        held
+        as_of_v22(held)
     }
 
     /// The three tables of what a person typed, cleared and is to be told
@@ -3235,7 +3810,7 @@ mod tests {
             assert!(!rows.is_empty());
             held.extend(rows);
         }
-        held
+        as_of_v22(held)
     }
 
     /// The table of what a relay refused for room is made in one step
@@ -3666,11 +4241,15 @@ mod tests {
 
     /// Everything a database holds: each definition, and each row of each
     /// table, in the order of their names, but what the step to version 20
-    /// adds and what the steps after it add (the shared channels', 21 and
-    /// 22).
+    /// adds and what the steps after it add (the removal's 21 and 22, and
+    /// the shared channels', 27 to 32).
     fn everything_but_v20(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
-            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE substr(name, 1, 5) != 'file_'
+                       AND name NOT LIKE 'sqlite_autoindex_file_%' ORDER BY name",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
@@ -3678,11 +4257,16 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            if NEW_IN_V20.contains(&name.as_str())
+            // What the step to version 21 adds is no row of a step before
+            // it either, nor what the shared channels' steps (27 to 32) add.
+            let later = NEW_IN_V20
+                .iter()
+                .chain(NEW_IN_V21.iter())
+                .chain(NEW_IN_V22.iter());
+            if later
+                .clone()
+                .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
                 || name.contains("shared")
-                || NEW_IN_V20
-                    .iter()
-                    .any(|new| name == format!("sqlite_autoindex_{new}_1"))
             {
                 continue;
             }
@@ -3697,10 +4281,13 @@ mod tests {
                 let values: Vec<String> = (0..columns)
                     .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
                     .collect();
+                if name == "node_meta" && values[0].contains("person.judge_kept") {
+                    continue;
+                }
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
-        held
+        as_of_v22(held)
     }
 
     /// The step to version 20 adds the tables of a person's hold, empty,
@@ -3729,10 +4316,8 @@ mod tests {
             "the tables go with the version"
         );
 
-        // The next start runs the step from the beginning, and the steps
-        // of the shared channels' record after it.
-        init_db(&conn).unwrap();
-        assert_eq!(version(&conn), SCHEMA_VERSION);
+        migrate_in_one(&conn, MIGRATION_V20, 20).unwrap();
+        assert_eq!(version(&conn), 20);
         assert_eq!(new_in_v20(&conn), NEW_IN_V20);
         assert_eq!(everything_but_v20(&conn), before);
         assert!(
@@ -3934,7 +4519,11 @@ mod tests {
     /// version 19 adds.
     fn everything_but_v19(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
-            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE substr(name, 1, 5) != 'file_'
+                       AND name NOT LIKE 'sqlite_autoindex_file_%' ORDER BY name",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
@@ -3942,10 +4531,15 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            // What the step to version 19 adds, and what later steps add.
+            // Nor what the steps to versions 21 and 22 make, nor the shared
+            // channels' steps (27 to 32).
             if NEW_IN_V19.contains(&name.as_str())
                 || name.contains("message")
                 || name.contains("shared")
+                || NEW_IN_V21
+                    .iter()
+                    .chain(NEW_IN_V22.iter())
+                    .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
             {
                 continue;
             }
@@ -3960,10 +4554,13 @@ mod tests {
                 let values: Vec<String> = (0..columns)
                     .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
                     .collect();
+                if name == "node_meta" && values[0].contains("person.judge_kept") {
+                    continue;
+                }
                 held.push(format!("{name}: {}", values.join(", ")));
             }
         }
-        held
+        as_of_v22(held)
     }
 
     /// The step to version 19 adds the tables of messages, empty, and
@@ -4987,6 +5584,979 @@ mod tests {
         assert_eq!(held_after_the_steps("personal.db", true), 1);
     }
 
+    /// The tables the step to version 21 adds.
+    const V21_TABLES: [&str; 4] = [
+        "person_clear_mark",
+        "person_holders",
+        "person_holders_past",
+        "person_removed_keys",
+    ];
+
+    /// What the step to version 21 adds, by name: four tables, and a
+    /// trigger for each write of each table that says whether the change
+    /// followed is clear, that makes the mark anew.
+    const NEW_IN_V21: [&str; 22] = [
+        "person_clear_mark",
+        "person_clear_on_additions_delete",
+        "person_clear_on_additions_insert",
+        "person_clear_on_additions_update",
+        "person_clear_on_holders_delete",
+        "person_clear_on_holders_insert",
+        "person_clear_on_holders_update",
+        "person_clear_on_meta_delete",
+        "person_clear_on_meta_insert",
+        "person_clear_on_meta_update",
+        "person_clear_on_past_delete",
+        "person_clear_on_past_insert",
+        "person_clear_on_past_update",
+        "person_clear_on_person_delete",
+        "person_clear_on_person_insert",
+        "person_clear_on_person_update",
+        "person_clear_on_removed_delete",
+        "person_clear_on_removed_insert",
+        "person_clear_on_removed_update",
+        "person_holders",
+        "person_holders_past",
+        "person_removed_keys",
+    ];
+
+    /// What a database holds of the step to version 21, by name.
+    fn new_in_v21(conn: &Connection) -> Vec<String> {
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names
+            .into_iter()
+            .filter(|name| NEW_IN_V21.contains(&name.as_str()))
+            .collect()
+    }
+
+    /// A database at version 20, as main before the removal's first slice
+    /// leaves one, with what [`at_v19`] holds and a person's read and a
+    /// bound of step 20.
+    fn at_v20() -> Connection {
+        let conn = at_v19();
+        migrate_in_one(&conn, MIGRATION_V20, 20).unwrap();
+        conn.execute_batch(
+            "INSERT INTO message_person_marks (key, id, taken_at)
+                 VALUES (zeroblob(32), zeroblob(16), 9);
+             INSERT INTO message_bounds (key, a, b_kind, b, bound, set_order, at_clock,
+                                         for_secs, first_held, start)
+                 VALUES (zeroblob(32), 'notes', 2, '', NULL, zeroblob(8), zeroblob(8), 60, 9,
+                         NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Everything a database holds, each definition and each row of each
+    /// table, but what the step to version 21 adds, and what the shared
+    /// channels' steps (27 to 32) add.
+    fn everything_but_v21(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE substr(name, 1, 5) != 'file_'
+                       AND name NOT LIKE 'sqlite_autoindex_file_%'
+                       AND name NOT LIKE '%shared%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if NEW_IN_V21
+                .iter()
+                .chain(NEW_IN_V22.iter())
+                .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
+            {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect();
+                if name == "node_meta" && values[0].contains("person.judge_kept") {
+                    continue;
+                }
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        as_of_v22(held)
+    }
+
+    /// The step to version 21 adds what a device knows of removals,
+    /// empty, and changes no older row or definition (decision 2026-10-24
+    /// (removal), rules 2 and 3): it is made in one step with its version,
+    /// so a failure between them leaves none of it, and the step asked for
+    /// twice is run once. What its tables keep stays across a start, and
+    /// each takes no row that cannot be what a device keeps.
+    #[test]
+    fn step_21_adds_what_a_device_knows_of_removals_and_changes_no_older_row() {
+        let conn = at_v20();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v21(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert_eq!(version(&conn), 20);
+        assert!(new_in_v21(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V21} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 21).is_err());
+        assert_eq!(version(&conn), 20);
+        assert!(
+            new_in_v21(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v21(&conn), NEW_IN_V21);
+        assert_eq!(everything_but_v21(&conn), before);
+
+        conn.execute_batch(
+            "INSERT INTO person_removed_keys (key, seen_at) VALUES (zeroblob(32), 9);
+             INSERT INTO person_holders (number, hash, key)
+                 VALUES (3, zeroblob(16), zeroblob(32));
+             INSERT INTO person_holders_past (number, hash) VALUES (3, zeroblob(16));",
+        )
+        .unwrap();
+        let counted = |conn: &Connection| -> Vec<i64> {
+            V21_TABLES
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [1, 1, 1, 1]);
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        assert_eq!(
+            (version(&conn), counted(&conn)),
+            (SCHEMA_VERSION, vec![1, 1, 1, 1])
+        );
+        assert_eq!(everything_but_v21(&conn), before);
+
+        // A row that cannot be what a device keeps is refused, and the
+        // same row with a value of its type and bound is taken.
+        let key = "X'0202020202020202020202020202020202020202020202020202020202020202'";
+        let hash = "X'02020202020202020202020202020202'";
+        let cases: Vec<(String, String)> = vec![
+            (
+                "INSERT INTO person_removed_keys (key, seen_at) VALUES (zeroblob(31), 9)".into(),
+                format!("INSERT INTO person_removed_keys (key, seen_at) VALUES ({key}, 9)"),
+            ),
+            (
+                format!("INSERT INTO person_removed_keys (key, seen_at) VALUES ({key}, 'nine')"),
+                format!("INSERT INTO person_removed_keys (key, seen_at) VALUES ({key}, 9)"),
+            ),
+            (
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (0, {hash}, {key})"),
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (1, {hash}, {key})"),
+            ),
+            (
+                format!(
+                    "INSERT INTO person_holders (number, hash, key) VALUES (1, zeroblob(15), {key})"
+                ),
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (1, {hash}, {key})"),
+            ),
+            (
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (1, {hash}, 'k')"),
+                format!("INSERT INTO person_holders (number, hash, key) VALUES (1, {hash}, {key})"),
+            ),
+            (
+                format!("INSERT INTO person_holders_past (number, hash) VALUES ('one', {hash})"),
+                format!("INSERT INTO person_holders_past (number, hash) VALUES (1, {hash})"),
+            ),
+            (
+                "INSERT INTO person_holders_past (number, hash) VALUES (1, zeroblob(17))".into(),
+                format!("INSERT INTO person_holders_past (number, hash) VALUES (1, {hash})"),
+            ),
+        ];
+        for (refused, taken) in cases {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert!(conn.execute_batch(&refused).is_err(), "{refused}");
+            assert!(conn.execute_batch(&taken).is_ok(), "{taken}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
+    /// What the step to version 22 makes, by name: the table of change
+    /// entries made again, its index of the change followed, and the
+    /// table of the times of changes.
+    const NEW_IN_V22: [&str; 3] = [
+        "idx_person_change_entries_followed",
+        "person_change_entries",
+        "person_change_times",
+    ];
+
+    /// What a database holds of the step to version 22, by name, with the
+    /// definition of each.
+    fn new_in_v22(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, Option<String>)> = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names
+            .into_iter()
+            .filter(|(name, sql)| {
+                NEW_IN_V22.contains(&name.as_str())
+                    && (name != "person_change_entries"
+                        || sql.as_deref().is_some_and(|sql| sql.contains("followed")))
+            })
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// Everything a database holds, each definition and each row of each
+    /// table, but what the step to version 22 makes or writes, and what the
+    /// shared channels' steps (27 to 32) add.
+    fn everything_but_v22(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE substr(name, 1, 5) != 'file_'
+                       AND name NOT LIKE 'sqlite_autoindex_file_%'
+                       AND name NOT LIKE '%shared%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if NEW_IN_V22
+                .iter()
+                .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
+            {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect();
+                if name == "node_meta" && values[0].contains("person.judge_kept") {
+                    continue;
+                }
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        as_of_v22(held)
+    }
+
+    /// A database at version 21, as the removal's first slice leaves one:
+    /// a device in a fork, with what [`at_v20`] holds, its person's row and
+    /// the two change entries it keeps.
+    fn at_v21() -> Connection {
+        let conn = at_v20();
+        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        conn.execute_batch(
+            "UPDATE person SET state = 'fork';
+             INSERT INTO person_change_entries
+                 (kept, channel, slot, author, rev, content, author_sig, channel_sig)
+                 VALUES ('apart', zeroblob(32), zeroblob(32), zeroblob(32), 3, X'03',
+                         zeroblob(64), zeroblob(64)),
+                        ('latest', zeroblob(32), zeroblob(32), zeroblob(32), 2, X'02',
+                         zeroblob(64), zeroblob(64));",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// The step to version 22 makes the table of change entries again, and
+    /// carries each row (decision 2026-10-24 (removal), rules 1, 2 and 12):
+    /// the latest as the change followed, and the one kept apart as a head
+    /// set aside at the step's time. It adds the times of changes, empty,
+    /// and marks a device that follows a phrase to judge what it kept. It
+    /// changes nothing else; it is made in one step with its version, so a
+    /// failure between them leaves none of it, and asked for twice it is
+    /// run once. The new table takes no row that cannot be what a device
+    /// keeps.
+    #[test]
+    fn step_22_keeps_every_head_and_carries_what_was_kept() {
+        let conn = at_v21();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v22(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert_eq!(version(&conn), 21);
+        assert!(new_in_v22(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V22} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 22).is_err());
+        assert_eq!(version(&conn), 21);
+        assert!(
+            new_in_v22(&conn).is_empty(),
+            "the step goes with the version"
+        );
+
+        let began = chrono::Utc::now().timestamp();
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v22(&conn), NEW_IN_V22);
+        assert_eq!(everything_but_v22(&conn), before);
+        let rows: Vec<(i64, Option<i64>, i64, Vec<u8>)> = conn
+            .prepare(
+                "SELECT followed, set_aside_at, rev, content FROM person_change_entries
+                 ORDER BY followed DESC",
+            )
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            (rows[0].0, rows[0].1, rows[0].2, &rows[0].3),
+            (1, None, 2, &vec![2u8])
+        );
+        assert_eq!((rows[1].0, rows[1].2, &rows[1].3), (0, 3, &vec![3u8]));
+        let at = rows[1].1.unwrap();
+        assert!(at >= began && at <= chrono::Utc::now().timestamp(), "{at}");
+        let marked = |conn: &Connection| -> Option<String> {
+            conn.query_row(
+                "SELECT value FROM node_meta WHERE key = 'person.judge_kept'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(marked(&conn).as_deref(), Some("1"));
+        let times: i64 = conn
+            .query_row("SELECT COUNT(*) FROM person_change_times", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(times, 0);
+
+        // Asked for again: nothing more.
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(everything_but_v22(&conn), before);
+
+        // A device that follows no phrase is not marked.
+        let none = at_v20();
+        migrate_in_one(&none, MIGRATION_V21, 21).unwrap();
+        none.execute_batch("DELETE FROM person").unwrap();
+        init_db(&none).unwrap();
+        assert_eq!(marked(&none), None);
+
+        // A row that cannot be what a device keeps is refused, and the
+        // same row with a value of its type and bound is taken.
+        let entry = |followed: &str, at: &str| {
+            format!(
+                "INSERT INTO person_change_entries
+                     (followed, set_aside_at, channel, slot, author, rev, content, author_sig,
+                      channel_sig)
+                 VALUES ({followed}, {at}, zeroblob(32), zeroblob(32), zeroblob(32), 4, X'04',
+                         zeroblob(64), zeroblob(64))"
+            )
+        };
+        conn.execute_batch("DELETE FROM person_change_entries")
+            .unwrap();
+        let hash = "X'02020202020202020202020202020202'";
+        let cases: Vec<(String, String)> = vec![
+            (entry("2", "9"), entry("0", "9")),
+            (entry("0", "NULL"), entry("0", "9")),
+            (entry("1", "9"), entry("1", "NULL")),
+            (entry("0", "'nine'"), entry("0", "9")),
+            (
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (0, {hash}, 9)"),
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (1, {hash}, 9)"),
+            ),
+            (
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (257, {hash}, 9)"),
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (256, {hash}, NULL)"),
+            ),
+            (
+                "INSERT INTO person_change_times (number, hash, made_at) VALUES (1, zeroblob(15), 9)".into(),
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (1, {hash}, 9)"),
+            ),
+            (
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (1, {hash}, 'nine')"),
+                format!("INSERT INTO person_change_times (number, hash, made_at) VALUES (1, {hash}, 9)"),
+            ),
+        ];
+        for (refused, taken) in cases {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert!(conn.execute_batch(&refused).is_err(), "{refused}");
+            assert!(conn.execute_batch(&taken).is_ok(), "{taken}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+        // One change followed at most.
+        conn.execute_batch(&entry("1", "NULL")).unwrap();
+        assert!(conn.execute_batch(&entry("1", "NULL")).is_err());
+        conn.execute_batch(&entry("0", "9")).unwrap();
+        conn.execute_batch(&entry("0", "10")).unwrap();
+    }
+
+    /// The rows of the table of entries, with every column it had at
+    /// version 22, in the order they were stored; and the definitions of
+    /// its two indexes.
+    fn entries_as_at_v22(conn: &Connection) -> Vec<String> {
+        let mut held: Vec<String> = conn
+            .prepare(
+                "SELECT hex(channel_id) || hex(slot) || hex(author) || rev || is_delete
+                     || hex(content) || hex(author_sig) || hex(channel_sig) || seq
+                     || stored_at || channel_place
+                 FROM entries ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        held.push(definition_of(conn, "idx_entries_channel_seq"));
+        held.push(definition_of(conn, "idx_entries_channel_place"));
+        held
+    }
+
+    /// The step to version 23 makes the table of entries again, with a
+    /// column `head` in its key (decision 2026-10-24 (removal), rule 14),
+    /// and adds the table of the room a relay keeps for heads (rule 15),
+    /// empty. Every row is carried as it was, with its places and an empty
+    /// `head`, and so are the two indexes of its orders; nothing else
+    /// changes. It is made in one step with its version, so a failure
+    /// between them leaves none of it, and asked for twice it is run once.
+    /// After it, an author has one row in a slot by the store's rule, and a
+    /// row more for each head, named by an ID.
+    #[test]
+    fn step_23_keeps_a_row_for_each_head_and_carries_every_entry() {
+        let conn = at_v21();
+        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let has_rooms = |conn: &Connection| {
+            conn.prepare("SELECT COUNT(*) FROM relay_head_rooms")
+                .is_ok()
+        };
+        let before = everything_but_v22(&conn);
+        let entries_before = entries_as_at_v22(&conn);
+        let definition_before = definition_of(&conn, "entries");
+        assert!(entries_before.len() > 2, "{entries_before:?}");
+        assert!(!definition_before.contains("head"));
+
+        let failing = format!("{MIGRATION_V23} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 23).is_err());
+        assert_eq!(version(&conn), 22);
+        assert!(!has_rooms(&conn), "the step goes with the version");
+        assert_eq!(definition_of(&conn, "entries"), definition_before);
+
+        init_db(&conn).unwrap();
+        assert!(version(&conn) >= 23);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(everything_but_v22(&conn), before);
+        assert_eq!(entries_as_at_v22(&conn), entries_before);
+        let definition = definition_of(&conn, "entries");
+        assert!(definition.contains("PRIMARY KEY (channel_id, slot, author, head)"));
+        let (empty, rooms): (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM entries WHERE head = x''),
+                        (SELECT COUNT(*) FROM relay_head_rooms)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((empty as usize, rooms), (entries_before.len() - 2, 0));
+        // The autoindex of the key is the table's own, by its name.
+        let autoindex: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE name IN ('sqlite_autoindex_entries_1', 'sqlite_autoindex_entries_22_1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(autoindex, 1);
+
+        // Asked for again: nothing more.
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
+        assert_eq!(entries_as_at_v22(&conn), entries_before);
+
+        // One row by the store's rule for an author in a slot, and a row
+        // more for each head, named by 32 bytes; nothing else.
+        let row = |head: &str, seq: i64, place: i64| {
+            format!(
+                "INSERT INTO entries (channel_id, slot, author, rev, is_delete, content,
+                                      author_sig, channel_sig, seq, stored_at, channel_place,
+                                      head)
+                 VALUES (X'{c}', X'{c}', X'{c}', 3, 0, X'03', zeroblob(64), zeroblob(64),
+                         {seq}, 9, {place}, {head})",
+                c = "AB".repeat(32)
+            )
+        };
+        conn.execute_batch(&row("x''", 9001, 1)).unwrap();
+        assert!(conn.execute_batch(&row("x''", 9002, 2)).is_err());
+        conn.execute_batch(&row("zeroblob(32)", 9003, 3)).unwrap();
+        conn.execute_batch(&row(&format!("X'{}'", "01".repeat(32)), 9004, 4))
+            .unwrap();
+        assert!(conn.execute_batch(&row("zeroblob(32)", 9005, 5)).is_err());
+        assert!(conn.execute_batch(&row("zeroblob(31)", 9006, 6)).is_err());
+        assert!(conn.execute_batch(&row("'text'", 9007, 7)).is_err());
+    }
+
+    /// What the step to version 24 makes, by name.
+    const NEW_IN_V24: [&str; 11] = [
+        "file_arrivals",
+        "file_arrivals_by_stored",
+        "file_arrivals_dropped",
+        "file_arrivals_stored",
+        "file_arrivals_stored_by_file",
+        "file_copies",
+        "file_line_from",
+        "file_put_back",
+        "person_change_times_lists",
+        "person_removed_keys_by",
+        "person_removed_keys_spared",
+    ];
+
+    /// What a database holds of the step to version 24, by name.
+    fn new_in_v24(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name NOT LIKE 'sqlite_autoindex%' ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .filter(|name| NEW_IN_V24.contains(&name.as_str()))
+        .collect()
+    }
+
+    /// Everything a database holds, each definition and each row of each
+    /// table, but what the step to version 24 adds, and what the shared
+    /// channels' steps (27 to 32) add.
+    fn everything_but_v24(conn: &Connection) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE name NOT LIKE '%shared%' ORDER BY name",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            // What a later step makes is no older object: step 26's tables.
+            if NEW_IN_V24
+                .iter()
+                .chain(&["file_cut", "file_cut_written"])
+                .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
+            {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get_ref(i).unwrap()))
+                    .collect();
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        held
+    }
+
+    /// The step to version 24 (decision 2026-10-24 (removal), rules 2, 6
+    /// and 7) adds the tables of what a device took before it knew, empty,
+    /// and changes no older definition or row; it is made in one step with
+    /// its version, so a failure between them leaves none of it, and asked
+    /// for twice it is run once. Its tables take no row that cannot be what
+    /// a device keeps.
+    #[test]
+    fn step_24_adds_what_a_device_took_before_it_knew_and_changes_no_older_row() {
+        let conn = at_v21();
+        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
+        conn.execute_batch(
+            "INSERT INTO person_change_times (number, hash, made_at) VALUES (2, zeroblob(16), 9);",
+        )
+        .unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v24(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert!(new_in_v24(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V24} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 24).is_err());
+        assert_eq!(version(&conn), 23);
+        assert!(
+            new_in_v24(&conn).is_empty(),
+            "the step goes with the version"
+        );
+
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v24(&conn), NEW_IN_V24);
+        assert_eq!(everything_but_v24(&conn), before);
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V24, 24).unwrap();
+        assert_eq!(everything_but_v24(&conn), before);
+        for table in ["file_arrivals_stored", "file_arrivals", "file_put_back"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table}");
+        }
+
+        let key = "X'0202020202020202020202020202020202020202020202020202020202020202'";
+        let hash = "X'02020202020202020202020202020202'";
+        let cases: Vec<(String, String)> = vec![
+            (
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                     VALUES (1, {hash}, zeroblob(31), x'', x'')"
+                ),
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                     VALUES (1, {hash}, zeroblob(32), x'', x'')"
+                ),
+            ),
+            (
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                     VALUES (1, {hash}, x'', zeroblob(23), x'')"
+                ),
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                     VALUES (1, {hash}, x'', zeroblob(24), x'')"
+                ),
+            ),
+            (
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices,
+                         commitment)
+                     VALUES (1, {hash}, x'', x'', x'', zeroblob(31))"
+                ),
+                format!(
+                    "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices,
+                         commitment)
+                     VALUES (1, {hash}, x'', x'', x'', zeroblob(32))"
+                ),
+            ),
+            (
+                format!("INSERT INTO person_removed_keys_by (key, added_by) VALUES ({key}, 'k')"),
+                format!("INSERT INTO person_removed_keys_by (key, added_by) VALUES ({key}, {key})"),
+            ),
+            (
+                "INSERT INTO file_arrivals (stored, signer) VALUES (1, zeroblob(15))".into(),
+                "INSERT INTO file_arrivals (stored, signer) VALUES (1, zeroblob(16))".into(),
+            ),
+            (
+                "INSERT INTO file_arrivals (stored, signer, times) VALUES (1, zeroblob(16), 0)"
+                    .into(),
+                "INSERT INTO file_arrivals (stored, signer, times) VALUES (1, zeroblob(16), 2)"
+                    .into(),
+            ),
+            (
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
+                     VALUES (zeroblob(32), zeroblob(32), 0, {hash}, 9)"
+                ),
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
+                     VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9)"
+                ),
+            ),
+            (
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                         stored_id)
+                     VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9, zeroblob(31))"
+                ),
+                format!(
+                    "INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                         stored_id)
+                     VALUES (zeroblob(32), zeroblob(32), 1, {hash}, 9, zeroblob(32))"
+                ),
+            ),
+            (
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+                 VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(31))"
+                    .into(),
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+                 VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(32))"
+                    .into(),
+            ),
+        ];
+        for (refused, taken) in cases {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert!(conn.execute_batch(&refused).is_err(), "{refused}");
+            assert!(conn.execute_batch(&taken).is_ok(), "{taken}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
+    /// The step to version 25 adds `file_copies.held`, 0 on every copy noted
+    /// before it, and `file_arrivals_stored.unknown`, 1 on an event whose
+    /// chain was full; each takes no value but 0 or 1; it is made in one
+    /// step with its version, and asked for twice it is run once.
+    #[test]
+    fn step_25_holds_no_copy_noted_before_it() {
+        let conn = at_v21();
+        for (sql, version) in [
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+        ] {
+            migrate_in_one(&conn, sql, version).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO file_copies (channel_id, slot, folder, key, chain)
+             VALUES (zeroblob(32), zeroblob(32), '/m', 'a.md', zeroblob(32));
+             INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at)
+             VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 9);
+             INSERT INTO file_arrivals_stored (channel_id, slot, number, hash, stored_at,
+                 full_signers)
+             VALUES (zeroblob(32), zeroblob(32), 1, zeroblob(16), 10, zeroblob(16));",
+        )
+        .unwrap();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let failing = format!("{MIGRATION_V25} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 25).is_err());
+        assert_eq!(version(&conn), 24);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        migrate_in_one(&conn, MIGRATION_V25, 25).unwrap();
+        let held: i64 = conn
+            .query_row("SELECT held FROM file_copies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(held, 0);
+        // An event whose chain was full is judged as one that may have
+        // dropped links; one that was not, is not.
+        let unknown: Vec<i64> = conn
+            .prepare("SELECT unknown FROM file_arrivals_stored ORDER BY stored_at")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(unknown, [0, 1]);
+        for (value, taken) in [("0", true), ("1", true), ("2", false), ("'one'", false)] {
+            let sql = format!(
+                "INSERT INTO file_copies (channel_id, slot, folder, key, chain, held)
+                 VALUES (zeroblob(32), X'{}', '/m', 'b.md', x'', {value})",
+                "01".repeat(32)
+            );
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+    }
+
+    /// Step 26 (the review of the fixes of the whole build, its H1 and M2):
+    /// it makes the two tables of what a cut touched in one step with its
+    /// version, and asked for twice it is run once; a text's hash is 64
+    /// characters of text, and its time an integer. A file cut is refused a
+    /// restore of any text but one written after the cut, which a cut
+    /// again takes back.
+    #[test]
+    fn step_26_records_what_a_cut_touched() {
+        let conn = at_v21();
+        for (sql, version) in [
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+            (MIGRATION_V25, 25),
+        ] {
+            migrate_in_one(&conn, sql, version).unwrap();
+        }
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let failing = format!("{MIGRATION_V26} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 26).is_err());
+        assert_eq!(version(&conn), 25);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        migrate_in_one(&conn, MIGRATION_V26, 26).unwrap();
+        let sha = "ab".repeat(32);
+        for (sql, taken) in [
+            (
+                format!("INSERT INTO file_cut_written VALUES ('f', 'a.md', '{sha}', 1)"),
+                true,
+            ),
+            (
+                "INSERT INTO file_cut_written VALUES ('f', 'a.md', 'ab', 1)".to_string(),
+                false,
+            ),
+            (
+                format!("INSERT INTO file_cut_written VALUES ('f', 'a.md', '{sha}', 'one')"),
+                false,
+            ),
+        ] {
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            assert_eq!(conn.execute_batch(&sql).is_ok(), taken, "{sql}");
+            conn.execute_batch("ROLLBACK TO one; RELEASE one").unwrap();
+        }
+
+        use crate::sync_state::{note_cut, note_written, restore_refused};
+        let refused = |sha: Option<&str>| restore_refused(&conn, "f", "a.md", sha).unwrap();
+        assert!(!refused(Some(&sha)) && !refused(None));
+        // Nothing is noted as written of a file never cut.
+        note_written(&conn, "f", "a.md", &sha, 100).unwrap();
+        note_cut(&conn, "f", "a.md").unwrap();
+        assert!(refused(Some(&sha)) && refused(None));
+        note_written(&conn, "f", "a.md", &sha, 100).unwrap();
+        assert!(!refused(Some(&sha)));
+        assert!(refused(Some(&"cd".repeat(32))));
+        assert!(!restore_refused(&conn, "f", "b.md", None).unwrap());
+        assert!(!restore_refused(&conn, "g", "a.md", None).unwrap());
+        // What is older than history keeps goes, with the next note.
+        let later = 100 + i64::from(cordelia_core::protocol::HISTORY_DAYS) * 86_400 + 1;
+        note_written(&conn, "f", "a.md", &"cd".repeat(32), later).unwrap();
+        assert!(refused(Some(&sha)));
+        assert!(!refused(Some(&"cd".repeat(32))));
+        // Cut again, nothing written before is let through.
+        note_cut(&conn, "f", "a.md").unwrap();
+        assert!(refused(Some(&"cd".repeat(32))));
+    }
+
+    /// The version before, whose schema is at step 23, stops on a database
+    /// that was stepped to 24, as every version stops on one from a later
+    /// version: it is refused with both versions, and nothing of it is
+    /// changed.
+    #[test]
+    fn the_version_before_stops_on_a_database_of_step_24() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 23);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 23
+                })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    /// The version before, whose schema is at step 21, stops on a database
+    /// that was stepped to 22, as every version stops on one from a later
+    /// version: it is refused with both versions, and nothing of it is
+    /// changed.
+    #[test]
+    fn the_version_before_stops_on_a_database_of_step_22() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 21);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 21
+                })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(refuse_a_later_version(&at_v21(), 21).is_ok());
+    }
+
+    /// The version before, whose schema is at step 20, stops on a database
+    /// that was stepped to 21, as every version stops on one from a later
+    /// version: it is refused with both versions, and nothing of it is
+    /// changed. A database at step 20 it opens.
+    #[test]
+    fn the_version_before_stops_on_a_database_of_step_21() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        let refused = refuse_a_later_version(&conn, 20);
+        assert!(
+            matches!(
+                refused,
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 20
+                })
+            ),
+            "{refused:?}"
+        );
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(refuse_a_later_version(&at_v20(), 20).is_ok());
+    }
+
     /// The version before, whose schema is at step 19, stops on a
     /// database that was stepped to 20 (decision 2026-10-09 §9.2, decision
     /// 2026-10-25, section 7), as every version stops on one from a later
@@ -5005,7 +6575,10 @@ mod tests {
         assert!(
             matches!(
                 refused,
-                Err(StorageError::LaterVersion { found, own: 19 }) if found == SCHEMA_VERSION
+                Err(StorageError::LaterVersion {
+                    found: SCHEMA_VERSION,
+                    own: 19
+                })
             ),
             "{refused:?}"
         );
@@ -5017,54 +6590,169 @@ mod tests {
         assert!(refuse_a_later_version(&at_19, 18).is_err());
     }
 
-    /// A database at version 20, as this version's start leaves one before
-    /// the steps of the shared channels' record: what [`at_v19`] holds, and
-    /// a person's read that another device said.
-    fn at_v20() -> Connection {
-        let conn = at_v19();
-        migrate_in_one(&conn, MIGRATION_V20, 20).unwrap();
-        conn.execute_batch(
-            "INSERT INTO message_person_marks (key, id, taken_at)
-                 VALUES (zeroblob(32), zeroblob(16), 9);",
-        )
-        .unwrap();
+    /// A database at version 26, as the removal build's steps leave one
+    /// before the steps of the shared channels' record, 27 to 32: what
+    /// [`at_v20`] holds, stepped through the removal's 21 to 26.
+    fn at_v26() -> Connection {
+        let conn = at_v20();
+        for (sql, at) in [
+            (MIGRATION_V21, 21),
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+            (MIGRATION_V25, 25),
+            (MIGRATION_V26, 26),
+        ] {
+            migrate_in_one(&conn, sql, at).unwrap();
+        }
         conn
     }
 
-    /// The version before, whose schema is at step 20 (decision 2026-10-25),
-    /// stops on a database that was stepped past 20 (decision 2026-10-10
-    /// §14, "going back"), as every version stops on one from a later
-    /// version: it is refused with both versions, and nothing of it is
-    /// changed. A database at step 20 it opens.
+    /// A version before, whose schema is at step 20 (0.2.0-alpha.17,
+    /// decision 2026-10-25) or at step 26 (the removal build, decision
+    /// 2026-10-24), stops on a database that was stepped past it (decision
+    /// 2026-10-10 §14, "going back"), as every version stops on one from a
+    /// later version: it is refused with both versions, and nothing of it
+    /// is changed. A database at its own step it opens.
     #[test]
-    fn the_version_before_stops_on_a_database_stepped_past_20() {
+    fn the_version_before_stops_on_a_database_stepped_past_its_own_step() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cordelia.db");
         drop(crate::db::open(&path).unwrap());
         let before = std::fs::read(&path).unwrap();
 
         let conn = Connection::open(&path).unwrap();
-        let refused = refuse_a_later_version(&conn, 20);
-        assert!(
-            matches!(
-                refused,
-                Err(StorageError::LaterVersion { found: 26, own: 20 })
-            ),
-            "{refused:?}"
-        );
+        for own in [20, 26] {
+            let refused = refuse_a_later_version(&conn, own);
+            assert!(
+                matches!(
+                    refused,
+                    Err(StorageError::LaterVersion { found, own: o }) if found == SCHEMA_VERSION && o == own
+                ),
+                "{refused:?}"
+            );
+        }
         drop(conn);
         assert_eq!(std::fs::read(&path).unwrap(), before);
 
         let at_20 = at_v20();
         assert!(refuse_a_later_version(&at_20, 20).is_ok());
         assert!(refuse_a_later_version(&at_20, 19).is_err());
+        let at_26 = at_v26();
+        assert!(refuse_a_later_version(&at_26, 26).is_ok());
+        assert!(refuse_a_later_version(&at_26, 25).is_err());
     }
 
-    /// What the step to version 21 adds: two tables.
-    const NEW_IN_V21: [&str; 2] = ["shared_list_taken", "shared_lists"];
+    /// A database that a build which no release made left at a step that
+    /// this version numbers otherwise is refused, before any pragma is set
+    /// or any step is run, and nothing of it is changed: the shared
+    /// channels' build at its steps 21 to 26, which this version reads as
+    /// the removal's, and the removal build at its steps 27 and 28 while
+    /// its rule 27 stood, which this version reads as the shared channels'.
+    /// A database of the removal build at its own steps is stepped on, and
+    /// so is one of this version's at any shared step.
+    #[test]
+    fn a_database_whose_steps_an_unreleased_build_numbered_otherwise_is_refused() {
+        let as_that_build_numbered = [
+            (21, MIGRATION_V27),
+            (22, MIGRATION_V28),
+            (23, MIGRATION_V29),
+            (24, MIGRATION_V30),
+            (25, MIGRATION_V31),
+            (26, MIGRATION_V32),
+        ];
+        for (old, _) in as_that_build_numbered {
+            // As that build left it: alpha.17's step 20, then the shared
+            // steps as it numbered them, and none of the removal's.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cordelia.db");
+            at_v20()
+                .execute_batch(&format!("VACUUM INTO '{}'", path.display()))
+                .unwrap();
+            let conn = Connection::open(&path).unwrap();
+            for (at, step) in as_that_build_numbered {
+                if at <= old {
+                    migrate_in_one(&conn, step, at).unwrap();
+                }
+            }
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
 
-    /// What a database holds of the step to version 21, by name.
-    fn new_in_v21(conn: &Connection) -> Vec<String> {
+            let conn = Connection::open(&path).unwrap();
+            let refused = init_db(&conn);
+            assert!(
+                matches!(
+                    refused,
+                    Err(StorageError::NumberedOtherwise { found }) if found == old
+                ),
+                "{refused:?}"
+            );
+            drop(conn);
+            assert_eq!(std::fs::read(&path).unwrap(), before, "at {old}");
+            let conn = crate::db::open(&path);
+            assert!(
+                matches!(conn, Err(StorageError::NumberedOtherwise { .. })),
+                "at {old}"
+            );
+        }
+
+        // The removal build while its rule 27 stood: at its step 27 or 28,
+        // with that rule's tables and none of the shared steps.
+        for old in [27, 28] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cordelia.db");
+            at_v26()
+                .execute_batch(&format!("VACUUM INTO '{}'", path.display()))
+                .unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE file_own_dropped (folder TEXT NOT NULL, file TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", old).unwrap();
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
+            let refused = crate::db::open(&path);
+            assert!(
+                matches!(refused, Err(StorageError::NumberedOtherwise { found }) if found == old),
+                "{:?}",
+                refused.err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "at {old}");
+        }
+
+        // The removal build's database at its step 21 and at its step 26
+        // is stepped on to this version's, and one of this version's at
+        // any step of the shared channels opens.
+        for conn in [at_v21(), at_v26()] {
+            init_db(&conn).unwrap();
+            let at: u32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(at, SCHEMA_VERSION);
+        }
+        for at in 27..=31 {
+            let conn = at_v26();
+            for (step, to) in [
+                (MIGRATION_V27, 27),
+                (MIGRATION_V28, 28),
+                (MIGRATION_V29, 29),
+                (MIGRATION_V30, 30),
+                (MIGRATION_V31, 31),
+            ] {
+                if to <= at {
+                    migrate_in_one(&conn, step, to).unwrap();
+                }
+            }
+            init_db(&conn).unwrap();
+        }
+    }
+
+    /// What the step to version 27 adds: two tables.
+    const NEW_IN_V27: [&str; 2] = ["shared_list_taken", "shared_lists"];
+
+    /// What a database holds of the step to version 27, by name.
+    fn new_in_v27(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
              WHERE name LIKE 'shared_list%' AND name NOT LIKE 'sqlite_autoindex%'
@@ -5077,8 +6765,8 @@ mod tests {
         .unwrap()
     }
 
-    /// What the step to version 22 adds: nine tables and their indexes.
-    const NEW_IN_V22: [&str; 15] = [
+    /// What the step to version 28 adds: nine tables and their indexes.
+    const NEW_IN_V28: [&str; 15] = [
         "idx_shared_first_held_id",
         "idx_shared_index_signer",
         "idx_shared_keys_held_order",
@@ -5096,8 +6784,8 @@ mod tests {
         "shared_unopened",
     ];
 
-    /// What a database holds of the step to version 22, by name.
-    fn new_in_v22(conn: &Connection) -> Vec<String> {
+    /// What a database holds of the step to version 28, by name.
+    fn new_in_v28(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
              WHERE (name LIKE 'shared%' OR name LIKE 'idx_shared%')
@@ -5115,34 +6803,34 @@ mod tests {
     }
 
     /// Everything a database holds, each definition and each row, but
-    /// what the steps of the shared channels' record add, from step 21 on.
-    fn everything_but_v21(conn: &Connection) -> Vec<String> {
+    /// what the steps of the shared channels' record add, from step 27 on.
+    fn everything_but_v27(conn: &Connection) -> Vec<String> {
         everything_but(conn, |name| name.contains("shared"))
     }
 
     /// Everything a database holds, each definition and each row, but
-    /// what the step to version 22 adds.
-    fn everything_but_v22(conn: &Connection) -> Vec<String> {
+    /// what the step to version 28 adds.
+    fn everything_but_v28(conn: &Connection) -> Vec<String> {
         everything_but(conn, |name| {
-            NEW_IN_V22.contains(&name)
-                || NEW_IN_V23.contains(&name)
-                || NEW_IN_V24.contains(&name)
+            NEW_IN_V28.contains(&name)
+                || NEW_IN_V29.contains(&name)
+                || NEW_IN_V30.contains(&name)
                 || name.contains("shared_msg_")
                 || name.contains("shared_anew_")
                 || (name.starts_with("sqlite_autoindex_shared_") && !name.contains("shared_list"))
         })
     }
 
-    /// What the step to version 23 adds: four tables.
-    const NEW_IN_V23: [&str; 4] = [
+    /// What the step to version 29 adds: four tables.
+    const NEW_IN_V29: [&str; 4] = [
         "shared_relay_places",
         "shared_relay_sent",
         "shared_take_out_channels",
         "shared_take_out_keys",
     ];
 
-    /// What a database holds of the step to version 23, by name.
-    fn new_in_v23(conn: &Connection) -> Vec<String> {
+    /// What a database holds of the step to version 29, by name.
+    fn new_in_v29(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
              WHERE (name LIKE 'shared_relay_%' OR name LIKE 'shared_take_out_%')
@@ -5157,11 +6845,11 @@ mod tests {
     }
 
     /// Everything a database holds, each definition and each row, but
-    /// what the step to version 23 adds.
-    fn everything_but_v23(conn: &Connection) -> Vec<String> {
+    /// what the step to version 29 adds.
+    fn everything_but_v29(conn: &Connection) -> Vec<String> {
         everything_but(conn, |name| {
-            NEW_IN_V23.contains(&name)
-                || NEW_IN_V24.contains(&name)
+            NEW_IN_V29.contains(&name)
+                || NEW_IN_V30.contains(&name)
                 || name.contains("shared_msg_")
                 || name.contains("shared_anew_")
                 || name.starts_with("sqlite_autoindex_shared_relay_")
@@ -5171,48 +6859,48 @@ mod tests {
         })
     }
 
-    /// The step to version 23 (decision 2026-10-10 §8.4, §6.3, §14 and
-    /// §19, item 19): from a database at step 22 that holds rows of it, it
+    /// The step to version 29 (decision 2026-10-10 §8.4, §6.3, §14 and
+    /// §19, item 19): from a database at step 28 that holds rows of it, it
     /// adds the tables of the shared pass and of a take-out in steps,
     /// empty, and changes no older row or definition; a failure leaves
     /// none of it, and the step asked for twice is run once. Each column
     /// takes only its type and its bound.
-    fn step_23_adds_its_tables_and_changes_no_older_row() {
+    fn step_29_adds_its_tables_and_changes_no_older_row() {
         let version = |conn: &Connection| -> u32 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap()
         };
-        let conn = at_v20();
-        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
-        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        let conn = at_v26();
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
+        migrate_in_one(&conn, MIGRATION_V28, 28).unwrap();
         conn.execute_batch(
             "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
                                           first_held)
                  VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9);",
         )
         .unwrap();
-        let before = everything_but_v23(&conn);
+        let before = everything_but_v29(&conn);
         assert!(
             before
                 .iter()
                 .any(|row| row.starts_with("shared_channels: "))
         );
-        assert!(new_in_v23(&conn).is_empty());
+        assert!(new_in_v29(&conn).is_empty());
 
-        let failing = format!("{MIGRATION_V23} SELECT no_such_function();");
-        assert!(migrate_in_one(&conn, &failing, 23).is_err());
-        assert_eq!(version(&conn), 22);
+        let failing = format!("{MIGRATION_V29} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 29).is_err());
+        assert_eq!(version(&conn), 28);
         assert!(
-            new_in_v23(&conn).is_empty(),
+            new_in_v29(&conn).is_empty(),
             "the tables go with the version"
         );
-        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
-        assert_eq!(version(&conn), 23);
-        assert_eq!(new_in_v23(&conn), NEW_IN_V23);
-        assert_eq!(everything_but_v23(&conn), before);
+        migrate_in_one(&conn, MIGRATION_V29, 29).unwrap();
+        assert_eq!(version(&conn), 29);
+        assert_eq!(new_in_v29(&conn), NEW_IN_V29);
+        assert_eq!(everything_but_v29(&conn), before);
 
         let counted = |conn: &Connection| -> Vec<i64> {
-            NEW_IN_V23
+            NEW_IN_V29
                 .iter()
                 .map(|table| {
                     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -5236,9 +6924,9 @@ mod tests {
         let kept = counted(&conn);
         assert_eq!(kept, [1; 4]);
         init_db(&conn).unwrap();
-        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
+        migrate_in_one(&conn, MIGRATION_V29, 29).unwrap();
         assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
-        assert_eq!(everything_but_v23(&conn), before);
+        assert_eq!(everything_but_v29(&conn), before);
 
         conn.execute_batch(
             "DELETE FROM shared_relay_places; DELETE FROM shared_relay_sent;
@@ -5274,11 +6962,11 @@ mod tests {
         }
     }
 
-    /// What the step to version 24 adds: three tables.
-    const NEW_IN_V24: [&str; 3] = ["shared_share_sent", "shared_shares", "shared_typed_keys"];
+    /// What the step to version 30 adds: three tables.
+    const NEW_IN_V30: [&str; 3] = ["shared_share_sent", "shared_shares", "shared_typed_keys"];
 
-    /// What a database holds of the step to version 24, by name.
-    fn new_in_v24(conn: &Connection) -> Vec<String> {
+    /// What a database holds of the step to version 30, by name.
+    fn new_in_v30(conn: &Connection) -> Vec<String> {
         conn.prepare(
             "SELECT name FROM sqlite_master
              WHERE (name LIKE 'shared_typed_%' OR name LIKE 'shared_share%')
@@ -5292,22 +6980,22 @@ mod tests {
         .unwrap()
     }
 
-    /// The step to version 24 (decision 2026-10-10 §3.1, §3.2, §14): from a
-    /// database at step 23 that holds rows of the steps before it, it adds
+    /// The step to version 30 (decision 2026-10-10 §3.1, §3.2, §14): from a
+    /// database at step 29 that holds rows of the steps before it, it adds
     /// the tables of the keys typed for channels and of the shares this
     /// device wrote, empty, and changes no older row or definition; a
     /// failure leaves none of it, and the step asked for twice is run once.
     /// Each column takes only its type and its bound.
     #[test]
-    fn step_24_adds_its_tables_and_changes_no_older_row() {
+    fn step_30_adds_its_tables_and_changes_no_older_row() {
         let version = |conn: &Connection| -> u32 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap()
         };
-        let conn = at_v20();
-        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
-        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
-        migrate_in_one(&conn, MIGRATION_V23, 23).unwrap();
+        let conn = at_v26();
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
+        migrate_in_one(&conn, MIGRATION_V28, 28).unwrap();
+        migrate_in_one(&conn, MIGRATION_V29, 29).unwrap();
         conn.execute_batch(
             "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
                                           first_held)
@@ -5317,7 +7005,7 @@ mod tests {
         .unwrap();
         let but = |conn: &Connection| {
             everything_but(conn, |name| {
-                NEW_IN_V24.contains(&name)
+                NEW_IN_V30.contains(&name)
                     || name.contains("shared_msg_")
                     || name.contains("shared_anew_")
                     || name.starts_with("sqlite_autoindex_shared_typed_")
@@ -5325,24 +7013,24 @@ mod tests {
             })
         };
         let before = but(&conn);
-        assert!(new_in_v24(&conn).is_empty());
+        assert!(new_in_v30(&conn).is_empty());
 
-        let failing = format!("{MIGRATION_V24} SELECT no_such_function();");
-        assert!(migrate_in_one(&conn, &failing, 24).is_err());
-        assert_eq!(version(&conn), 23);
+        let failing = format!("{MIGRATION_V30} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 30).is_err());
+        assert_eq!(version(&conn), 29);
         assert!(
-            new_in_v24(&conn).is_empty(),
+            new_in_v30(&conn).is_empty(),
             "the tables go with the version"
         );
-        migrate_in_one(&conn, MIGRATION_V24, 24).unwrap();
-        assert_eq!(version(&conn), 24);
+        migrate_in_one(&conn, MIGRATION_V30, 30).unwrap();
+        assert_eq!(version(&conn), 30);
         init_db(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
-        assert_eq!(new_in_v24(&conn), NEW_IN_V24);
+        assert_eq!(new_in_v30(&conn), NEW_IN_V30);
         assert_eq!(but(&conn), before);
 
         let counted = |conn: &Connection| -> Vec<i64> {
-            NEW_IN_V24
+            NEW_IN_V30
                 .iter()
                 .map(|table| {
                     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -5363,7 +7051,7 @@ mod tests {
         .unwrap();
         let kept = counted(&conn);
         assert_eq!(kept, [1; 3]);
-        migrate_in_one(&conn, MIGRATION_V24, 24).unwrap();
+        migrate_in_one(&conn, MIGRATION_V30, 30).unwrap();
         init_db(&conn).unwrap();
         assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
         assert_eq!(but(&conn), before);
@@ -5398,8 +7086,8 @@ mod tests {
         }
     }
 
-    /// What the step to version 25 adds: seven tables.
-    const NEW_IN_V25: [&str; 7] = [
+    /// What the step to version 31 adds: seven tables.
+    const NEW_IN_V31: [&str; 7] = [
         "shared_msg_kept",
         "shared_msg_kept_numbers",
         "shared_msg_lists",
@@ -5409,8 +7097,8 @@ mod tests {
         "shared_msg_subscribed",
     ];
 
-    /// What a database holds of the step to version 25, by name.
-    fn new_in_v25(conn: &Connection) -> Vec<String> {
+    /// What a database holds of the step to version 31, by name.
+    fn new_in_v31(conn: &Connection) -> Vec<String> {
         let mut names: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
             .unwrap()
@@ -5418,29 +7106,29 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        names.retain(|name: &String| NEW_IN_V25.contains(&name.as_str()));
+        names.retain(|name: &String| NEW_IN_V31.contains(&name.as_str()));
         names
     }
 
-    /// The step to version 25 (decision 2026-10-10 §4.1, §6.1, §6.4, §14):
-    /// from a database at step 24 that holds rows of the steps before it, it
+    /// The step to version 31 (decision 2026-10-10 §4.1, §6.1, §6.4, §14):
+    /// from a database at step 30 that holds rows of the steps before it, it
     /// adds the tables of subscriptions, shared marks, a person's reads of
     /// shared messages, the channel's hour and the kept values, empty, and
     /// changes no older row or definition; a failure leaves none of it, and
     /// the step asked for twice is run once. Each column takes only its type
     /// and its bound.
     #[test]
-    fn step_25_adds_its_tables_and_changes_no_older_row() {
+    fn step_31_adds_its_tables_and_changes_no_older_row() {
         let version = |conn: &Connection| -> u32 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap()
         };
-        let conn = at_v20();
+        let conn = at_v26();
         for (sql, at) in [
-            (MIGRATION_V21, 21),
-            (MIGRATION_V22, 22),
-            (MIGRATION_V23, 23),
-            (MIGRATION_V24, 24),
+            (MIGRATION_V27, 27),
+            (MIGRATION_V28, 28),
+            (MIGRATION_V29, 29),
+            (MIGRATION_V30, 30),
         ] {
             migrate_in_one(&conn, sql, at).unwrap();
         }
@@ -5461,22 +7149,22 @@ mod tests {
             })
         };
         let before = but(&conn);
-        assert!(new_in_v25(&conn).is_empty());
+        assert!(new_in_v31(&conn).is_empty());
 
-        let failing = format!("{MIGRATION_V25} SELECT no_such_function();");
-        assert!(migrate_in_one(&conn, &failing, 25).is_err());
-        assert_eq!(version(&conn), 24);
+        let failing = format!("{MIGRATION_V31} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 31).is_err());
+        assert_eq!(version(&conn), 30);
         assert!(
-            new_in_v25(&conn).is_empty(),
+            new_in_v31(&conn).is_empty(),
             "the tables go with the version"
         );
         init_db(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
-        assert_eq!(new_in_v25(&conn), NEW_IN_V25);
+        assert_eq!(new_in_v31(&conn), NEW_IN_V31);
         assert_eq!(but(&conn), before);
 
         let counted = |conn: &Connection| -> Vec<i64> {
-            NEW_IN_V25
+            NEW_IN_V31
                 .iter()
                 .map(|table| {
                     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -5500,7 +7188,7 @@ mod tests {
         .unwrap();
         let kept = counted(&conn);
         assert_eq!(kept, [1; 7]);
-        migrate_in_one(&conn, MIGRATION_V25, 25).unwrap();
+        migrate_in_one(&conn, MIGRATION_V31, 31).unwrap();
         init_db(&conn).unwrap();
         assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
         assert_eq!(but(&conn), before);
@@ -5553,32 +7241,32 @@ mod tests {
         }
     }
 
-    /// What the step to version 26 adds: three tables.
-    const NEW_IN_V26: [&str; 3] = [
+    /// What the step to version 32 adds: three tables.
+    const NEW_IN_V32: [&str; 3] = [
         "shared_anew_made",
         "shared_anew_not_clean",
         "shared_anew_offers",
     ];
 
-    /// The step to version 26 (decision 2026-10-10 §3.5, §7, §14): from a
-    /// database at step 25 that holds rows of the steps before it, it adds
+    /// The step to version 32 (decision 2026-10-10 §3.5, §7, §14): from a
+    /// database at step 31 that holds rows of the steps before it, it adds
     /// the tables of the offers read, the channels made anew here and the
     /// channels not yet clean, empty, and changes no older row or
     /// definition; a failure leaves none of it, and the step asked for twice
     /// is run once. Each column takes only its type and its bound.
     #[test]
-    fn step_26_adds_its_tables_and_changes_no_older_row() {
+    fn step_32_adds_its_tables_and_changes_no_older_row() {
         let version = |conn: &Connection| -> u32 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap()
         };
-        let conn = at_v20();
+        let conn = at_v26();
         for (sql, at) in [
-            (MIGRATION_V21, 21),
-            (MIGRATION_V22, 22),
-            (MIGRATION_V23, 23),
-            (MIGRATION_V24, 24),
-            (MIGRATION_V25, 25),
+            (MIGRATION_V27, 27),
+            (MIGRATION_V28, 28),
+            (MIGRATION_V29, 29),
+            (MIGRATION_V30, 30),
+            (MIGRATION_V31, 31),
         ] {
             migrate_in_one(&conn, sql, at).unwrap();
         }
@@ -5589,7 +7277,7 @@ mod tests {
              INSERT INTO shared_msg_subscribed (channel, agent, start) VALUES (zeroblob(32), 'r', 9);",
         )
         .unwrap();
-        let new_in_v26 = |conn: &Connection| -> Vec<String> {
+        let new_in_v32 = |conn: &Connection| -> Vec<String> {
             let mut names: Vec<String> = conn
                 .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
                 .unwrap()
@@ -5597,23 +7285,23 @@ mod tests {
                 .unwrap()
                 .collect::<Result<_, _>>()
                 .unwrap();
-            names.retain(|name: &String| NEW_IN_V26.contains(&name.as_str()));
+            names.retain(|name: &String| NEW_IN_V32.contains(&name.as_str()));
             names
         };
         let but = |conn: &Connection| everything_but(conn, |name| name.contains("shared_anew_"));
         let before = but(&conn);
-        assert!(new_in_v26(&conn).is_empty());
-        let failing = format!("{MIGRATION_V26} SELECT no_such_function();");
-        assert!(migrate_in_one(&conn, &failing, 26).is_err());
-        assert_eq!(version(&conn), 25);
+        assert!(new_in_v32(&conn).is_empty());
+        let failing = format!("{MIGRATION_V32} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 32).is_err());
+        assert_eq!(version(&conn), 31);
         assert!(
-            new_in_v26(&conn).is_empty(),
+            new_in_v32(&conn).is_empty(),
             "the tables go with the version"
         );
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 26);
+        assert_eq!(version(&conn), 32);
         assert_eq!(version(&conn), SCHEMA_VERSION);
-        assert_eq!(new_in_v26(&conn), NEW_IN_V26);
+        assert_eq!(new_in_v32(&conn), NEW_IN_V32);
         assert_eq!(but(&conn), before);
         conn.execute_batch(
             "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32),
@@ -5622,10 +7310,10 @@ mod tests {
              INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 1, 0);",
         )
         .unwrap();
-        migrate_in_one(&conn, MIGRATION_V26, 26).unwrap();
+        migrate_in_one(&conn, MIGRATION_V32, 32).unwrap();
         init_db(&conn).unwrap();
         assert_eq!(but(&conn), before);
-        for table in NEW_IN_V26 {
+        for table in NEW_IN_V32 {
             let rows: i64 = conn
                 .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
                     row.get(0)
@@ -5666,13 +7354,13 @@ mod tests {
         }
     }
 
-    /// The bound that step 23 writes as a number in its SQL is that of
+    /// The bound that step 29 writes as a number in its SQL is that of
     /// protocol.rs: a revision of a shared channel is below the half of
     /// band 0.
     #[test]
-    fn the_bounds_of_step_23_are_those_of_protocol_rs() {
+    fn the_bounds_of_step_29_are_those_of_protocol_rs() {
         use cordelia_core::protocol::REV_BAND_HALF;
-        let count = |text: &str| MIGRATION_V23.matches(text).count();
+        let count = |text: &str| MIGRATION_V29.matches(text).count();
         assert_eq!(count(&format!("rev < {REV_BAND_HALF})")), 1);
         assert_eq!(count(&REV_BAND_HALF.to_string()), 1);
     }
@@ -5709,7 +7397,7 @@ mod tests {
         held
     }
 
-    /// The step to version 21 adds the tables of the person's lists,
+    /// The step to version 27 adds the tables of the person's lists,
     /// empty, and changes no older row or definition (decision 2026-10-10
     /// §14, "the upgrade", and §20, item 8): it is made in one step with its
     /// version, so a failure between them leaves none of it, and the step
@@ -5724,21 +7412,21 @@ mod tests {
     /// for an act.
     #[test]
     fn each_step_of_this_record_adds_its_tables_and_changes_no_older_row() {
-        let conn = at_v20();
+        let conn = at_v26();
         let version = |conn: &Connection| -> u32 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap()
         };
-        let before = everything_but_v21(&conn);
+        let before = everything_but_v27(&conn);
         assert!(before.len() > 40, "{before:?}");
-        assert_eq!(version(&conn), 20);
-        assert!(new_in_v21(&conn).is_empty());
+        assert_eq!(version(&conn), 26);
+        assert!(new_in_v27(&conn).is_empty());
 
-        let failing = format!("{MIGRATION_V21} SELECT no_such_function();");
-        assert!(migrate_in_one(&conn, &failing, 21).is_err());
-        assert_eq!(version(&conn), 20);
+        let failing = format!("{MIGRATION_V27} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 27).is_err());
+        assert_eq!(version(&conn), 26);
         assert!(
-            new_in_v21(&conn).is_empty(),
+            new_in_v27(&conn).is_empty(),
             "the tables go with the version"
         );
 
@@ -5746,12 +7434,12 @@ mod tests {
         // after it.
         init_db(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
-        assert_eq!(new_in_v21(&conn), NEW_IN_V21);
-        assert_eq!(new_in_v22(&conn), NEW_IN_V22);
-        assert_eq!(new_in_v23(&conn), NEW_IN_V23);
-        assert_eq!(everything_but_v21(&conn), before);
+        assert_eq!(new_in_v27(&conn), NEW_IN_V27);
+        assert_eq!(new_in_v28(&conn), NEW_IN_V28);
+        assert_eq!(new_in_v29(&conn), NEW_IN_V29);
+        assert_eq!(everything_but_v27(&conn), before);
         let counted = |conn: &Connection| -> Vec<i64> {
-            NEW_IN_V21
+            NEW_IN_V27
                 .iter()
                 .map(|table| {
                     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
@@ -5785,12 +7473,12 @@ mod tests {
         // A start after that, and the step asked for again, change
         // nothing: what the device keeps stays.
         init_db(&conn).unwrap();
-        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
         assert_eq!(
             (version(&conn), counted(&conn)),
             (SCHEMA_VERSION, kept.clone())
         );
-        assert_eq!(everything_but_v21(&conn), before);
+        assert_eq!(everything_but_v27(&conn), before);
 
         let lists =
             |values: &str| format!("INSERT INTO shared_lists (one, list, rev) VALUES ({values})");
@@ -5836,42 +7524,42 @@ mod tests {
             assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
         }
 
-        step_21_adds_its_tables_and_changes_no_older_row();
-        step_23_adds_its_tables_and_changes_no_older_row();
+        step_27_adds_its_tables_and_changes_no_older_row();
+        step_29_adds_its_tables_and_changes_no_older_row();
     }
 
-    /// The step to version 22 (decision 2026-10-10 §2.2, §6.3, §14): from a
-    /// database at step 21 that holds rows of it, it adds the tables of the
+    /// The step to version 28 (decision 2026-10-10 §2.2, §6.3, §14): from a
+    /// database at step 27 that holds rows of it, it adds the tables of the
     /// shared channels a device holds, empty, and changes no older row or
     /// definition; a failure leaves none of it, and the step asked for
     /// twice is run once. Each column takes only its type and its bound: a
     /// channel's ID, a card, a name and how a channel came; a key's row,
     /// held or refused, with revisions kept below the half of band 0; a
     /// message's ID, number and place.
-    fn step_21_adds_its_tables_and_changes_no_older_row() {
+    fn step_27_adds_its_tables_and_changes_no_older_row() {
         let version = |conn: &Connection| -> u32 {
             conn.pragma_query_value(None, "user_version", |row| row.get(0))
                 .unwrap()
         };
-        let conn = at_v20();
-        migrate_in_one(&conn, MIGRATION_V21, 21).unwrap();
+        let conn = at_v26();
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
         conn.execute_batch("INSERT INTO shared_lists (one, list, rev) VALUES (1, zeroblob(5), 9);")
             .unwrap();
-        let before = everything_but_v22(&conn);
+        let before = everything_but_v28(&conn);
         assert!(before.iter().any(|row| row.starts_with("shared_lists: ")));
-        assert!(new_in_v22(&conn).is_empty());
+        assert!(new_in_v28(&conn).is_empty());
 
-        let failing = format!("{MIGRATION_V22} SELECT no_such_function();");
-        assert!(migrate_in_one(&conn, &failing, 22).is_err());
-        assert_eq!(version(&conn), 21);
+        let failing = format!("{MIGRATION_V28} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 28).is_err());
+        assert_eq!(version(&conn), 27);
         assert!(
-            new_in_v22(&conn).is_empty(),
+            new_in_v28(&conn).is_empty(),
             "the tables go with the version"
         );
         init_db(&conn).unwrap();
         assert_eq!(version(&conn), SCHEMA_VERSION);
-        assert_eq!(new_in_v22(&conn), NEW_IN_V22);
-        assert_eq!(everything_but_v22(&conn), before);
+        assert_eq!(new_in_v28(&conn), NEW_IN_V28);
+        assert_eq!(everything_but_v28(&conn), before);
 
         let tables = [
             "shared_channels",
@@ -5936,9 +7624,9 @@ mod tests {
         let kept = counted(&conn);
         assert_eq!(kept, [3, 2, 1, 1, 1, 1, 2, 1, 1]);
         init_db(&conn).unwrap();
-        migrate_in_one(&conn, MIGRATION_V22, 22).unwrap();
+        migrate_in_one(&conn, MIGRATION_V28, 28).unwrap();
         assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
-        assert_eq!(everything_but_v22(&conn), before);
+        assert_eq!(everything_but_v28(&conn), before);
 
         let channel = |values: &str| {
             format!(
@@ -6046,17 +7734,17 @@ mod tests {
         }
     }
 
-    /// The bounds that step 22 writes as numbers in its SQL are those of
+    /// The bounds that step 28 writes as numbers in its SQL are those of
     /// protocol.rs (decision 2026-10-10 §2.1, §2.3, §6.3): a card of one
     /// relay and of two, a name at its longest, a revision kept below the
     /// half of band 0, and a message's highest number.
     #[test]
-    fn step_21s_bounds_are_those_of_protocol_rs() {
+    fn step_27s_bounds_are_those_of_protocol_rs() {
         use cordelia_core::protocol::{
             AGENT_MESSAGE_NAME_MAX_BYTES, AGENT_MESSAGE_NUMBER_MAX, REV_BAND_HALF,
             SHARED_MAX_RELAYS, SHARED_SEED_BYTES,
         };
-        let count = |text: &str| MIGRATION_V22.matches(text).count();
+        let count = |text: &str| MIGRATION_V28.matches(text).count();
         let card = |relays: usize| SHARED_SEED_BYTES + 1 + 32 * relays;
         assert_eq!(SHARED_MAX_RELAYS, 2);
         assert_eq!(
@@ -6075,13 +7763,13 @@ mod tests {
         assert_eq!(count(&format!("highest <= {AGENT_MESSAGE_NUMBER_MAX})")), 1);
     }
 
-    /// The bounds that step 21 writes as numbers in its SQL are those of
+    /// The bounds that step 27 writes as numbers in its SQL are those of
     /// protocol.rs (decision 2026-10-10 §3.4): a list's value at every
     /// bound and an empty list, a revision's most, and the last statement.
     #[test]
-    fn the_bounds_of_step_21_are_those_of_protocol_rs() {
+    fn the_bounds_of_step_27_are_those_of_protocol_rs() {
         use cordelia_core::protocol::{MAX_REV, MAX_STATEMENT_NUMBER, SHARED_LIST_MAX_VALUE_BYTES};
-        let count = |text: &str| MIGRATION_V21.matches(text).count();
+        let count = |text: &str| MIGRATION_V27.matches(text).count();
         assert_eq!(
             count(&format!("length(list) <= {SHARED_LIST_MAX_VALUE_BYTES})")),
             1
@@ -6113,7 +7801,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 13] = [
+        let from: [(u32, Connection); 15] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -6127,6 +7815,8 @@ mod tests {
             (18, at_v18()),
             (19, at_v19()),
             (20, at_v20()),
+            (21, at_v21()),
+            (26, at_v26()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -6152,9 +7842,44 @@ mod tests {
             assert_eq!(new_in_v20(&conn), NEW_IN_V20, "from version {at}");
             assert_eq!(new_in_v21(&conn), NEW_IN_V21, "from version {at}");
             assert_eq!(new_in_v22(&conn), NEW_IN_V22, "from version {at}");
-            assert_eq!(new_in_v23(&conn), NEW_IN_V23, "from version {at}");
             assert!(item_counts(&conn).is_some(), "from version {at}");
             assert!(channel_places(&conn).is_some(), "from version {at}");
+            // Step 23: a head for each entry, and the room a relay keeps
+            // for heads (the review of the removal build into main, its
+            // low on the upgrade).
+            assert!(
+                conn.prepare("SELECT head FROM entries").is_ok(),
+                "from version {at}"
+            );
+            assert!(table_of(&conn, "relay_head_rooms"), "from version {at}");
+            // Steps 24 to 26: the arrivals, a conflict copy kept here, and
+            // what a cut touched; and nothing of rule 27 of decision
+            // 2026-10-24 (removal), which was taken out with its steps.
+            assert_eq!(new_in_v24(&conn), NEW_IN_V24, "from version {at}");
+            assert!(
+                conn.prepare("SELECT held FROM file_copies").is_ok()
+                    && conn
+                        .prepare("SELECT unknown FROM file_arrivals_stored")
+                        .is_ok(),
+                "from version {at}"
+            );
+            assert!(table_of(&conn, "file_cut"), "from version {at}");
+            assert!(table_of(&conn, "file_cut_written"), "from version {at}");
+            for gone in [
+                "SELECT own FROM file_arrivals_stored",
+                "SELECT own FROM file_put_back",
+                "SELECT * FROM file_own_dropped",
+                "SELECT * FROM file_own_set_aside",
+            ] {
+                assert!(conn.prepare(gone).is_err(), "from version {at}: {gone}");
+            }
+            // Steps 27 to 32: the shared channels' (decision 2026-10-10 §14).
+            assert_eq!(new_in_v27(&conn), NEW_IN_V27, "from version {at}");
+            assert_eq!(new_in_v28(&conn), NEW_IN_V28, "from version {at}");
+            assert_eq!(new_in_v29(&conn), NEW_IN_V29, "from version {at}");
+            assert_eq!(new_in_v30(&conn), NEW_IN_V30, "from version {at}");
+            assert_eq!(new_in_v31(&conn), NEW_IN_V31, "from version {at}");
+            assert!(table_of(&conn, "shared_anew_made"), "from version {at}");
         }
     }
 

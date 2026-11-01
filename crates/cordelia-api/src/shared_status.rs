@@ -122,9 +122,9 @@ pub fn status_of(
             ),
             _ => format!("({})", fingerprint::shown(key)),
         };
-        // Every key removed so far, where none is kept of the removal of
-        // a mark's time.
-        let every_removed: Vec<[u8; 32]> = held.statement.statement.removed.clone();
+        // Every key removed so far, on any branch, where none is kept of
+        // the removal of a mark's time.
+        let every_removed = crate::person::removed_known(conn, &held.statement.statement)?;
         let mut by_since: BTreeMap<i64, Vec<String>> = BTreeMap::new();
         for mark in st(anew_rows::not_clean_all(conn))? {
             if !shared_anew::is_not_clean(conn, &mark.channel)? {

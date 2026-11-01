@@ -202,6 +202,7 @@ fn why_not_applied(conn: &Connection) -> Result<&'static str, PersonError> {
     Ok(match stands(conn)? {
         Stands::NoPhrase => "this device follows no recovery phrase yet",
         Stands::Stopped(state) => crate::look::short_why(state),
+        Stands::Closed => crate::look::CLOSED_SHORT,
         Stands::Applied => crate::look::short_why(cordelia_storage::person::State::Applied),
     })
 }
@@ -316,10 +317,11 @@ pub fn sender_form(
     if key == own {
         return Ok("this device".into());
     }
-    let counting = crate::person::Counting::of(
+    let counting = crate::person::counting(
+        conn,
         &held.statement.statement,
         &cordelia_storage::person::additions(conn)?,
-    );
+    )?;
     if counting.counts(key) {
         let label = crate::reader::label_of(conn, &held.statement.statement, key)?;
         return Ok(format!(
@@ -332,7 +334,8 @@ pub fn sender_form(
 }
 
 /// The key is another person's device: not this device or one of the
-/// person's, and not one the person's statement lists as removed (§5.5).
+/// person's, and not one this device knows to be removed, on any branch
+/// (§5.5; decision 2026-10-24, rules 2 and 6).
 /// `what` is the command, for its line.
 fn another_persons(
     conn: &Connection,
@@ -342,7 +345,7 @@ fn another_persons(
     what: &str,
 ) -> Out<()> {
     let statement = &held.statement.statement;
-    if statement.removed.contains(key) {
+    if crate::person::removed_known(conn, statement)?.contains(key) {
         return refused(
             "removed_key",
             format!(
@@ -353,7 +356,7 @@ fn another_persons(
         );
     }
     let counting =
-        crate::person::Counting::of(statement, &cordelia_storage::person::additions(conn)?);
+        crate::person::counting(conn, statement, &cordelia_storage::person::additions(conn)?)?;
     if key == own || counting.counts(key) {
         let form = sender_form(conn, held, own, key)?;
         let line = match what {

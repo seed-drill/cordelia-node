@@ -335,8 +335,9 @@ enum Commands {
     /// without saying that you can. Any status other than 0, 1 and 2 means
     /// that the change is made: do not make it again.
     Renew,
-    /// Settle two changes that were made apart, with the recovery
-    /// phrase, on a device that has seen both. Asks at a terminal.
+    /// Join changes that were made apart, with your recovery phrase.
+    /// Run it on a device that keeps a change made apart. Asks at a
+    /// terminal.
     ///
     /// Keep this machine on until the command says you can close it.
     /// Where a relay that is not known to hold the change cannot be
@@ -404,6 +405,10 @@ enum Commands {
     ChangeMade {
         /// The change's number
         number: u64,
+        /// Its change entry, in hex: a device that moves from it ends the
+        /// wait with status 3 (decision 2026-10-24 (removal), rule 9)
+        #[arg(long)]
+        entry: Option<String>,
     },
     /// List your devices and what each relay has
     ///
@@ -953,9 +958,9 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
         // Its own exit status: 3 where the change is made and not known
         // to be at every relay (decision 2026-10-19 §4, rule 8).
-        Some(Commands::ChangeMade { number }) => {
-            std::process::exit(person_cmd::change_made(&cli.config, number))
-        }
+        Some(Commands::ChangeMade { number, entry }) => std::process::exit(
+            person_cmd::change_made(&cli.config, number, entry.as_deref()),
+        ),
         Some(Commands::Recover { name }) => recover_cmd::recover(&cli.config, name),
         Some(Commands::RecoverMade {
             number,
@@ -2172,6 +2177,14 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
     indicator::Devices {
         not_applied: person["state"] == "applied" && person["cannot_go_on"].is_string(),
         removal_not_applied_secs: applied_secs.filter(|_| removal && not_by_all),
+        // A head set aside on a device that goes on (decision 2026-10-24
+        // (removal), rule 11): from the newest.
+        set_aside_secs: match person["state"] == "applied" {
+            true => list("set_aside")
+                .filter_map(|head| ago(&head["set_aside_at"]))
+                .min(),
+            false => None,
+        },
         added_not_cleared: list("notices")
             .filter(|notice| notice["kind"] == "added")
             .count(),
@@ -2604,7 +2617,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let advertised_port = if accepts_inbound { p2p_port as u16 } else { 0 };
 
         // ── Connection manager ─────────────────────────────────────
-        let roles = vec![config.network.role.clone()];
+        let roles = p2p::handshake_roles(&config.network.role);
         let allow_private = config.network.allow_private_addresses;
         let conn_mgr = cordelia_network::connection::ConnectionManager::new(
             identity_arc.clone(),
@@ -7510,6 +7523,7 @@ mod tests {
             indicator::Devices {
                 not_applied: false,
                 removal_not_applied_secs: Some(3_600),
+                set_aside_secs: None,
                 added_not_cleared: 2,
                 said_left: 2,
                 // Each relay that lacks the change, connected or not, as
@@ -7557,6 +7571,20 @@ mod tests {
         // nor one of which this device does not know when it applied it.
         let all_applied = edit(&|look| look["devices"][1]["applied"] = 3.into());
         assert_eq!(all_applied.removal_not_applied_secs, None);
+        // A head set aside on a device that goes on: from the newest
+        // (decision 2026-10-24 (removal), rule 11). On a closed device it
+        // is no amber: the device is red.
+        let heads = serde_json::json!([
+            { "set_aside_at": now - 500 },
+            { "set_aside_at": now - 40 },
+        ]);
+        let aside = edit(&|look| look["set_aside"] = heads.clone());
+        assert_eq!(aside.set_aside_secs, Some(40));
+        let closed = edit(&|look| {
+            look["set_aside"] = heads.clone();
+            look["state"] = "fork".into();
+        });
+        assert_eq!(closed.set_aside_secs, None);
         // A renewal: the statement lists the keys removed so far, and
         // removed none itself. So too beside a node that does not say.
         let none_removed = edit(&|look| look["removed_a_key"] = false.into());

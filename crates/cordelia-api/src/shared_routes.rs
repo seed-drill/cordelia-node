@@ -495,10 +495,11 @@ fn said_of(
     now: i64,
 ) -> Result<Value, PersonError> {
     let own = identity.public_key();
-    let counting = crate::person::Counting::of(
+    let counting = crate::person::counting(
+        conn,
         &held.statement.statement,
         &cordelia_storage::person::additions(conn)?,
-    );
+    )?;
     let kind = match message.signer {
         signer if signer == own => "this",
         signer if counting.counts(&signer) => "own",
@@ -532,6 +533,7 @@ fn refusal_of(conn: &Connection, why: &Refused, name: &str) -> Result<HttpRespon
             let why_not = match stands(conn).map_err(crate::commands::refused)? {
                 Stands::NoPhrase => "this device follows no recovery phrase yet",
                 Stands::Stopped(state) => crate::look::short_why(state),
+                Stands::Closed => crate::look::CLOSED_SHORT,
                 Stands::Applied => crate::look::short_why(cordelia_storage::person::State::Applied),
             };
             Ok(refused_with(why.word(), "", json!({ "why": why_not })))

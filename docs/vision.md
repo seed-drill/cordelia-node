@@ -73,8 +73,9 @@ phrase brings back what the relays still hold, and no more. Anyone who needs
 a guarantee runs their own relay, for themselves or for their team.
 
 What a relay learns is who connects, how much they send and when, which
-entries are revisions of one another, and that a person's channels change
-together when a device is removed. It learns no content, no name of a file
+entries are revisions of one another, that a person's channels change
+together when a device is removed, and how a person's changes of devices
+follow each other and when each was made. It learns no content, no name of a file
 or a project, and no key.
 
 ## 4. Paying for relays
