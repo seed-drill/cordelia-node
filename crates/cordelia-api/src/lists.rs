@@ -289,12 +289,22 @@ impl Takings {
         }
     }
 
+    /// What is kept, with each act first read now stamped no earlier than
+    /// the newest time of taking kept, as an arrival is (decision
+    /// 2026-10-24 (removal), rule 7): a clock stepped back moves no act
+    /// taken after a cut to before it.
     fn load(conn: &Connection, now: Taken) -> Result<Self, PersonError> {
         let mut takings = Self::now(now);
+        let mut newest = now.taken_at;
         for (signature, row) in kept_rows::taken(conn)? {
+            newest = newest.max(row.taken.taken_at);
             takings.known.insert(signature, row.taken);
             takings.carried_in.insert(signature, row.carried_in);
         }
+        takings.now = Some(Taken {
+            taken_at: newest,
+            ..now
+        });
         Ok(takings)
     }
 
@@ -1082,10 +1092,7 @@ pub fn act(
             .cloned()
             .chain(made.iter().cloned());
         reading.with_own(&own, list_of(own_list));
-        let taken = Taken {
-            generation: reading.standing.number(),
-            taken_at: now,
-        };
+        let taken = reading.takings.now_or_zero();
         for act in &made {
             reading.takings.record(act.signature(), taken);
         }

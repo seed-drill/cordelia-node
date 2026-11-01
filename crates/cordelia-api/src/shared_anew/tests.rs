@@ -1718,3 +1718,40 @@ fn a_device_on_a_change_not_clear_follows_the_lists_and_writes_none() {
         assert_ne!(row(&s, 1, &channel).state, State::Held, "closed: {closed}");
     }
 }
+
+/// An act is stamped as taken no earlier than the newest time of taking
+/// kept (the review of #277, low 2; decision 2026-10-24 (removal), rule 7,
+/// as an arrival is): the desktop takes the laptop's act; its clock is then
+/// stepped back an hour, and the act it makes then is kept as taken no
+/// earlier than the laptop's.
+#[test]
+fn an_act_taken_on_a_clock_stepped_back_is_taken_no_earlier_than_the_last() {
+    let mut s = bob(2);
+    let now = s.now + 10;
+    holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1]);
+    crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
+    let first = cordelia_storage::shared_lists::taken(&s[1].conn).unwrap();
+    let newest = first
+        .iter()
+        .map(|(_, row)| row.taken.taken_at)
+        .max()
+        .unwrap();
+    let back = newest - 3600;
+    let done = crate::lists::act(
+        &s[1].conn,
+        &s[1].identity,
+        Do::File(filing(8, "desk")),
+        back,
+    )
+    .unwrap();
+    let crate::lists::Done::Made(made) = done else {
+        panic!("{done:?}")
+    };
+    let kept = cordelia_storage::shared_lists::taken(&s[1].conn).unwrap();
+    let (_, own) = kept
+        .iter()
+        .find(|(signature, _)| *signature == made[0].signature())
+        .unwrap();
+    assert_eq!(own.taken.taken_at, newest, "not {back}");
+}
