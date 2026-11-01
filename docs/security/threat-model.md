@@ -196,6 +196,8 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/shared_e2e.rs`: `a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_the_device_that_made_them`
 - `crates/cordelia-api/src/lists/tests.rs`: `a_device_away_brings_nothing_back`
 - `crates/cordelia-node/src/indicator.rs`: `a_removed_device_that_holds_a_shared_channel_makes_the_line_amber_for_seven_days`
+- `crates/cordelia-api/src/shared_anew/tests.rs`: `a_removal_known_before_it_is_applied_makes_each_shared_channel_not_clean`
+- `crates/cordelia-api/src/lists/tests.rs`: `an_act_taken_within_the_margin_of_a_removal_counts_for_nothing`
 - `crates/cordelia-api/src/lists/tests.rs`: `an_act_made_with_no_relay_survives_coming_back`
 - `crates/cordelia-node/tests/removal_e2e.rs`: `a_removal_made_apart_from_a_renewal_takes_effect_without_settle`
 - `crates/cordelia-node/tests/removal_e2e.rs`: `relays_that_work_together_spread_a_removal_made_apart`
