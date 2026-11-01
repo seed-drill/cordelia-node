@@ -2040,7 +2040,7 @@ fn folders_of_an_install_from_before_mappings_stop_and_sync_again_once_mapped() 
 /// `apart`, no time of any change, and schema version 21. What step 23
 /// adds goes too: the table of the room a relay keeps for heads; and the
 /// tables step 24 adds (decision 2026-10-24 (removal), rules 6 and 7), and
-/// those of step 26. (Step 23
+/// those of step 26, and the shared channels' of steps 27 to 32. (Step 23
 /// makes the table of entries again from the columns it had at step 22,
 /// so the one column more it finds there changes nothing.)
 fn as_a_fork_of_the_version_before(node: &Node) {
@@ -2081,6 +2081,24 @@ fn as_a_fork_of_the_version_before(node: &Node) {
          COMMIT;",
     )
     .unwrap();
+    // Nor did it have the shared channels' steps, 27 to 32: a database at
+    // 21 that holds them is refused as one whose steps an unreleased build
+    // numbered otherwise.
+    let shared: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND substr(name, 1, 7) = 'shared_'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(!shared.is_empty());
+    for table in shared {
+        conn.execute_batch(&format!("DROP TABLE \"{table}\";"))
+            .unwrap();
+    }
     conn.pragma_update(None, "user_version", 21).unwrap();
 }
 
