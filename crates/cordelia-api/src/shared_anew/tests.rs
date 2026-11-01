@@ -1569,3 +1569,73 @@ fn a_removal_known_before_it_is_applied_makes_each_shared_channel_not_clean() {
         Some(vec![tablet.public_key()])
     );
 }
+
+// ── The fix round of the removal build, joined (#277) ────────────────
+
+/// A channel that a device first holds while it knows of a removal is not
+/// clean (the review of #277, high 1; decision 2026-10-24, rule 23): the
+/// desktop removes the tablet; before the laptop hears of it, the laptop
+/// files "notes" under the change before, which the tablet reads and
+/// holds; the laptop applies the removal, and the desktop then reads the
+/// laptop's list. The desktop holds "notes" not clean, and sends nothing
+/// there. A channel the desktop files itself is clean, and so is "notes"
+/// once the laptop makes it anew.
+#[test]
+fn a_channel_first_held_while_a_removal_is_known_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    s.meet(&[0, 1, 2]);
+    s.change(1, &[0, 1], &[2]);
+    let channel = holds(&s, 0, 9, "notes", now);
+    s.pass(0, 2);
+    crate::lists::follow(&s[2].conn, &s[2].identity, now).unwrap();
+    assert_eq!(
+        row(&s, 2, &channel).state,
+        State::Held,
+        "the tablet holds it"
+    );
+
+    s.pass(1, 0);
+    let now = s.now + 20;
+    crate::lists::follow(&s[0].conn, &s[0].identity, now).unwrap();
+    out(&s, 0, now);
+    assert!(is_not_clean(&s[0].conn, &channel.id).unwrap(), "rule 23");
+    s.pass(0, 1);
+    crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
+    out(&s, 1, now);
+    let desktop = row(&s, 1, &channel);
+    assert_eq!(desktop.state, State::Held);
+    assert!(is_not_clean(&s[1].conn, &channel.id).unwrap(), "rule 23");
+    assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
+
+    // A channel the desktop files itself, knowing, is clean.
+    let own = holds(&s, 1, 11, "own", now);
+    assert!(!is_not_clean(&s[1].conn, &own.id).unwrap());
+
+    // The laptop makes "notes" anew; the desktop follows, and the new
+    // channel is clean.
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let listed = asked_of(conn, identity, "notes", now);
+    let (_, plan) = anew_plan(
+        conn,
+        identity,
+        &relays(),
+        "notes",
+        None,
+        &[],
+        Some((&[], &listed)),
+        now,
+    )
+    .unwrap();
+    make_anew(conn, identity, &relays(), &plan.unwrap().what, now).unwrap();
+    let new = filed_as(&s, 0, "notes");
+    s.pass(0, 1);
+    crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
+    out(&s, 1, now);
+    assert_eq!(row(&s, 1, &new).state, State::Held);
+    assert!(!is_not_clean(&s[1].conn, &new.id).unwrap());
+    assert!(
+        !is_not_clean(&s[1].conn, &channel.id).unwrap(),
+        "moved from"
+    );
+}
