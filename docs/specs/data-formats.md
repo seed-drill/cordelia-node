@@ -134,7 +134,11 @@
 >   file cut but one of these texts. It was step 28 while rule 27 of that
 >   record was built; steps 26 and 27 held that rule's columns and tables,
 >   and went with it, unreleased. A database of such a build at step 27 or
->   28 is refused as one from a later version.
+>   28 is refused as one from a later version. One at that build's step 26
+>   (rule 27's columns and tables, and no `file_cut`) is taken as current:
+>   a carry that would cut a file fails at the missing table, so nothing is
+>   applied, and every restore is refused. It fails closed, and no such
+>   build was released.
 >
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed

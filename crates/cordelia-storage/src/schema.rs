@@ -1373,7 +1373,11 @@ UPDATE file_arrivals_stored SET unknown = 1 WHERE full_signers IS NOT NULL;
 /// It was step 28 while rule 27 of that record was built: steps 26 and 27
 /// held that rule's columns and tables, and went with it. No released
 /// version had any step after 20, and a database of an unreleased build at
-/// step 27 or 28 is refused as one from a later version.
+/// step 27 or 28 is refused as one from a later version. One at that
+/// build's step 26 (rule 27's columns and tables, and no `file_cut`) is
+/// taken as current: a carry that would cut a file fails at the missing
+/// table, so nothing is applied, and every restore is refused. It fails
+/// closed, and no such build was released.
 const MIGRATION_V26: &str = r#"
 CREATE TABLE file_cut (
     folder  TEXT NOT NULL,

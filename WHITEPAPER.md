@@ -558,7 +558,8 @@ as long as that lasts; a device whose clock is more than ten minutes behind
 carries what reached it in that excess; what a remaining device wrote
 itself after an agent there read the removed device's late text, before
 the device knew of the removal, is kept and carried, though the late text
-itself is set aside, and the agent's context keeps what it read; and until every device of a person's has this
+itself is set aside, and the agent's context keeps what it read; and
+until every device of a person's has this
 version, a device of `v0.2.0-alpha.17` or earlier carries
 the removed device's late writing on, and cannot make a change over one made
 on this version. Shared channels are not built, so the record's rules for them are
