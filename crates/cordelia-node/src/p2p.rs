@@ -3228,7 +3228,7 @@ pub async fn p2p_loop(
                         dial_errored(
                             &mut relay_tries,
                             &mut dialling,
-                            &dialled,
+                            (&relays_set_up, &dialled),
                             (addr, error, ended),
                             (p2p_gov_tick_secs, any_connected),
                             reach.as_deref(),
@@ -4610,10 +4610,19 @@ fn dial_answered(
 /// at that address is credited no timeout** (decision 2026-10-24
 /// (removal), section 8): its address changed while it was dialled, which
 /// a spoofed lookup can cause, as [`dial_answered`] has it.
+///
+/// Where another key answered, each relay at the address now is judged by
+/// that key ([`answered_at`]), as [`dial_answered`] judges it: only one
+/// given another key is shown with the wrong key. One that the key answers
+/// for came to the address while the dial was in flight, and the dial was
+/// closed by the keys from before; it fails as one whose address changed.
 fn dial_errored(
     tries: &mut std::collections::HashMap<TriedRelay, RelayTry>,
     dialling: &mut Dialling,
-    relays: &[cordelia_network::bootstrap::RelayAddr],
+    (set_up, relays): (
+        &[cordelia_network::bootstrap::Relay],
+        &[cordelia_network::bootstrap::RelayAddr],
+    ),
     (addr, error, ended): (std::net::SocketAddr, String, DialEnd),
     (tick_secs, any_connected): (u64, bool),
     reach: Option<&cordelia_node::device_entries::Reach>,
@@ -4623,6 +4632,10 @@ fn dial_errored(
         .filter(|relay| relay.addr == addr)
         .map(tried_relay)
         .collect();
+    let judged = match ended {
+        DialEnd::AnotherKey(answered) => Some(answered_at(set_up, relays, addr, &answered)),
+        _ => None,
+    };
     let mut failed = here.clone();
     for begun in dialling.remove(&addr).unwrap_or_default() {
         if !failed.contains(&begun) {
@@ -4640,9 +4653,17 @@ fn dial_errored(
             );
             continue;
         }
-        let (error, wrong_key) = match ended {
-            DialEnd::AnotherKey => (ANOTHER_KEY_ANSWERED.to_string(), true),
-            _ => (error.clone(), false),
+        let (error, wrong_key) = match &judged {
+            Some((_, refused, _)) if refused.iter().any(|relay| tried_relay(relay) == tried) => {
+                (ANOTHER_KEY_ANSWERED.to_string(), true)
+            }
+            Some((_, _, passed)) => {
+                match passed.iter().find(|(relay, _)| tried_relay(relay) == tried) {
+                    Some((_, other)) => (no_key_at(other), false),
+                    None => ("its address changed while it was dialled".into(), false),
+                }
+            }
+            None => (error.clone(), false),
         };
         dial_failed(
             tries,
@@ -4940,8 +4961,8 @@ enum DialEnd {
     /// QUIC's handshake, or Cordelia's after it, timed out.
     TimedOut,
     /// Another key answered at the address of relays configured by key,
-    /// as TLS gave it: the dial was closed there.
-    AnotherKey,
+    /// as TLS gave it (the key that answered): the dial was closed there.
+    AnotherKey([u8; 32]),
     /// Refused, closed, or answered wrongly in any other way.
     Failed,
 }
@@ -4949,7 +4970,9 @@ enum DialEnd {
 impl DialEnd {
     fn of(error: &cordelia_network::connection::ConnectionError) -> Self {
         match error {
-            cordelia_network::connection::ConnectionError::NotTheRelay(_) => Self::AnotherKey,
+            cordelia_network::connection::ConnectionError::NotTheRelay(answered) => {
+                Self::AnotherKey(answered.0)
+            }
             error if error.timed_out() => Self::TimedOut,
             _ => Self::Failed,
         }
@@ -10447,7 +10470,7 @@ mod tests {
                 false => dial_errored(
                     &mut tries,
                     &mut dialling,
-                    &now_listed,
+                    (&[], &now_listed),
                     (b.addr, "timed out".into(), DialEnd::TimedOut),
                     (10, false),
                     Some(&reach),
@@ -10478,7 +10501,7 @@ mod tests {
         for (ended, moved, counts) in [
             (DialEnd::TimedOut, false, true),
             (DialEnd::TimedOut, true, false),
-            (DialEnd::AnotherKey, false, false),
+            (DialEnd::AnotherKey([3; 32]), false, false),
             (DialEnd::Failed, false, false),
         ] {
             let (reach, clock) = reach_of(&[(&tried, Holds::Lacks)]);
@@ -10501,7 +10524,7 @@ mod tests {
             dial_errored(
                 &mut tries,
                 &mut dialling,
-                &now_listed,
+                (&[], &now_listed),
                 (b.addr, "it ended".into(), ended),
                 (10, true),
                 Some(&reach),
@@ -10511,11 +10534,54 @@ mod tests {
                 counts,
                 "{ended:?}, moved {moved}"
             );
-            let wrong_key = ended == DialEnd::AnotherKey;
+            let wrong_key = matches!(ended, DialEnd::AnotherKey(_));
             assert_eq!(tries[&tried].wrong_key, wrong_key, "{ended:?}");
             if wrong_key {
                 assert_eq!(tries[&tried].error.as_deref(), Some(ANOTHER_KEY_ANSWERED));
             }
+        }
+    }
+
+    /// Another key that closed a dial judges the relays at the address as
+    /// they resolve when the dial ends, by that key (the review of the
+    /// removal build into main, its low 1): a relay that came to the
+    /// address while the dial was in flight, with the key that answered or
+    /// with none, is not shown with the wrong key; the one dialled is.
+    #[test]
+    fn another_key_that_closed_a_dial_is_judged_against_the_relays_there_now() {
+        let b = relay_at("b.example:9474", "127.0.0.1:9474", 2);
+        let mut tries: std::collections::HashMap<TriedRelay, RelayTry> = Default::default();
+        let mut dialling = Dialling::default();
+        assert!(relay_tick(
+            &mut tries,
+            &mut dialling,
+            (std::slice::from_ref(&b), &b),
+            &|_| false,
+            tick_at(std::time::Instant::now(), false),
+            None,
+        ));
+        // A lookup puts two more relays at the address: one with the key
+        // that then answers, one with none.
+        let came = relay_at("c.example:9474", "127.0.0.1:9474", 3);
+        let no_key = cordelia_network::bootstrap::RelayAddr {
+            key: None,
+            ..relay_at("d.example:9474", "127.0.0.1:9474", 0)
+        };
+        let now_listed = vec![b.clone(), came.clone(), no_key.clone()];
+        dial_errored(
+            &mut tries,
+            &mut dialling,
+            (&[], &now_listed),
+            (b.addr, "another key".into(), DialEnd::AnotherKey([3; 32])),
+            (10, false),
+            None,
+        );
+        let of = |relay| &tries[&tried_relay(relay)];
+        assert!(of(&b).wrong_key);
+        assert_eq!(of(&b).error.as_deref(), Some(ANOTHER_KEY_ANSWERED));
+        for relay in [&came, &no_key] {
+            assert!(!of(relay).wrong_key, "{}", relay.host);
+            assert_ne!(of(relay).error.as_deref(), Some(ANOTHER_KEY_ANSWERED));
         }
     }
 
@@ -10552,7 +10618,10 @@ mod tests {
                 let (node_key, relay_key, stranger_key) = (id(31), id(32), id(33));
                 let node = manager(&node_key);
                 for (answers, ended) in [
-                    (&stranger_key, DialEnd::AnotherKey),
+                    (
+                        &stranger_key,
+                        DialEnd::AnotherKey(stranger_key.public_key()),
+                    ),
                     (&relay_key, DialEnd::TimedOut),
                 ] {
                     // It takes QUIC and TLS, and then holds the connection silent.
@@ -10582,7 +10651,7 @@ mod tests {
                         }
                         Ok(outcome) => panic!("the dial connected to {}", outcome.node_id),
                     }
-                    if ended == DialEnd::AnotherKey {
+                    if matches!(ended, DialEnd::AnotherKey(_)) {
                         assert!(
                             took < std::time::Duration::from_secs(5),
                             "another key ended the dial only after {took:?}"
