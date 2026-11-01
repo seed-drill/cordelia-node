@@ -82,10 +82,10 @@ pub enum Maker {
 /// took count for nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cut {
-    /// The key is known to be removed by the statement applied alone, and
-    /// no cut time is known: every act this device took counts. **This is
-    /// what the slice answers today,** until the removal record's cut times
-    /// are built (decision 2026-10-10 §20, item 7).
+    /// The key is removed, and no cut is read: every act this device took
+    /// counts. For what reads only which keys are removed ([`holds`]), and
+    /// a recovery's machine, which took no act before; the lists are worked
+    /// out with the cut times ([`ByTheCuts`]).
     StatementAlone,
     /// The cut times of the removal record, rule 2: for each generation
     /// (the number of a statement this device applied) on the chain of a
@@ -115,16 +115,16 @@ impl Cut {
 
 /// Which keys this device knows to be removed, and the cut on each: the
 /// interface that the removal record's build fills (decision 2026-10-24,
-/// rule 2, "a table beside `person_change_entries`").
+/// rule 2, "a table beside `person_change_entries`"; [`ByTheCuts`]).
 pub trait Removals {
     /// `None` where `key` is not a removed key; its cut where it is.
     fn removal(&self, key: &[u8; 32]) -> Option<Cut>;
 }
 
-/// Today's answer, from the statement applied alone: each key it lists as
-/// removed, with no cut time ([`Cut::StatementAlone`]). Not yet the
-/// removal record's: its removed keys of every change seen, and their cut
-/// times, are built with that record (decision 2026-10-10 §20, item 7).
+/// Each key of a list as removed, with no cut time ([`Cut::StatementAlone`]):
+/// where nothing is cut, only which keys are removed matters. What
+/// [`holds`] reads, which cuts nothing, with every key the device knows to
+/// be removed; and a recovery's machine, which took no act before.
 pub struct ByTheStatement {
     removed: Vec<[u8; 32]>,
 }
@@ -140,6 +140,46 @@ impl ByTheStatement {
 impl Removals for ByTheStatement {
     fn removal(&self, key: &[u8; 32]) -> Option<Cut> {
         self.removed.contains(key).then_some(Cut::StatementAlone)
+    }
+}
+
+/// The removal record's answer (decision 2026-10-24, rules 2 and 6; the
+/// shared record's property 9 and §20, item 7): every key this device
+/// knows to be removed, on any branch, with its cut ([`Cut::Times`]). The
+/// generations listed for a key are those by number on the chain of every
+/// change it noted that removes the key, and at which it noted no other
+/// change: an act taken in any other generation, a removal of the key,
+/// one made after it or one made apart among them, counts for nothing,
+/// and one taken in a listed generation counts for nothing at or after the
+/// key's cut time. A key it knows no change of removes has every act cut.
+pub struct ByTheCuts {
+    cuts: Vec<([u8; 32], Cut)>,
+}
+
+impl ByTheCuts {
+    pub(crate) fn read(
+        conn: &Connection,
+        statement: &cordelia_crypto::statement::Statement,
+    ) -> Result<Self, PersonError> {
+        let noted = crate::cut::Cuts::read(conn)?;
+        let mut cuts = Vec::new();
+        for key in crate::person::removed_known(conn, statement)? {
+            let times = match noted.act_generations(&key) {
+                Some((at, generations)) => generations.into_iter().map(|g| (g, at)).collect(),
+                None => Vec::new(),
+            };
+            cuts.push((key, Cut::Times(times)));
+        }
+        Ok(Self { cuts })
+    }
+}
+
+impl Removals for ByTheCuts {
+    fn removal(&self, key: &[u8; 32]) -> Option<Cut> {
+        self.cuts
+            .iter()
+            .find(|(removed, _)| removed == key)
+            .map(|(_, cut)| cut.clone())
     }
 }
 
@@ -159,13 +199,26 @@ impl Makers {
         }
     }
 
-    /// The makers where this device stands: today, removed keys by the
-    /// statement alone ([`ByTheStatement`]).
-    fn of(standing: &Standing) -> Self {
-        Self::new(
+    /// The makers where this device stands, for working the lists out:
+    /// every key it knows to be removed, with its cut ([`ByTheCuts`]).
+    fn of(conn: &Connection, standing: &Standing) -> Result<Self, PersonError> {
+        Ok(Self::new(
             standing.counting.clone(),
-            ByTheStatement::of(&standing.held.statement.statement.removed),
-        )
+            ByTheCuts::read(conn, &standing.held.statement.statement)?,
+        ))
+    }
+
+    /// The makers where this device stands, for naming what it holds:
+    /// every key it knows to be removed, with no cut, which naming does not
+    /// read ([`ByTheStatement`]). It reads no change noted.
+    fn named(conn: &Connection, standing: &Standing) -> Result<Self, PersonError> {
+        Ok(Self::new(
+            standing.counting.clone(),
+            ByTheStatement::of(&crate::person::removed_known(
+                conn,
+                &standing.held.statement.statement,
+            )?),
+        ))
     }
 
     /// What `key` is as a maker: `None` where it is neither a device that
@@ -841,7 +894,7 @@ impl Reading {
         own: &[u8; 32],
         now: i64,
     ) -> Result<Self, PersonError> {
-        let makers = Makers::of(&standing);
+        let makers = Makers::of(conn, &standing)?;
         let lists = lists_read(conn, &standing, own)?;
         let takings = Takings::load(
             conn,
@@ -1313,7 +1366,7 @@ pub fn holds(conn: &Connection) -> Result<Holds, PersonError> {
     let Ok(standing) = Standing::of(conn) else {
         return Ok(Holds::default());
     };
-    let makers = Makers::of(&standing);
+    let makers = Makers::named(conn, &standing)?;
     let Some(kept) = kept_rows::kept(conn)? else {
         return Ok(Holds::default());
     };

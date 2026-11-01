@@ -297,6 +297,42 @@ impl Cuts {
         false
     }
 
+    /// The generations, by their number alone, in which an act of the
+    /// person's lists that `key` made, and that this device took, is judged
+    /// by the key's cut time, with that time (decision 2026-10-10 property
+    /// 9, which keeps a generation by its number; `lists::ByTheCuts`):
+    /// each number on the chain of every noted change that removes the key,
+    /// at which no noted change stands that is not on each such chain. Two
+    /// generations made apart at one number are told apart by their hash
+    /// alone, so a number at which one stands off a chain is not listed:
+    /// what was taken there is cut, which fails safe. A generation that is
+    /// a removal of the key, or made after one, is not listed either: an
+    /// act taken there was taken after the cut time. `None` where the
+    /// device does not know the key to be removed; no number where no
+    /// noted change removes it.
+    pub(crate) fn act_generations(&self, key: &[u8; 32]) -> Option<(Option<i64>, Vec<u64>)> {
+        let cut = self.of_key(key)?;
+        let on_every_chain =
+            |change: &Change| cut.removals.iter().all(|(_, chain)| chain.contains(change));
+        let mut numbers: Vec<u64> = match cut.removals.first() {
+            Some((_, chain)) => chain
+                .iter()
+                .filter(|change| on_every_chain(change))
+                .map(|(number, _)| *number)
+                .collect(),
+            None => Vec::new(),
+        };
+        numbers.retain(|number| {
+            self.chains
+                .keys()
+                .filter(|(at, _)| at == number)
+                .all(on_every_chain)
+        });
+        numbers.sort_unstable();
+        numbers.dedup();
+        Some((cut.at, numbers))
+    }
+
     /// Whether what `key` wrote or added, taken at `at` in `generation`,
     /// is cut: `false` for a key this device does not know to be removed.
     pub(crate) fn cuts_key(&self, key: &[u8; 32], generation: &Change, at: i64) -> bool {
