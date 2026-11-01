@@ -86,7 +86,8 @@ After that:
 - If two machines edit the same memory before hearing from each other, one
   version stays in the file and the other is kept beside it as
   `<name>.conflict-<device>.md`, on every machine. The memory index
-  (`MEMORY.md`) is merged line by line instead. (The decision records list
+  (`MEMORY.md`) is merged line by line instead; where it is not, its copy
+  stays on the machine that made it. (The decision records list
   the limits.)
 - `cordelia sync status` lists what was found on the machine and is not
   syncing, with the command that maps it, and what the person's other

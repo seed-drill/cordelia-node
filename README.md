@@ -220,7 +220,9 @@ beside it as a **conflict copy**, named `<file>.conflict-<tag>.md`. Each
 device whose text was replaced keeps its own copy, named with that device's
 tag. A conflict copy is a file like any other in the folder:
 
-- Every copy reaches every device that syncs the name.
+- Every copy reaches every device that syncs the name, but a copy of the
+  index, `MEMORY.md`, which stays on the device that made it (a removal
+  cannot judge where its text came from).
 - Each of those devices shows the conflict in `cordelia status`, and
   `cordelia sync status` names the file.
 - To clear a copy, merge what you want from it into the file, then delete

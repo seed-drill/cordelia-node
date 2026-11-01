@@ -857,7 +857,10 @@ fn an_edit_overtaken_by_an_edit_and_a_delete_is_kept() {
 /// The index, with one line added on one device against two on the
 /// other. At a higher revision it is not merged: the index is taken as
 /// any file is, and the index that was overtaken is kept whole beside
-/// it, with the line that used to be lost.
+/// it, with the line that used to be lost, on the device that wrote it:
+/// a copy of the index is never published (decision 2026-10-24
+/// (removal), rule 7; the review of the removal build into main, its
+/// M1), so the other device has none.
 #[test]
 fn an_index_overtaken_by_two_edits_is_kept_whole_beside_it() {
     let base = "- [Base](base.md) — shared\n";
@@ -872,10 +875,12 @@ fn an_index_overtaken_by_two_edits_is_kept_whole_beside_it() {
     );
     for mem in [&a_mem, &b_mem] {
         assert_eq!(read(mem, "MEMORY.md").as_deref(), Some(two.as_str()));
-        let copies = copies_of(mem, "MEMORY.md");
-        assert_eq!(copies.len(), 1, "{copies:?}");
-        assert_eq!(copies[0].1, from_b);
     }
+    let copies = copies_of(&b_mem, "MEMORY.md");
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    assert_eq!(copies[0].1, from_b);
+    let copies = copies_of(&a_mem, "MEMORY.md");
+    assert!(copies.is_empty(), "{copies:?}");
 }
 
 /// Only the entries of memory files say what they were written after: an
