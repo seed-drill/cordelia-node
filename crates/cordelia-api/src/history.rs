@@ -19,7 +19,9 @@ use cordelia_core::claude_code::is_safe_file_name;
 use cordelia_core::protocol::HISTORY_TURN_WAIT_SECS;
 use cordelia_crypto::entry::Value;
 use cordelia_storage::atomic::write_atomic;
-use cordelia_storage::history::{About, Change, Id, Record, Replacement, Store, Whose, kept};
+use cordelia_storage::history::{
+    About, Change, Id, Listing, Record, Replacement, Store, Stuck, Whose, kept,
+};
 use cordelia_storage::meta;
 
 use crate::auth;
@@ -92,11 +94,11 @@ impl Line {
         }
     }
 
-    /// The line, with why restore would refuse it as `records` say now
+    /// The line, with why restore would refuse it as history says now
     /// ([`refusal_now`]).
-    fn asked(state: &AppState, record: &Record, records: &[Record]) -> Self {
+    fn asked(state: &AppState, record: &Record, listing: &Listing, pending: &[Stuck]) -> Self {
         Self {
-            refused: refusal_now(state, &record.about, records),
+            refused: refusal_now(state, &record.about, listing, pending),
             ..Self::of(record)
         }
     }
@@ -350,11 +352,15 @@ pub fn list(state: &AppState, request: &ListRequest) -> Result<ListResponse, Api
             .filter(|r| !Path::new(&r.about.folder).join(&r.about.file).exists())
             .collect();
     }
+    let pending = match request.removed {
+        true => store.pending().map_err(io("cannot be read"))?,
+        false => Vec::new(),
+    };
     response.records = records
         .into_iter()
         .filter(|r| written_since(&r.about))
         .map(|r| match request.removed {
-            true => Line::asked(state, r, &listing.records),
+            true => Line::asked(state, r, &listing, &pending),
             false => Line::of(r),
         })
         .collect();
@@ -386,9 +392,11 @@ pub fn show(state: &AppState, request: &ShowRequest) -> Result<ShowResponse, Api
             _ => io("cannot be read")(e),
         })?
         .ok_or_else(|| ApiError::NotFound(format!("no record {id} in history")))?;
-    let records = store.list().map(|listing| listing.records);
-    let line = match &records {
-        Ok(records) => Line::asked(state, &record, records),
+    let seen = store
+        .list()
+        .and_then(|listing| Ok((listing, store.pending()?)));
+    let line = match &seen {
+        Ok((listing, pending)) => Line::asked(state, &record, listing, pending),
         Err(e) => Line {
             refused: Some(format!(
                 "history cannot be read to say whether a change set this version aside ({e})"
@@ -535,7 +543,14 @@ fn set_aside_refusal(state: &AppState, store: &Store, about: &About) -> Option<S
         Ok(listing) => listing,
         Err(e) => return cannot(e),
     };
-    if !listing.unreadable.is_empty() || stuck.iter().any(|s| s.about.is_none()) {
+    refused_by_history(about, &listing, &stuck)
+}
+
+/// Why restore refuses `about` by what history holds: the records of
+/// `listing`, and `pending`, the records left pending. A record that
+/// cannot be read may be one set aside.
+fn refused_by_history(about: &About, listing: &Listing, pending: &[Stuck]) -> Option<String> {
+    if !listing.unreadable.is_empty() || pending.iter().any(|s| s.about.is_none()) {
         return Some(
             "history holds a record that cannot be read, and it may be one a change set aside: \
              nothing was put back. `cordelia history drop --all` removes every record"
@@ -546,17 +561,25 @@ fn set_aside_refusal(state: &AppState, store: &Store, about: &About) -> Option<S
         .records
         .iter()
         .map(|r| &r.about)
-        .chain(stuck.iter().filter_map(|s| s.about.as_ref()));
+        .chain(pending.iter().filter_map(|s| s.about.as_ref()));
     holds_a_text_set_aside(about, abouts)
 }
 
-/// Why restore would refuse `about`, as `records` say now, with no turn
+/// Why restore would refuse `about`, as history says now, with no turn
 /// held and nothing marked: what `history show` and `--removed` ask, so
 /// that they offer no restore that restore refuses. Restore asks again
-/// ([`set_aside_refusal`]).
-fn refusal_now(state: &AppState, about: &About, records: &[Record]) -> Option<String> {
-    refusal_of(state, about)
-        .or_else(|| holds_a_text_set_aside(about, records.iter().map(|r| &r.about)))
+/// ([`set_aside_refusal`]). `pending` is every record pending now
+/// ([`Store::pending`]), of which restore asks those that the marking
+/// leaves pending, and those it marks with the rest: so a record pending
+/// for a change in hand, which then fails, may make this refuse what
+/// restore would not. That is the side that fails safe.
+fn refusal_now(
+    state: &AppState,
+    about: &About,
+    listing: &Listing,
+    pending: &[Stuck],
+) -> Option<String> {
+    refusal_of(state, about).or_else(|| refused_by_history(about, listing, pending))
 }
 
 /// Where a version of `abouts` set aside holds the very text of `about`.
@@ -1336,6 +1359,12 @@ mod tests {
         let pending = store.keep(about, Some("the late text\n"), at(10)).unwrap();
         std::mem::forget(pending);
         let copy = n.kept("copy.md", Change::Pulled, Some("the late text\n"), 20);
+        // `history show`, which marks nothing, asks the pending record
+        // too, and offers no restore (the review of the removal build
+        // into main, its low 3).
+        let shown = |id: &str| show(&n.state, &ShowRequest { id: id.into() }).unwrap();
+        let refused = shown(&copy).record.refused.unwrap_or_default();
+        assert!(refused.contains("set aside"), "{refused:?}");
         let done = n.restore(&[&copy]);
         assert!(!done[0].done, "{done:?}");
         assert!(done[0].message.contains("set aside"), "{done:?}");
@@ -1345,10 +1374,13 @@ mod tests {
         let broken = n.kept("broken.md", Change::Pulled, Some("x\n"), 40);
         let path = n.state.home_dir.join("history").join(&broken);
         std::fs::write(&path, b"not a record").unwrap();
+        let refused = shown(&fine).record.refused.unwrap_or_default();
+        assert!(refused.contains("cannot be read"), "{refused:?}");
         let done = n.restore(&[&fine]);
         assert!(!done[0].done, "{done:?}");
         assert!(done[0].message.contains("cannot be read"), "{done:?}");
         std::fs::remove_file(&path).unwrap();
+        assert_eq!(shown(&fine).record.refused, None);
         assert!(n.restore(&[&fine])[0].done);
     }
 

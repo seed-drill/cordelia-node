@@ -469,6 +469,20 @@ impl Store {
         Ok(found)
     }
 
+    /// The pending records as they are, with nothing marked: what one who
+    /// holds no turn can see of those [`Store::recover`] marks or leaves.
+    /// Some may belong to a change in hand.
+    pub fn pending(&self) -> std::io::Result<Vec<Stuck>> {
+        let mut found = Vec::new();
+        for name in self.names()? {
+            if let Some((id, PENDING)) = record_name(&name) {
+                let about = read_about(&self.dir.join(&name));
+                found.push(Stuck { id, about });
+            }
+        }
+        Ok(found)
+    }
+
     /// Remove a pending record that could not be marked: what a drop does
     /// with one that was to go. Whoever does it holds the turn, so the
     /// record belongs to no change in hand. `false` where it is no longer
