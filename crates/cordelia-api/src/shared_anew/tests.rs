@@ -1639,3 +1639,48 @@ fn a_channel_first_held_while_a_removal_is_known_is_not_clean() {
         "moved from"
     );
 }
+
+/// A recovery takes by the person's word the acts of the devices the
+/// person named at the terminal alone, and seals without every key it
+/// removes (the review of #277, high 2; decision 2026-10-24 (removal),
+/// rules 6, 22 and 24): the laptop, said to be lost, files "review"; the
+/// tablet, which another change removed, files "thief" after its removal.
+/// The recovered machine holds "review", not clean and owed its making
+/// anew, and nothing of the tablet's: its acts are passed over.
+#[test]
+fn a_recovery_takes_no_act_of_a_device_another_change_removed() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let review = holds(&s, 1, 7, "review", now);
+    let thief = holds(&s, 2, 9, "thief", now);
+    let personal = s[1].personal();
+    let handed: Vec<CheckedEntry> = s[1].stored().into_iter().chain(s[2].stored()).collect();
+    let lists = crate::lists::lists_in(&handed, &personal, &[s.key(1), s.key(2)]).unwrap();
+    assert_eq!(lists.len(), 2);
+    s.change(0, &[0], &[1, 2]);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    let shown = crate::recover::Shown {
+        gone: vec![(s.key(1), "laptop".into())],
+        removed_apart: vec![(s.key(2), "tablet".into())],
+        ..Default::default()
+    };
+    in_one(conn, || {
+        crate::recover::shared_recovered(conn, &s[0].identity, &lists, &shown, now)
+    })
+    .unwrap();
+    let filed: Vec<String> = sharing::filed(conn)
+        .unwrap()
+        .into_iter()
+        .map(|filing| filing.name)
+        .collect();
+    assert_eq!(filed, ["review"], "the tablet's acts are passed over");
+    assert!(st(kept::channel(conn, &thief.id)).unwrap().is_none());
+    assert!(is_not_clean(conn, &review.id).unwrap(), "rule 24");
+    assert!(
+        st(rows::not_clean_of(conn, &review.id))
+            .unwrap()
+            .unwrap()
+            .owed
+    );
+}

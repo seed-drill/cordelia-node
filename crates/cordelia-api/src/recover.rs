@@ -1106,10 +1106,15 @@ pub struct MakeRequest {
     /// it that its change entry gave the phrase: what the machine keeps
     /// as a device keeps a secret it left (decision 2026-10-04 §3, §9).
     pub left: Vec<LeftSecret>,
-    /// The keys that the statement newly removes, each with the label
-    /// that the person was shown it by.
+    /// The keys that the person said are gone, lost or in someone else's
+    /// hands, each with the label that the person was shown it by.
     #[serde(default)]
     pub gone: Vec<KeyLabel>,
+    /// The devices of the change recovered from that another change the
+    /// recovery read removed, of which the person was asked nothing
+    /// (decision 2026-10-24 (removal), rule 22), each with its label.
+    #[serde(default)]
+    pub removed_apart: Vec<KeyLabel>,
     /// The devices that the person still has, which are in neither list:
     /// each is shown as that until it is added again (§8).
     #[serde(default)]
@@ -1176,8 +1181,11 @@ fn to_look(state: &AppState, entry: &CheckedEntry, word: &Word) -> Result<ToLook
 /// key with its label.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Shown {
-    /// The keys that the statement newly removes.
+    /// The keys that the person said are gone.
     pub gone: Vec<([u8; 32], String)>,
+    /// The keys that another change the recovery read removed: the person
+    /// was asked nothing of them.
+    pub removed_apart: Vec<([u8; 32], String)>,
     /// The devices that the person still has, which are in neither list.
     pub still_have: Vec<([u8; 32], String)>,
     /// The keys of the rows that could not be shown.
@@ -1239,7 +1247,13 @@ pub fn follow(
             acts::forget_every_typed_key(conn)?;
             let held = person::held(conn)?.ok_or(PersonError::FollowsNoPhrase)?;
             let listed = &held.statement.statement;
-            crate::look::note_removed_labels(conn, listed, &shown.gone)?;
+            let removed: Vec<([u8; 32], String)> = shown
+                .gone
+                .iter()
+                .chain(&shown.removed_apart)
+                .cloned()
+                .collect();
+            crate::look::note_removed_labels(conn, listed, &removed)?;
             let in_no_list = |key: &[u8; 32]| !listed.lists(key) && !listed.removes(key);
             for (key, label) in shown.still_have.iter().filter(|(key, _)| in_no_list(key)) {
                 acts::note_left_out(conn, key, label, applied.number, at)?;
@@ -1263,18 +1277,7 @@ pub fn follow(
             // that has ended it does not write that it has sent what it
             // carried (§8).
             meta::set(conn, meta::PERSON_LOOK_PENDING, "1")?;
-            // The person's lists of shared channels (decision 2026-10-10
-            // §3.5): the acts the recovery takes by the rules of §3.4, the
-            // devices it removes as removed keys and those still had in no
-            // list, written as this machine's list; it holds the channels
-            // they file, and owes each its making anew once it has read it
-            // where the recovery removed a key (decision 2026-10-24, rule
-            // 24).
-            let gone: Vec<[u8; 32]> = shown.gone.iter().map(|(key, _)| *key).collect();
-            crate::lists::write_recovered(conn, identity, shared_lists, &gone, at)?;
-            if !gone.is_empty() {
-                crate::shared_anew::recovered(conn, &gone, at)?;
-            }
+            shared_recovered(conn, identity, shared_lists, shown, at)?;
             Ok(applied.number)
         });
         if applied.is_ok() {
@@ -1283,6 +1286,37 @@ pub fn follow(
         applied
     })?;
     Ok((number, to_look))
+}
+
+/// The person's lists of shared channels on the machine of a recovery
+/// (decision 2026-10-10 §3.5), in the caller's transaction: the acts the
+/// recovery takes by the rules of §3.4 are written as this machine's list,
+/// and it holds the channels they file. **The acts of a device the person
+/// said is gone are taken, by the person's word** (decision 2026-10-24
+/// (removal), rule 6); those of a device that another change removed, of
+/// which the person was asked nothing, are passed over, as are those of a
+/// device still had (rule 22: the look takes nothing that it wrote). Every
+/// key the recovery removes, either way, held each seed: each channel is
+/// owed its making anew without them once read (rule 24).
+pub(crate) fn shared_recovered(
+    conn: &rusqlite::Connection,
+    identity: &NodeIdentity,
+    shared_lists: &[([u8; 32], cordelia_crypto::acts::SharedList)],
+    shown: &Shown,
+    at: i64,
+) -> Result<(), PersonError> {
+    let by_word: Vec<[u8; 32]> = shown.gone.iter().map(|(key, _)| *key).collect();
+    crate::lists::write_recovered(conn, identity, shared_lists, &by_word, at)?;
+    let without: Vec<[u8; 32]> = shown
+        .gone
+        .iter()
+        .chain(&shown.removed_apart)
+        .map(|(key, _)| *key)
+        .collect();
+    if !without.is_empty() {
+        crate::shared_anew::recovered(conn, &without, at)?;
+    }
+    Ok(())
 }
 
 /// The channel of each of `names` that this device holds, in their order:
@@ -1390,6 +1424,7 @@ pub async fn make(
     };
     let shown = Shown {
         gone: labelled(&body.gone)?,
+        removed_apart: labelled(&body.removed_apart)?,
         still_have: labelled(&body.still_have)?,
         not_shown: labelled(&body.not_shown)?,
     };
@@ -2644,6 +2679,7 @@ mod tests {
             left,
             shown: Shown {
                 gone: labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
+                removed_apart: Vec::new(),
                 still_have: labelled(|said| *said == Answer::Have),
                 not_shown: not_shown.map(|row| (row.key, row.label.clone())).collect(),
             },

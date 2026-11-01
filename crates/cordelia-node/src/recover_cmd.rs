@@ -1539,12 +1539,13 @@ fn at_a_row(
 }
 
 /// The keys that the node is handed with the label of each (decision
-/// 2026-10-04 §9, step 4): `gone`, each that the person said is gone, and
-/// each device of the change recovered from that another change the
-/// recovery read removed, which is removed whatever is said (decision
-/// 2026-10-24 (removal), rule 22): it held the seed of every shared channel
-/// that the lists recovered from file, so the recovery makes each anew
-/// without it as without a device said to be gone (rule 24);
+/// 2026-10-04 §9, step 4): `gone`, each that the person said is gone;
+/// `removed_apart`, each device of the change recovered from that another
+/// change the recovery read removed, which is removed whatever is said and
+/// asked nothing (decision 2026-10-24 (removal), rule 22): it held the seed
+/// of every shared channel that the lists recovered from file, so the
+/// recovery makes each anew without it (rule 24), and takes none of its
+/// acts, since the person gave no word of it (rule 6);
 /// `still_have`, each that they still have; and `not_shown`, each row
 /// that could not be shown. **Each label is the one that its row was
 /// shown by** ([`recover::label_shown`], decision 2026-10-17 §2.4): the
@@ -1570,10 +1571,8 @@ fn labels_for_the_node(generation: &Generation, answers: &[Answer], own: &[u8; 3
     json!({
         // A row that counts is not asked about only where another change
         // removed it (`at_a_row`).
-        "gone": labelled(|row, said| {
-            matches!(said, Answer::Lost | Answer::OtherHands)
-                || (row.counts && *said == Answer::NotAsked)
-        }),
+        "gone": labelled(|_, said| matches!(said, Answer::Lost | Answer::OtherHands)),
+        "removed_apart": labelled(|row, said| row.counts && *said == Answer::NotAsked),
         "still_have": labelled(|_, said| *said == Answer::Have),
         "not_shown": not_shown,
     })
@@ -1869,6 +1868,7 @@ pub fn recover(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         "statement_key": hex::encode(*statement_key),
         "left": left,
         "gone": labels["gone"],
+        "removed_apart": labels["removed_apart"],
         "still_have": labels["still_have"],
         "not_shown": labels["not_shown"],
         "word": word,
@@ -3352,7 +3352,7 @@ mod tests {
     /// recovers from change 2 and reads that branch. Were the desktop
     /// asked, `have` would bring back what it wrote after its removal,
     /// and the recovery's statement would remove it all the same. The node
-    /// is handed it as gone (rule 24).
+    /// is handed it as removed apart (rules 6 and 24).
     #[test]
     fn test_a_device_that_another_change_read_removed_is_not_asked_and_nothing_is_taken() {
         let rows = rows();
@@ -3384,20 +3384,23 @@ mod tests {
         assert!(!takes.contains(&desktop), "{takes:?}");
         assert!(takes.contains(&[1; 32]) && takes.contains(&[3; 32]));
         assert!(!recover::gone(&rows, &answers).contains(&desktop));
-        // The node is handed it as gone all the same, with its label: it
-        // held the seed of every shared channel the lists recovered from
-        // file, which the recovery makes anew without it (rule 24).
+        // The node is handed it as removed apart, with its label, and not
+        // as gone: it held the seed of every shared channel the lists
+        // recovered from file, which the recovery makes anew without it
+        // (rule 24), and the person gave no word of it, so none of its acts
+        // is taken (rule 6; the review of #277, high 2).
         let generation = Generation {
             rows: rows.clone(),
             ..Default::default()
         };
         let labels = labels_for_the_node(&generation, &answers, &[9; 32]);
-        let gone = labels["gone"].as_array().unwrap();
-        assert!(
-            gone.iter().any(|one| one["key"] == hex::encode(desktop)),
-            "{labels}"
-        );
-        assert_eq!(gone.len(), 1, "{labels}");
+        let named = |field: &str| -> Vec<String> {
+            let keys = labels[field].as_array().unwrap().iter();
+            keys.map(|one| one["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert!(!named("gone").contains(&hex::encode(desktop)), "{labels}");
+        assert_eq!(named("removed_apart"), [hex::encode(desktop)], "{labels}");
         // The control: where no other change removed it, it is asked.
         assert!(matches!(
             at_a_row(&rows, &answers[..1], 1, 2, &[9; 32], &room, &|_| false),
