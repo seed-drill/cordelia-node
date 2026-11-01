@@ -279,8 +279,12 @@ pub fn take_at(state: &AppState, version: &str, room: RoomThere, now: Instant) -
 /// in a fork applies rule 8 to the entry it kept apart: it goes on, moves
 /// (rule 9), or stays closed. Once: the mark goes
 /// with the judging. What it came to is said in the log. One that cannot
-/// be judged is said, and judged again at the next first start: it stays
-/// closed meanwhile, as a device in a fork is closed.
+/// be judged is said, and judged again at the next first start. A device
+/// in a fork stays closed meanwhile, as a device in a fork is closed; one
+/// in no fork goes on as it was, with the times of its changes not yet
+/// noted (the review of the removal build into main, its low on the
+/// upgrade), so that a cut finds no time and cuts all of a removed key's
+/// in such a generation, which fails safe (rule 2).
 fn judge_kept(state: &AppState) {
     let judged = {
         let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
