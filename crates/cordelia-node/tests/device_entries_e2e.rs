@@ -10538,8 +10538,10 @@ async fn the_status_says_when_the_device_woke() {
     woke_at(&device, started);
     device.clock.run_ahead(Duration::from_secs(60));
     device.connects_to("a", a.port, a.key).await;
-    device.passes().await;
+    // The pass notes the wake as it begins: read after it, the moment
+    // could fall a second late.
     let woke = device.now();
+    device.passes().await;
     woke_at(&device, woke);
     device.clock.run_ahead(Duration::from_secs(60));
     device.passes().await;
