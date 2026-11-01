@@ -1327,6 +1327,29 @@ mod tests {
             cordelia_storage::sync_state::note_cut(&db, &folder, "notes.md").unwrap();
         }
         assert!(!n.restore(&[&own])[0].done);
+        // `--removed` says so too, of a removed file a carry cut, and of
+        // no other (the review of the removal build into main, its low 4).
+        let gone = n.kept("gone.md", Change::Removed, Some("was here\n"), 40);
+        let freed = n.kept("freed.md", Change::Removed, Some("free\n"), 41);
+        {
+            let db = n.state.db.lock().unwrap();
+            cordelia_storage::sync_state::note_cut(&db, &folder, "gone.md").unwrap();
+        }
+        let removed = ListRequest {
+            of: Some("lab".into()),
+            removed: true,
+            ..Default::default()
+        };
+        let listed = list(&n.state, &removed).unwrap().records;
+        let refused = |id: &str| {
+            listed
+                .iter()
+                .find(|l| l.id == id)
+                .map(|l| l.refused.is_some())
+        };
+        assert_eq!(refused(&gone), Some(true), "{listed:?}");
+        assert_eq!(refused(&freed), Some(false), "{listed:?}");
+        assert!(!n.restore(&[&gone])[0].done);
         // Another file is restored as before.
         let other = n.kept("other.md", Change::Pulled, Some("other\n"), 30);
         let shown = show(
