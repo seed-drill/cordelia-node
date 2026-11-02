@@ -3026,7 +3026,7 @@ fn messages_at_start(state: &cordelia_api::state::AppState) {
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %e, "messages: could not read the lists held"),
     }
-    // And the lists of shared marks held from before step 25 (decision
+    // And the lists of shared marks held from before step 31 (decision
     // 2026-10-10 §14), before the first pass.
     match cordelia_api::reader::read_held_shared_lists(&db, &state.identity, now) {
         Ok(true) => tracing::info!("messages: read the lists of shared marks held"),

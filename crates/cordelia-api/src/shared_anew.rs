@@ -4,7 +4,7 @@
 //!
 //! - **An offer** is an anew record that is not empty, in the slot of a key
 //!   this device shows. The reader keeps what each says once for each
-//!   revision of it ([`read`]), apart from the store (schema step 26), and
+//!   revision of it ([`read`]), apart from the store (schema step 32), and
 //!   each is judged where it is shown or acted on ([`judged`]): a fault
 //!   (of a channel the person holds or held, by a key the person's
 //!   statement removed, or whose seal for this device does not open),

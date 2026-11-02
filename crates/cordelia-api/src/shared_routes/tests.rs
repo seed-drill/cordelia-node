@@ -797,7 +797,7 @@ fn a_reply_goes_only_where_its_message_came_from() {
     }
 }
 
-/// The `sread/` lists that the store held before step 25 are read once
+/// The `sread/` lists that the store held before step 31 are read once
 /// (decision 2026-10-10 §14): an `sread/` list that a device stored while
 /// it was of the version before, counted then among its signer's entries
 /// that were not messages, is read through the reader at the first start

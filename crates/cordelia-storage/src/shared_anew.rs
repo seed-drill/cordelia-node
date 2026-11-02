@@ -1,5 +1,5 @@
 //! What a device keeps of channels made anew (decision 2026-10-10 §3.5,
-//! §7; decision 2026-10-24, rules 23 to 26): the tables of schema step 26.
+//! §7; decision 2026-10-24, rules 23 to 26): the tables of schema step 32.
 //!
 //! - **The offers read** (`shared_anew_offers`): for each channel and each
 //!   key that wrote an offer there that this device read, what the offer

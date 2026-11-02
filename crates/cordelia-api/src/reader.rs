@@ -349,7 +349,7 @@ pub fn held_lists_were_read(conn: &Connection) -> bool {
     )
 }
 
-/// Whether the `sread/` lists that the store held from before step 25 were
+/// Whether the `sread/` lists that the store held from before step 31 were
 /// read ([`read_held_shared_lists`]): then it does nothing, at any later
 /// call.
 pub fn held_shared_lists_were_read(conn: &Connection) -> bool {
