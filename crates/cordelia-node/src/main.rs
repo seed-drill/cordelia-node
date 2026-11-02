@@ -587,8 +587,9 @@ enum MsgCommand {
     /// says so and asks nothing. Anywhere else it shows only those of this
     /// folder's agent, and marks nothing.
     Log {
-        /// Only messages sent since a time (2026-10-03T09:00:00Z), or in
-        /// the last while (30m, 2h, 3d)
+        /// Only your own agents' messages sent since a time
+        /// (2026-10-03T09:00:00Z), or in the last while (30m, 2h, 3d); a
+        /// shared channel's are all shown
         #[arg(long)]
         since: Option<String>,
     },
