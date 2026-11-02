@@ -82,7 +82,11 @@ pub fn carried_from(
 ///   exactly an edit's, and nothing tells the two apart by their chains:
 ///   at a removal every index version another device wrote is set aside
 ///   in its window, edit or merge (decision 2026-10-24 (removal), rule 7,
-///   the index rule).
+///   the index rule). The test compares hashes alone. A rule that ever
+///   reads a merge's chain to tell it from an edit must not rest on this:
+///   it would compare whole links, hash and signer, or put the other's
+///   link second always (that record, section 13, the reads of the index
+///   rule).
 /// - **Where it is not,** the two were written apart. The other's link
 ///   comes second, and after it the links of the two chains, one from
 ///   each in turn, the channel's first.
