@@ -161,7 +161,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-node/tests/shared_e2e.rs`: `a_device_of_the_version_before_ignores_shared_lists`
 
 ### T16
-- `crates/cordelia-api/src/shared_anew/tests.rs`: `a_channel_moved_to_before_a_removal_is_not_clean_where_it_is_first_held`, `a_channel_taken_again_after_a_removal_is_not_clean`, `a_channel_made_anew_by_a_device_that_had_not_heard_is_not_clean`, `shared_anew_after_a_removal_is_clean_where_the_one_before_was`
+- `crates/cordelia-api/src/shared_anew/tests.rs`: `a_channel_moved_to_before_a_removal_is_not_clean_where_it_is_first_held`, `a_channel_taken_again_after_a_removal_is_not_clean`, `a_channel_made_anew_by_a_device_that_had_not_heard_is_not_clean`, `a_second_channel_made_anew_out_of_one_moved_from_is_not_clean`, `shared_anew_after_a_removal_is_clean_where_the_one_before_was`
 - `crates/cordelia-api/tests/entries.rs`: `a_removed_device_can_no_longer_write`
 - `crates/cordelia-node/tests/threat_model.rs`: `t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not`
 - `crates/cordelia-api/tests/entries.rs`: `t16_a_removed_device_cannot_put_a_name_out_of_reach`
