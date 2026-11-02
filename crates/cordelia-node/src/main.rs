@@ -9468,16 +9468,16 @@ mod tests {
         let line = indicator::shown(&f).summary;
         assert_eq!(
             line,
-            "shared: a removed device still holds 1 shared channel: make each anew \
-             (cordelia devices)"
+            "shared: 1 shared channel not made anew since a removal: make \
+             each anew once with cordelia shared anew <name>"
         );
         let (memory, shared) = memory_and_shared(&f);
         assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
         assert!(memory.holds.is_empty(), "{:?}", memory.holds);
         assert_eq!(
             shared_line(&shared.unwrap().says),
-            "  Shared:    a removed device still holds 1 shared channel: make each anew \
-             (cordelia devices)"
+            "  Shared:    1 shared channel not made anew since a removal: make \
+             each anew once with cordelia shared anew <name>"
         );
         // Beside another amber hold: that one is under `Memory:`.
         f.devices.said_left = 1;

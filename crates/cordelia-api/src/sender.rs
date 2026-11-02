@@ -174,9 +174,9 @@ pub enum Refused {
     /// it or in its threads, wait to be read by a person on this device.
     #[error("messages of this agent's loop in the channel wait to be read by a person")]
     SharedHeld { from: String, waiting: u64 },
-    /// The shared channel was held by a device that was removed, and is
-    /// not yet made anew (decision 2026-10-24, rules 23 and 25).
-    #[error("the shared channel was held by a device that was removed")]
+    /// The shared channel is not yet made anew on this device since a
+    /// removal (decision 2026-10-24, rules 23 and 25).
+    #[error("the shared channel is not made anew on this device since a removal")]
     NotClean,
     /// An offer that seals to this person and leaves out a key was read in
     /// the shared channel, and the person has neither moved nor stayed

@@ -2117,6 +2117,9 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
         300,
         || (id_filed(&laptop, "review")? == new).then_some(()),
     );
+    // There it is not clean until the laptop makes it anew once itself
+    // (rule 23, as the person ruled on 2 November), and its status says so.
+    removed_device_holds_review(&laptop, "tablet");
     // The offer is the desktop's one entry there since; nothing of the
     // laptop's.
     let offer = offer_at(&relay, &old_card, &key_of(&desktop));
@@ -2315,8 +2318,8 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     assert_eq!(ended, Some(false));
     assert!(
         err.contains(
-            "\"review\" was held by a device that was removed: make it anew with cordelia \
-             shared anew review"
+            "\"review\" is not clean: after a removal, each shared channel is made anew once \
+             on this device before it sends there. Run cordelia shared anew review"
         ),
         "{err}"
     );
@@ -2365,8 +2368,8 @@ fn removed_device_holds_review(n: &Node, removed: &str) {
     let plain = n.cli(&["status"]);
     assert!(
         plain.contains(
-            "  Shared:    a removed device still holds 1 shared channel: make each anew \
-             (cordelia devices)"
+            "  Shared:    1 shared channel not made anew since a removal: make \
+             each anew once with cordelia shared anew <name>"
         ),
         "{plain}"
     );

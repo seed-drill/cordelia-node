@@ -317,11 +317,13 @@ pub fn without_memory(says: &str) -> &str {
 }
 
 /// What the line says of the one fact of a shared channel that sets a
-/// level (decision 2026-10-10 §9): a removed device still holds `n` shared
-/// channels that the person has not made anew.
+/// level (decision 2026-10-10 §9): `n` shared channels are not made anew
+/// on this device since a removal, each of which is made anew once
+/// (decision 2026-10-24, rule 23).
 pub fn removed_holds_shared_says(n: usize) -> String {
     format!(
-        "shared: a removed device still holds {n} shared {}: make each anew (cordelia devices)",
+        "shared: {n} shared {} not made anew since a removal: make each anew once with cordelia \
+         shared anew <name>",
         plural(n as u64, "channel")
     )
 }
@@ -3650,14 +3652,14 @@ mod tests {
         assert_eq!(whats(&six), [SHARED_HOLD]);
         assert_eq!(
             six.summary,
-            "shared: a removed device still holds 2 shared channels: make each anew \
-             (cordelia devices)"
+            "shared: 2 shared channels not made anew since a removal: make \
+             each anew once with cordelia shared anew <name>"
         );
         let one = with_shared(&holding(6, &["review"]), &|_| {});
         assert_eq!(
             one.summary,
-            "shared: a removed device still holds 1 shared channel: make each anew \
-             (cordelia devices)"
+            "shared: 1 shared channel not made anew since a removal: make \
+             each anew once with cordelia shared anew <name>"
         );
         // A channel named by two removals counts once.
         let twice = with_shared(
@@ -3693,7 +3695,7 @@ mod tests {
         ]));
         let two = with_shared(&two, &|_| {});
         assert!(
-            two.summary.contains("holds 1 shared channel:"),
+            two.summary.contains("1 shared channel not made anew"),
             "{}",
             two.summary
         );
@@ -3720,7 +3722,8 @@ mod tests {
         // The plain status says it on a line of its own, without its word.
         assert_eq!(
             without_shared(&six.summary),
-            "a removed device still holds 2 shared channels: make each anew (cordelia devices)"
+            "2 shared channels not made anew since a removal: make each anew once with cordelia \
+             shared anew <name>"
         );
         assert!(is_shared(&six.holds[0]));
     }
