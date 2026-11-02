@@ -2988,7 +2988,11 @@ fn after_a_removal_each_device_makes_a_shared_channel_anew_once() {
     let tablet = device_started_with_its_relays_key("tablet", &relay);
     let bob = person("bob", &relay);
     let all = [&relay, &laptop, &desktop, &phone, &tablet, &bob];
-    for (device, label) in [(&desktop, "desktop"), (&phone, "phone"), (&tablet, "tablet")] {
+    for (device, label) in [
+        (&desktop, "desktop"),
+        (&phone, "phone"),
+        (&tablet, "tablet"),
+    ] {
         adds(&laptop, device, label);
         has_applied(device, 1, &all);
         sync_on(device);
@@ -3061,7 +3065,11 @@ fn after_a_removal_each_device_makes_a_shared_channel_anew_once() {
     for device in [&laptop, &desktop] {
         files_as(&after, device, "review", third);
     }
-    for (device, dir) in [(&laptop, &dirs[0]), (&desktop, &dirs[1]), (&phone, &dirs[2])] {
+    for (device, dir) in [
+        (&laptop, &dirs[0]),
+        (&desktop, &dirs[1]),
+        (&phone, &dirs[2]),
+    ] {
         assert_eq!(
             send_comes_to(&after, device, dir, "review", "after the third"),
             None,

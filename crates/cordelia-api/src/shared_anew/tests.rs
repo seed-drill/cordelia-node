@@ -2019,7 +2019,10 @@ fn share_hands_out_no_channel_that_is_not_clean() {
     let (conn, identity) = (&s[1].conn, &s[1].identity);
     let to = sharing::share_plan(conn, identity, &relays(), "review", &alice, None, now).unwrap();
     sharing::make_share(conn, identity, &relays(), &to.what, now).unwrap();
-    assert_eq!(sharing::shares_to_push(conn, identity, &AT).unwrap().len(), 1);
+    assert_eq!(
+        sharing::shares_to_push(conn, identity, &AT).unwrap().len(),
+        1
+    );
     let carol = encode_public_key(&member(2).public_key()).unwrap();
     let later =
         sharing::share_plan(conn, identity, &relays(), "review", &carol, None, now).unwrap();
@@ -2030,7 +2033,13 @@ fn share_hands_out_no_channel_that_is_not_clean() {
     let (conn, identity) = (&s[1].conn, &s[1].identity);
     assert_eq!(share_word(&s, 1, "review", now), "not_clean");
     assert_eq!(
-        refusal_word(sharing::make_share(conn, identity, &relays(), &later.what, now)),
+        refusal_word(sharing::make_share(
+            conn,
+            identity,
+            &relays(),
+            &later.what,
+            now
+        )),
         "not_clean"
     );
     assert!(
@@ -2115,7 +2124,12 @@ fn a_paused_device_shows_nothing_of_a_key_its_offer_leaves_out() {
         )
     };
     stores(&s, 0, &without_carol(21, 2), now);
-    stores(&s, 0, &message(&carol, &channel, 2, "after", now + 1), now + 1);
+    stores(
+        &s,
+        0,
+        &message(&carol, &channel, 2, "after", now + 1),
+        now + 1,
+    );
     assert_eq!(
         shown_signers(&s, 0, &channel, now + 1),
         vec![alice.public_key()]
@@ -2123,7 +2137,10 @@ fn a_paused_device_shows_nothing_of_a_key_its_offer_leaves_out() {
     make_stay(&s[0].conn, &channel.id, "review").unwrap();
     let shown = shown_signers(&s, 0, &channel, now + 1);
     assert_eq!(
-        shown.iter().filter(|key| **key == carol.public_key()).count(),
+        shown
+            .iter()
+            .filter(|key| **key == carol.public_key())
+            .count(),
         2
     );
     // A later offer pauses it again; Bob moves to it.

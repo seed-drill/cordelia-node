@@ -48,6 +48,7 @@
 
 use rusqlite::Connection;
 
+use crate::at_relays::Stands;
 use cordelia_core::protocol::{
     AGENT_MESSAGE_CONTENT_BYTES, AGENT_MESSAGE_KEPT_DAYS, AGENT_MESSAGE_RING,
     MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, REV_BAND_HALF, SHARED_ANEW_CONTENT_BYTES, SHARED_KEYS_KEPT,
@@ -65,7 +66,6 @@ use cordelia_crypto::slots::slot_id;
 use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::meta;
 use cordelia_storage::person as held_rows;
-use crate::at_relays::Stands;
 use cordelia_storage::shared::{
     self as kept, Came, Channel, ChannelStep, Indexed, Opened, ShownKey, State,
 };
