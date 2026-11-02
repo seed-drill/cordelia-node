@@ -301,6 +301,11 @@ Then it asks you to type yes, and then for the phrase.
   still lists the removed device. The removed device can still read who
   your devices are in each later change, by key and label. That is a known
   limit.
+- **After a removal, make each shared channel anew once on each device.**
+  The removal makes each one anew on the device that removes; every other
+  device sends nothing in a shared channel until you run
+  `cordelia shared anew <name>` there once. `cordelia status` says how
+  many are left.
 - **Keep the machine on until the command says you can close it.** The
   command stays until every relay has the change and this device has sent
   what it has.
