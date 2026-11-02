@@ -346,6 +346,44 @@ pub fn pause_of(
         .find(|judged| judged.offer.maker != identity.public_key() && judged.pauses()))
 }
 
+/// The keys whose messages this device shows nothing of in the channel of
+/// `row`, though it shows the keys (the review of #281, medium 1): while
+/// an offer pauses it there, the keys that offer leaves out; in a channel
+/// it moved from, each key that wrote there that the offer it moved to
+/// does not seal to, but the person's own devices. What such a key sent
+/// before the offer is hidden too: the store does not say which of its
+/// messages came after it. `shared stay` ends a pause, and brings them
+/// back.
+pub fn hidden_by_an_offer(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    row: &Channel,
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    match row.state {
+        State::Held => Ok(pause_of(conn, identity, row)?
+            .map(|pause| pause.left_out)
+            .unwrap_or_default()),
+        State::Moved => {
+            let own = identity.public_key();
+            let counting = crate::person::who_counts(conn)?;
+            for offer in st(rows::offers_in(conn, &row.channel))? {
+                let moved_there = st(kept::channel(conn, &offer.new_channel))?
+                    .is_some_and(|new| new.came == kept::Came::Moved(row.channel));
+                if moved_there {
+                    return Ok(st(kept::index_signers(conn, row.id))?
+                        .into_iter()
+                        .filter(|key| {
+                            !offer.sealed_to.contains(key) && *key != own && !counting.counts(key)
+                        })
+                        .collect());
+                }
+            }
+            Ok(Vec::new())
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Whether the shared channel `channel` is not yet clean (decision
 /// 2026-10-24, rules 23 and 25): this device held it when it applied a
 /// statement that removed a key, or came to hold it after one and did not

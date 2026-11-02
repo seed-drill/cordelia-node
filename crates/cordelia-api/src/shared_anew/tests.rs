@@ -2071,3 +2071,73 @@ fn share_hands_out_no_channel_that_is_paused() {
     make_stay(&s[0].conn, &channel.id, "review").unwrap();
     assert_eq!(share_word(&s, 0, "review", now), "ok");
 }
+
+/// The signers of what device `n` shows in `channel` at `now`.
+fn shown_signers(s: &Several, n: usize, channel: &Shared, now: i64) -> Vec<[u8; 32]> {
+    crate::shared::shown(&s[n].conn, &s[n].identity, &channel.id, now)
+        .unwrap()
+        .into_iter()
+        .map(|shown| shown.signer)
+        .collect()
+}
+
+/// While an offer pauses a device, it shows nothing of the keys the offer
+/// leaves out, and after a move nothing of those the offer moved to leaves
+/// out (the review of #281, medium 1): Alice makes "review" anew without
+/// Carol (a device Carol removed, say), sealed to Bob. Carol's messages,
+/// before the offer and after it, are not shown on Bob's device; `shared
+/// stay` brings them back. A later offer without Carol pauses it again,
+/// and once Bob moves to it, the old channel shows nothing of Carol's.
+#[test]
+fn a_paused_device_shows_nothing_of_a_key_its_offer_leaves_out() {
+    use crate::shared::tests::message;
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    stores(&s, 0, &message(&carol, &channel, 1, "before", now), now);
+    stores(&s, 0, &message(&alice, &channel, 1, "hello", now), now);
+    let both = vec![alice.public_key(), carol.public_key()];
+    let mut seen = shown_signers(&s, 0, &channel, now);
+    seen.sort();
+    let mut want = both.clone();
+    want.sort();
+    assert_eq!(seen, want);
+    let without_carol = |seed: u8, rev: u64| {
+        offer_by(
+            &alice,
+            &channel,
+            seed,
+            &[alice.public_key(), s.key(0)],
+            now,
+            rev,
+        )
+    };
+    stores(&s, 0, &without_carol(21, 2), now);
+    stores(&s, 0, &message(&carol, &channel, 2, "after", now + 1), now + 1);
+    assert_eq!(
+        shown_signers(&s, 0, &channel, now + 1),
+        vec![alice.public_key()]
+    );
+    make_stay(&s[0].conn, &channel.id, "review").unwrap();
+    let shown = shown_signers(&s, 0, &channel, now + 1);
+    assert_eq!(
+        shown.iter().filter(|key| **key == carol.public_key()).count(),
+        2
+    );
+    // A later offer pauses it again; Bob moves to it.
+    stores(&s, 0, &without_carol(22, 3), now + 2);
+    assert_eq!(
+        shown_signers(&s, 0, &channel, now + 2),
+        vec![alice.public_key()]
+    );
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let plan = move_plan(conn, identity, &relays(), "review", None, None, now + 2).unwrap();
+    make_move(conn, identity, &plan.what, now + 2).unwrap();
+    assert_eq!(row(&s, 0, &channel).state, State::Moved);
+    assert_eq!(
+        shown_signers(&s, 0, &channel, now + 2),
+        vec![alice.public_key()]
+    );
+}

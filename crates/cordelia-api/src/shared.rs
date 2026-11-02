@@ -995,8 +995,9 @@ pub fn read_again_begun(
 /// (decision 2026-10-10 §2.4): of the keys it shows, with a place by the
 /// reader's rate and, for the keys the person has not labelled, among 64
 /// in an hour for all of them. Of a channel moved from, what it showed,
-/// until each expires. Nothing where the device holds no such channel, or
-/// follows no phrase.
+/// until each expires. Nothing of a key an offer leaves out
+/// ([`crate::shared_anew::hidden_by_an_offer`]). Nothing where the device
+/// holds no such channel, or follows no phrase.
 pub fn shown(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -1008,16 +1009,20 @@ pub fn shown(
             return Ok(Vec::new());
         };
         let knows = Knows::of(conn, &held)?;
+        // Nothing of a key an offer leaves out, while it pauses this
+        // device, or after it moved (the review of #281, medium 1).
+        let hidden = crate::shared_anew::hidden_by_an_offer(conn, identity, &row)?;
         // A channel moved from shows what it showed, until each expires,
         // and gives no place (§6.3).
         if row.state == State::Moved {
             let keys: Vec<[u8; 32]> = kept::index_signers(conn, row.id)?
                 .into_iter()
-                .filter(|key| !knows.removed.contains(key))
+                .filter(|key| !knows.removed.contains(key) && !hidden.contains(key))
                 .collect();
             return Ok(kept::shown(conn, row.id, &keys, now)?);
         }
-        let keys = knows.shown(conn, row.id)?;
+        let mut keys = knows.shown(conn, row.id)?;
+        keys.retain(|key| !hidden.contains(&key.key));
         kept::give_places(conn, row.id, &identity.public_key(), &keys, now)?;
         let keys: Vec<[u8; 32]> = keys.iter().map(|key| key.key).collect();
         Ok(kept::shown(conn, row.id, &keys, now)?)
