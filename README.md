@@ -304,8 +304,11 @@ Then it asks you to type yes, and then for the phrase.
 - **After a removal, make each shared channel anew once on each device.**
   The removal makes each one anew on the device that removes; every other
   device sends nothing in a shared channel until you run
-  `cordelia shared anew <name>` there once. `cordelia status` says how
-  many are left.
+  `cordelia shared anew <name>` there once. Each run asks the other people
+  in the channel to say yes again. This lasts: from your first removal on,
+  a shared channel you make or take later is also made anew once on each of
+  your other devices. `cordelia status` says how many are left for seven
+  days; `cordelia devices` names them after that.
 - **Keep the machine on until the command says you can close it.** The
   command stays until every relay has the change and this device has sent
   what it has.
