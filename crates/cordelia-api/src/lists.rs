@@ -1507,7 +1507,7 @@ pub fn write_recovered(
                     taken_at: TAKEN_BY_THE_PERSONS_WORD,
                 };
                 (
-                    act.signature(),
+                    act.taking(),
                     TakenRow {
                         taken,
                         carried_in: statement.number,
