@@ -2204,3 +2204,33 @@ fn shared_move_checks_again_after_its_yes() {
     );
     assert_eq!(row(&s, 1, &channel).state, State::Held);
 }
+
+/// The status names no device for a channel first held after a removal
+/// (issue #279, its first part): the laptop removes the tablet, holding no
+/// shared channel; an hour on it files one, which is not clean, and the
+/// status's `removed_device_holds` lists it with no device.
+#[test]
+fn the_status_names_no_device_for_a_channel_first_held_after_a_removal() {
+    let mut s = bob(3);
+    s.meet(&[0, 1, 2]);
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + HOUR_SECS;
+    let channel = holds(&s, 0, 9, "later", now);
+    assert!(is_not_clean(&s[0].conn, &channel.id).unwrap());
+    let own = relays();
+    let said = crate::state::SharedSaid::default();
+    let beside = crate::shared_status::Beside {
+        own_relays: &own,
+        connected: &[AT],
+        said: &said,
+    };
+    let shared = crate::shared_status::status_of(&s[0].conn, &s[0].identity, &beside, now)
+        .unwrap()
+        .unwrap();
+    let groups = shared["removed_device_holds"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(groups[0]["channels"], serde_json::json!(["later"]));
+    assert_eq!(groups[0]["device"], "");
+}
+
+const HOUR_SECS: i64 = 3600;

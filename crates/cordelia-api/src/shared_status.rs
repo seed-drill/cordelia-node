@@ -122,9 +122,6 @@ pub fn status_of(
             ),
             _ => format!("({})", fingerprint::shown(key)),
         };
-        // Every key removed so far, on any branch, where none is kept of
-        // the removal of a mark's time.
-        let every_removed = crate::person::removed_known(conn, &held.statement.statement)?;
         let mut by_since: BTreeMap<i64, Vec<String>> = BTreeMap::new();
         for mark in st(anew_rows::not_clean_all(conn))? {
             if !shared_anew::is_not_clean(conn, &mark.channel)? {
@@ -135,11 +132,12 @@ pub fn status_of(
             }
         }
         // Each group names the keys that the removal of its time removed,
-        // and the statement before it did not.
+        // and the statement before it did not. A group of channels first
+        // held after a removal, marked at no removal's time, names no
+        // device: none of them was held by a removed device (issue #279).
         let mut removed_device_holds: Vec<Value> = Vec::new();
         for (since, channels) in by_since {
-            let removed =
-                shared_anew::removed_at(conn, since)?.unwrap_or_else(|| every_removed.clone());
+            let removed = shared_anew::removed_at(conn, since)?.unwrap_or_default();
             let device: Vec<String> = removed.iter().map(named).collect();
             removed_device_holds.push(json!({
                 "device": device.join(", "),
