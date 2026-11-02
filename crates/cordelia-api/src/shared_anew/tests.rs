@@ -1680,6 +1680,153 @@ fn a_channel_first_held_while_a_removal_is_known_is_not_clean() {
     assert!(writes_there(&s[0].conn, &s[0].identity, &row(&s, 0, &newer)).unwrap());
 }
 
+// ── The person's ruling of 2 November: made anew once, no exemptions ─
+
+/// A channel moved to before a removal is not clean on a device that
+/// first holds it after one (the short review of #277, its high): the
+/// laptop makes "notes" anew before the removal, and the tablet holds the
+/// new channel; the desktop removes the tablet, and nobody makes "notes"
+/// anew. The laptop holds it not clean, and so does the phone, which
+/// follows the lists for the first time after the removal.
+#[test]
+fn a_channel_moved_to_before_a_removal_is_not_clean_where_it_is_first_held() {
+    let mut s = bob(4);
+    let now = s.now + 10;
+    holds(&s, 0, 9, "notes", now);
+    let new = made_anew_on(&s, 0, "notes", now);
+    follows(&mut s, 0, 2, now);
+    assert_eq!(row(&s, 2, &new).state, State::Held, "the tablet holds it");
+
+    s.change(1, &[0, 1, 3], &[2]);
+    let now = s.now + 20;
+    follows(&mut s, 1, 0, now);
+    assert!(is_not_clean(&s[0].conn, &new.id).unwrap(), "rule 23");
+    follows(&mut s, 0, 3, now);
+    let phone = row(&s, 3, &new);
+    assert_eq!(phone.state, State::Held);
+    assert!(
+        is_not_clean(&s[3].conn, &new.id).unwrap(),
+        "moved, but before"
+    );
+    assert!(!writes_there(&s[3].conn, &s[3].identity, &phone).unwrap());
+}
+
+/// A channel taken again after a removal is not clean (the short review
+/// of #277, its medium): the laptop holds "notes" when the desktop removes
+/// the tablet, makes it anew and moves from it; someone else stays in the
+/// old channel and shares it again, and the laptop's filing of it, as a
+/// take files it, is its own. It is not clean, and nothing is sent there.
+#[test]
+fn a_channel_taken_again_after_a_removal_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let old = holds(&s, 0, 9, "notes", now);
+    s.change(1, &[0, 1], &[2]);
+    follows(&mut s, 1, 0, now);
+    let new = made_anew_on(&s, 0, "notes", now);
+    assert!(!is_not_clean(&s[0].conn, &new.id).unwrap());
+    assert_eq!(row(&s, 0, &old).state, State::Moved);
+
+    let mut again = filing(9, "notes-again");
+    again.came = Came::Taken(member(1).public_key());
+    acts(&s, 0, Do::File(again), now + 1);
+    let laptop = row(&s, 0, &old);
+    assert_eq!(laptop.state, State::Held);
+    assert!(is_not_clean(&s[0].conn, &old.id).unwrap(), "taken again");
+    assert!(!writes_there(&s[0].conn, &s[0].identity, &laptop).unwrap());
+}
+
+/// A channel made anew by a device that had not heard of the removal is
+/// not clean on the devices that follow it (the gap the first fix round of
+/// #277 stated): the desktop removes the tablet and makes nothing anew;
+/// the laptop, not knowing, makes "notes" anew under the change before,
+/// which the tablet reads. The desktop held "notes" when it applied the
+/// removal, so the channel made anew out of it is not clean there; nor on
+/// the laptop, once it hears.
+#[test]
+fn a_channel_made_anew_by_a_device_that_had_not_heard_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    holds(&s, 0, 9, "notes", now);
+    s.meet(&[0, 1, 2]);
+    for n in 1..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+    }
+    s.change(1, &[0, 1], &[2]);
+    let new = made_anew_on(&s, 0, "notes", now);
+    follows(&mut s, 0, 2, now);
+    assert_eq!(row(&s, 2, &new).state, State::Held, "the tablet holds it");
+
+    let now = s.now + 20;
+    follows(&mut s, 1, 0, now);
+    assert!(is_not_clean(&s[0].conn, &new.id).unwrap(), "rule 23");
+    follows(&mut s, 0, 1, now);
+    let desktop = row(&s, 1, &new);
+    assert_eq!(desktop.state, State::Held);
+    assert!(
+        is_not_clean(&s[1].conn, &new.id).unwrap(),
+        "made by one not knowing"
+    );
+    assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
+}
+
+/// `shared anew` after a removal makes a channel clean on the devices that
+/// hold clean the channel it was made out of, and on no other: the
+/// desktop removes the tablet, and makes "notes" anew as a removal does;
+/// it is clean on the desktop and not on the laptop or the phone. The
+/// laptop makes it anew: the desktop holds that clean, and the phone, on
+/// which the one before was not clean, does not, until it makes it anew
+/// itself; then all three hold it clean.
+#[test]
+fn shared_anew_after_a_removal_is_clean_where_the_one_before_was() {
+    let mut s = bob(4);
+    let now = s.now + 10;
+    let old = holds(&s, 0, 9, "notes", now);
+    s.meet(&[0, 1, 2, 3]);
+    for n in 1..4 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        assert_eq!(row(&s, n, &old).state, State::Held);
+    }
+    s.change(1, &[0, 1, 3], &[2]);
+    let said = anew_at_removal(&s[1].conn, &s[1].identity, &relays(), now).unwrap();
+    assert_eq!(said.len(), 1, "{said:?}");
+    out(&s, 1, now);
+    let first = filed_as(&s, 1, "notes");
+    assert!(
+        !is_not_clean(&s[1].conn, &first.id).unwrap(),
+        "made at the removal"
+    );
+    for n in [0, 3] {
+        follows(&mut s, 1, n, now);
+        assert_eq!(row(&s, n, &first).state, State::Held);
+        assert!(is_not_clean(&s[n].conn, &first.id).unwrap(), "device {n}");
+    }
+
+    let second = made_anew_on(&s, 0, "notes", now);
+    for n in [1, 3] {
+        follows(&mut s, 0, n, now);
+        assert_eq!(row(&s, n, &second).state, State::Held);
+    }
+    assert!(
+        !is_not_clean(&s[1].conn, &second.id).unwrap(),
+        "the desktop"
+    );
+    assert!(is_not_clean(&s[3].conn, &second.id).unwrap(), "the phone");
+
+    let third = made_anew_on(&s, 3, "notes", now);
+    for n in [0, 1] {
+        follows(&mut s, 3, n, now);
+    }
+    for n in [0, 1, 3] {
+        let held = row(&s, n, &third);
+        assert_eq!(held.state, State::Held, "device {n}");
+        assert!(
+            writes_there(&s[n].conn, &s[n].identity, &held).unwrap(),
+            "device {n}"
+        );
+    }
+}
+
 /// A recovery takes by the person's word the acts of the devices the
 /// person named at the terminal alone, and seals without every key it
 /// removes (the review of #277, high 2; decision 2026-10-24 (removal),
