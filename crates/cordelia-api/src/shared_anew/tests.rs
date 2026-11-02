@@ -1770,6 +1770,40 @@ fn a_channel_made_anew_by_a_device_that_had_not_heard_is_not_clean() {
     assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
 }
 
+/// A second channel made anew out of one this device moved from is not
+/// clean, though the mark of the one moved from is gone: the desktop
+/// removes the tablet and makes "notes" anew itself; the laptop, not
+/// knowing, makes "notes" anew too, under the change before, which the
+/// tablet reads. The desktop then holds the laptop's channel, and holds it
+/// not clean.
+#[test]
+fn a_second_channel_made_anew_out_of_one_moved_from_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let old = holds(&s, 0, 9, "notes", now);
+    s.meet(&[0, 1, 2]);
+    for n in 1..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+    }
+    s.change(1, &[0, 1], &[2]);
+    let desktops = made_anew_on(&s, 1, "notes", now);
+    assert_eq!(row(&s, 1, &old).state, State::Moved);
+    assert!(!is_not_clean(&s[1].conn, &desktops.id).unwrap());
+    let laptops = made_anew_on(&s, 0, "notes", now);
+    assert_ne!(laptops.id, desktops.id);
+
+    let now = s.now + 20;
+    follows(&mut s, 1, 0, now);
+    follows(&mut s, 0, 1, now);
+    let desktop = row(&s, 1, &laptops);
+    assert_eq!(desktop.state, State::Held, "the desktop holds it");
+    assert!(
+        is_not_clean(&s[1].conn, &laptops.id).unwrap(),
+        "made out of one moved from"
+    );
+    assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
+}
+
 /// `shared anew` after a removal makes a channel clean on the devices that
 /// hold clean the channel it was made out of, and on no other: the
 /// desktop removes the tablet, and makes "notes" anew as a removal does;
