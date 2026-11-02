@@ -391,7 +391,10 @@ pub fn not_clean_all(conn: &Connection) -> Result<Vec<NotClean>, CordeliaError> 
 
 /// The removal on this device left `channel` not clean, since it does not
 /// reach its relays (decision 2026-10-24, rule 24): it is made anew on a
-/// device that does.
+/// device that does. Nothing sets it back while the mark stands, not a
+/// later removal nor the relays reached since: it says only which line
+/// names the channel, never whether anything is written there (the review
+/// of #281, low 12).
 pub fn unreached(conn: &Connection, channel: &[u8; 32]) -> Result<(), CordeliaError> {
     conn.execute(
         "UPDATE shared_anew_not_clean SET unreached = 1 WHERE channel = ?1",
