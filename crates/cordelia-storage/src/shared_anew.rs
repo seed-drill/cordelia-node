@@ -12,8 +12,9 @@
 //!   channel's entries wait for the offer to be at each relay of its card.
 //! - **The channels not yet clean** (`shared_anew_not_clean`): each shared
 //!   channel this device held when it applied a statement that removed a
-//!   key, with when; and whether this device owes the channel its making
-//!   anew itself, once it has read it (a recovery).
+//!   key, or came to hold after one, with when; and whether this device
+//!   owes the channel its making anew itself, once it has read it (a
+//!   recovery).
 //!
 //! Nothing here judges an offer: that is done where these are read
 //! (`cordelia_api::shared_anew`). Every time here is the node's.
@@ -322,7 +323,7 @@ pub fn forget_made(conn: &Connection, channel: &[u8; 32]) -> Result<(), Cordelia
 pub struct NotClean {
     pub channel: [u8; 32],
     /// When this device applied the statement that removed a key that held
-    /// it.
+    /// it, or came to hold it after a removal.
     pub since: i64,
     /// Whether this device makes it anew itself once it has read it: the
     /// machine of a recovery (decision 2026-10-10 §3.5).

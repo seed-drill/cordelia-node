@@ -348,8 +348,9 @@ pub fn pause_of(
 
 /// Whether the shared channel `channel` is not yet clean (decision
 /// 2026-10-24, rules 23 and 25): this device held it when it applied a
-/// statement that removed a key, and still holds it, not made anew and
-/// moved from, or dropped.
+/// statement that removed a key, or came to hold it after one and did not
+/// make it anew itself, and still holds it, not made anew and moved from,
+/// or dropped.
 pub fn is_not_clean(conn: &Connection, channel: &[u8; 32]) -> Result<bool, PersonError> {
     if st(rows::not_clean_of(conn, channel))?.is_none() {
         return Ok(false);
