@@ -865,6 +865,9 @@ pub fn share_plan(
             ),
         );
     }
+    if let Some(refusal) = not_written_there(conn, identity, &filing.channel, name)? {
+        return Err(Failed::Refused(refusal));
+    }
     let shown = crate::shared::shown_keys(conn, &filing.channel)?;
     if shown.len() >= SHARED_MAX_KEYS && !shown.contains(&key) {
         return refused(
@@ -905,6 +908,40 @@ pub fn share_plan(
         asks,
         what: ShareTo { filing, key },
     })
+}
+
+/// Why `share` hands nothing of the channel `channel`, named `name`: it is
+/// not yet clean on this device, or paused by an offer (§5.5; decision
+/// 2026-10-24, rules 23, 25 and 26). A removed key may read it, and a
+/// person who took it would write there without knowing of the removal.
+fn not_written_there(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    channel: &[u8; 32],
+    name: &str,
+) -> Result<Option<Refusal>, PersonError> {
+    if crate::shared_anew::is_not_clean(conn, channel)? {
+        return Ok(Some(Refusal {
+            word: "not_clean",
+            line: crate::shared_anew::not_clean_line(name),
+        }));
+    }
+    let Some(row) = kept::channel(conn, channel).map_err(PersonError::Storage)? else {
+        return Ok(None);
+    };
+    if crate::shared_anew::pause_of(conn, identity, &row)?.is_some() {
+        let word = crate::shared_routes::shell_word(name);
+        return Ok(Some(Refusal {
+            word: "paused",
+            line: format!(
+                "\"{}\" was made anew without some keys, so your devices send nothing more \
+                 there and share it with no one: move with cordelia shared move {word}, or go \
+                 on there with cordelia shared stay {word} (at a terminal).",
+                crate::messages::cleaned(name)
+            ),
+        }));
+    }
+    Ok(None)
 }
 
 /// The revision of an entry this device writes in `slot` of the share pair
@@ -977,7 +1014,12 @@ pub fn make_share(
     let (pair, secret) =
         share_pair(identity, &to.key).ok_or_else(|| PersonError::Held("no share pair".into()))?;
     let channel = to.filing.channel;
-    in_one(conn, || {
+    let refusal = in_one(conn, || {
+        // Checked again where it is written: a removal or an offer may
+        // have come since the plan.
+        if let Some(refusal) = not_written_there(conn, identity, &channel, &to.filing.name)? {
+            return Ok(Some(refusal));
+        }
         for other in rows::shares(conn)? {
             if other.key == to.key && other.channel != channel && !other.gone {
                 write_over(conn, identity, &other, now)?;
@@ -1014,8 +1056,11 @@ pub fn make_share(
                 gone: false,
             },
         )?;
-        Ok(())
+        Ok(None)
     })?;
+    if let Some(refusal) = refusal {
+        return Err(Failed::Refused(refusal));
+    }
     let at: Vec<String> = to
         .filing
         .card
@@ -1321,7 +1366,10 @@ pub type ShareToPush = ([u8; 32], [u8; 32], CheckedEntry);
 /// What waits to be pushed to the relay whose key is `relay` of the shares
 /// this device wrote (§3.1, §8.4): each share, or the delete written over
 /// it, whose card names that relay, at a revision the relay has not
-/// answered. A share is left at its card's relays and nowhere else.
+/// answered. A share is left at its card's relays and nowhere else. A
+/// share of a channel this device does not write in (not held, not yet
+/// clean, or paused: decision 2026-10-24, rules 23, 25 and 26) waits and
+/// is not sent; the delete written over a share always is.
 pub fn shares_to_push(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -1338,6 +1386,9 @@ pub fn shares_to_push(
         let Some((pair, secret)) = share_pair(identity, &row.key) else {
             continue;
         };
+        if !row.gone && !writes_there_now(conn, identity, &row.channel)? {
+            continue;
+        }
         let slot = slot_id(&derive::slot_key(&secret)?, &share_name(&row.channel));
         let Some(held) = entries::author_entry(conn, &pair, &slot, &own)? else {
             continue;
@@ -1351,6 +1402,19 @@ pub fn shares_to_push(
         }
     }
     Ok(waiting)
+}
+
+/// Whether this device writes in the shared channel `channel` now
+/// ([`crate::shared_anew::writes_there`]); not where it holds it no more.
+fn writes_there_now(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    channel: &[u8; 32],
+) -> Result<bool, PersonError> {
+    match kept::channel(conn, channel).map_err(PersonError::Storage)? {
+        Some(row) => crate::shared_anew::writes_there(conn, identity, &row),
+        None => Ok(false),
+    }
 }
 
 /// The relay whose key is `relay` answered a push of the share of `key` and

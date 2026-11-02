@@ -1976,3 +1976,98 @@ fn an_act_taken_on_a_clock_stepped_back_is_taken_no_earlier_than_the_last() {
         .unwrap();
     assert_eq!(own.taken.taken_at, newest, "not {back}");
 }
+
+// ── The review of #281 ───────────────────────────────────────────────
+
+/// What `share` says of the channel named `name` on device `n` for Alice:
+/// the word of its refusal, or "ok".
+fn share_word(s: &Several, n: usize, name: &str, now: i64) -> &'static str {
+    let alice = encode_public_key(&member(1).public_key()).unwrap();
+    match sharing::share_plan(
+        &s[n].conn,
+        &s[n].identity,
+        &relays(),
+        name,
+        &alice,
+        None,
+        now,
+    ) {
+        Ok(_) => "ok",
+        Err(Failed::Refused(refusal)) => refusal.word,
+        Err(Failed::Error(e)) => panic!("{e}"),
+    }
+}
+
+/// `share` hands out no channel a removed key may read (the review of
+/// #281, high 2; §5.5): after the laptop removes the tablet, the desktop
+/// refuses to share "review" (`not_clean`), a share planned before the
+/// removal and made after it is refused where it is written, and a share
+/// made before the removal that waits to be sent is not sent. Once the
+/// desktop makes the channel anew, the new one is shared.
+#[test]
+fn share_hands_out_no_channel_that_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    // Before the removal, the desktop makes a share, and plans another.
+    let alice = encode_public_key(&member(1).public_key()).unwrap();
+    let (conn, identity) = (&s[1].conn, &s[1].identity);
+    let to = sharing::share_plan(conn, identity, &relays(), "review", &alice, None, now).unwrap();
+    sharing::make_share(conn, identity, &relays(), &to.what, now).unwrap();
+    assert_eq!(sharing::shares_to_push(conn, identity, &AT).unwrap().len(), 1);
+    let carol = encode_public_key(&member(2).public_key()).unwrap();
+    let later =
+        sharing::share_plan(conn, identity, &relays(), "review", &carol, None, now).unwrap();
+
+    s.change(0, &[0, 1], &[2]);
+    s.pass(0, 1);
+    let now = s.now + 20;
+    let (conn, identity) = (&s[1].conn, &s[1].identity);
+    assert_eq!(share_word(&s, 1, "review", now), "not_clean");
+    assert_eq!(
+        refusal_word(sharing::make_share(conn, identity, &relays(), &later.what, now)),
+        "not_clean"
+    );
+    assert!(
+        sharing::shares_to_push(conn, identity, &AT)
+            .unwrap()
+            .is_empty()
+    );
+    // Made anew here, the new channel is shared.
+    made_anew_on(&s, 1, "review", now);
+    assert_eq!(share_word(&s, 1, "review", now), "ok");
+}
+
+/// `share` hands out no channel paused by an offer (the review of #281,
+/// high 2; §5.5): Alice makes "review" anew without Carol, sealed to Bob;
+/// Bob's device refuses to share it (`paused`) until he stays.
+#[test]
+fn share_hands_out_no_channel_that_is_paused() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    assert_eq!(share_word(&s, 0, "review", now), "ok");
+    stores(
+        &s,
+        0,
+        &offer_by(
+            &alice,
+            &channel,
+            21,
+            &[alice.public_key(), s.key(0)],
+            now,
+            2,
+        ),
+        now,
+    );
+    assert_eq!(share_word(&s, 0, "review", now), "paused");
+    make_stay(&s[0].conn, &channel.id, "review").unwrap();
+    assert_eq!(share_word(&s, 0, "review", now), "ok");
+}
