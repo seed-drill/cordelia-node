@@ -233,8 +233,8 @@ fn an_offer_leaves_out_or_is_a_fault_by_its_seals_and_your_statement_alone() {
     assert_eq!(refusal_word(refused), "no_offer");
 
     // Sealed to the desktop and not the laptop: on the laptop, run it
-    // there.
-    let second = holds(&s, 0, 10, "second", now);
+    // there. Made here after the removal, so clean here (rule 23).
+    let second = made_new(&s, 0, "second", now);
     written_by(&s, 0, &second, &[&alice], now);
     stores(
         &s,
@@ -942,6 +942,46 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
 // ── The fix round of slice 8 ─────────────────────────────────────────
 
 /// The channel that device `n` files as `name` now, as a `Shared`.
+/// Device `n` makes the shared channel `name` with `shared new`, at the
+/// relay of these tests.
+fn made_new(s: &Several, n: usize, name: &str, now: i64) -> Shared {
+    let new = sharing::New {
+        name: name.into(),
+        relays: relays(),
+    };
+    sharing::make_new(&s[n].conn, &s[n].identity, &new, now).unwrap();
+    filed_as(s, n, name)
+}
+
+/// Device `n` makes the channel filed as `name` anew with `shared anew`,
+/// keeping every key it is asked about, and returns the new channel.
+fn made_anew_on(s: &Several, n: usize, name: &str, now: i64) -> Shared {
+    let (conn, identity) = (&s[n].conn, &s[n].identity);
+    let listed = asked_of(conn, identity, name, now);
+    let (_, plan) = anew_plan(
+        conn,
+        identity,
+        &relays(),
+        name,
+        None,
+        &[],
+        Some((&[], &listed)),
+        now,
+    )
+    .unwrap();
+    make_anew(conn, identity, &relays(), &plan.unwrap().what, now).unwrap();
+    out(s, n, now);
+    filed_as(s, n, name)
+}
+
+/// Device `to` is given what device `from` holds, follows the lists and
+/// ends the take-outs it began, at `now`.
+fn follows(s: &mut Several, from: usize, to: usize, now: i64) {
+    s.pass(from, to);
+    crate::lists::follow(&s[to].conn, &s[to].identity, now).unwrap();
+    out(s, to, now);
+}
+
 fn filed_as(s: &Several, n: usize, name: &str) -> Shared {
     let filing = sharing::filed(&s[n].conn)
         .unwrap()
@@ -1573,13 +1613,16 @@ fn a_removal_known_before_it_is_applied_makes_each_shared_channel_not_clean() {
 // ── The fix round of the removal build, joined (#277) ────────────────
 
 /// A channel that a device first holds while it knows of a removal is not
-/// clean (the review of #277, high 1; decision 2026-10-24, rule 23): the
-/// desktop removes the tablet; before the laptop hears of it, the laptop
-/// files "notes" under the change before, which the tablet reads and
-/// holds; the laptop applies the removal, and the desktop then reads the
-/// laptop's list. The desktop holds "notes" not clean, and sends nothing
-/// there. A channel the desktop files itself is clean, and so is "notes"
-/// once the laptop makes it anew.
+/// clean (the review of #277, high 1; decision 2026-10-24, rule 23, as the
+/// person ruled on 2 November): the desktop removes the tablet; before the
+/// laptop hears of it, the laptop files "notes" under the change before,
+/// which the tablet reads and holds; the laptop applies the removal, and
+/// the desktop then reads the laptop's list. The desktop holds "notes" not
+/// clean, and sends nothing there. A channel the desktop files itself is
+/// not clean either; one it makes with `shared new` is. The laptop makes
+/// "notes" anew: the new channel is clean on the laptop and not on the
+/// desktop, where "notes" was not; once the desktop makes it anew too, it
+/// is clean on both.
 #[test]
 fn a_channel_first_held_while_a_removal_is_known_is_not_clean() {
     let mut s = bob(3);
@@ -1600,44 +1643,41 @@ fn a_channel_first_held_while_a_removal_is_known_is_not_clean() {
     crate::lists::follow(&s[0].conn, &s[0].identity, now).unwrap();
     out(&s, 0, now);
     assert!(is_not_clean(&s[0].conn, &channel.id).unwrap(), "rule 23");
-    s.pass(0, 1);
-    crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
-    out(&s, 1, now);
+    follows(&mut s, 0, 1, now);
     let desktop = row(&s, 1, &channel);
     assert_eq!(desktop.state, State::Held);
     assert!(is_not_clean(&s[1].conn, &channel.id).unwrap(), "rule 23");
     assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
 
-    // A channel the desktop files itself, knowing, is clean.
+    // A channel the desktop files itself is not clean: its own filing
+    // shows nothing of where the card was before. One it makes is.
     let own = holds(&s, 1, 11, "own", now);
-    assert!(!is_not_clean(&s[1].conn, &own.id).unwrap());
+    assert!(is_not_clean(&s[1].conn, &own.id).unwrap(), "own filing");
+    let made = made_new(&s, 1, "made", now);
+    assert!(!is_not_clean(&s[1].conn, &made.id).unwrap(), "made here");
 
-    // The laptop makes "notes" anew; the desktop follows, and the new
-    // channel is clean.
-    let (conn, identity) = (&s[0].conn, &s[0].identity);
-    let listed = asked_of(conn, identity, "notes", now);
-    let (_, plan) = anew_plan(
-        conn,
-        identity,
-        &relays(),
-        "notes",
-        None,
-        &[],
-        Some((&[], &listed)),
-        now,
-    )
-    .unwrap();
-    make_anew(conn, identity, &relays(), &plan.unwrap().what, now).unwrap();
-    let new = filed_as(&s, 0, "notes");
-    s.pass(0, 1);
-    crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
-    out(&s, 1, now);
+    // The laptop makes "notes" anew: clean there, and not on the desktop.
+    let new = made_anew_on(&s, 0, "notes", now);
+    assert!(
+        !is_not_clean(&s[0].conn, &new.id).unwrap(),
+        "made anew here"
+    );
+    follows(&mut s, 0, 1, now);
     assert_eq!(row(&s, 1, &new).state, State::Held);
-    assert!(!is_not_clean(&s[1].conn, &new.id).unwrap());
+    assert!(is_not_clean(&s[1].conn, &new.id).unwrap(), "made elsewhere");
     assert!(
         !is_not_clean(&s[1].conn, &channel.id).unwrap(),
         "moved from"
     );
+
+    // The desktop makes it anew: clean there, and on the laptop, where the
+    // channel it was made out of is clean.
+    let newer = made_anew_on(&s, 1, "notes", now);
+    assert!(!is_not_clean(&s[1].conn, &newer.id).unwrap());
+    follows(&mut s, 1, 0, now);
+    assert_eq!(row(&s, 0, &newer).state, State::Held);
+    assert!(!is_not_clean(&s[0].conn, &newer.id).unwrap());
+    assert!(writes_there(&s[0].conn, &s[0].identity, &row(&s, 0, &newer)).unwrap());
 }
 
 /// A recovery takes by the person's word the acts of the devices the

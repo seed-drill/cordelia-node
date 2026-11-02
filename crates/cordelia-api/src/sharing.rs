@@ -790,6 +790,10 @@ pub fn make_new(conn: &Connection, identity: &NodeIdentity, new: &New, now: i64)
         if let Err(failed) = act(conn, identity, &held, Do::File(filing.clone()), now) {
             return Ok(Err(failed));
         }
+        // A seed made here is clean here, whatever removal this device
+        // knows (decision 2026-10-24, rule 23); on the person's other
+        // devices it is not, until each makes it anew.
+        cordelia_storage::shared_anew::clean(conn, &channel)?;
         write_empty_anew_records(conn, identity, now)?;
         Ok(Ok(()))
     })??;

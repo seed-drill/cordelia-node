@@ -810,6 +810,10 @@ fn make_anew_of(
             }
         }
         st(rows::clean(conn, &row.channel))?;
+        // Made anew here, by a device that knows of every removal it
+        // knows: the new seed is sealed to none of its removed keys, and
+        // its card is in a list none of them reads (rule 23).
+        st(rows::clean(conn, &new))?;
         sharing::write_empty_anew_records(conn, identity, now)?;
         Ok(())
     });
@@ -2312,12 +2316,14 @@ pub(crate) fn made_anew_past_a_bound(
     Ok(found)
 }
 
-/// The line of a channel not yet clean (decision 2026-10-24, rule 25).
+/// The line of a channel not yet clean (decision 2026-10-24, rules 23 and
+/// 25): true of every such channel, whether a removed device held it or
+/// it came to be held after the removal.
 pub fn not_clean_line(name: &str) -> String {
     let word = crate::shared_routes::shell_word(name);
     format!(
-        "\"{}\" was held by a device that was removed: make it anew with cordelia shared anew \
-         {word}",
+        "\"{}\" is not clean: after a removal, each shared channel is made anew once on this \
+         device before it sends there. Run cordelia shared anew {word}",
         crate::messages::cleaned(name)
     )
 }
