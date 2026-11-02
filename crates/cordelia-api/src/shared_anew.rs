@@ -196,7 +196,7 @@ impl Judged {
 /// The channels the person holds, or held and dropped while the drop is
 /// kept, as the list this device last wrote says (§3.4), with those a
 /// bound left out where `worked_out` gives them.
-fn held_or_dropped(
+pub(crate) fn held_or_dropped(
     conn: &Connection,
     worked_out: Option<(&[u8; 32], i64)>,
 ) -> Result<Vec<[u8; 32]>, PersonError> {

@@ -1312,6 +1312,14 @@ pub fn take_share(
             );
             return keep("already_held", line);
         }
+        // A channel the person dropped or moved from, while the lists keep
+        // its drop, is not taken back, as `shared move` refuses it (the
+        // review of #281, low 2): a key left out of it could share it again.
+        if crate::shared_anew::held_or_dropped(conn, None)?.contains(&channel) {
+            let line = "Your devices dropped this channel, or moved from it: nothing was taken."
+                .to_string();
+            return keep("already_held", line);
+        }
         if filings.len() >= SHARED_MAX_CHANNELS {
             return keep("too_many_channels", TOO_MANY_CHANNELS.into());
         }

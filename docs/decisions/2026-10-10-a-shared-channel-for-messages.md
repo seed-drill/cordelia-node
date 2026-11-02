@@ -205,7 +205,7 @@ It refuses a key that is one of the person's own devices, and a key that the per
 6. it is for this device's key;
 7. Not used.
 8. the ID worked out from the card is the `<ID>` of its name;
-9. this person does not already hold that channel, and holds fewer than 16 channels (`SHARED_MAX_CHANNELS`, 3.4);
+9. this person does not already hold that channel, nor dropped or moved from it while the lists keep its drop, and holds fewer than 16 channels (`SHARED_MAX_CHANNELS`, 3.4);
 10. the device stands applied, under the person's latest statement it has seen, with sync on;
 11. every relay of the card is one of the device's own, by key (8.2). This is what keeps a taker at its own relays: a card can name no other.
 
@@ -582,6 +582,7 @@ An argument that the command line does not take is refused by the parser with ex
 | `label` | A label of more than 64 bytes, or of which nothing is left once cleaned | `bad_label` | err, 1 | `A label is 1 to 64 bytes of text.` |
 | `accept --channel` | Nothing taken within its wait | (none) | out, 0 | `Nothing was taken yet. This device goes on asking until <time>: cordelia shared list says what became of it.` |
 | `accept --channel` (or later, `shared list`) | The share is of a channel the person holds already (3.2, rule 9) | `already_held` | err, 1 | `Your devices hold this channel already, as "<name>": nothing was taken.` |
+| `accept --channel` (or later, `shared list`) | The share is of a channel the person dropped or moved from, while the lists keep its drop (3.2, rule 9; as `shared move` refuses it; the review of #281, low 2) | `already_held` | err, 1 | `Your devices dropped this channel, or moved from it: nothing was taken.` |
 | `accept --channel` (or later, `shared list`) | More than one share from the typed key | `more_than_one_share` | err, 1 | `<sender form> has <n> shares waiting for this device: nothing was taken. Ask them to share the one channel again, which takes back the others, and run cordelia accept again.` |
 | `label` | 64 labels held | `too_many_labels` | err, 1 | `Your devices hold 64 labels, or removed labels still needed by the lists of <labels of devices>, which is the most: remove a label with cordelia label <key> --none, or have those devices write their lists.` |
 | `subscribe`, `unsubscribe` without `--agent`, `send --channel`, `read --next-shared` | The folder is not mapped | `not_mapped` | err, 1 | The messages record's line |
