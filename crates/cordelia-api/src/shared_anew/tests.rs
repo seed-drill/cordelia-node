@@ -1972,7 +1972,7 @@ fn an_act_taken_on_a_clock_stepped_back_is_taken_no_earlier_than_the_last() {
     let kept = cordelia_storage::shared_lists::taken(&s[1].conn).unwrap();
     let (_, own) = kept
         .iter()
-        .find(|(signature, _)| *signature == made[0].signature())
+        .find(|(taking, _)| *taking == made[0].taking())
         .unwrap();
     assert_eq!(own.taken.taken_at, newest, "not {back}");
 }
