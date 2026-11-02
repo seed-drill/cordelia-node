@@ -64,7 +64,8 @@ use cordelia_crypto::shared::{self as forms, Anew, NotShared, SharedTaken, anew_
 use cordelia_crypto::slots::slot_id;
 use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::meta;
-use cordelia_storage::person::{self as held_rows, State as HeldState};
+use cordelia_storage::person as held_rows;
+use crate::at_relays::Stands;
 use cordelia_storage::shared::{
     self as kept, Came, Channel, ChannelStep, Indexed, Opened, ShownKey, State,
 };
@@ -247,8 +248,14 @@ pub(crate) fn taken_as_shared(
     let Some(held) = held(conn)? else {
         return refused(NotTaken::FollowsNoPhrase);
     };
-    if held.state != HeldState::Applied {
-        return refused(NotTaken::Stopped(held.state));
+    // Where the device stands, as every other door of its own reads it: a
+    // closed device takes nothing (decision 2026-10-24 (removal), rule 10;
+    // the review of #281, low 1).
+    match crate::at_relays::stands(conn)? {
+        Stands::Applied => {}
+        Stands::Closed => return refused(NotTaken::Closed),
+        Stands::Stopped(state) => return refused(NotTaken::Stopped(state)),
+        Stands::NoPhrase => return refused(NotTaken::FollowsNoPhrase),
     }
     if meta::get(conn, meta::SYNC_CLAUDE_DIR)?.is_none() {
         return refused(NotTaken::SyncOff);

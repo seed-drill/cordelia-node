@@ -2141,3 +2141,25 @@ fn a_paused_device_shows_nothing_of_a_key_its_offer_leaves_out() {
         vec![alice.public_key()]
     );
 }
+
+/// A closed device's door takes nothing in a shared channel (the review of
+/// #281, low 1; decision 2026-10-24 (removal), rule 10): the device keeps
+/// a key as removed that holds its change's secret, and Alice's message is
+/// refused as `Closed`, not stored.
+#[test]
+fn a_closed_device_takes_nothing_in_a_shared_channel() {
+    use crate::shared::tests::{given, message};
+    use crate::take::{NotTaken, Taken};
+    let s = bob(3);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let alice = member(1);
+    written_by(&s, 0, &channel, &[&alice], now);
+    let conn = &s[0].conn;
+    cordelia_storage::person::keep_removed(conn, &[s.key(2)], now).unwrap();
+    assert!(!crate::person::follows_a_clear_change(conn).unwrap());
+    assert_eq!(
+        given(&s, 0, &message(&alice, &channel, 1, "hello", now), now),
+        Taken::Refused(NotTaken::Closed)
+    );
+}
