@@ -177,12 +177,12 @@ pub fn subscribe_plan(
     }))
 }
 
-/// How many keys wrote in `channel` as this device holds it, this device
-/// not among them, and how many of them the person labelled, as `shared
-/// list` counts them.
+/// How many keys of other people wrote in `channel` as this device holds
+/// it, and how many of them the person labelled: no device of the person's
+/// own, removed or not, is counted (the review of #281, low 6).
 fn keys_that_wrote(
     conn: &Connection,
-    _held: &crate::person::Held,
+    held: &crate::person::Held,
     own: &[u8; 32],
     channel: &[u8; 32],
 ) -> Result<(usize, usize), PersonError> {
@@ -195,10 +195,13 @@ fn keys_that_wrote(
         .filter(|(act, _)| act.item.label.is_some())
         .map(|(act, _)| act.item.key)
         .collect();
+    let counting = crate::person::who_counts(conn)?;
+    let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     let wrote: Vec<[u8; 32]> = kept::keys(conn, row.id)?
         .into_iter()
         .filter(|key| key.first_held.is_some() && key.key != *own)
         .map(|key| key.key)
+        .filter(|key| !counting.counts(key) && !removed.contains(key))
         .collect();
     let labelled = wrote.iter().filter(|key| labels.contains(key)).count();
     Ok((wrote.len(), labelled))
