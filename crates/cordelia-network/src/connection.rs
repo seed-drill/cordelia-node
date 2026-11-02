@@ -67,8 +67,27 @@ pub enum ConnectionError {
     #[error("peer already connected: {0}")]
     AlreadyConnected(NodeId),
 
-    #[error("{0} connected from a listed relay's address, with another key")]
+    #[error("{0} answered at, or connected from, a configured relay's address, with another key")]
     NotTheRelay(NodeId),
+}
+
+impl ConnectionError {
+    /// Whether a dial ended so by a timeout: QUIC's handshake not done
+    /// within STREAM_TIMEOUT_SECS (or QUIC's own timeout), or Cordelia's
+    /// handshake not done within HANDSHAKE_TIMEOUT_SECS after it. Where
+    /// it is not, the dial was refused, closed or answered wrongly: what
+    /// anyone on the path can cause in one round trip (decision
+    /// 2026-10-24 (removal), section 8).
+    pub fn timed_out(&self) -> bool {
+        use crate::codec::CodecError;
+        use crate::handshake::HandshakeError;
+        match self {
+            Self::Quinn(error) => error == "timed out",
+            Self::Handshake(HandshakeError::Timeout)
+            | Self::Handshake(HandshakeError::Codec(CodecError::Timeout(_))) => true,
+            _ => false,
+        }
+    }
 }
 
 /// Metadata for an active peer connection.
@@ -487,18 +506,26 @@ pub async fn outbound_connect(
         .endpoint
         .connect(addr, "cordelia")
         .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
-    outbound_on(ctx, connecting, addr, false).await
+    outbound_on(ctx, connecting, addr, false, None).await
 }
 
 /// Outbound connect to a relay configured by key, as [`outbound_connect`],
 /// with the transport settings of a connection between relays listed by
 /// key (decision 2026-10-22, memory across connections, rule 12): today's
 /// windows and 64 streams, where any other peer gets a small message's.
-/// Whether the key that answers is the relay's is the caller's question,
-/// as for any dial of a configured relay.
+///
+/// **`keys`: the keys configured at `addr`,** where every relay configured
+/// there has one. Once TLS gives the peer's key, a key that is not among
+/// them closes the connection and ends the dial as [`ConnectionError::NotTheRelay`],
+/// which is no timeout (decision 2026-10-24 (removal), section 8): a host
+/// at a relay's address with another key that then stalls Cordelia's
+/// handshake does not end a wake's wait. Which configured relay a key that
+/// is among them answers for is the caller's question, as for any dial of
+/// a configured relay. `None` asks nothing of the key here.
 pub async fn outbound_connect_to_listed(
     ctx: &ConnectContext,
     addr: SocketAddr,
+    keys: Option<&[[u8; 32]]>,
 ) -> Result<ConnectOutcome, ConnectionError> {
     let connecting = match &ctx.listed {
         Some(listed) => ctx
@@ -507,7 +534,7 @@ pub async fn outbound_connect_to_listed(
         None => ctx.endpoint.connect(addr, "cordelia"),
     }
     .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
-    outbound_on(ctx, connecting, addr, ctx.listed.is_some()).await
+    outbound_on(ctx, connecting, addr, ctx.listed.is_some(), keys).await
 }
 
 async fn outbound_on(
@@ -515,6 +542,7 @@ async fn outbound_on(
     connecting: quinn::Connecting,
     addr: SocketAddr,
     listed_settings: bool,
+    keys: Option<&[[u8; 32]]>,
 ) -> Result<ConnectOutcome, ConnectionError> {
     let conn = tokio::time::timeout(
         Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS),
@@ -527,26 +555,37 @@ async fn outbound_on(
     let peer_node_id = extract_node_id_from_conn(&conn)?;
     let node_id = NodeId(peer_node_id);
 
-    let (mut send, mut recv) = conn
-        .open_bi()
+    if let Some(keys) = keys
+        && !keys.contains(&peer_node_id)
+    {
+        tracing::warn!(peer = %node_id, %addr, "closing a dial of a configured relay that another key answered");
+        conn.close(0u32.into(), CLOSED_AS_NOT_THE_RELAY);
+        return Err(ConnectionError::NotTheRelay(node_id));
+    }
+
+    // The first stream is opened within the handshake's time: a host that
+    // gives no streams, and acknowledges keepalives, would otherwise hold
+    // the dial, and its address, for ever.
+    let handshake_result =
+        tokio::time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT_SECS), async {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
+            let mut stream = tokio::io::join(&mut recv, &mut send);
+            handshake::initiate_handshake(
+                &mut stream,
+                &ctx.public_key,
+                &ctx.channel_ids,
+                &ctx.roles,
+                &peer_node_id,
+                ctx.p2p_port,
+            )
+            .await
+            .map_err(ConnectionError::from)
+        })
         .await
-        .map_err(|e| ConnectionError::Quinn(e.to_string()))?;
-
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-
-    let handshake_result = tokio::time::timeout(
-        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        handshake::initiate_handshake(
-            &mut stream,
-            &ctx.public_key,
-            &ctx.channel_ids,
-            &ctx.roles,
-            &peer_node_id,
-            ctx.p2p_port,
-        ),
-    )
-    .await
-    .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))??;
+        .map_err(|_| ConnectionError::Handshake(handshake::HandshakeError::Timeout))??;
 
     info!(
         peer = %node_id,
@@ -682,6 +721,31 @@ mod tests {
     use super::*;
     use crate::transport;
 
+    /// A dial ends as a timeout only where QUIC's handshake or Cordelia's
+    /// timed out (decision 2026-10-24 (removal), section 8): a refusal,
+    /// another key or an error of TLS is not one, as anyone on the path
+    /// can cause it in one round trip.
+    #[test]
+    fn a_dial_ends_as_a_timeout_only_where_it_timed_out() {
+        use crate::codec::CodecError;
+        use crate::handshake::HandshakeError;
+        assert!(ConnectionError::Quinn("timed out".into()).timed_out());
+        assert!(ConnectionError::Handshake(HandshakeError::Timeout).timed_out());
+        assert!(
+            ConnectionError::Handshake(HandshakeError::Codec(CodecError::Timeout(10))).timed_out()
+        );
+        for not in [
+            ConnectionError::Quinn("the cryptographic handshake failed: error 42".into()),
+            ConnectionError::Quinn("connection refused".into()),
+            ConnectionError::Handshake(HandshakeError::Rejected("no".into())),
+            ConnectionError::Handshake(HandshakeError::IdentityMismatch),
+            ConnectionError::Transport(TransportError::Tls("bad certificate".into())),
+            ConnectionError::NotTheRelay(NodeId([1; 32])),
+        ] {
+            assert!(!not.timed_out(), "{not}");
+        }
+    }
+
     fn make_test_identity() -> Arc<NodeIdentity> {
         Arc::new(NodeIdentity::generate().unwrap())
     }
@@ -723,6 +787,46 @@ mod tests {
         )));
         assert!(!closed_for_another(&quinn::ConnectionError::TimedOut));
         assert!(!closed_for_another(&quinn::ConnectionError::Reset));
+    }
+
+    /// A host that finishes QUIC and gives no streams, while it
+    /// acknowledges keepalives, ends a dial within HANDSHAKE_TIMEOUT_SECS,
+    /// as a timeout (the review of the removal build into main, its low
+    /// 2): the first stream is opened within the handshake's time.
+    #[tokio::test]
+    async fn a_dial_of_a_host_that_gives_no_streams_times_out() {
+        let (id_a, id_b) = (make_test_identity(), make_test_identity());
+        let ep_b = make_endpoint(&id_b);
+        let b_addr = ep_b.local_addr().unwrap();
+        let mut no_streams = transport::server_config(&id_b).unwrap();
+        let mut settings = quinn::TransportConfig::default();
+        settings.max_concurrent_bidi_streams(0u32.into());
+        settings.keep_alive_interval(Some(Duration::from_secs(1)));
+        no_streams.transport_config(Arc::new(settings));
+        let held = tokio::spawn(async move {
+            let incoming = ep_b.accept().await.unwrap();
+            let conn = incoming
+                .accept_with(Arc::new(no_streams))
+                .unwrap()
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            drop(conn);
+        });
+        let mgr_a = ConnectionManager::new(id_a.clone(), make_endpoint(&id_a), vec![], vec![], 0);
+        let began = std::time::Instant::now();
+        let dialled = tokio::time::timeout(
+            Duration::from_secs(HANDSHAKE_TIMEOUT_SECS + 10),
+            outbound_connect(&mgr_a.connect_context(), b_addr),
+        )
+        .await
+        .expect("the dial of a host that gives no streams did not end");
+        match dialled {
+            Err(e) => assert!(e.timed_out(), "{e}"),
+            Ok(outcome) => panic!("the dial connected to {}", outcome.node_id),
+        }
+        assert!(began.elapsed() < Duration::from_secs(HANDSHAKE_TIMEOUT_SECS + 5));
+        held.abort();
     }
 
     #[tokio::test]

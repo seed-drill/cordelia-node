@@ -2,6 +2,8 @@
 
 **Date**: 2026-10-24
 **Status**: Rules 1 to 7 built. Revised once after its review (section 8). **Rules 1 to 7 are built first; rules 8 and 9, and the parts of rule 10 that state them, are held** until the record of a removal that fails safe (`2026-10-24-removal-fails-safe.md`) is settled. The person ruled on 24 October that a removal must fail safe by construction, and that a warning before the phrase is a nicety, not the fix. Under that record a fork can no longer let a removed device back in, so what rule 9 warns of changes; and its narrow check found two high findings in rules 8 and 9 (section 8). They are written again against that record before they are built.
+
+**Under the record of a removal that fails safe, as built** (its section 5, item 35): "in a fork" here is "closed, or keeping a head set aside" (that record's rules 10 and 11). Rule 9's sentence "Until you do, a device that the other change removed may still be listed in this one, and may read what your devices write after it" holds only until each device has read both changes: from then each follows a clear one (its rule 8), and the next change made on a device that has seen both joins them (its rule 21), with no `settle` asked. Rules 8 and 9 are still held, and are written again against that record before they are built.
 **Cited as**: "decision 2026-10-24, rule 3". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:

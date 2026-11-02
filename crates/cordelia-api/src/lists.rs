@@ -82,10 +82,10 @@ pub enum Maker {
 /// took count for nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cut {
-    /// The key is known to be removed by the statement applied alone, and
-    /// no cut time is known: every act this device took counts. **This is
-    /// what the slice answers today,** until the removal record's cut times
-    /// are built (decision 2026-10-10 §20, item 7).
+    /// The key is removed, and no cut is read: every act this device took
+    /// counts. For what reads only which keys are removed ([`holds`]), and
+    /// a recovery's machine, which took no act before; the lists are worked
+    /// out with the cut times ([`ByTheCuts`]).
     StatementAlone,
     /// The cut times of the removal record, rule 2: for each generation
     /// (the number of a statement this device applied) on the chain of a
@@ -100,9 +100,18 @@ pub enum Cut {
     Times(Vec<(u64, Option<i64>)>),
 }
 
+/// The time of taking kept for an act that the person took at a
+/// recovery's terminal, with the phrase ([`write_recovered`]): no cut takes
+/// it back (decision 2026-10-24 (removal), rule 6, "one way in is a
+/// person's"). No clock reads it.
+pub const TAKEN_BY_THE_PERSONS_WORD: i64 = i64::MIN;
+
 impl Cut {
     /// Whether an act this device took as `taken` counts for nothing.
     pub fn cuts(&self, taken: Taken) -> bool {
+        if taken.taken_at == TAKEN_BY_THE_PERSONS_WORD {
+            return false;
+        }
         match self {
             Cut::StatementAlone => false,
             Cut::Times(times) => match times.iter().find(|(g, _)| *g == taken.generation) {
@@ -115,16 +124,16 @@ impl Cut {
 
 /// Which keys this device knows to be removed, and the cut on each: the
 /// interface that the removal record's build fills (decision 2026-10-24,
-/// rule 2, "a table beside `person_change_entries`").
+/// rule 2, "a table beside `person_change_entries`"; [`ByTheCuts`]).
 pub trait Removals {
     /// `None` where `key` is not a removed key; its cut where it is.
     fn removal(&self, key: &[u8; 32]) -> Option<Cut>;
 }
 
-/// Today's answer, from the statement applied alone: each key it lists as
-/// removed, with no cut time ([`Cut::StatementAlone`]). Not yet the
-/// removal record's: its removed keys of every change seen, and their cut
-/// times, are built with that record (decision 2026-10-10 §20, item 7).
+/// Each key of a list as removed, with no cut time ([`Cut::StatementAlone`]):
+/// where nothing is cut, only which keys are removed matters. What
+/// [`holds`] reads, which cuts nothing, with every key the device knows to
+/// be removed; and a recovery's machine, which took no act before.
 pub struct ByTheStatement {
     removed: Vec<[u8; 32]>,
 }
@@ -140,6 +149,46 @@ impl ByTheStatement {
 impl Removals for ByTheStatement {
     fn removal(&self, key: &[u8; 32]) -> Option<Cut> {
         self.removed.contains(key).then_some(Cut::StatementAlone)
+    }
+}
+
+/// The removal record's answer (decision 2026-10-24, rules 2 and 6; the
+/// shared record's property 9 and §20, item 7): every key this device
+/// knows to be removed, on any branch, with its cut ([`Cut::Times`]). The
+/// generations listed for a key are those by number on the chain of every
+/// change it noted that removes the key, and at which it noted no other
+/// change: an act taken in any other generation, a removal of the key,
+/// one made after it or one made apart among them, counts for nothing,
+/// and one taken in a listed generation counts for nothing at or after the
+/// key's cut time. A key it knows no change of removes has every act cut.
+pub struct ByTheCuts {
+    cuts: Vec<([u8; 32], Cut)>,
+}
+
+impl ByTheCuts {
+    pub(crate) fn read(
+        conn: &Connection,
+        statement: &cordelia_crypto::statement::Statement,
+    ) -> Result<Self, PersonError> {
+        let noted = crate::cut::Cuts::read(conn)?;
+        let mut cuts = Vec::new();
+        for key in crate::person::removed_known(conn, statement)? {
+            let times = match noted.act_generations(&key) {
+                Some((at, generations)) => generations.into_iter().map(|g| (g, at)).collect(),
+                None => Vec::new(),
+            };
+            cuts.push((key, Cut::Times(times)));
+        }
+        Ok(Self { cuts })
+    }
+}
+
+impl Removals for ByTheCuts {
+    fn removal(&self, key: &[u8; 32]) -> Option<Cut> {
+        self.cuts
+            .iter()
+            .find(|(removed, _)| removed == key)
+            .map(|(_, cut)| cut.clone())
     }
 }
 
@@ -159,13 +208,26 @@ impl Makers {
         }
     }
 
-    /// The makers where this device stands: today, removed keys by the
-    /// statement alone ([`ByTheStatement`]).
-    fn of(standing: &Standing) -> Self {
-        Self::new(
+    /// The makers where this device stands, for working the lists out:
+    /// every key it knows to be removed, with its cut ([`ByTheCuts`]).
+    fn of(conn: &Connection, standing: &Standing) -> Result<Self, PersonError> {
+        Ok(Self::new(
             standing.counting.clone(),
-            ByTheStatement::of(&standing.held.statement.statement.removed),
-        )
+            ByTheCuts::read(conn, &standing.held.statement.statement)?,
+        ))
+    }
+
+    /// The makers where this device stands, for naming what it holds:
+    /// every key it knows to be removed, with no cut, which naming does not
+    /// read ([`ByTheStatement`]). It reads no change noted.
+    fn named(conn: &Connection, standing: &Standing) -> Result<Self, PersonError> {
+        Ok(Self::new(
+            standing.counting.clone(),
+            ByTheStatement::of(&crate::person::removed_known(
+                conn,
+                &standing.held.statement.statement,
+            )?),
+        ))
     }
 
     /// What `key` is as a maker: `None` where it is neither a device that
@@ -227,12 +289,22 @@ impl Takings {
         }
     }
 
+    /// What is kept, with each act first read now stamped no earlier than
+    /// the newest time of taking kept, as an arrival is (decision
+    /// 2026-10-24 (removal), rule 7): a clock stepped back moves no act
+    /// taken after a cut to before it.
     fn load(conn: &Connection, now: Taken) -> Result<Self, PersonError> {
         let mut takings = Self::now(now);
+        let mut newest = now.taken_at;
         for (signature, row) in kept_rows::taken(conn)? {
+            newest = newest.max(row.taken.taken_at);
             takings.known.insert(signature, row.taken);
             takings.carried_in.insert(signature, row.carried_in);
         }
+        takings.now = Some(Taken {
+            taken_at: newest,
+            ..now
+        });
         Ok(takings)
     }
 
@@ -841,7 +913,7 @@ impl Reading {
         own: &[u8; 32],
         now: i64,
     ) -> Result<Self, PersonError> {
-        let makers = Makers::of(&standing);
+        let makers = Makers::of(conn, &standing)?;
         let lists = lists_read(conn, &standing, own)?;
         let takings = Takings::load(
             conn,
@@ -1020,10 +1092,7 @@ pub fn act(
             .cloned()
             .chain(made.iter().cloned());
         reading.with_own(&own, list_of(own_list));
-        let taken = Taken {
-            generation: reading.standing.number(),
-            taken_at: now,
-        };
+        let taken = reading.takings.now_or_zero();
         for act in &made {
             reading.takings.record(act.signature(), taken);
         }
@@ -1202,9 +1271,11 @@ pub fn follow(conn: &Connection, identity: &NodeIdentity, now: i64) -> Result<bo
         let own = identity.public_key();
         let standing = match Standing::to_write(conn) {
             Ok(standing) => standing,
-            Err(PersonError::FollowsNoPhrase | PersonError::Stopped(_)) => {
+            Err(PersonError::FollowsNoPhrase | PersonError::Stopped(_) | PersonError::NotClear) => {
                 // It writes nothing; the table of shared channels still
-                // follows who counts.
+                // follows who counts. A closed device too (decision
+                // 2026-10-24 (removal), rule 10): who is shown, and the
+                // labels, follow what it knows.
                 crate::shared::keep(conn, &own, now)?;
                 return Ok(false);
             }
@@ -1313,7 +1384,7 @@ pub fn holds(conn: &Connection) -> Result<Holds, PersonError> {
     let Ok(standing) = Standing::of(conn) else {
         return Ok(Holds::default());
     };
-    let makers = Makers::of(&standing);
+    let makers = Makers::named(conn, &standing)?;
     let Some(kept) = kept_rows::kept(conn)? else {
         return Ok(Holds::default());
     };
@@ -1398,7 +1469,38 @@ pub fn write_recovered(
 ) -> Result<(), PersonError> {
     let (written, _) = recovered(lists, |key| gone.contains(key).then_some(Maker::Removed));
     let standing = Standing::to_write(conn)?;
-    write_list(conn, identity, &standing, &acts_of(&written), now)?;
+    let acts = acts_of(&written);
+    write_list(conn, identity, &standing, &acts, now)?;
+    // The person took these at the recovery's terminal, with the phrase,
+    // from the lists of the generation recovered from: a removed device's
+    // acts among them by the person's word, as the look takes what a lost
+    // device wrote (decision 2026-10-24 (removal), rule 6, "one way in is
+    // a person's"). So each is kept as taken by the person's word, in the
+    // generation recovered from, and the cut of the device the recovery
+    // removes does not take them back when this machine works its lists
+    // out: this machine noted no time of that generation, so the cut would
+    // otherwise take back everything of the device's.
+    let statement = &standing.held.statement.statement;
+    let recovered_from = statement.chain.iter().map(|link| link.number).max();
+    if let Some(generation) = recovered_from {
+        let rows: Vec<([u8; 64], TakenRow)> = acts
+            .iter()
+            .map(|act| {
+                let taken = Taken {
+                    generation,
+                    taken_at: TAKEN_BY_THE_PERSONS_WORD,
+                };
+                (
+                    act.signature(),
+                    TakenRow {
+                        taken,
+                        carried_in: statement.number,
+                    },
+                )
+            })
+            .collect();
+        kept_rows::keep_taken(conn, &rows)?;
+    }
     crate::shared::keep(conn, &identity.public_key(), now)?;
     Ok(())
 }

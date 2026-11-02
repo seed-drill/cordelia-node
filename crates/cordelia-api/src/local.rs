@@ -53,8 +53,9 @@ fn refused(e: PersonError) -> ApiError {
             crate::look::WAYS_ON
         )),
         PersonError::Stopped(State::Fork) => ApiError::BadRequest(
-            "two changes were made apart, and this device has seen both: it publishes nothing \
-             until that is settled with the phrase (`cordelia settle`)."
+            "no change that lists this device is clear of a device that was removed: it \
+             publishes nothing until it is shown one, or a change is made with the phrase \
+             (`cordelia devices` says the way on)."
                 .into(),
         ),
         PersonError::Stopped(_) => ApiError::BadRequest(
@@ -173,6 +174,12 @@ fn publish_over(
                 return Err(ApiError::Conflict(
                     "no revision is left under that key until the next change of devices \
                      (`cordelia renew` makes one): nothing was written."
+                        .into(),
+                ));
+            }
+            Published::KeptHere => {
+                return Err(ApiError::Conflict(
+                    "that key is a conflict copy kept on this device alone: nothing was written."
                         .into(),
                 ));
             }

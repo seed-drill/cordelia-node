@@ -146,7 +146,7 @@ The X25519 key is derived on demand and never persisted separately (ecies-envelo
 > |------|-------|-------------|
 > | The device's own key (the Ed25519 seed above) | `identity.key`, 0600 | CRITICAL to the device. It is not the person's identity: a lost device is removed, and a new one added, with no change to the others' keys |
 > | The person secret it has applied, and each one it left in the last 90 days. A machine that recovered also keeps, as secrets it left then, the one of the generation it recovered from and those before it that the change entry gave the phrase: nine at most | The database (`person_secrets`), 0600 | CRITICAL: whoever reads it reads every name of the person's until the next removal |
-> | What it follows: the phrase's public key, the statement key, the ID of the phrase's channel; the statement applied; the latest change entry | The database (`person`, `person_change_entries`) | The statement key lets its holder read every later statement: who the person's devices are, by key and label |
+> | What it follows: the phrase's public key, the statement key, the ID of the phrase's channel; the statement applied; the change entry of the change it follows, and of each head it sets aside (decision 2026-10-24 (removal), rule 1); the keys it knows to be removed | The database (`person`, `person_change_entries`) | The statement key lets its holder read every later statement: who the person's devices are, by key and label |
 > | The recovery phrase | Nowhere on any device. Written down by the person | CRITICAL: a copy reads everything, through every removal, with no sign; without it no device can be removed and nothing recovered |
 >
 > A personal node has no file under `channel-keys/` from its first start on

@@ -247,6 +247,7 @@ pub fn take_at(state: &AppState, version: &str, room: RoomThere, now: Instant) -
                 );
             }
             state.held.set_key_files_in_place(key_files.in_place);
+            judge_kept(state);
             *tries = Tries::default();
             state.held.release();
             true
@@ -269,6 +270,36 @@ pub fn take_at(state: &AppState, version: &str, room: RoomThere, now: Instant) -
             state.held.hold(Held::FirstStart(says));
             false
         }
+    }
+}
+
+/// A device judges the change entries it kept, at its first start on the
+/// version that keeps every head (decision 2026-10-24 (removal), rule 12):
+/// where schema step 22 marked it, it notes the time of each, and a device
+/// in a fork applies rule 8 to the entry it kept apart: it goes on, moves
+/// (rule 9), or stays closed. Once: the mark goes
+/// with the judging. What it came to is said in the log. One that cannot
+/// be judged is said, and judged again at the next first start. A device
+/// in a fork stays closed meanwhile, as a device in a fork is closed; one
+/// in no fork goes on as it was, with the times of its changes not yet
+/// noted (the review of the removal build into main, its low on the
+/// upgrade), so that a cut finds no time and cuts all of a removed key's
+/// in such a generation, which fails safe (rule 2).
+fn judge_kept(state: &AppState) {
+    let judged = {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        crate::person::judge_kept(&db, &state.identity, chrono::Utc::now().timestamp())
+    };
+    match judged {
+        Ok(Some(shown)) => tracing::info!(
+            ?shown,
+            "first start on this version: the change kept apart is judged by what this device knows of removals"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not judge the change entries kept at the first start on this version"
+        ),
     }
 }
 

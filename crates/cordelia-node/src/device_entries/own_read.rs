@@ -290,6 +290,7 @@ impl DeviceEntries {
             link,
             under: *under,
             gated: true,
+            closed: false,
         };
         at.key = Some(link.relay().0);
         // The proof too is within the round's time: where the time goes

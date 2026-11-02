@@ -110,6 +110,38 @@ pub enum Action {
     Merge(String),
     /// Nothing to move; record that both sides agree on this state.
     Record(Agreed),
+    /// A carry left out what the file holds (decision 2026-10-24 (removal),
+    /// rule 7): write the channel's version to the file (`Some`), or remove
+    /// it (`None`), whatever it holds, keeping what it held in local history
+    /// alone; then record it as `agreed`. Nothing is published, and no
+    /// conflict file is made.
+    PutBack {
+        text: Option<String>,
+        agreed: Agreed,
+    },
+}
+
+/// Plan a file that a carry left out (decision 2026-10-24 (removal), rule
+/// 7): the folder takes the channel's version back, whatever its file holds.
+/// `agreed` is the folder's record, which names the version the carry went
+/// back to, or none.
+pub fn put_back(local: Option<&Content>, remote: Option<&Remote>, agreed: &Agreed) -> Vec<Action> {
+    let there = remote.and_then(|r| r.content.as_ref());
+    let record = match remote {
+        Some(r) => r.agreed_with(there.map(|c| c.hash)),
+        None => Agreed {
+            hash: None,
+            ..agreed.clone()
+        },
+    };
+    match (local, there) {
+        (Some(l), Some(c)) if l.hash == c.hash => vec![Action::Record(record)],
+        (None, None) => vec![Action::Record(record)],
+        (_, there) => vec![Action::PutBack {
+            text: there.map(|c| c.text.clone()),
+            agreed: record,
+        }],
+    }
 }
 
 /// Whether the channel's version `r` is known to have been written after

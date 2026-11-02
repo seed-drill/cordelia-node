@@ -55,6 +55,13 @@ pub const SYNC_CLAUDE_ACTIVITY: &str = "sync.claude.activity";
 /// at each statement applied.
 pub const PERSON_NOT_CARRIED: &str = "person.not_carried";
 
+/// How many edits a carry set aside (decision 2026-10-24 (removal), rule
+/// 7), and when the last was: two numbers, the count and then the time in
+/// seconds, and a third, how many of them were not kept, as local history
+/// was off (none where it is not there). What each held is in local
+/// history, where it was on.
+pub const PERSON_EDITS_SET_ASIDE: &str = "person.edits_set_aside";
+
 /// Present where the statement that this device has applied removes a key
 /// that the statement it held before did not (decision 2026-10-04
 /// §10.1), as the device found it at the moment it applied the
@@ -125,6 +132,25 @@ pub const PERSON_NOT_SHOWN: &str = "person.not_shown";
 /// batch handed under one. A word goes from the list once its time has
 /// gone by, and the list goes when the device leaves its phrase.
 pub const PERSON_WORDS_TAKEN: &str = "person.words_taken";
+
+/// `"1"` where a change this device saw would have had it keep more keys
+/// as removed than `MAX_KNOWN_REMOVED` (decision 2026-10-24 (removal),
+/// rule 2): the device is then closed, which fails closed. It goes, with
+/// the removed keys, when the device leaves its phrase.
+pub const PERSON_REMOVED_PAST_BOUND: &str = "person.removed_past_bound";
+
+/// `"1"` where the device is to judge the change entries it kept, at its
+/// first start on the version that keeps every head (decision 2026-10-24
+/// (removal), rule 12): schema step 22 writes it on a device that follows
+/// a phrase, and the node removes it once it has judged them. A device in
+/// a fork then applies rule 8 to the entry it kept apart.
+pub const PERSON_JUDGE_KEPT: &str = "person.judge_kept";
+
+/// JSON array of the moves this device made (decision 2026-10-24
+/// (removal), rule 9), the latest last, up to `MAX_CHANGE_HEADS`: each the
+/// change entry it left, in hex, and what a command that waits after that
+/// change says of the move. It goes when the device leaves its phrase.
+pub const PERSON_MOVED_FROM: &str = "person.moved_from";
 
 /// The mark that the first start on a version that carries no channel of
 /// the older kind is done, with whether the step was made and the version

@@ -409,6 +409,9 @@ struct Found {
     above: Vec<String>,
     /// How many deletes of theirs there are, which are never taken.
     deletes: usize,
+    /// How many the cut leaves out: another removed key wrote them, or
+    /// what they were written over (decision 2026-10-24 (removal), rule 7).
+    cut: usize,
     /// How many the new channel holds already, or holds a higher
     /// revision of.
     held: usize,
@@ -439,6 +442,7 @@ impl Found {
             empty: number("empty"),
             above: files("above"),
             deletes: number("deletes"),
+            cut: number("cut"),
             held: number("held"),
             higher: number("higher"),
             ties: files("ties"),
@@ -500,6 +504,29 @@ impl Found {
                     1 => "1 delete is".to_string(),
                     n => format!("{n} deletes are"),
                 }
+            ));
+        }
+        if self.cut > 0 {
+            lines.push(format!(
+                "  {} out: another removed device wrote {}, or what {} written over. Name that \
+                 device too to bring {}. A version of the index, or one with a full chain, names \
+                 every removed key, so each removed key cut there must be named.",
+                match self.cut {
+                    1 => "1 version is left".to_string(),
+                    n => format!("{n} versions are left"),
+                },
+                match self.cut {
+                    1 => "it",
+                    _ => "them",
+                },
+                match self.cut {
+                    1 => "it was",
+                    _ => "they were",
+                },
+                match self.cut {
+                    1 => "it",
+                    _ => "them",
+                },
             ));
         }
         let there = self.held + self.higher + self.ties.len();
@@ -1083,7 +1110,14 @@ fn batches(versions: &[Handed], max_bytes: usize) -> Vec<&[Handed]> {
 
 /// Add what the node said of one batch to what it said of those before.
 fn add_to(total: &mut Value, done: &Value) {
-    for field in ["carried", "held", "higher", "deletes", "by_other_keys"] {
+    for field in [
+        "carried",
+        "held",
+        "higher",
+        "deletes",
+        "cut",
+        "by_other_keys",
+    ] {
         let sum = total[field].as_u64().unwrap_or(0) + done[field].as_u64().unwrap_or(0);
         total[field] = sum.into();
     }
@@ -1093,6 +1127,30 @@ fn add_to(total: &mut Value, done: &Value) {
             all.extend(more);
         }
     }
+}
+
+/// What is said of the versions a carry left out because a removed device
+/// wrote them, wrote what they were written over, or no chain can show
+/// otherwise (decision 2026-10-24 (removal), rule 7; the review of the
+/// removal build into main, its M3): an honest device's version comes in
+/// with that device's own carry, and `--from` brings in what a removed
+/// device wrote.
+pub(crate) fn left_out_line(how_many: usize, name: &str) -> String {
+    format!(
+        "  {} left out: a removed device wrote {}, or what {} written over, or no chain can \
+         show otherwise (the index, and a busy file with a full chain). Another device's version \
+         comes in with that device's own carry; what a removed device wrote, with the recovery \
+         phrase: `cordelia sync carry {name} --from <its label>`.",
+        counted(how_many, "version"),
+        match how_many {
+            1 => "it",
+            _ => "them",
+        },
+        match how_many {
+            1 => "it was",
+            _ => "they were",
+        }
+    )
 }
 
 /// A number of seconds, as minutes, in words.
@@ -1207,6 +1265,9 @@ pub(crate) fn carried_lines(done: &Value) -> Vec<String> {
                 n => format!("{n} deletes were"),
             }
         ));
+    }
+    if number("cut") > 0 {
+        lines.push(left_out_line(number("cut"), &name));
     }
     // What could not be read, by generation and relay.
     lines.extend(not_read_lines(done));
@@ -1360,10 +1421,20 @@ mod tests {
                 }],
                 "under": hex::encode([3u8; 32]),
                 "empty": 2, "above": above, "deletes": 1, "held": 1, "higher": 1,
-                "ties": ["t.md"], "has_folder": has_folder,
+                "ties": ["t.md"], "has_folder": has_folder, "cut": 1,
             })
         };
         let read = Found::of(&found(json!(["a.md", "b\u{202e}.md"]), true)).unwrap();
+        // What the cut leaves out, which naming the other device brings
+        // (the third read of slice 8, its first low finding).
+        assert!(
+            read.lines("lab").join("\n").contains(
+                "1 version is left out: another removed device wrote it, or what it was \
+                 written over. Name that device too to bring it."
+            ),
+            "{:?}",
+            read.lines("lab")
+        );
         assert_eq!(read.keys, [key]);
         assert_eq!(read.under, [3u8; 32]);
         assert_eq!((read.empty, read.deletes), (2, 1));
@@ -1928,20 +1999,47 @@ mod tests {
 
         let mut total = json!({
             "carried": 1, "held": 0, "higher": 0, "ties": ["a.md"], "above": [],
-            "deletes": 0, "by_other_keys": 2,
+            "deletes": 0, "cut": 0, "by_other_keys": 2,
         });
         let done = json!({
             "carried": 2, "held": 1, "higher": 3, "ties": ["b.md"], "above": ["c.md"],
-            "deletes": 1, "by_other_keys": 1,
+            "deletes": 1, "cut": 2, "by_other_keys": 1,
         });
         add_to(&mut total, &done);
         assert_eq!(
             total,
             json!({
                 "carried": 3, "held": 1, "higher": 3, "ties": ["a.md", "b.md"],
-                "above": ["c.md"], "deletes": 1, "by_other_keys": 3,
+                "above": ["c.md"], "deletes": 1, "cut": 2, "by_other_keys": 3,
             })
         );
+    }
+
+    /// A carry says how many versions it left out because a removed
+    /// device wrote them, or what they were written over (decision
+    /// 2026-10-24 (removal), rule 7), and that only `--from` brings that
+    /// in.
+    #[test]
+    fn test_what_a_carry_left_out_for_a_removed_device_is_said() {
+        let done = json!({
+            "name": "lab", "generations": [], "carried": 1, "higher": 0, "ties": [],
+            "above": [], "deletes": 0, "cut": 2, "by_other_keys": 0, "nothing": null,
+        });
+        let all = carried_lines(&done).join("\n");
+        assert!(
+            all.contains(
+                "  2 versions left out: a removed device wrote them, or what they were written \
+                 over, or no chain can show otherwise (the index, and a busy file with a full \
+                 chain). Another device's version comes in with that device's own carry; what a \
+                 removed device wrote, with the recovery phrase: `cordelia sync carry lab --from \
+                 <its label>`."
+            ),
+            "{all}"
+        );
+        let one = left_out_line(1, "lab");
+        assert!(one.contains("1 version left out: a removed device wrote it, or what it was"));
+        let none = json!({ "name": "lab", "carried": 1, "cut": 0, "nothing": null });
+        assert!(!carried_lines(&none).join("\n").contains("left out"));
     }
 
     /// What a carry with the phrase left is said too: what stands above

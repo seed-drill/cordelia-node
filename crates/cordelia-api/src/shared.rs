@@ -155,7 +155,7 @@ impl Knows {
     pub(crate) fn of(conn: &Connection, held: &Held) -> Result<Self, PersonError> {
         let statement = &held.statement.statement;
         let additions = held_rows::additions(conn)?;
-        let counting = Counting::of(statement, &additions);
+        let counting = crate::person::counting(conn, statement, &additions)?;
         let mut devices: Vec<[u8; 32]> = Vec::new();
         let listed = statement.devices.iter().map(|device| device.key);
         for key in listed.chain(additions.iter().map(|record| record.key)) {
@@ -170,7 +170,7 @@ impl Knows {
             .map(|(act, _)| act)
             .collect();
         labels.sort_by_key(|act| (act.time, act.count, act.maker));
-        let removed = statement.removed.clone();
+        let removed = crate::person::removed_known(conn, statement)?;
         let labels = labels
             .into_iter()
             .map(|act| act.item.key)
@@ -483,16 +483,32 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
             anywhere.push(filing.item.channel);
         }
     }
-    for filing in &filed {
+    // Whether this device knows of any removal: from then, every channel
+    // it comes to hold is not clean (decision 2026-10-24, rule 23, as the
+    // person ruled on 2 November), whoever filed it and however it came,
+    // until this device makes it anew itself. Neither an act nor an offer
+    // says which generation of the person's lists first carried the card,
+    // so nothing here can show that the removed key never read it. One
+    // way stays clean: a channel made anew out of one this device holds
+    // clean now. Its seed was made after that channel's, which no removed
+    // key holds, and was sealed to the keys of that channel alone.
+    let removal_known = match held(conn)? {
+        Some(held) => !crate::person::removed_known(conn, &held.statement.statement)?.is_empty(),
+        None => false,
+    };
+    for (act, _) in &holds.filings {
+        let filing = &act.item;
         // A channel whose every entry is being taken out is held again
         // only once the take-out has ended: what the door stored meanwhile
-        // would go with the rest.
-        let going = match kept::channel(conn, &filing.channel)? {
-            Some(row) => pass_rows::channel_out(conn, row.id)?.is_some(),
-            None => false,
+        // would go with the rest. A channel moved from or dropped that is
+        // filed again comes to be held, as one with no row does.
+        let comes_to_be_held = match kept::channel(conn, &filing.channel)? {
+            Some(row) if pass_rows::channel_out(conn, row.id)?.is_some() => continue,
+            Some(row) => !matches!(row.state, State::Held | State::NotInForce),
+            None => true,
         };
-        if going {
-            continue;
+        if comes_to_be_held && removal_known && !made_anew_out_of_a_clean_one(conn, &filing.came)? {
+            cordelia_storage::shared_anew::not_clean(conn, &filing.channel, now, false)?;
         }
         let came = match filing.came {
             FiledAs::Made => Came::Made,
@@ -576,6 +592,23 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
         kept::drop_index_rows(conn, older.id)?;
     }
     Ok(())
+}
+
+/// Whether a channel that came as `came` was made anew out of a channel
+/// this device holds, and holds clean (decision 2026-10-24, rule 23): the
+/// one way a channel that a device comes to hold after a removal is clean
+/// there. A channel moved from is not held, so a second channel made anew
+/// out of it, which a device that had not heard of the removal may have
+/// made, is not clean.
+fn made_anew_out_of_a_clean_one(conn: &Connection, came: &FiledAs) -> Result<bool, PersonError> {
+    let FiledAs::Moved(from) = came else {
+        return Ok(false);
+    };
+    let Some(row) = kept::channel(conn, from)? else {
+        return Ok(false);
+    };
+    Ok(matches!(row.state, State::Held | State::NotInForce)
+        && cordelia_storage::shared_anew::not_clean_of(conn, from)?.is_none())
 }
 
 /// Keep what each key of the channel of `row` is to the person (decision

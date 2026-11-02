@@ -3,6 +3,7 @@
 //! Spec: seed-drill/specs/data-formats.md, seed-drill/specs/channels-api.md
 
 pub mod acts;
+pub mod arrivals;
 pub mod at_relays;
 pub mod atomic;
 pub mod channels;
@@ -50,4 +51,16 @@ pub enum StorageError {
          version {own} and none after: a later version wrote it, and nothing was changed"
     )]
     LaterVersion { found: u32, own: u32 },
+
+    /// The database was left by a build that no release made, at schema
+    /// version `found`, a step that this version numbers otherwise: the
+    /// shared channels' build at its steps 21 to 26 (27 to 32 here), or the
+    /// removal build at its steps 27 and 28 while its rule 27 stood. This
+    /// version would read it wrong, and refuses it. Nothing of it was
+    /// changed.
+    #[error(
+        "the database is at schema version {found} of a build that no release made, whose steps \
+         this version of Cordelia numbers otherwise: it is refused, and nothing was changed"
+    )]
+    NumberedOtherwise { found: u32 },
 }

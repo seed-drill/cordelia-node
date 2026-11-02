@@ -353,7 +353,7 @@ Phase 4: device management UI, selective revocation via key rotation.
 > | `cordelia devices [--clear]` | Your devices, what each has applied, and what each relay holds. `--clear` goes through what this device has to tell you | `--clear` does |
 > | `cordelia remove-device <key>` | Remove one of your devices. Given a key that this device knows nothing of (it is in no list of the last change, and was not added since), it says so, and that removing it refuses that key for good, and asks a typed answer, `refuse`, before it goes on as any removal | Yes, and the phrase |
 > | `cordelia renew` | Give the devices that stay a new secret: of each device added since the last change, you say whether it stays | Yes, and the phrase |
-> | `cordelia settle` | Settle two changes that were made apart, on a device that has seen both | Yes, and the phrase |
+> | `cordelia settle` | Join the changes that were made apart, on a device that keeps a head set aside (decision 2026-10-24 (removal), rule 21). On a device that keeps none it is refused: "there is nothing to settle"; a closed device there asks for `cordelia renew`. There `remove-device` and `renew` make such a change too, and every change lists as removed every key this device knows to be removed (rule 20) | Yes, and the phrase |
 > | `cordelia recover [--name <label>]` | On a machine that follows no phrase, with no device left that you trust: bring back what the relays hold. It asks the relays that the machine is set up with, and takes no other. Of each device it asks a typed `have`, `lost` or `hands` (§9) | Yes, and the phrase, which it asks for first |
 > | `cordelia sync claude [--dir <path>] [--mapped-only] [--no-home] [--reset]` | Turn on Claude Code memory sync. Nothing syncs until a folder is mapped. `--dir` sets the Claude Code directory, and `--reset` goes back to `~/.claude`; `--no-home` unmaps the home directory; `--mapped-only` is taken, and is the only scope there is. `--all` and `--exclude` are refused | |
 > | `cordelia sync map <folder> [name] [--home]`, `cordelia sync unmap <folder or name>` | Sync Claude's memory for a folder under a name, and stop. `--home` maps the home directory itself | |
@@ -481,8 +481,12 @@ JSON output (`--json`):
 >   stopped or was not asked, and a relay or a bootnode have states of their
 >   own and no level.
 > - **Red,** in this order. Whatever sync is set to: this device has stopped
->   (it was removed, or is in no list of the last change, or is in a fork,
->   or was answered with a change that it could not open or apply); the node
+>   (it was removed, or is in no list of the last change, or is closed: no
+>   change that lists it is clear of a removed device, which the line says
+>   as "no change that lists this device is clear", or the change it
+>   follows has a secret that a removed device holds, decision 2026-10-24
+>   (removal), rule 10; or was answered with a change that it could not
+>   open or apply); the node
 >   is held up (its first start on this version has not succeeded, or its
 >   database is from a later version: §10.5). With sync on: it follows no
 >   phrase, where something is mapped ("not added yet" after the upgrade,
@@ -497,7 +501,11 @@ JSON output (`--json`):
 > - **Amber, of a person's devices,** wherever this device follows a phrase,
 >   with sync on or off and with or without a folder mapped: a removal that
 >   some device has not applied, for seven days from when this device
->   applied it (after that it is in `cordelia devices` only); a device added
+>   applied it (after that it is in `cordelia devices` only); a change made
+>   apart that this device sets aside while it goes on under a clear one,
+>   for seven days from when it set it aside ("a change made apart is set
+>   aside"; after that in `cordelia devices` only, until a change joins
+>   them, decision 2026-10-24 (removal), rule 11); a device added
 >   since the last change, on every device until a person clears it there
 >   (`cordelia devices --clear`) or a statement lists it, as a renewal does
 >   (`cordelia renew`); a device that has said it left.
@@ -529,7 +537,18 @@ JSON output (`--json`):
 > more days each can be brought in, what this device has still to send, and
 > for each relay whether it holds the latest change. Beside a device that
 > has not applied the change, or is still sending, it names `cordelia sync
-> carry`.
+> carry`. It names each change made apart that this device sets aside, with
+> its lists, and, where it is not clear, the removed device it lists ("a
+> change made apart on laptop (change 3) lists tablet, which a change made
+> on desktop removed: it is set aside", decision 2026-10-24 (removal), rule
+> 11).
+>
+> `cordelia status`, and not `cordelia devices`, says for seven days from
+> the last how many edits a change set aside because a removed device wrote
+> them or they were written over what one wrote, with `cordelia history`
+> and `cordelia restore` named (rule 7). It says so only while the device
+> has applied the change it follows: a device stored as `fork` (closed
+> among changes made apart), or one that has stopped, does not say it.
 
 ### 4.4 `cordelia peers`
 

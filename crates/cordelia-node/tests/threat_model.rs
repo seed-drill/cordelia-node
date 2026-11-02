@@ -1308,11 +1308,13 @@ fn applied_as_heard_by(n: &Node, key: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// T16. A device is removed. What it last wrote is still in the name's
-/// channel for the device that removed it and for one added afterwards: a
-/// file it edited keeps its edit, a file it created is there, and a file
-/// it deleted stays deleted. What it writes after its removal reaches
-/// nobody, and the names it wrote stay writable.
+/// T16. A device is removed. What it wrote within ten minutes before the
+/// removal was made is after its cut time, and is not carried (decision
+/// 2026-10-24 (removal), rules 2 and 7): for the device that removed it
+/// and for one added afterwards, a file it edited goes back to the version
+/// before its edit, a file it created is not there, and a file it deleted
+/// is there again. What it writes after its removal reaches nobody, and
+/// the names it wrote stay writable.
 ///
 /// The removed device stops once it hears, and its own node then
 /// publishes nothing. A removed device that does not stop still holds its
@@ -1366,15 +1368,21 @@ async fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not(
     });
     let left = name_secret_of(&a, PROJECT);
 
-    // A removes R, with the phrase. What the name holds is as it was: A
-    // carried it into the channel that the name moved to.
+    // A removes R, with the phrase. A carried into the channel that the
+    // name moved to what it held before R's writing: R wrote within the
+    // margin of ten minutes, so all it wrote is left out.
     let r_key = key_of(&r);
     let mut at = removes(&a, &r_key, &[], &words);
     at.says("The change is made (change 2)");
+    let held: BTreeMap<String, Option<String>> = [
+        ("deleted.md".to_string(), text("by a")),
+        ("edited.md".to_string(), text("by a")),
+    ]
+    .into();
     assert_eq!(
         reads(&a, PROJECT),
         held,
-        "removing r changed what the channel holds"
+        "a carried what r wrote after its cut time"
     );
     let moved_to = name_secret_of(&a, PROJECT);
     assert_ne!(channel_of(&left), channel_of(&moved_to));
@@ -1469,10 +1477,11 @@ async fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not(
         "d shows what r wrote after its removal"
     );
 
-    // The names stay writable, at the next revision: what R wrote after
-    // its removal counts for nothing, on the device that knew it either.
+    // The names stay writable, at the next revision above what was
+    // carried: what R wrote counts for nothing, on the device that knew it
+    // either.
     let published = publishes(&a, PROJECT, "edited.md", "by a again");
-    assert_eq!(published["rev"], 3, "{published}");
+    assert_eq!(published["rev"], 2, "{published}");
     wait_for("d reads a's edit", &all, 90, || {
         (reads(&d, PROJECT).get("edited.md") == Some(&text("by a again"))).then_some(())
     });

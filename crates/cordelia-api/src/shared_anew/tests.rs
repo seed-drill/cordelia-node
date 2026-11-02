@@ -233,8 +233,8 @@ fn an_offer_leaves_out_or_is_a_fault_by_its_seals_and_your_statement_alone() {
     assert_eq!(refusal_word(refused), "no_offer");
 
     // Sealed to the desktop and not the laptop: on the laptop, run it
-    // there.
-    let second = holds(&s, 0, 10, "second", now);
+    // there. Made here after the removal, so clean here (rule 23).
+    let second = made_new(&s, 0, "second", now);
     written_by(&s, 0, &second, &[&alice], now);
     stores(
         &s,
@@ -942,6 +942,46 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
 // ── The fix round of slice 8 ─────────────────────────────────────────
 
 /// The channel that device `n` files as `name` now, as a `Shared`.
+/// Device `n` makes the shared channel `name` with `shared new`, at the
+/// relay of these tests.
+fn made_new(s: &Several, n: usize, name: &str, now: i64) -> Shared {
+    let new = sharing::New {
+        name: name.into(),
+        relays: relays(),
+    };
+    sharing::make_new(&s[n].conn, &s[n].identity, &new, now).unwrap();
+    filed_as(s, n, name)
+}
+
+/// Device `n` makes the channel filed as `name` anew with `shared anew`,
+/// keeping every key it is asked about, and returns the new channel.
+fn made_anew_on(s: &Several, n: usize, name: &str, now: i64) -> Shared {
+    let (conn, identity) = (&s[n].conn, &s[n].identity);
+    let listed = asked_of(conn, identity, name, now);
+    let (_, plan) = anew_plan(
+        conn,
+        identity,
+        &relays(),
+        name,
+        None,
+        &[],
+        Some((&[], &listed)),
+        now,
+    )
+    .unwrap();
+    make_anew(conn, identity, &relays(), &plan.unwrap().what, now).unwrap();
+    out(s, n, now);
+    filed_as(s, n, name)
+}
+
+/// Device `to` is given what device `from` holds, follows the lists and
+/// ends the take-outs it began, at `now`.
+fn follows(s: &mut Several, from: usize, to: usize, now: i64) {
+    s.pass(from, to);
+    crate::lists::follow(&s[to].conn, &s[to].identity, now).unwrap();
+    out(s, to, now);
+}
+
 fn filed_as(s: &Several, n: usize, name: &str) -> Shared {
     let filing = sharing::filed(&s[n].conn)
         .unwrap()
@@ -1511,4 +1551,428 @@ fn a_recovery_makes_a_channel_anew_only_once_it_has_read_it() {
             .unwrap()
             .is_some()
     );
+}
+
+/// A device that comes to know of a removal before it applies it, on any
+/// branch, sends nothing in a shared channel from that moment, and leaves
+/// the removed key out of a channel it makes anew (decision 2026-10-24
+/// (removal), rules 2, 23 and 24): the laptop is shown a change that
+/// removes the tablet, and keeps the key as removed without applying the
+/// change. Each shared channel it holds is then not clean, and the key is
+/// no key that stays in the listing of `shared anew`, though the statement
+/// the laptop applies does not list it.
+#[test]
+fn a_removal_known_before_it_is_applied_makes_each_shared_channel_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for k in 0..3 {
+        crate::lists::follow(&s[k].conn, &s[k].identity, now).unwrap();
+        out(&s, k, now);
+    }
+    let tablet = crate::several::identity_of(2);
+    stores(&s, 0, &anew(&tablet, &channel, 1), now);
+    let conn = &s[0].conn;
+    let own = s[0].identity.public_key();
+    let held = crate::person::held(conn).unwrap().unwrap();
+    // The keys that stay with no question: the person's own devices, and
+    // those asked of.
+    let listed = |conn: &Connection| {
+        let held = crate::person::held(conn).unwrap().unwrap();
+        let listing = listing_of(conn, &held, &own, &row(&s, 0, &channel)).unwrap();
+        [listing.own_devices, listing.asked].concat()
+    };
+    assert!(!is_not_clean(conn, &channel.id).unwrap());
+    assert!(listed(conn).contains(&tablet.public_key()));
+
+    // A change made apart that removes the tablet, shown and not applied.
+    let mut apart = held.statement.statement.clone();
+    apart.removed.push(tablet.public_key());
+    crate::person::know_removed(conn, &apart, &own, now + 1, false).unwrap();
+    assert!(
+        !crate::person::held(conn)
+            .unwrap()
+            .unwrap()
+            .statement
+            .statement
+            .removes(&tablet.public_key()),
+        "the statement applied does not list it"
+    );
+    assert!(is_not_clean(conn, &channel.id).unwrap(), "rule 23");
+    assert!(
+        !listed(conn).contains(&tablet.public_key()),
+        "rule 24: a key known to be removed does not stay"
+    );
+    assert_eq!(
+        removed_at(conn, now + 1).unwrap(),
+        Some(vec![tablet.public_key()])
+    );
+}
+
+// ── The fix round of the removal build, joined (#277) ────────────────
+
+/// A channel that a device first holds while it knows of a removal is not
+/// clean (the review of #277, high 1; decision 2026-10-24, rule 23, as the
+/// person ruled on 2 November): the desktop removes the tablet; before the
+/// laptop hears of it, the laptop files "notes" under the change before,
+/// which the tablet reads and holds; the laptop applies the removal, and
+/// the desktop then reads the laptop's list. The desktop holds "notes" not
+/// clean, and sends nothing there. A channel the desktop files itself is
+/// not clean either; one it makes with `shared new` is. The laptop makes
+/// "notes" anew: the new channel is clean on the laptop and not on the
+/// desktop, where "notes" was not; once the desktop makes it anew too, it
+/// is clean on both.
+#[test]
+fn a_channel_first_held_while_a_removal_is_known_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    s.meet(&[0, 1, 2]);
+    s.change(1, &[0, 1], &[2]);
+    let channel = holds(&s, 0, 9, "notes", now);
+    s.pass(0, 2);
+    crate::lists::follow(&s[2].conn, &s[2].identity, now).unwrap();
+    assert_eq!(
+        row(&s, 2, &channel).state,
+        State::Held,
+        "the tablet holds it"
+    );
+
+    s.pass(1, 0);
+    let now = s.now + 20;
+    crate::lists::follow(&s[0].conn, &s[0].identity, now).unwrap();
+    out(&s, 0, now);
+    assert!(is_not_clean(&s[0].conn, &channel.id).unwrap(), "rule 23");
+    follows(&mut s, 0, 1, now);
+    let desktop = row(&s, 1, &channel);
+    assert_eq!(desktop.state, State::Held);
+    assert!(is_not_clean(&s[1].conn, &channel.id).unwrap(), "rule 23");
+    assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
+
+    // A channel the desktop files itself is not clean: its own filing
+    // shows nothing of where the card was before. One it makes is.
+    let own = holds(&s, 1, 11, "own", now);
+    assert!(is_not_clean(&s[1].conn, &own.id).unwrap(), "own filing");
+    let made = made_new(&s, 1, "made", now);
+    assert!(!is_not_clean(&s[1].conn, &made.id).unwrap(), "made here");
+
+    // The laptop makes "notes" anew: clean there, and not on the desktop.
+    let new = made_anew_on(&s, 0, "notes", now);
+    assert!(
+        !is_not_clean(&s[0].conn, &new.id).unwrap(),
+        "made anew here"
+    );
+    follows(&mut s, 0, 1, now);
+    assert_eq!(row(&s, 1, &new).state, State::Held);
+    assert!(is_not_clean(&s[1].conn, &new.id).unwrap(), "made elsewhere");
+    assert!(
+        !is_not_clean(&s[1].conn, &channel.id).unwrap(),
+        "moved from"
+    );
+
+    // The desktop makes it anew: clean there, and on the laptop, where the
+    // channel it was made out of is clean.
+    let newer = made_anew_on(&s, 1, "notes", now);
+    assert!(!is_not_clean(&s[1].conn, &newer.id).unwrap());
+    follows(&mut s, 1, 0, now);
+    assert_eq!(row(&s, 0, &newer).state, State::Held);
+    assert!(!is_not_clean(&s[0].conn, &newer.id).unwrap());
+    assert!(writes_there(&s[0].conn, &s[0].identity, &row(&s, 0, &newer)).unwrap());
+}
+
+// ── The person's ruling of 2 November: made anew once, no exemptions ─
+
+/// A channel moved to before a removal is not clean on a device that
+/// first holds it after one (the short review of #277, its high): the
+/// laptop makes "notes" anew before the removal, and the tablet holds the
+/// new channel; the desktop removes the tablet, and nobody makes "notes"
+/// anew. The laptop holds it not clean, and so does the phone, which
+/// follows the lists for the first time after the removal.
+#[test]
+fn a_channel_moved_to_before_a_removal_is_not_clean_where_it_is_first_held() {
+    let mut s = bob(4);
+    let now = s.now + 10;
+    holds(&s, 0, 9, "notes", now);
+    let new = made_anew_on(&s, 0, "notes", now);
+    follows(&mut s, 0, 2, now);
+    assert_eq!(row(&s, 2, &new).state, State::Held, "the tablet holds it");
+
+    s.change(1, &[0, 1, 3], &[2]);
+    let now = s.now + 20;
+    follows(&mut s, 1, 0, now);
+    assert!(is_not_clean(&s[0].conn, &new.id).unwrap(), "rule 23");
+    follows(&mut s, 0, 3, now);
+    let phone = row(&s, 3, &new);
+    assert_eq!(phone.state, State::Held);
+    assert!(
+        is_not_clean(&s[3].conn, &new.id).unwrap(),
+        "moved, but before"
+    );
+    assert!(!writes_there(&s[3].conn, &s[3].identity, &phone).unwrap());
+}
+
+/// A channel taken again after a removal is not clean (the short review
+/// of #277, its medium): the laptop holds "notes" when the desktop removes
+/// the tablet, makes it anew and moves from it; someone else stays in the
+/// old channel and shares it again, and the laptop's filing of it, as a
+/// take files it, is its own. It is not clean, and nothing is sent there.
+#[test]
+fn a_channel_taken_again_after_a_removal_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let old = holds(&s, 0, 9, "notes", now);
+    s.change(1, &[0, 1], &[2]);
+    follows(&mut s, 1, 0, now);
+    let new = made_anew_on(&s, 0, "notes", now);
+    assert!(!is_not_clean(&s[0].conn, &new.id).unwrap());
+    assert_eq!(row(&s, 0, &old).state, State::Moved);
+
+    let mut again = filing(9, "notes-again");
+    again.came = Came::Taken(member(1).public_key());
+    acts(&s, 0, Do::File(again), now + 1);
+    let laptop = row(&s, 0, &old);
+    assert_eq!(laptop.state, State::Held);
+    assert!(is_not_clean(&s[0].conn, &old.id).unwrap(), "taken again");
+    assert!(!writes_there(&s[0].conn, &s[0].identity, &laptop).unwrap());
+}
+
+/// A channel made anew by a device that had not heard of the removal is
+/// not clean on the devices that follow it (the gap the first fix round of
+/// #277 stated): the desktop removes the tablet and makes nothing anew;
+/// the laptop, not knowing, makes "notes" anew under the change before,
+/// which the tablet reads. The desktop held "notes" when it applied the
+/// removal, so the channel made anew out of it is not clean there; nor on
+/// the laptop, once it hears.
+#[test]
+fn a_channel_made_anew_by_a_device_that_had_not_heard_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    holds(&s, 0, 9, "notes", now);
+    s.meet(&[0, 1, 2]);
+    for n in 1..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+    }
+    s.change(1, &[0, 1], &[2]);
+    let new = made_anew_on(&s, 0, "notes", now);
+    follows(&mut s, 0, 2, now);
+    assert_eq!(row(&s, 2, &new).state, State::Held, "the tablet holds it");
+
+    let now = s.now + 20;
+    follows(&mut s, 1, 0, now);
+    assert!(is_not_clean(&s[0].conn, &new.id).unwrap(), "rule 23");
+    follows(&mut s, 0, 1, now);
+    let desktop = row(&s, 1, &new);
+    assert_eq!(desktop.state, State::Held);
+    assert!(
+        is_not_clean(&s[1].conn, &new.id).unwrap(),
+        "made by one not knowing"
+    );
+    assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
+}
+
+/// A second channel made anew out of one this device moved from is not
+/// clean, though the mark of the one moved from is gone: the desktop
+/// removes the tablet and makes "notes" anew itself; the laptop, not
+/// knowing, makes "notes" anew too, under the change before, which the
+/// tablet reads. The desktop then holds the laptop's channel, and holds it
+/// not clean.
+#[test]
+fn a_second_channel_made_anew_out_of_one_moved_from_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let old = holds(&s, 0, 9, "notes", now);
+    s.meet(&[0, 1, 2]);
+    for n in 1..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+    }
+    s.change(1, &[0, 1], &[2]);
+    let desktops = made_anew_on(&s, 1, "notes", now);
+    assert_eq!(row(&s, 1, &old).state, State::Moved);
+    assert!(!is_not_clean(&s[1].conn, &desktops.id).unwrap());
+    let laptops = made_anew_on(&s, 0, "notes", now);
+    assert_ne!(laptops.id, desktops.id);
+
+    let now = s.now + 20;
+    follows(&mut s, 1, 0, now);
+    follows(&mut s, 0, 1, now);
+    let desktop = row(&s, 1, &laptops);
+    assert_eq!(desktop.state, State::Held, "the desktop holds it");
+    assert!(
+        is_not_clean(&s[1].conn, &laptops.id).unwrap(),
+        "made out of one moved from"
+    );
+    assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
+}
+
+/// `shared anew` after a removal makes a channel clean on the devices that
+/// hold clean the channel it was made out of, and on no other: the
+/// desktop removes the tablet, and makes "notes" anew as a removal does;
+/// it is clean on the desktop and not on the laptop or the phone. The
+/// laptop makes it anew: the desktop holds that clean, and the phone, on
+/// which the one before was not clean, does not, until it makes it anew
+/// itself; then all three hold it clean.
+#[test]
+fn shared_anew_after_a_removal_is_clean_where_the_one_before_was() {
+    let mut s = bob(4);
+    let now = s.now + 10;
+    let old = holds(&s, 0, 9, "notes", now);
+    s.meet(&[0, 1, 2, 3]);
+    for n in 1..4 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        assert_eq!(row(&s, n, &old).state, State::Held);
+    }
+    s.change(1, &[0, 1, 3], &[2]);
+    let said = anew_at_removal(&s[1].conn, &s[1].identity, &relays(), now).unwrap();
+    assert_eq!(said.len(), 1, "{said:?}");
+    out(&s, 1, now);
+    let first = filed_as(&s, 1, "notes");
+    assert!(
+        !is_not_clean(&s[1].conn, &first.id).unwrap(),
+        "made at the removal"
+    );
+    for n in [0, 3] {
+        follows(&mut s, 1, n, now);
+        assert_eq!(row(&s, n, &first).state, State::Held);
+        assert!(is_not_clean(&s[n].conn, &first.id).unwrap(), "device {n}");
+    }
+
+    let second = made_anew_on(&s, 0, "notes", now);
+    for n in [1, 3] {
+        follows(&mut s, 0, n, now);
+        assert_eq!(row(&s, n, &second).state, State::Held);
+    }
+    assert!(
+        !is_not_clean(&s[1].conn, &second.id).unwrap(),
+        "the desktop"
+    );
+    assert!(is_not_clean(&s[3].conn, &second.id).unwrap(), "the phone");
+
+    let third = made_anew_on(&s, 3, "notes", now);
+    for n in [0, 1] {
+        follows(&mut s, 3, n, now);
+    }
+    for n in [0, 1, 3] {
+        let held = row(&s, n, &third);
+        assert_eq!(held.state, State::Held, "device {n}");
+        assert!(
+            writes_there(&s[n].conn, &s[n].identity, &held).unwrap(),
+            "device {n}"
+        );
+    }
+}
+
+/// A recovery takes by the person's word the acts of the devices the
+/// person named at the terminal alone, and seals without every key it
+/// removes (the review of #277, high 2; decision 2026-10-24 (removal),
+/// rules 6, 22 and 24): the laptop, said to be lost, files "review"; the
+/// tablet, which another change removed, files "thief" after its removal.
+/// The recovered machine holds "review", not clean and owed its making
+/// anew, and nothing of the tablet's: its acts are passed over.
+#[test]
+fn a_recovery_takes_no_act_of_a_device_another_change_removed() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let review = holds(&s, 1, 7, "review", now);
+    let thief = holds(&s, 2, 9, "thief", now);
+    let personal = s[1].personal();
+    let handed: Vec<CheckedEntry> = s[1].stored().into_iter().chain(s[2].stored()).collect();
+    let lists = crate::lists::lists_in(&handed, &personal, &[s.key(1), s.key(2)]).unwrap();
+    assert_eq!(lists.len(), 2);
+    s.change(0, &[0], &[1, 2]);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    let shown = crate::recover::Shown {
+        gone: vec![(s.key(1), "laptop".into())],
+        removed_apart: vec![(s.key(2), "tablet".into())],
+        ..Default::default()
+    };
+    in_one(conn, || {
+        crate::recover::shared_recovered(conn, &s[0].identity, &lists, &shown, now)
+    })
+    .unwrap();
+    let filed: Vec<String> = sharing::filed(conn)
+        .unwrap()
+        .into_iter()
+        .map(|filing| filing.name)
+        .collect();
+    assert_eq!(filed, ["review"], "the tablet's acts are passed over");
+    assert!(st(kept::channel(conn, &thief.id)).unwrap().is_none());
+    assert!(is_not_clean(conn, &review.id).unwrap(), "rule 24");
+    assert!(
+        st(rows::not_clean_of(conn, &review.id))
+            .unwrap()
+            .unwrap()
+            .owed
+    );
+}
+
+/// A device that does not follow a clear change works its lists out
+/// again, closed or not yet closed (the review of #277, low 3; decision
+/// 2026-10-24 (removal), rules 4 and 10): it writes no list, and the table
+/// of shared channels still follows the lists it holds, as on a device
+/// that is stopped. The laptop drops "review", and the desktop stores its
+/// list; the desktop then knows the tablet, which its change lists, to be
+/// removed, and works its lists out before it is closed (`NotClear`): it
+/// holds "review" no more. Closed (`Stopped`), it does the same.
+#[test]
+fn a_device_on_a_change_not_clear_follows_the_lists_and_writes_none() {
+    for closed in [false, true] {
+        let mut s = bob(3);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 7, "review", now);
+        s.meet(&[0, 1]);
+        crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
+        assert_eq!(row(&s, 1, &channel).state, State::Held);
+        acts(&s, 0, Do::Drop(channel.id), now);
+        s.pass(0, 1);
+        assert_eq!(row(&s, 1, &channel).state, State::Held, "not yet followed");
+        let conn = &s[1].conn;
+        cordelia_storage::person::keep_removed(conn, &[s.key(2)], now).unwrap();
+        assert!(!crate::person::follows_a_clear_change(conn).unwrap());
+        if closed {
+            cordelia_storage::person::set_state(conn, cordelia_storage::person::State::Fork)
+                .unwrap();
+        }
+        let wrote = crate::lists::follow(conn, &s[1].identity, now).unwrap();
+        assert!(!wrote, "it writes no list");
+        out(&s, 1, now);
+        assert_ne!(row(&s, 1, &channel).state, State::Held, "closed: {closed}");
+    }
+}
+
+/// An act is stamped as taken no earlier than the newest time of taking
+/// kept (the review of #277, low 2; decision 2026-10-24 (removal), rule 7,
+/// as an arrival is): the desktop takes the laptop's act; its clock is then
+/// stepped back an hour, and the act it makes then is kept as taken no
+/// earlier than the laptop's.
+#[test]
+fn an_act_taken_on_a_clock_stepped_back_is_taken_no_earlier_than_the_last() {
+    let mut s = bob(2);
+    let now = s.now + 10;
+    holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1]);
+    crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
+    let first = cordelia_storage::shared_lists::taken(&s[1].conn).unwrap();
+    let newest = first
+        .iter()
+        .map(|(_, row)| row.taken.taken_at)
+        .max()
+        .unwrap();
+    let back = newest - 3600;
+    let done = crate::lists::act(
+        &s[1].conn,
+        &s[1].identity,
+        Do::File(filing(8, "desk")),
+        back,
+    )
+    .unwrap();
+    let crate::lists::Done::Made(made) = done else {
+        panic!("{done:?}")
+    };
+    let kept = cordelia_storage::shared_lists::taken(&s[1].conn).unwrap();
+    let (_, own) = kept
+        .iter()
+        .find(|(signature, _)| *signature == made[0].signature())
+        .unwrap();
+    assert_eq!(own.taken.taken_at, newest, "not {back}");
 }

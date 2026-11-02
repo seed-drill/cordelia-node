@@ -2141,6 +2141,7 @@ fn why_not_applied(conn: &Connection) -> Result<&'static str, PersonError> {
     Ok(match stands(conn)? {
         Stands::NoPhrase => "this device follows no recovery phrase yet",
         Stands::Stopped(state) => crate::look::short_why(state),
+        Stands::Closed => crate::look::CLOSED_SHORT,
         Stands::Applied => crate::look::short_why(cordelia_storage::person::State::Applied),
     })
 }

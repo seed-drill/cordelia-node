@@ -64,7 +64,52 @@ pub(super) struct Beside {
     pub id: String,
     /// The lowest key that signed an entry of it.
     pub author: [u8; 32],
+    /// Every key that signed an entry of it, and the first 16 bytes of each
+    /// key its entries' chains name: no line is taken from it where one is
+    /// removed (decision 2026-10-24 (removal), rule 7).
+    pub signers: Vec<[u8; 32]>,
+    pub links: Vec<[u8; 16]>,
+    /// Whether an entry's chain may have dropped links: it is missing,
+    /// holds the most a chain keeps, or is the index's, which a merge cuts
+    /// short (`cordelia_api::may_have_dropped_links`). It then names every
+    /// removed key (the extra look of the third read of slice 8, and the
+    /// fourth read's round). Every version beside the index's is one.
+    pub unknown: bool,
     pub text: String,
+}
+
+/// Whether the put-back takes lines from `version`, a version beside the
+/// index's (decision 2026-10-24 (removal), rule 7): not where a key that
+/// signed it is cut (`key`), nor one that a link of its chain names
+/// (`signer`), nor, where its chain may have dropped links, where anything
+/// of a removed key is cut (`any`; the extra look of the third read of
+/// slice 8).
+pub(super) fn lines_taken_from(
+    version: &Beside,
+    key: impl Fn(&[u8; 32]) -> bool,
+    signer: impl Fn(&[u8; 16]) -> bool,
+    any: bool,
+) -> bool {
+    !version.signers.iter().any(key)
+        && !version.links.iter().any(signer)
+        && !(version.unknown && any)
+}
+
+/// Whether the put-back puts back the line of `record`, a line this device
+/// removed from a version of the index (decision 2026-10-24 (removal),
+/// rule 7): not where a key that signed that version is cut (`key`), and
+/// not where anything of a removed key is cut (`any`). That version's
+/// chain is the index's, which may have dropped links, so it names every
+/// removed key, as its chain's signers would and more (the fourth read of
+/// slice 8, its low): a merge stops a chain where a hash of it stands
+/// further on in the other, and a removed key's link behind it goes, and a
+/// chain of 100 links drops its oldest. So the record keeps no chain.
+pub(super) fn line_put_back(
+    record: &index_lines::Record,
+    key: impl Fn(&[u8; 32]) -> bool,
+    any: bool,
+) -> bool {
+    !record.from.iter().any(key) && !any
 }
 
 /// What a cycle read of the index's slot, beyond the channel's version.
@@ -98,6 +143,18 @@ pub(super) fn beside(slot: &Slot) -> Vec<Beside> {
                 id: ids.join("+"),
                 // A version's entries are in order of their signers' keys.
                 author: version.entries.first()?.author,
+                signers: version.entries.iter().map(|entry| entry.author).collect(),
+                links: version
+                    .entries
+                    .iter()
+                    .flat_map(|entry| entry.chain.iter().flatten().map(|link| link.signer))
+                    .collect(),
+                unknown: version.entries.iter().any(|entry| {
+                    cordelia_api::may_have_dropped_links(
+                        Some(&version.name),
+                        entry.chain.as_deref(),
+                    )
+                }),
                 text: text.clone(),
             })
         })
@@ -159,8 +216,22 @@ pub(super) fn published(
                 removed.push((file, line.trim_end()));
             }
         }
-        // One write for the edit, however many lines it dropped.
-        return index_lines::lines_removed(db, folder, channel, &removed, now);
+        // One write for the edit, however many lines it dropped, with the
+        // keys that signed the version they were dropped from (decision
+        // 2026-10-24 (removal), rule 7). Its chain is not kept: the index's
+        // names every removed key ([`line_put_back`]).
+        let from: Vec<[u8; 32]> = ctx
+            .over
+            .map(|version| {
+                version
+                    .version
+                    .entries
+                    .iter()
+                    .map(|entry| entry.author)
+                    .collect()
+            })
+            .unwrap_or_default();
+        return index_lines::lines_removed_from(db, folder, channel, &removed, &from, now);
     }
     if names::is_conflict_name(key) {
         return Ok(());
@@ -484,7 +555,41 @@ fn put_back(
             asked.insert(file.to_string(), deleted);
             Ok(deleted)
         };
-        let text = with_lines(there, &stands, due, &mut is_deleted)?;
+        // On a device that knows of a removal, no line is taken from a
+        // version that a removed key signed, or that names one in its chain,
+        // nor a line removed from such a version, where the cut of rule 7
+        // (decision 2026-10-24 (removal)) would leave it out: what a carry
+        // left out is put back by nobody. It is judged in the generation
+        // followed, at the time now, which fails safe: in a generation made
+        // after the key's removal nothing of it is cut, and honest lines
+        // whose chains still name the key are put back. Every chain of the
+        // index may have dropped a link, so where anything of a removed key
+        // is cut, no line is taken at all (the fourth read of slice 8).
+        let cut = cordelia_api::CutNow::read(&db, chrono::Utc::now().timestamp())
+            .map_err(super::of_person)?;
+        let stands: Vec<Beside> = stands
+            .into_iter()
+            .filter(|version| {
+                lines_taken_from(
+                    version,
+                    |key| cut.key(key),
+                    |link| cut.signer(link),
+                    cut.any(),
+                )
+            })
+            .collect();
+        let (due, of_removed): (Vec<&index_lines::Record>, Vec<&index_lines::Record>) = due
+            .iter()
+            .copied()
+            .partition(|record| line_put_back(record, |key| cut.key(key), cut.any()));
+        for record in &of_removed {
+            index_lines::drop_record(&db, folder, channel, &record.file)?;
+        }
+        let text = with_lines(there, &stands, &due, &mut is_deleted)?;
+        if text == *there {
+            return not_now("every line due was of a removed device's version");
+        }
+        let files: Vec<&str> = due.iter().map(|record| record.file.as_str()).collect();
         if !publish::fits(INDEX_FILE, &Value::Text(text.clone())) {
             for file in &files {
                 index_lines::drop_record(&db, folder, channel, file)?;

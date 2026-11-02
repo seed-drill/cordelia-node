@@ -20,8 +20,10 @@
 //!   among the others: its one entry is read where a person accepts
 //!   ([`crate::adding::accept`]), and nowhere else.
 //!
-//! A device that has stopped, or is in a fork, takes nothing in its own
-//! channels (§4.3, §4.5). It still looks at the phrase's channel: that is
+//! A device that has stopped, is in a fork, or is closed takes nothing in
+//! its own channels (§4.3, §4.5; decision 2026-10-24 (removal), rule 10).
+//! Nor does any device take what a key it knows to be removed signed, on
+//! any branch (rule 6). It still looks at the phrase's channel: that is
 //! how a device in a fork is shown the statement that settles it.
 //!
 //! Each outcome says what it was ([`Taken`]), so that a caller can count
@@ -66,8 +68,8 @@ use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::person::{self as held_rows, State};
 
 use crate::person::{
-    AdditionSeen, Counting, PersonError, Shown, added_name, applied_secret, held, in_one,
-    see_addition, shown, who_counts,
+    AdditionSeen, PersonError, Shown, added_name, applied_secret, held, in_one, see_addition,
+    shown, who_counts,
 };
 
 /// What became of an entry from outside.
@@ -126,6 +128,10 @@ pub enum NotTaken {
     /// This device has stopped, or is in a fork: it takes nothing in its
     /// own channels.
     Stopped(State),
+    /// This device is closed: the change it follows is not clear, and it
+    /// takes nothing in its own channels (decision 2026-10-24 (removal),
+    /// rule 10).
+    Closed,
     /// The key that signed it does not count, as this device knows them
     /// (decision 2026-10-04 §4.4).
     SignerDoesNotCount,
@@ -198,12 +204,53 @@ pub fn take(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Taken, PersonError> {
+    taken_by(conn, identity, entry, now, Taker::Device)
+}
+
+/// [`take`], for a reader that seals nothing: a recovery's look, which
+/// reads the personal channel of a generation in a database of its own
+/// and drops it (decision 2026-10-04 §9, step 3). It takes as a device
+/// does in every rule, who counts among them, but for one: it is not
+/// refused where that generation's secret is not clear (decision
+/// 2026-10-24 (removal), rule 10). A record there that hands a removed
+/// key the secret is what it reads, and the recovery's own change lists
+/// one device, so is clear by construction (rule 22).
+pub fn take_to_read(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<Taken, PersonError> {
+    taken_by(conn, identity, entry, now, Taker::Reader)
+}
+
+/// Who takes an entry through the door.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Taker {
+    /// A device, into the channels it seals in.
+    Device,
+    /// A reader that seals nothing ([`take_to_read`]).
+    Reader,
+}
+
+fn taken_by(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    entry: &CheckedEntry,
+    now: i64,
+    taker: Taker,
+) -> Result<Taken, PersonError> {
     let taken = in_one(conn, || {
-        let taken = match taken_as_its_own(conn, identity, entry, now)? {
+        let taken = match taken_as_its_own(conn, identity, entry, now, taker)? {
             Some(taken) => Some(taken),
             // Of no channel of the person's own: perhaps of a shared
             // channel, in the same transaction (decision 2026-10-10 §2.3).
-            None => crate::shared::taken_as_shared(conn, &identity.public_key(), entry, now)?,
+            // A reader that seals nothing reads only a generation's own
+            // channels, and takes none.
+            None if taker == Taker::Device => {
+                crate::shared::taken_as_shared(conn, &identity.public_key(), entry, now)?
+            }
+            None => None,
         };
         // Who the person knows may have changed: a statement applied, or a
         // key that came to count. The shared channels follow it (§6.3).
@@ -219,7 +266,10 @@ pub fn take(
         // written where it changed (§3.4, "What a device writes"), in a
         // write of its own: an error there is logged, and takes back
         // nothing of what was taken, a statement applied among it.
-        if knows_anew && let Err(e) = crate::lists::follow(conn, identity, now) {
+        if taker == Taker::Device
+            && knows_anew
+            && let Err(e) = crate::lists::follow(conn, identity, now)
+        {
             tracing::warn!(error = %e, "could not work out the person's lists again");
         }
         Ok(taken)
@@ -241,6 +291,7 @@ fn taken_as_its_own(
     identity: &NodeIdentity,
     entry: &CheckedEntry,
     now: i64,
+    taker: Taker,
 ) -> Result<Option<Taken>, PersonError> {
     let Some(held) = held(conn)? else {
         return Ok(Some(Taken::Refused(NotTaken::FollowsNoPhrase)));
@@ -266,15 +317,76 @@ fn taken_as_its_own(
     if held.state != State::Applied {
         return Ok(Some(Taken::Refused(NotTaken::Stopped(held.state))));
     }
-    let counting = Counting::of(statement, &held_rows::additions(conn)?);
+    // A closed device takes nothing in a channel of its own (decision
+    // 2026-10-24 (removal), rules 5 and 10): from the commit that kept the
+    // record or the key that made its change not clear, the next entry is
+    // refused here.
+    if taker == Taker::Device && !crate::person::follows_a_clear_change(conn)? {
+        return Ok(Some(Taken::Refused(NotTaken::Closed)));
+    }
+    // Who counts reads every key the device knows to be removed, on any
+    // branch: what such a key signed is not taken (rule 6).
+    let counting = crate::person::counting(conn, statement, &held_rows::additions(conn)?)?;
     if !counting.counts(&entry.author) {
+        // A removed key whose entry opens under a secret of the change
+        // followed holds that secret: a branch that never heard of its
+        // removal added it again, and the record has not come. The entry
+        // is refused all the same, and is the proof: the key is kept as a
+        // holder of the change, and the device closes in this transaction
+        // (the review of the whole build, its M3; decision 2026-10-24
+        // (removal), rules 3 and 8). A reader that seals nothing is not
+        // closed.
+        if taker == Taker::Device
+            && counting.is_removed(&entry.author)
+            && opens_under_the_change_followed(conn, entry, &secret, is_personal, is_messages)?
+        {
+            let link = statement.link()?;
+            held_rows::keep_holder(conn, link.number, &link.hash, &entry.author)?;
+            crate::person::close_if_not_clear(conn)?;
+        }
         return Ok(Some(Taken::Refused(NotTaken::SignerDoesNotCount)));
     }
     if band(entry.rev) > statement.number {
         return Ok(Some(Taken::Refused(NotTaken::BandAboveTheStatements)));
     }
 
+    // An entry that another key signed in the channel of a name makes
+    // arrivals in its file (decision 2026-10-24 (removal), rule 7): what
+    // the file held before it is read first.
+    let own = identity.public_key();
+    let file = match (taker, is_personal || is_messages || entry.author == own) {
+        (Taker::Device, false) => match held_rows::name_of_channel(conn, &entry.channel)? {
+            Some(name) => {
+                let secret = derive::own_secret(&secret, &name)?;
+                let before = crate::arrivals::before(
+                    conn,
+                    &own,
+                    entry,
+                    &secret,
+                    statement.number,
+                    &counting,
+                )?;
+                Some((secret, before))
+            }
+            None => None,
+        },
+        _ => None,
+    };
     let stored = entries::store(conn, entry, now)?;
+    if stored == Outcome::Stored
+        && let Some((secret, before)) = &file
+    {
+        let link = statement.link()?;
+        crate::arrivals::noted_at_the_door(
+            conn,
+            &own,
+            entry,
+            secret,
+            &(link.number, link.hash),
+            before,
+            now,
+        )?;
+    }
     // What the store kept of the messages channel the reader reads in
     // this write (decision 2026-10-09 §7.1): an entry it held already, or
     // one below what it holds, is not read again.
@@ -289,11 +401,19 @@ fn taken_as_its_own(
     // A device's list stored: this device keeps when it first held each
     // act the list brings (decision 2026-10-10 property 9). An error there
     // is logged, and takes back nothing of the entry.
-    if is_personal && stored == Outcome::Stored {
-        let own = identity.public_key();
-        if let Err(e) = crate::lists::took(conn, &own, entry, &personal, now) {
-            tracing::warn!(error = %e, "could not keep when this device took the acts of a list");
-        }
+    if is_personal
+        && stored == Outcome::Stored
+        && let Err(e) = crate::lists::took(conn, &own, entry, &personal, now)
+    {
+        tracing::warn!(error = %e, "could not keep when this device took the acts of a list");
+    }
+    // The holders of the secret it follows grew by a record: where a
+    // removed key is among them now, rule 8 closes a device in this
+    // transaction (decision 2026-10-24 (removal), rules 3, 8 and 10). A
+    // reader that seals nothing is not closed: what it reads is what it
+    // shows.
+    if taker == Taker::Device && matches!(taken.0, Some(Record::Seen(_))) {
+        crate::person::close_if_not_clear(conn)?;
     }
     // A record that was taken can let a key add: the one it adds, where
     // a device of the statement signed it. (A record that is not counted
@@ -312,6 +432,29 @@ fn taken_as_its_own(
         came_to_count: taken.1,
         came_to_add,
     }))
+}
+
+/// Whether `entry`, of the personal channel, the messages channel or the
+/// channel of a name under the secret `secret` of the change followed,
+/// opens under its channel's secret: whoever wrote it holds `secret`.
+fn opens_under_the_change_followed(
+    conn: &Connection,
+    entry: &CheckedEntry,
+    secret: &[u8; 32],
+    is_personal: bool,
+    is_messages: bool,
+) -> Result<bool, PersonError> {
+    let of_channel = if is_personal {
+        derive::personal_secret(secret)?
+    } else if is_messages {
+        derive::messages_secret(secret)?
+    } else {
+        match held_rows::name_of_channel(conn, &entry.channel)? {
+            Some(name) => derive::own_secret(secret, &name)?,
+            None => return Ok(false),
+        }
+    };
+    Ok(entry.open(&of_channel).is_ok())
 }
 
 /// Why an entry is refused that is of no channel this device takes from:
@@ -1579,6 +1722,51 @@ mod tests {
         assert_eq!((slot.current, slot.next), (None, Some(at(1, 2))));
     }
 
+    /// A removed key whose entry opens under a secret of the change the
+    /// device follows holds that secret (the review of the whole build,
+    /// its M3): a branch that never heard of the removal added it again,
+    /// and the record has not reached this device. The door refuses the
+    /// entry, keeps the key as a holder of the change, and closes the
+    /// device, so that it seals nothing more under that secret. An entry
+    /// of the key's that does not open there proves nothing, and changes
+    /// nothing.
+    ///
+    /// Taken out: the holder kept (the device goes on: the second fails).
+    #[test]
+    fn test_a_removed_keys_entry_that_opens_under_the_secret_followed_closes_the_device() {
+        let s = two();
+        let tablet = Machine::new(9);
+        held_rows::keep_removed(&s[0].conn, &[tablet.key()], s.now).unwrap();
+        assert!(crate::person::follows_a_clear_change(&s[0].conn).unwrap());
+        let channel = s[0].own("notes");
+
+        // One that does not open under the channel's secret: refused, and
+        // the device goes on.
+        let elsewhere = entry_by(&tablet.identity, &[0xee; 32], 3, "a.md", text("x"), &[]);
+        let unread = signed_in(
+            &channel,
+            &tablet.identity,
+            elsewhere.slot,
+            3,
+            elsewhere.content.clone(),
+        );
+        assert_eq!(
+            given(&s, 0, &unread),
+            Taken::Refused(NotTaken::SignerDoesNotCount)
+        );
+        assert!(crate::person::follows_a_clear_change(&s[0].conn).unwrap());
+
+        // One that opens: refused, and the device is closed.
+        let late = entry_by(&tablet.identity, &channel, 4, "a.md", text("late"), &[]);
+        assert_eq!(
+            given(&s, 0, &late),
+            Taken::Refused(NotTaken::SignerDoesNotCount)
+        );
+        assert!(!crate::person::follows_a_clear_change(&s[0].conn).unwrap());
+        assert_eq!(s[0].held().state, State::Fork);
+        assert!(!s[0].stored_in(&channel).contains(&late));
+    }
+
     /// A device of the version before this one beside one of this version
     /// (decision 2026-10-19 §7): an entry under `reached/` is taken by the
     /// one door where its signer counts, and stored; and the paths that
@@ -1608,7 +1796,7 @@ mod tests {
         let additions = held_rows::additions(conn).unwrap();
         let counting = who_counts(conn).unwrap();
         let other = identity_of(7).public_key();
-        let counted = |counting: &Counting| {
+        let counted = |counting: &crate::person::Counting| {
             let keys = [key, s[1].key(), other];
             (counting.adders(), keys.map(|key| counting.counts(&key)))
         };

@@ -11,7 +11,7 @@ use crate::several::Several;
 use crate::take::take;
 use cordelia_crypto::acts::Came;
 use cordelia_crypto::share::{Card, Relays};
-use cordelia_storage::person::{self as held_rows, Kept as KeptEntry};
+use cordelia_storage::person as held_rows;
 
 const DAY: i64 = 24 * 60 * 60;
 
@@ -29,6 +29,14 @@ pub(crate) fn filing(seed: u8, name: &str) -> Filing {
         came: Came::Made,
     }
 }
+
+/// How long after an act is taken a removal of its maker comes, in the
+/// tests whose removed key's acts stay in force: past the removal's margin
+/// (decision 2026-10-24 (removal), rule 2), an act taken before the
+/// removal's own time less `REMOVAL_TAKEN_MARGIN_SECS` stays (property 9),
+/// and one taken after it counts for nothing
+/// ([`an_act_taken_within_the_margin_of_a_removal_counts_for_nothing`]).
+const PAST_THE_CUT: i64 = cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS as i64 + 1;
 
 /// A filing as [`filing`] makes it, of a card at the relay of `relay`.
 fn filing_at(seed: u8, name: &str, relay: [u8; 32]) -> Filing {
@@ -612,9 +620,9 @@ fn an_act_whose_signature_fails_or_whose_maker_was_never_a_device_is_not_taken()
 /// decision 2026-10-10 property 9 and §20, item 7): an act of the removed
 /// key taken before its cut time stays in force, named as the removed
 /// key's; one taken at or after it, or in a generation made apart from the
-/// removal, is passed over, on every device that took them alike. Today
-/// the cut times are not built, and a key the statement removes is taken
-/// by the statement alone ([`ByTheStatement`]): that is said here too.
+/// removal, is passed over, on every device that took them alike. By the
+/// statement alone ([`ByTheStatement`]), which reads no cut, every act
+/// taken counts: that is said here too.
 #[test]
 fn an_act_of_a_removed_key_after_its_cut_time_counts_for_nothing() {
     let (laptop, desktop, tablet) = (device(1), device(2), device(3));
@@ -693,7 +701,7 @@ fn an_act_of_a_removed_key_after_its_cut_time_counts_for_nothing() {
     assert!(in_force_of(&computed, &apart));
     assert!(in_force_of(&computed, &before));
     assert!(!in_force_of(&computed, &after));
-    // Today: by the statement alone, every act taken counts.
+    // By the statement alone, which reads no cut, every act taken counts.
     let today = makers_by_statement(&laptop, &tablet);
     let computed = compute(&of, &today, &takings, Bounds::OF_A_LIST);
     for act in [&before, &after, &apart] {
@@ -1602,9 +1610,10 @@ fn refused(s: &Several, n: usize, what: Do, now: i64) -> Refused {
 }
 
 /// Device `to` is given, at `now`, everything device `from` holds: the
-/// change entry it keeps, and then every entry of its store.
+/// change entry of the change it follows, and then every entry of its
+/// store.
 fn give(s: &Several, from: usize, to: usize, now: i64) {
-    let kept = held_rows::change_entry(&s[from].conn, KeptEntry::Latest).unwrap();
+    let kept = held_rows::followed_entry(&s[from].conn).unwrap();
     let entries = kept.map(|entry| entry.check().unwrap()).into_iter();
     for entry in entries.chain(s[from].stored()) {
         take(&s[to].conn, &s[to].identity, &entry, now).unwrap();
@@ -1861,7 +1870,7 @@ fn which_makers_are_valid_comes_from_the_statement_alone() {
     }
     // The laptop is removed: the stranger's act, which no list carries
     // now, is passed over still.
-    s.now = now + 10;
+    s.now = now + 10 + PAST_THE_CUT;
     s.change(1, &[1, 3], &[0]);
     now = s.now + 1;
     give(&s, 1, 3, now);
@@ -2045,7 +2054,7 @@ fn undone_at_the_bound(undoer: usize) -> (Several, i64) {
         assert_eq!(subscribes(&s, n, 1, "notes"), Some(true), "device {n}");
     }
     let before: Vec<SharedList> = STAY.iter().map(|(n, _)| kept(&s, *n)).collect();
-    s.now = now + 2;
+    s.now = now + 2 + PAST_THE_CUT;
     s.change(1, &[1, 3], &[THIEF]);
     now = s.now + 1;
     give(&s, 1, 3, now);
@@ -2381,7 +2390,7 @@ fn a_drop_and_a_move_take_no_place() {
             "device {n}"
         );
     }
-    s.now = now + 8;
+    s.now = now + 8 + PAST_THE_CUT;
     s.change(0, &[0, 1], &[2]);
     now = s.now + 1;
     give(&s, 0, 1, now);
@@ -2790,7 +2799,7 @@ fn what_a_thief_past_a_bound_leaves_after_its_removal() {
             assert_eq!(labelled(&s, n, 0), None, "device {n}");
         }
         // Removed: the thief, and the device it added.
-        s.now = now + 10;
+        s.now = now + 10 + PAST_THE_CUT;
         s.change(0, &[0, 1], &writers);
         now = s.now + 1;
         give(&s, 0, 1, now);
@@ -2907,7 +2916,7 @@ fn an_act_is_taken_when_the_door_first_stores_a_list_that_brings_it() {
     // The tablet removed: the desktop applies the statement at its door
     // and works its lists out again; the act, from the laptop's copy,
     // keeps the time it was first held.
-    s.now = now + 10;
+    s.now = now + 10 + PAST_THE_CUT;
     s.change(0, &[0, 1], &[2]);
     give(&s, 0, 1, s.now + 1);
     assert!(s[1].number() > first.generation);
@@ -2917,6 +2926,38 @@ fn an_act_is_taken_when_the_door_first_stores_a_list_that_brings_it() {
     fetch(&s, 1, s.now + 2);
     assert_eq!(labelled(&s, 1, 7), Some(Some("tablet's".into())));
     assert_eq!(taken_of(&s, 1, &made[0]), Some(first));
+}
+
+/// The removal record's cut on acts, through the lists as a device works
+/// them out (decision 2026-10-24 (removal), rules 2 and 6; decision
+/// 2026-10-10 property 9 and §20, item 7): the tablet labels a key long
+/// before its removal and another within the removal's margin. Once the
+/// desktop applies the removal, the first stays in force, named as the
+/// removed tablet's; the second counts for nothing.
+#[test]
+fn an_act_taken_within_the_margin_of_a_removal_counts_for_nothing() {
+    let mut s = person(3, 3);
+    let now = s.now + 10;
+    on(&s, 2, Do::Label(label(7, Some("long before"))), now + 1);
+    fetch_from(&s, &[2], 0, now + 2);
+    give(&s, 0, 1, now + 3);
+    let late = now + 3 + PAST_THE_CUT;
+    on(&s, 2, Do::Label(label(8, Some("late"))), late);
+    fetch_from(&s, &[2], 0, late + 1);
+    give(&s, 0, 1, late + 2);
+    fetch(&s, 1, late + 3);
+    assert_eq!(labelled(&s, 1, 7), Some(Some("long before".into())));
+    assert_eq!(labelled(&s, 1, 8), Some(Some("late".into())));
+
+    s.now = late + 10;
+    s.change(0, &[0, 1], &[2]);
+    give(&s, 0, 1, s.now + 1);
+    fetch(&s, 1, s.now + 2);
+    assert_eq!(labelled(&s, 1, 7), Some(Some("long before".into())));
+    let holds = holds(&s[1].conn).unwrap();
+    let of_7 = holds.labels.iter().find(|(a, _)| a.item.key == [7; 32]);
+    assert_eq!(of_7.map(|(_, maker)| *maker), Some(Maker::Removed));
+    assert_eq!(labelled(&s, 1, 8), None, "taken within the margin: cut");
 }
 
 /// An error in the person's lists takes back nothing at the door: a list

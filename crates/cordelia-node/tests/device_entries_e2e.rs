@@ -201,7 +201,17 @@ impl Device {
         assert_eq!(relay.0, key, "another key answered at the port of {name}");
         let conn = self.manager.get_connection(&relay).unwrap().clone();
         self.set_up_with(name);
-        let link = Link::new(name, relay, conn);
+        // Whether the relay keeps every head is what it said in its
+        // handshake, as the node reads it (decision 2026-10-24 (removal),
+        // rule 18).
+        let roles = self
+            .manager
+            .get_peer(&relay)
+            .unwrap()
+            .handshake
+            .peer_roles
+            .clone();
+        let link = Link::new(name, relay, conn).naming(&roles);
         self.relay_mut(name).link = Some(link);
     }
 
@@ -747,7 +757,16 @@ struct StandIn {
 }
 
 impl StandIn {
+    /// A stand-in for a relay of the version before: it says "relay" alone
+    /// among its roles, and names no role `heads` (decision 2026-10-24
+    /// (removal), rule 18).
     async fn started() -> Self {
+        Self::naming(&["relay"]).await
+    }
+
+    /// A stand-in that says `roles` in its handshake: with "heads", a relay
+    /// of this version, which a device shows every head it keeps.
+    async fn naming(roles: &[&str]) -> Self {
         let identity = Arc::new(NodeIdentity::generate().unwrap());
         let key = identity.public_key();
         let endpoint =
@@ -757,7 +776,7 @@ impl StandIn {
             identity,
             endpoint.clone(),
             vec![],
-            vec!["relay".into()],
+            roles.iter().map(|role| role.to_string()).collect(),
             port,
         );
         let ctx = manager.connect_context();
@@ -1136,7 +1155,7 @@ async fn leave_lasts_ten_seconds_from_an_answer_and_is_asked_again_before_anythi
     reader
         .engine
         .leave()
-        .show(&link, &shown, false)
+        .show(&link, &shown, false, true)
         .await
         .unwrap();
     assert_eq!(reader.has_leave("relay"), Ok(()));
@@ -1637,7 +1656,7 @@ async fn an_answer_that_gives_no_leave_ends_the_leave_there_was() {
     // that gives none.
     let whole = Say::Answer(ShowAnswer::Whole);
     relay.says(whole.clone(), whole);
-    let answered = leave.show(&link, &shown, false).await.unwrap();
+    let answered = leave.show(&link, &shown, false, true).await.unwrap();
     assert_eq!(answered.answer, ShowAnswer::Whole);
     assert_eq!(device.has_leave("relay"), Err(NoLeave::NotGiven));
 
@@ -1645,10 +1664,10 @@ async fn an_answer_that_gives_no_leave_ends_the_leave_there_was() {
     // show that the relay resets, which is no answer, leaves it.
     let held = Say::Answer(ShowAnswer::Held);
     relay.says(held.clone(), held);
-    leave.show(&link, &shown, false).await.unwrap();
+    leave.show(&link, &shown, false, true).await.unwrap();
     assert_eq!(device.has_leave("relay"), Ok(()));
     relay.says(Say::Reset, Say::Reset);
-    assert!(leave.show(&link, &shown, false).await.is_err());
+    assert!(leave.show(&link, &shown, false, true).await.is_err());
     assert_eq!(device.has_leave("relay"), Ok(()));
 }
 
@@ -1911,7 +1930,9 @@ async fn a_relay_that_holds_a_change_the_device_refuses_is_said_to() {
         phrase_key: applied.phrase_key,
     };
     let signed = undoes.sign(&phrase().signing_key().unwrap()).unwrap();
-    let entry = change_entry::entry_of(&phrase(), &signed, &ForPhrase::first(secret)).unwrap();
+    let entry =
+        change_entry::entry_of(&phrase(), &signed, &ForPhrase::first(secret), 1_790_000_000)
+            .unwrap();
 
     device.connects_to("relay", relay.port, relay.key).await;
     let other = Say::Answer(ShowAnswer::Other {
@@ -2065,7 +2086,7 @@ async fn a_pass_held_by_its_pace_stops_and_moves_no_place() {
             device
                 .engine
                 .leave()
-                .show(&link, &entry, true)
+                .show(&link, &entry, true, true)
                 .await
                 .unwrap();
         }
@@ -2139,7 +2160,7 @@ async fn a_device_asks_only_so_much_of_a_relay_in_a_minute() {
     let mut refused = None;
     for n in 0..most {
         if n % 200 == 0 {
-            let shown = device.engine.leave().show(&link, &entry, true).await;
+            let shown = device.engine.leave().show(&link, &entry, true, true).await;
             shown.unwrap();
         }
         let asked = Asked {
@@ -2357,10 +2378,11 @@ async fn a_device_told_of_a_later_change_shows_its_own_whole_and_is_answered_wit
     assert_eq!(other.latest().id(), change.id());
     let after = other.counts("relay");
     // One show in short, which was told of another. Then its own entry
-    // whole, which was answered with the change. Then the change, whole,
-    // since it had not shown that one on this connection.
-    assert_eq!(after.short_shows, before.short_shows + 1);
-    assert_eq!(after.whole_shows, before.whole_shows + 2);
+    // whole, which was answered with the change. Then the change, in
+    // short: the relay handed it whole on this connection (decision
+    // 2026-10-24 (removal), rule 16).
+    assert_eq!(after.short_shows, before.short_shows + 2);
+    assert_eq!(after.whole_shows, before.whole_shows + 1);
     assert_eq!(other.has_leave("relay"), Ok(()));
     assert_eq!(other.at("relay").holds_latest, Some(true));
     // From then on, in short again.
@@ -2617,13 +2639,18 @@ async fn an_answer_that_does_not_check_is_behind_or_is_anothers_changes_nothing(
     assert!(any_of_a_channel(&relay.seen()));
 }
 
-/// Two changes made apart. The device that is answered with the other
-/// keeps both, stops, and has no leave. From then on it shows the one it
-/// had applied in short, is told of the other, which it keeps, and asks
-/// no more: it does not show whole again, and the entry is not handed to
-/// it again.
+/// Two changes made apart, each clear. The device that is answered with
+/// the other sets it aside and goes on under its own (decision 2026-10-24
+/// (removal), rules 8 and 11). The relay keeps both heads (rule 14), and
+/// hands the other whole once on the connection before it says that it
+/// holds the one shown (rule 16). The hand of a head the device keeps
+/// gives no leave and does not end the round (rule 18): the device shows
+/// the one it follows again, in short, is told that the relay holds it,
+/// and has leave in that round; then it shows the head it set aside, in
+/// short, since the relay handed it whole there. It does not show whole
+/// again, and the other is not handed to it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
+async fn a_device_that_sets_a_head_aside_keeps_both_entries_and_asks_the_relay_no_more() {
     let relay = relay_started("relay", None);
     let (mut one, mut other) = (Device::new("desktop"), Device::new("laptop"));
     one.makes_the_phrase(&phrase());
@@ -2643,49 +2670,47 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
     one.passes().await;
     assert!(holds_at(&relay, &by_one.channel, &by_one.id()));
 
-    // The other shows its own, whole, and is answered with that one.
+    // The other shows its own, whole, and is handed that one. It sets it
+    // aside, and the round goes on: its own again, in short, which the
+    // relay holds, and the head, in short. It has leave in that round.
     let before = other.counts("relay");
     other.passes().await;
-    assert_eq!(other.stands(), Stands::Stopped(State::Fork));
+    assert_eq!(other.stands(), Stands::Applied);
     let shows = at_relays::to_show(&other.db()).unwrap().unwrap();
     assert_eq!(
-        (shows.entry.id(), shows.apart),
-        (by_other.id(), Some(by_one.id()))
+        (shows.entry.id(), shows.set_aside),
+        (by_other.id(), vec![by_one.id()])
     );
-    assert_eq!(other.status().cannot_go_on, Some(CannotGoOn::Fork));
-    assert_eq!(other.has_leave("relay"), Err(NoLeave::Stopped(State::Fork)));
+    assert_eq!(other.status().cannot_go_on, None);
+    assert_eq!(other.has_leave("relay"), Ok(()));
     let forked = other.counts("relay");
     assert_eq!(forked.whole_shows, before.whole_shows + 1);
+    assert_eq!(forked.short_shows, before.short_shows + 2);
 
-    // Its whole show got no leave: the next is made after a wait, and
-    // nothing is shown while it lasts.
-    other.passes().await;
-    assert_eq!(other.counts("relay"), forked);
-    other.clock.run_ahead(Duration::from_secs(4));
-    // From then on, pass after pass: one short show each, answered with
-    // word of the entry that it keeps. Nothing whole, and no stream of a
-    // channel. (A show in short that gets no leave costs little, and
-    // starts no wait.)
+    // From then on, pass after pass, in short: the relay keeps both, has
+    // handed the other whole once, and says that it holds each shown.
+    // Nothing more whole, either way, and the device has leave.
     for _ in 0..4 {
         other.passes().await;
         other.sends().await;
     }
     let after = other.counts("relay");
     assert_eq!(after.whole_shows, forked.whole_shows);
-    assert_eq!(after.short_shows, forked.short_shows + 4);
-    assert_eq!(
-        (after.proofs, after.pages, after.pushes),
-        (forked.proofs, forked.pages, forked.pushes)
-    );
-    assert!(after.shown_bytes - forked.shown_bytes < 4 * 256);
-    assert_eq!(other.at("relay").holds_latest, Some(false));
-    // The relay holds the one it was shown first, and nothing that the
-    // other wrote under its own.
-    let held = held_at(&relay, &by_one.channel);
-    assert_eq!(held.len(), 1);
-    assert_eq!(held[0].id(), by_one.id());
-    assert!(!holds_at(&relay, &other.channel("notes"), &waiting.id()));
-    assert_eq!(other.stands(), Stands::Stopped(State::Fork));
+    assert!(after.short_shows > forked.short_shows);
+    assert_eq!(other.has_leave("relay"), Ok(()));
+    assert_eq!(other.at("relay").holds_latest, Some(true));
+    // The relay keeps both heads, and what the other wrote under its own
+    // change, which is clear, reaches it.
+    let mut held: Vec<[u8; 32]> = held_at(&relay, &by_one.channel)
+        .iter()
+        .map(|entry| entry.id())
+        .collect();
+    held.sort();
+    let mut both = vec![by_one.id(), by_other.id()];
+    both.sort();
+    assert_eq!(held, both);
+    assert!(holds_at(&relay, &other.channel("notes"), &waiting.id()));
+    assert_eq!(other.stands(), Stands::Applied);
 }
 
 /// **A statement that no relay held, shown later** (decision 2026-10-04
@@ -2698,8 +2723,13 @@ async fn a_device_in_a_fork_keeps_both_entries_and_asks_the_relay_no_more() {
 /// which holds an earlier change entry, takes the one it is shown.** The
 /// tablet, **which is behind, is answered with it there and applies
 /// it:** it is with the lost device. The laptop, **which has applied the
-/// other statement at that number, is shown it there and is in a
-/// fork;** and so is the tablet, once it is shown the laptop's.
+/// other statement at that number, is shown it there and sets it aside:**
+/// it lists the lost device, which the laptop's removes, and the laptop's
+/// is clear (decision 2026-10-24 (removal), rule 8). The tablet, once it is
+/// shown the laptop's, knows the lost device to be removed: the change it
+/// follows is not clear, and it moves, with no phrase, to the laptop's,
+/// which is clear and lists it, and sets the lost one's aside (rule 9;
+/// section 4, case 7).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_earlier_one() {
     let (near, far) = (relay_started("near", None), relay_started("far", None));
@@ -2756,24 +2786,25 @@ async fn a_statement_that_no_relay_held_comes_to_light_at_a_relay_that_holds_an_
     assert_eq!(behind.stands(), Stands::Applied);
 
     // The laptop has applied the other statement at that number. Shown
-    // the lost one's at that relay, it is in a fork, and keeps both.
+    // the lost one's at that relay, it sets it aside, keeps both, and goes
+    // on.
     remains.connects("far", &far).await;
     remains.passes().await;
-    assert_eq!(remains.stands(), Stands::Stopped(State::Fork));
+    assert_eq!(remains.stands(), Stands::Applied);
     let shows = at_relays::to_show(&remains.db()).unwrap().unwrap();
     assert_eq!(
-        (shows.entry.id(), shows.apart),
-        (again.id(), Some(unheard.id()))
+        (shows.entry.id(), shows.set_aside),
+        (again.id(), vec![unheard.id()])
     );
-    // And the tablet, which applied the lost one's, is in a fork once it
-    // is shown the laptop's, at the relay that holds that one.
+    // And the tablet, which applied the lost one's, moves to the
+    // laptop's once it is shown it, at the relay that holds that one.
     behind.connects("near", &near).await;
     behind.passes().await;
-    assert_eq!(behind.stands(), Stands::Stopped(State::Fork));
+    assert_eq!(behind.stands(), Stands::Applied);
     let shows = at_relays::to_show(&behind.db()).unwrap().unwrap();
     assert_eq!(
-        (shows.entry.id(), shows.apart),
-        (unheard.id(), Some(again.id()))
+        (shows.entry.id(), shows.set_aside),
+        (again.id(), vec![unheard.id()])
     );
 }
 
@@ -2908,7 +2939,7 @@ async fn a_change_applied_at_a_show_inside_a_pass_ends_the_pass_and_nothing_goes
     device
         .engine
         .leave()
-        .show(&link, &device.latest(), false)
+        .show(&link, &device.latest(), false, true)
         .await
         .unwrap();
     assert_eq!(device.has_leave("other"), Ok(()));
@@ -3385,6 +3416,175 @@ async fn with_a_relay_out_of_reach_a_device_waits_half_a_minute_and_then_goes_on
     let next = device.writes("notes", "b.md", "written once it was awake");
     device.sends().await;
     assert!(holds_at(&relay, &notes, &next.id()));
+}
+
+/// **A device that wakes waits no more for a relay whose dial has failed
+/// since the wake began,** once another relay has answered (decision
+/// 2026-10-04 §4.6; decision 2026-10-24 (removal), section 8). The relay
+/// is down from before the wake: its dial is in flight when the device
+/// reaches the other, and the device waits. That dial times out, and the
+/// device still waits: it began before the wake. The wake's own dial,
+/// owed to the relay, begins and times out, and the device goes on at
+/// once, well within the wait, with no time run ahead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_wakes_goes_on_once_the_dial_to_a_relay_that_is_down_has_failed() {
+    let relay = relay_started("reached", None);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let waiting = device.writes("notes", "a.md", "waiting to be sent");
+    let notes = device.channel("notes");
+    device.set_up_with("down");
+    device.passes().await;
+    let reach = device.engine.reach().clone();
+    assert!(!reach.dials_at_wake());
+    let down = relay_id("down");
+    reach.dial_begins(&down);
+
+    // It reaches one, which answers: the dial of the other is in flight,
+    // and it may still answer. The device waits.
+    device.connects("reached", &relay).await;
+    device.sends().await;
+    assert!(reach.dials_at_wake(), "the wake has every relay dialled");
+    assert!(device.at("reached").heard_since_woke);
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    assert_eq!(device.counts("reached").pushes, 0);
+
+    // The dial from before the wake times out: it says nothing of the
+    // wake, and the device waits.
+    reach.dial_timed_out(&down);
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    assert_eq!(device.counts("reached").pushes, 0);
+
+    // The wake's dial times out: the wake is over, and the device goes on.
+    reach.dial_begins(&down);
+    reach.dial_timed_out(&down);
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Ok(()));
+    assert!(holds_at(&relay, &notes, &waiting.id()));
+    // The other is still named as not heard from.
+    assert!(!device.at("down").heard_since_woke);
+}
+
+/// **A relay that is slow but may still answer is waited for, up to the
+/// wait** (decision 2026-10-24 (removal), section 8): its dial is in
+/// flight throughout, or it connected and has not answered a show. A dial
+/// that timed out before the wake began says nothing of now, and a dial
+/// refused within it, as anyone on the path can have it refused, says
+/// nothing either. At the wait the device goes on, as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_wakes_waits_for_a_relay_that_may_still_answer_up_to_the_wait() {
+    let relay = relay_started("reached", None);
+    let mut device = Device::new("laptop");
+    device.makes_the_phrase(&phrase());
+    device.holds("notes");
+    let waiting = device.writes("notes", "a.md", "waiting to be sent");
+    let notes = device.channel("notes");
+    device.set_up_with("slow");
+    device.passes().await;
+    let reach = device.engine.reach().clone();
+    let slow = relay_id("slow");
+    // A dial that timed out before the wake.
+    reach.dial_begins(&slow);
+    reach.dial_timed_out(&slow);
+    device.clock.run_ahead(Duration::from_millis(10));
+
+    device.connects("reached", &relay).await;
+    device.sends().await;
+    assert!(device.at("reached").heard_since_woke);
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    // A dial begun within the wake and refused: still waited for.
+    reach.dial_begins(&slow);
+    reach.dial_ends(&slow, false);
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    // A dial begun within the wake, in flight short of the wait.
+    reach.dial_begins(&slow);
+    device
+        .clock
+        .run_ahead(Duration::from_secs(WAKE_WAIT_SECS - 10));
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    // It connects, and has not answered a show yet: still waited for.
+    reach.dial_ends(&slow, true);
+    device.clock.run_ahead(Duration::from_secs(9));
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Err(NoLeave::Waking));
+    assert_eq!(device.counts("reached").pushes, 0);
+    assert!(!holds_at(&relay, &notes, &waiting.id()));
+    // At the wait the device goes on.
+    device.clock.run_ahead(Duration::from_secs(1));
+    device.passes().await;
+    assert_eq!(device.has_leave("reached"), Ok(()));
+    assert!(holds_at(&relay, &notes, &waiting.id()));
+}
+
+/// **A removal held only by a relay that comes back within the wake is
+/// heard before the device acts,** where its dial has not failed since
+/// the wake began (decision 2026-10-24 (removal), section 8): its last
+/// dial failed before the wake, and the dial that the wake began is in
+/// flight as it comes back. The device waits for it, is answered with the
+/// change, and applies it before anything goes anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_held_by_a_relay_that_comes_back_within_the_wake_is_heard_first() {
+    let (lacks, has) = (relay_started("lacks", None), relay_started("has", None));
+    let (mut maker, mut wakes) = (Device::new("desktop"), Device::new("laptop"));
+    maker.makes_the_phrase(&phrase());
+    maker.adds(&wakes);
+    for device in [&mut maker, &mut wakes] {
+        device.holds("notes");
+        device.connects("lacks", &lacks).await;
+        device.connects("has", &has).await;
+    }
+    all_pass(&[&maker, &wakes], 3).await;
+    let old_notes = maker.channel("notes");
+
+    // The laptop is closed, with an edit that it has not sent; the change
+    // is made, and reaches only the second relay.
+    wakes.disconnects("lacks");
+    wakes.disconnects("has");
+    wakes.passes().await;
+    let waiting = wakes.writes("notes", "mine.md", "written while it was closed");
+    maker.disconnects("lacks");
+    let change = maker.changes(&phrase(), &[&maker, &wakes], &[]);
+    maker.passes().await;
+    assert!(holds_at(&has, &change.channel, &change.id()));
+    assert!(!holds_at(&lacks, &change.channel, &change.id()));
+
+    // The second relay's last dial timed out before the laptop wakes.
+    let reach = wakes.engine.reach().clone();
+    let second = relay_id("has");
+    reach.dial_begins(&second);
+    reach.dial_timed_out(&second);
+    wakes.clock.run_ahead(Duration::from_millis(10));
+
+    // The laptop reaches the first, and the wake dials the second.
+    wakes.connects("lacks", &lacks).await;
+    wakes.passes().await;
+    assert!(reach.dials_at_wake());
+    reach.dial_begins(&second);
+    wakes.sends().await;
+    wakes.passes().await;
+    assert!(wakes.at("lacks").heard_since_woke);
+    assert_eq!(wakes.has_leave("lacks"), Err(NoLeave::Waking));
+    assert!(!holds_at(&lacks, &old_notes, &waiting.id()));
+
+    // The second comes back on that dial, and answers with the change.
+    wakes.connects("has", &has).await;
+    reach.dial_ends(&second, true);
+    wakes.passes().await;
+    assert_eq!(wakes.latest().id(), change.id());
+    wakes.passes().await;
+    for relay in [&lacks, &has] {
+        assert!(
+            !holds_at(relay, &old_notes, &waiting.id()),
+            "{}",
+            relay.name
+        );
+    }
 }
 
 /// A machine that slept wakes. Its connections still look open, and its
@@ -3916,7 +4116,7 @@ async fn pushed_by_hand(through: &Device, relay: &str, pushed: &[&Entry]) -> Vec
     through
         .engine
         .leave()
-        .show(&link, &shown, false)
+        .show(&link, &shown, false, true)
         .await
         .unwrap();
     let request = WireMessage::EntryPush(EntryPush {
@@ -4111,7 +4311,9 @@ async fn a_relays_refusal_for_room_is_said_as_what_it_is() {
         .iter()
         .map(|held| cost(&held.entry))
         .sum();
-    let relay = relay_started("relay", Some(cost(&device.latest()) + applied));
+    // The change entry's slot is counted at room for two heads
+    // (decision 2026-10-24 (removal), rule 15).
+    let relay = relay_started("relay", Some(2 * cost(&device.latest()) + applied));
     device.says_it_syncs("lab");
     device.connects("relay", &relay).await;
     // What `cordelia devices` says of the relay.
@@ -4192,7 +4394,9 @@ async fn an_entry_that_a_relay_has_no_room_for_is_kept_and_sent_again_later() {
         .iter()
         .map(|held| cost(&held.entry))
         .sum();
-    let room = cost(&device.latest()) + personal + cost(&fits);
+    // The change entry's slot is counted at room for two heads
+    // (decision 2026-10-24 (removal), rule 15).
+    let room = 2 * cost(&device.latest()) + personal + cost(&fits);
     let relay = relay_started("relay", Some(room));
     device.connects("relay", &relay).await;
 
@@ -4265,7 +4469,9 @@ async fn a_delete_behind_an_entry_that_found_no_room_reaches_the_relay_and_the_e
         .map(|held| cost(&held.entry))
         .sum();
     let slack = 512;
-    let room = cost(&device.latest()) + personal + cost(&large) + slack;
+    // The change entry's slot is counted at room for two heads
+    // (decision 2026-10-24 (removal), rule 15).
+    let room = 2 * cost(&device.latest()) + personal + cost(&large) + slack;
     let relay = relay_started("relay", Some(room));
     device.connects("relay", &relay).await;
 
@@ -4931,6 +5137,120 @@ async fn a_hand_over_is_a_change_of_settings_only_where_it_is_taken() {
     assert_eq!(new.latest().id(), adder.latest().id());
     assert_eq!(new.state.sync_control.generation(), counted + 2);
     assert!(!new.state.own_channels.first_fetch_done(&channel, noted));
+}
+
+/// A move at `cordelia accept` waits for the sync cycle's turn, and the
+/// device is closed while it waits (decision 2026-10-24 (removal), rules 5
+/// and 9). The laptop follows its own change, which lists the tablet. The
+/// desktop, apart from it, removes the tablet and adds the laptop again by
+/// a hand-over. Accepted, the hand-over's change is clear and counts the
+/// laptop by its record: the laptop moves to it. The removed key and the
+/// close commit first, so that while a cycle holds its turn the laptop
+/// stands closed, and seals nothing under the change it leaves; once the
+/// turn ends it has moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_at_accept_waits_for_the_cycle_with_the_device_closed() {
+    let relay = relay_started("relay", None);
+    let (mut desktop, mut laptop, tablet) = (
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+    );
+    desktop.makes_the_phrase(&phrase());
+    desktop.adds(&laptop);
+    desktop.adds(&tablet);
+    // Apart: the laptop's change lists the tablet; the desktop's removes
+    // it, and lists the desktop alone. The desktop adds the laptop again.
+    laptop.changes(&phrase(), &[&laptop, &desktop, &tablet], &[]);
+    let removal = desktop.changes(&phrase(), &[&desktop], &[&tablet]);
+    let now = desktop.now();
+    add_device(
+        &desktop.db(),
+        &desktop.state.identity,
+        &laptop.key(),
+        "laptop",
+        now,
+    )
+    .unwrap();
+    desktop.connects("relay", &relay).await;
+    desktop.passes().await;
+
+    laptop.connects("relay", &relay).await;
+    let typed = types(&laptop, &desktop);
+    assert_eq!(laptop.stands(), Stands::Applied);
+    let counted = laptop.state.sync_control.generation();
+    // A cycle holds its turn while the hand-over is read.
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let reading = scope.spawn(|| handle.block_on(asks_for_hand_over(&laptop, "relay", &typed)));
+        // The move asks for its change of settings, and waits for the turn.
+        let waited = std::time::Instant::now();
+        while laptop.state.sync_control.generation() == counted {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no move asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+        let removed = cordelia_storage::person::removed_keys(&laptop.db()).unwrap();
+        assert!(removed.contains(&tablet.key()));
+        drop(turn);
+        let read = reading.join().unwrap();
+        let Ok(PairRead::Read(read)) = read else {
+            panic!("{read:?}");
+        };
+        assert!(
+            matches!(read.as_slice(), [Accepted::Applied(_)]),
+            "{read:?}"
+        );
+    });
+    assert_eq!(laptop.stands(), Stands::Applied);
+    assert_eq!(laptop.latest().id(), removal.id());
+}
+
+/// A move in the pass waits for the sync cycle's turn, and the device is
+/// closed while it waits (decision 2026-10-24 (removal), rules 5 and 9):
+/// the pass holds the move back, so the head and its removed keys commit
+/// at once with the device closed, and only the move waits. The laptop
+/// follows its own change, which lists the tablet; the relay holds the
+/// desktop's, made apart, which removes the tablet and lists the laptop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_in_the_pass_waits_for_the_cycle_with_the_device_closed() {
+    let relay = relay_started("relay", None);
+    let (mut desktop, mut laptop, tablet) = (
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+    );
+    desktop.makes_the_phrase(&phrase());
+    desktop.adds(&laptop);
+    desktop.adds(&tablet);
+    laptop.changes(&phrase(), &[&laptop, &desktop, &tablet], &[]);
+    let removal = desktop.changes(&phrase(), &[&desktop, &laptop], &[&tablet]);
+    desktop.connects("relay", &relay).await;
+    desktop.passes().await;
+    assert!(holds_at(&relay, &removal.channel, &removal.id()));
+
+    laptop.connects("relay", &relay).await;
+    assert_eq!(laptop.stands(), Stands::Applied);
+    let counted = laptop.state.sync_control.generation();
+    // A cycle holds its turn while the laptop passes.
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let passing = scope.spawn(|| handle.block_on(laptop.passes()));
+        let waited = std::time::Instant::now();
+        while laptop.state.sync_control.generation() == counted {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no move asked");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+        let removed = cordelia_storage::person::removed_keys(&laptop.db()).unwrap();
+        assert!(removed.contains(&tablet.key()));
+        drop(turn);
+        passing.join().unwrap();
+    });
+    assert_eq!(laptop.stands(), Stands::Applied);
+    assert_eq!(laptop.latest().id(), removal.id());
 }
 
 /// The door for a typed key can do nothing else. It asks the relay
@@ -6812,7 +7132,7 @@ async fn a_read_with_places_of_its_own_asks_within_what_the_device_asks_of_a_rel
             device
                 .engine
                 .leave()
-                .show(&link, &entry, true)
+                .show(&link, &entry, true, true)
                 .await
                 .unwrap();
         }
@@ -7167,7 +7487,7 @@ async fn a_read_sends_nothing_while_the_relay_is_at_its_count() {
     device
         .engine
         .leave()
-        .show(&link, &entry, true)
+        .show(&link, &entry, true, true)
         .await
         .unwrap();
     relay.seen();
@@ -10220,8 +10540,10 @@ async fn the_status_says_when_the_device_woke() {
     woke_at(&device, started);
     device.clock.run_ahead(Duration::from_secs(60));
     device.connects_to("a", a.port, a.key).await;
-    device.passes().await;
+    // The pass notes the wake as it begins: read after it, the moment
+    // could fall a second late.
     let woke = device.now();
+    device.passes().await;
     woke_at(&device, woke);
     device.clock.run_ahead(Duration::from_secs(60));
     device.passes().await;
@@ -11646,4 +11968,921 @@ async fn a_shared_proof_takes_no_place_a_channel_of_the_devices_own_needs() {
         assert_eq!(asked, proved, "with room for {most}");
         assert_eq!(device.shared_counts("relay").proofs, u64::from(proved));
     }
+}
+
+// ── Every head (decision 2026-10-24 (removal), rule 18, and rule 5) ──
+
+/// A laptop that follows its own change 2 and sets aside two changes made
+/// apart from it, each clear: a tablet's change 2, and a desktop's change
+/// 3 (decision 2026-10-24 (removal), rules 8 and 11). Returns the laptop,
+/// the change entry it follows, the head at 2 and the head at 3.
+fn keeping_heads() -> (Device, CheckedEntry, CheckedEntry, CheckedEntry) {
+    let (laptop, desktop, tablet) = (
+        Device::new("laptop"),
+        Device::new("desktop"),
+        Device::new("tablet"),
+    );
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    laptop.adds(&tablet);
+    let all = [&laptop, &desktop, &tablet];
+    let followed = laptop.changes(&phrase(), &all, &[]);
+    let at_two = tablet.makes_change(&phrase(), &all, &[]);
+    desktop.changes(&phrase(), &all, &[]);
+    let at_three = desktop.makes_change(&phrase(), &all, &[]);
+    for head in [&at_two, &at_three] {
+        let outcome = shown(&laptop.db(), &laptop.state.identity, head, laptop.now()).unwrap();
+        assert!(matches!(outcome, Shown::SetAside), "{outcome:?}");
+    }
+    assert_eq!((followed.rev, at_two.rev, at_three.rev), (2, 2, 3));
+    assert_eq!(laptop.stands(), Stands::Applied);
+    (laptop, followed, at_two, at_three)
+}
+
+/// The change entries that `requests` showed, in their order: each by what
+/// it is named by, and whether it was shown whole.
+fn shows_in(requests: &[WireMessage]) -> Vec<([u8; 32], bool)> {
+    requests
+        .iter()
+        .filter_map(|request| match request {
+            WireMessage::EntryShow(show) => {
+                Some((Entry::from_wire(&show.entry).unwrap().id(), true))
+            }
+            WireMessage::EntryShowShort(show) => Some((show.id, false)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What a stand-in answers a show of the change entry named `id` with, by
+/// the entries of `answers`: `None` where the script says.
+fn answering(
+    answers: Vec<([u8; 32], ShowAnswer)>,
+) -> impl FnMut(&WireMessage) -> Option<Say> + Send + 'static {
+    move |request| {
+        let id = match request {
+            WireMessage::EntryShow(show) => Entry::from_wire(&show.entry).ok()?.id(),
+            WireMessage::EntryShowShort(show) => show.id,
+            _ => return None,
+        };
+        answers
+            .iter()
+            .find(|(of, _)| *of == id)
+            .map(|(_, answer)| Say::Answer(answer.clone()))
+    }
+}
+
+/// A device shows the change it follows first, and then each head it sets
+/// aside, the lowest number first (decision 2026-10-24 (removal), rule 18):
+/// at a relay that names the role `heads`, every one; at one that does not,
+/// as a relay of the version before, none numbered above the change it
+/// follows. Each is shown whole once on a connection, and in short after.
+///
+/// Taken out: the heads shown (only the change followed is shown: both
+/// fail); the bar on a head above at a relay that does not name the role
+/// (the head at 3 is shown there: the first fails); every head at one that
+/// names it (the bar there too: the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_shows_the_change_it_follows_first_and_then_each_head_set_aside() {
+    let (mut laptop, followed, at_two, at_three) = keeping_heads();
+    let (f, two, three) = (followed.id(), at_two.id(), at_three.id());
+
+    // A relay of the version before: no head above the change followed.
+    let before = StandIn::started().await;
+    laptop.connects_to("before", before.port, before.key).await;
+    assert!(!laptop.link("before").keeps_heads());
+    laptop.passes().await;
+    assert_eq!(shows_in(&before.requests()), [(f, true), (two, true)]);
+    assert_eq!(laptop.has_leave("before"), Ok(()));
+    laptop.passes().await;
+    assert_eq!(shows_in(&before.requests()), [(f, false), (two, false)]);
+
+    // A relay of this version: every head.
+    let heads = StandIn::naming(&["relay", "heads"]).await;
+    laptop.connects_to("heads", heads.port, heads.key).await;
+    assert!(laptop.link("heads").keeps_heads());
+    laptop.passes().await;
+    assert_eq!(
+        shows_in(&heads.requests()),
+        [(f, true), (two, true), (three, true)]
+    );
+    assert_eq!(laptop.has_leave("heads"), Ok(()));
+    laptop.passes().await;
+    assert_eq!(
+        shows_in(&heads.requests()),
+        [(f, false), (two, false), (three, false)]
+    );
+    // The relay of the version before was shown the same two, at each of
+    // those two passes, and never the head above.
+    assert_eq!(
+        shows_in(&before.requests()),
+        [(f, false), (two, false), (f, false), (two, false)]
+    );
+}
+
+/// Leave comes from the answer to the change followed, and the show of a
+/// head set aside neither takes it away nor gives it; only that answer is
+/// the relay's latest (decision 2026-10-24 (removal), rule 18).
+///
+/// Taken out: a head's answer ending the leave (a "show it whole" to the
+/// whole head ends it: the first fails); a head's answer giving it (it is
+/// given for the head, and the change followed has none: the second
+/// fails); a head's answer noted as the relay's latest (a head refused for
+/// room has the relay lack the change: the third fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn leave_comes_from_the_answer_to_the_change_followed_and_a_head_neither_takes_nor_gives_it()
+{
+    let (mut laptop, followed, at_two, _) = keeping_heads();
+    let (f, two) = (followed.id(), at_two.id());
+    let relay = StandIn::started().await;
+    let held = ShowAnswer::Held;
+
+    // The head is answered "show it whole" to its whole show: no answer.
+    relay.hook(answering(vec![(f, held.clone()), (two, ShowAnswer::Whole)]));
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(f, true), (two, true)]);
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+
+    // The head is answered "held".
+    relay.hook(answering(vec![(f, held.clone()), (two, held.clone())]));
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(f, true), (two, true)]);
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+
+    // The head is refused for room: the relay holds the change followed.
+    relay.hook(answering(vec![
+        (f, held),
+        (two, ShowAnswer::Refused(EntryRefused::NoRoom)),
+    ]));
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(f, true), (two, true)]);
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+    assert_eq!(laptop.at("relay").holds_latest, Some(true));
+    assert_eq!(laptop.at("relay").no_room, None);
+}
+
+/// An answer that hands a head the device keeps gives no leave, and does
+/// not end the round: the device shows the change followed again, and has
+/// leave from that answer (decision 2026-10-24 (removal), rule 18). A head
+/// that a relay answers with another entry is not shown there again on
+/// the connection; on a new one it is.
+///
+/// Taken out: the round going on after such a hand (it ends with no leave:
+/// the first fails); a head answered with another entry shown again on the
+/// connection (the last but one fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hand_of_a_head_the_device_keeps_gives_no_leave_and_the_round_goes_on() {
+    let (mut laptop, followed, at_two, _) = keeping_heads();
+    let (f, two) = (followed.id(), at_two.id());
+    let relay = StandIn::started().await;
+
+    // The first show of the change followed is handed the head at 2, which
+    // the device keeps; every show after is answered "held".
+    let mut first = true;
+    let hand = ShowAnswer::Another(at_two.to_wire());
+    relay.hook(move |request| {
+        let shown = shows_in(std::slice::from_ref(request));
+        let (id, _) = *shown.first()?;
+        let answer = match (id == f, first) {
+            (true, true) => {
+                first = false;
+                hand.clone()
+            }
+            _ => ShowAnswer::Held,
+        };
+        Some(Say::Answer(answer))
+    });
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    // The head was handed whole on the connection: it is shown in short.
+    assert_eq!(
+        shows_in(&relay.requests()),
+        [(f, true), (f, false), (two, false)]
+    );
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+    assert_eq!(laptop.at("relay").holds_latest, Some(true));
+
+    // The head is answered with another entry, the change followed: it is
+    // not shown there again on this connection.
+    let entry = ShowAnswer::Another(followed.to_wire());
+    relay.hook(answering(vec![(f, ShowAnswer::Held), (two, entry)]));
+    laptop.passes().await;
+    assert_eq!(
+        shows_in(&relay.requests()),
+        [(f, false), (two, false), (f, false)]
+    );
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(f, false)]);
+    // On a new connection it is.
+    relay.hook(answering(vec![
+        (f, ShowAnswer::Held),
+        (two, ShowAnswer::Held),
+    ]));
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(f, true), (two, true)]);
+}
+
+/// While the show of the change followed waits after an answer that gave
+/// no leave, each head set aside is still shown, on every pass (decision
+/// 2026-10-24 (removal), rule 18); the change followed is not, and the
+/// round gives no leave and changes nothing that the status says of the
+/// relay.
+///
+/// Taken out: the round ended at the wait (no head is shown on the second
+/// pass: the second assertion fails); a round of heads alone counted as an
+/// attempt at the relay (the relay is no longer reached: the last fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn while_the_show_of_the_change_followed_waits_each_head_is_shown() {
+    let (mut laptop, followed, at_two, _) = keeping_heads();
+    let (f, two) = (followed.id(), at_two.id());
+    let relay = StandIn::started().await;
+    // The relay holds another change, and names it to the whole show:
+    // it lacks the change followed, gives no leave, and the show waits.
+    let other = ShowAnswer::Other {
+        rev: followed.rev + 1,
+        id: [7; 32],
+    };
+    relay.hook(answering(vec![(f, other), (two, ShowAnswer::Held)]));
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(f, true)]);
+    let before = laptop.at("relay");
+    assert_eq!(before.holds_latest, Some(false));
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(two, true)]);
+    assert_eq!(laptop.has_leave("relay"), Err(NoLeave::NotGiven));
+    assert_eq!(laptop.at("relay"), before);
+}
+
+/// At a relay that names the role `heads`, a head answered with another
+/// entry is shown again at the next pass on the same connection, in short
+/// (decision 2026-10-24 (removal), rule 18): a relay of this version
+/// remembers what it was shown whole, so the show costs little, and one
+/// that had no room for the head when it answered may have it later.
+///
+/// Taken out: the role asked before a head is put by on the connection (it
+/// is never shown there again: the second assertion fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_a_relay_that_keeps_heads_a_head_answered_with_another_is_shown_again() {
+    let (mut laptop, followed, at_two, _) = keeping_heads();
+    let (f, two) = (followed.id(), at_two.id());
+    let relay = StandIn::naming(&["relay", "heads"]).await;
+    let entry = ShowAnswer::Another(followed.to_wire());
+    relay.hook(answering(vec![(f, ShowAnswer::Held), (two, entry)]));
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    assert!(laptop.link("relay").keeps_heads());
+    laptop.passes().await;
+    let shown = shows_in(&relay.requests());
+    assert!(shown.contains(&(two, true)), "{shown:?}");
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+    // Room freed: the relay takes the head now.
+    relay.hook(answering(vec![
+        (f, ShowAnswer::Held),
+        (two, ShowAnswer::Taken),
+    ]));
+    laptop.passes().await;
+    let shown = shows_in(&relay.requests());
+    assert!(shown.contains(&(two, false)), "{shown:?}");
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+}
+
+/// A show that fails at a relay that names the role `heads` drops the
+/// connection, so that a new one is handed every head again (the review of
+/// the whole build, its H2): the relay remembers each head it handed on a
+/// connection, and an answer that handed a removal and was lost after the
+/// relay wrote it would leave the device told "held" at its next show
+/// there. At a relay that names no role `heads` the connection stays. So
+/// does it at one that names the role and refuses the show for now
+/// (ERR_RATE_LIMIT), which it does before it hands anything (the review of
+/// the fixes of the whole build, its M3); a show answered with what is no
+/// answer to one drops it.
+///
+/// Taken out: the drop (the connection stays open: the first fails); the
+/// show refused for now let be (the connection is dropped: the assertion
+/// of a refused show fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_show_at_a_relay_that_keeps_heads_drops_the_connection() {
+    let (mut laptop, _, _, _) = keeping_heads();
+    let heads = StandIn::naming(&["relay", "heads"]).await;
+    heads.says(Say::Reset, Say::Reset);
+    laptop.connects_to("heads", heads.port, heads.key).await;
+    assert!(laptop.link("heads").keeps_heads());
+    laptop.passes().await;
+    assert!(
+        !shows_in(&heads.requests()).is_empty(),
+        "the device showed nothing"
+    );
+    assert!(
+        !laptop.link("heads").is_open(),
+        "a failed show at a relay that keeps heads left its connection open"
+    );
+    assert_ne!(laptop.has_leave("heads"), Ok(()));
+
+    // At a relay of the version before, the same failure keeps it.
+    let before = StandIn::started().await;
+    before.says(Say::Reset, Say::Reset);
+    laptop.connects_to("before", before.port, before.key).await;
+    assert!(!laptop.link("before").keeps_heads());
+    laptop.passes().await;
+    assert!(!shows_in(&before.requests()).is_empty());
+    assert!(laptop.link("before").is_open());
+
+    // Refused for now at a relay that keeps heads: nothing was handed,
+    // and the connection stays, pass after pass.
+    let busy = StandIn::naming(&["relay", "heads"]).await;
+    busy.says(Say::NotNow, Say::NotNow);
+    laptop.connects_to("busy", busy.port, busy.key).await;
+    assert!(laptop.link("busy").keeps_heads());
+    for _ in 0..2 {
+        laptop.passes().await;
+        assert!(!shows_in(&busy.requests()).is_empty());
+        assert!(
+            laptop.link("busy").is_open(),
+            "a show refused for now dropped the connection"
+        );
+    }
+    assert_ne!(laptop.has_leave("busy"), Ok(()));
+
+    // Answered with what is no answer to a show: dropped.
+    let wrong = StandIn::naming(&["relay", "heads"]).await;
+    wrong.says(Say::NotAShow, Say::NotAShow);
+    laptop.connects_to("wrong", wrong.port, wrong.key).await;
+    laptop.passes().await;
+    assert!(!shows_in(&wrong.requests()).is_empty());
+    assert!(!laptop.link("wrong").is_open());
+}
+
+/// Test 8 of decision 2026-10-24 (removal), section 7: a relay of the
+/// version before (it names no role `heads`) answers each show with a
+/// change that the device keeps as a head set aside, numbered above the
+/// change it follows. The device has leave there after the second such
+/// answer in a round, never shows the relay that head, and names the relay
+/// as lacking the change followed (rule 18). Once the relay holds the
+/// change followed, the device shows it the head at its number, and never
+/// the one above.
+///
+/// Taken out: rule 18's leave (the device has none: the first fails); its
+/// bar on a head above (the device shows it: the last fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_of_the_version_before_that_hands_a_head_set_aside_twice_gives_leave() {
+    let (mut laptop, followed, at_two, at_three) = keeping_heads();
+    let (f, two, three) = (followed.id(), at_two.id(), at_three.id());
+    let relay = StandIn::started().await;
+    let hand = Say::Answer(ShowAnswer::Another(at_three.to_wire()));
+    relay.says(hand.clone(), hand);
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    assert!(!laptop.link("relay").keeps_heads());
+    for _ in 0..3 {
+        laptop.passes().await;
+        assert_eq!(laptop.has_leave("relay"), Ok(()));
+        let requests = relay.requests();
+        let shown = shows_in(&requests);
+        assert_eq!(shown.len(), 2, "{shown:?}");
+        assert!(shown.iter().all(|(id, _)| *id == f), "{shown:?}");
+        // It goes on syncing through the relay: it pulls its channel.
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, WireMessage::EntryPull(_))),
+            "nothing was pulled"
+        );
+        // The relay is named as lacking the change followed.
+        assert_eq!(laptop.at("relay").holds_latest, Some(false));
+        assert_eq!(laptop.stands(), Stands::Applied);
+    }
+
+    // The relay holds the change followed: the head at 2 is shown, and
+    // never the one above.
+    let held = Say::Answer(ShowAnswer::Held);
+    relay.says(held.clone(), held);
+    laptop.passes().await;
+    laptop.passes().await;
+    let shown = shows_in(&relay.requests());
+    assert!(shown.contains(&(two, true)), "{shown:?}");
+    assert!(!shown.iter().any(|(id, _)| *id == three), "{shown:?}");
+    assert_eq!(laptop.at("relay").holds_latest, Some(true));
+}
+
+/// A relay that names the role `heads` and hands the same head twice in a
+/// round ends the round with no leave (decision 2026-10-24 (removal), rule
+/// 18): a relay of this version hands a head twice only once every head it
+/// keeps was handed, and it neither holds the entry shown, nor took it,
+/// nor refused it. It lacks the change, and the status says so.
+///
+/// Taken out: the role read (it is taken for a relay of the version
+/// before, and gives leave: the first fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_that_keeps_heads_and_hands_one_twice_gives_no_leave() {
+    let (mut laptop, followed, _, at_three) = keeping_heads();
+    let relay = StandIn::naming(&["relay", "heads"]).await;
+    let hand = Say::Answer(ShowAnswer::Another(at_three.to_wire()));
+    relay.says(hand.clone(), hand);
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(laptop.has_leave("relay"), Err(NoLeave::NotGiven));
+    let shown = shows_in(&relay.requests());
+    assert_eq!(shown, [(followed.id(), true), (followed.id(), false)]);
+    assert_eq!(laptop.at("relay").holds_latest, Some(false));
+}
+
+/// An `Other` is always followed by a whole show (decision 2026-10-24
+/// (removal), rule 18): also where it names a head that the device keeps.
+/// The whole show is what is answered, and gives leave.
+///
+/// Taken out: the early return on a head kept (the round ends at the
+/// `Other`, with no leave: both fail).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_other_is_always_followed_by_a_whole_show() {
+    let (mut laptop, followed, at_two, _) = keeping_heads();
+    let (f, two) = (followed.id(), at_two.id());
+    let relay = StandIn::started().await;
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(shows_in(&relay.requests()), [(f, true), (two, true)]);
+
+    let other = Say::Answer(ShowAnswer::Other {
+        rev: at_two.rev,
+        id: two,
+    });
+    relay.says(other, Say::Answer(ShowAnswer::Held));
+    relay.hook(answering(vec![(two, ShowAnswer::Held)]));
+    laptop.passes().await;
+    assert_eq!(
+        shows_in(&relay.requests()),
+        [(f, false), (f, true), (two, false)]
+    );
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+}
+
+/// A round has room for 23 shows (decision 2026-10-24 (removal), rule 18):
+/// a device that keeps eight heads, at a relay that keeps the same eight
+/// and hands seven of them on the connection, one at a show and each named
+/// first to a short show, ends its round with leave, and shows each head.
+///
+/// Taken out: a round of six shows (it ends before the relay says that it
+/// holds the change followed: no leave); an `Other` of a head kept ending
+/// the round (the same).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_that_keeps_eight_heads_ends_its_round_at_a_relay_that_keeps_eight() {
+    let relay = relay_started("relay", None);
+    let mut devices: Vec<Device> = ["laptop", "desktop", "tablet", "phone", "a", "b", "c", "d"]
+        .into_iter()
+        .map(Device::new)
+        .collect();
+    devices[0].makes_the_phrase(&phrase());
+    for n in 1..devices.len() {
+        devices[0].adds(&devices[n]);
+    }
+    // Each makes a change 2 of its own, apart from every other's.
+    let changes: Vec<CheckedEntry> = {
+        let all: Vec<&Device> = devices.iter().collect();
+        devices
+            .iter()
+            .map(|device| device.changes(&phrase(), &all, &[]))
+            .collect()
+    };
+    // The relay keeps the seven others, each shown it by its own device.
+    for device in devices.iter_mut().skip(1) {
+        device.connects("relay", &relay).await;
+        device.passes().await;
+        device.disconnects("relay");
+    }
+    let laptop = &devices[0];
+    for change in &changes[1..] {
+        let outcome = shown(&laptop.db(), &laptop.state.identity, change, laptop.now()).unwrap();
+        assert!(matches!(outcome, Shown::SetAside), "{outcome:?}");
+    }
+    let shows = at_relays::to_show(&laptop.db()).unwrap().unwrap();
+    assert_eq!(shows.heads.len(), 7);
+
+    let mut laptop = devices.swap_remove(0);
+    laptop.connects("relay", &relay).await;
+    laptop.passes().await;
+    let counts = laptop.counts("relay");
+    let shows = counts.whole_shows + counts.short_shows;
+    assert!(shows <= 23, "{counts:?}");
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+    assert_eq!(laptop.at("relay").holds_latest, Some(true));
+    let mut held: Vec<[u8; 32]> = held_at(&relay, &changes[0].channel)
+        .iter()
+        .map(|entry| entry.id())
+        .collect();
+    held.sort();
+    let mut all: Vec<[u8; 32]> = changes.iter().map(|change| change.id()).collect();
+    all.sort();
+    assert_eq!(held, all);
+}
+
+/// At a wake, a relay is heard once its answer is judged, and not when it
+/// arrives (decision 2026-10-24 (removal), rule 5): while relay A's answer,
+/// a change for the device to apply, waits for the sync cycle's turn, the
+/// pass that sends starts at no relay, relay B included, which has
+/// answered "held".
+///
+/// Taken out: the relay heard as its answer arrives (relay B is pushed what
+/// waits under the change the device leaves: the assertion fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn at_a_wake_a_relay_is_heard_once_its_answer_is_judged() {
+    let (a, b) = (StandIn::started().await, StandIn::started().await);
+    let (mut laptop, desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    laptop.holds("notes");
+    laptop.writes("notes", "a.md", "waits to be sent");
+    let change = desktop.changes(&phrase(), &[&laptop, &desktop], &[]);
+    // Relay A holds the change: it answers a whole show with it.
+    a.says(
+        Say::Answer(ShowAnswer::Whole),
+        Say::Answer(ShowAnswer::Another(change.to_wire())),
+    );
+    laptop.connects_to("a", a.port, a.key).await;
+    laptop.connects_to("b", b.port, b.key).await;
+    assert!(laptop.engine.leave().is_waking());
+
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let passing = scope.spawn(|| handle.block_on(laptop.passes()));
+        // Both relays have answered the wake's shows.
+        let waited = std::time::Instant::now();
+        let mut shown = (false, false);
+        while shown != (true, true) {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no shows");
+            std::thread::sleep(Duration::from_millis(20));
+            shown.0 |= !shows_in(&a.requests()).is_empty();
+            shown.1 |= !shows_in(&b.requests()).is_empty();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        // Relay A's answer waits for the cycle's turn: the pass that sends
+        // starts nowhere.
+        assert!(laptop.engine.leave().is_waking());
+        let sends = scope
+            .spawn(|| {
+                handle.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), laptop.sends()).await
+                })
+            })
+            .join()
+            .unwrap();
+        assert!(sends.is_ok(), "the pass that sends waited");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !b.seen().contains(&Seen::Push),
+            "relay B was sent what waits while relay A's answer was judged"
+        );
+        drop(turn);
+        passing.join().unwrap();
+    });
+    assert_eq!(laptop.latest().id(), change.id());
+    assert!(!laptop.engine.leave().is_waking());
+}
+
+/// A change made after the one followed that removes a key is known at
+/// once (decision 2026-10-24 (removal), rule 5): while relay A's answer, the
+/// desktop's change that removes the tablet, waits for the sync cycle's
+/// turn to be applied, the device is closed from the commit that keeps the
+/// keys it removes. Relay B, which still holds the change followed and has
+/// given leave, is pushed nothing sealed under it. Once the turn ends the
+/// change is applied.
+///
+/// Taken out: the keys and the close committed before the apply waits (the
+/// device stands applied while it waits: the check that it is closed
+/// fails, and without that check relay B is pushed what waits under the
+/// change that the tablet holds, and the check of B fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_after_the_one_followed_that_removes_a_key_is_known_at_once() {
+    let (a, b) = (StandIn::started().await, StandIn::started().await);
+    let (mut laptop, desktop, tablet) = (
+        Device::new("laptop"),
+        Device::new("desktop"),
+        Device::new("tablet"),
+    );
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    laptop.adds(&tablet);
+    laptop.holds("notes");
+    let change = desktop.changes(&phrase(), &[&laptop, &desktop], &[&tablet]);
+    laptop.connects_to("a", a.port, a.key).await;
+    laptop.connects_to("b", b.port, b.key).await;
+    laptop.passes().await;
+    assert_eq!(laptop.has_leave("b"), Ok(()));
+    laptop.sends().await;
+    a.requests();
+    b.requests();
+
+    // Relay A comes to hold the desktop's change; relay B does not.
+    a.says(
+        Say::Answer(ShowAnswer::Whole),
+        Say::Answer(ShowAnswer::Another(change.to_wire())),
+    );
+    laptop.writes("notes", "a.md", "waits to be sent");
+    let turn = laptop.state.history.turn();
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let passing = scope.spawn(|| handle.block_on(laptop.passes()));
+        let waited = std::time::Instant::now();
+        while !a.seen().contains(&Seen::Whole) {
+            assert!(waited.elapsed() < Duration::from_secs(30), "no whole show");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        // The apply waits for the cycle's turn, with the device closed.
+        assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+        let sends = scope
+            .spawn(|| {
+                handle.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(5), laptop.sends()).await
+                })
+            })
+            .join()
+            .unwrap();
+        assert!(sends.is_ok(), "the pass that sends waited");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !b.seen().contains(&Seen::Push),
+            "relay B was pushed what waits while relay A's answer waited for the turn"
+        );
+        drop(turn);
+        passing.join().unwrap();
+    });
+    assert_eq!(laptop.latest().id(), change.id());
+    assert_eq!(laptop.stands(), Stands::Applied);
+}
+
+/// A push open at the commit after which the device may use the connection
+/// no more, and not yet answered, is reset (decision 2026-10-24 (removal),
+/// rule 5): from the commit that closes the device the stream is let go at
+/// once, and it does not wait out the relay's answer. Before it, the
+/// device had leave there; from it, it has none.
+///
+/// Taken out: the reset (the push waits for the relay until the stream's
+/// timeout: the assertion of time fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_push_open_at_the_commit_that_closes_the_device_is_reset() {
+    let relay = StandIn::started().await;
+    let (mut laptop, desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.adds(&desktop);
+    laptop.holds("notes");
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    assert_eq!(laptop.has_leave("relay"), Ok(()));
+    relay.requests();
+
+    // The relay takes the next push and answers nothing.
+    relay.hook(|request| matches!(request, WireMessage::EntryPush(_)).then_some(Say::Nothing));
+    laptop.writes("notes", "a.md", "on its way at the commit");
+    let handle = tokio::runtime::Handle::current();
+    std::thread::scope(|scope| {
+        let sending = scope.spawn(|| {
+            let began = std::time::Instant::now();
+            handle.block_on(laptop.sends());
+            began.elapsed()
+        });
+        let waited = std::time::Instant::now();
+        while !relay.seen().contains(&Seen::Push) {
+            assert!(waited.elapsed() < Duration::from_secs(10), "no push");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The commit that closes the device: its own key kept as removed,
+        // set so by hand. The change it follows is not clear from here.
+        let closed_at = std::time::Instant::now();
+        cordelia_storage::person::keep_removed(&laptop.db(), &[laptop.key()], 2).unwrap();
+        assert_eq!(laptop.stands(), Stands::Closed);
+        assert_eq!(laptop.has_leave("relay"), Err(NoLeave::Closed));
+        sending.join().unwrap();
+        let after = closed_at.elapsed();
+        assert!(
+            after < Duration::from_secs(3),
+            "the push waited {after:?} after the commit"
+        );
+    });
+}
+
+/// A closed device sends the delete that it wrote over a hand-over that a
+/// relay was sent, and nothing else (decision 2026-10-24 (removal), rules
+/// 4, 5 and 10): the hand-over carries the secret it follows, which is not
+/// clear, and is dropped from its store; the delete withdraws it at the
+/// relay. What it wrote in a channel of its own waits.
+///
+/// Taken out: the delete sent (the relay is sent nothing: the first
+/// fails); the hand-over dropped on a closed device (no delete is written:
+/// the same).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_closed_device_sends_the_delete_over_a_hand_over_and_nothing_else() {
+    let relay = StandIn::started().await;
+    let (mut laptop, desktop) = (Device::new("laptop"), Device::new("desktop"));
+    laptop.makes_the_phrase(&phrase());
+    laptop.holds("notes");
+    let now = laptop.now();
+    let added = add_device(
+        &laptop.db(),
+        &laptop.state.identity,
+        &desktop.key(),
+        "desktop",
+        now,
+    );
+    let pair = added.unwrap().hand_over.channel;
+    laptop.connects_to("relay", relay.port, relay.key).await;
+    laptop.passes().await;
+    // The hand-over reached the relay.
+    let pushed = |requests: &[WireMessage]| -> Vec<Entry> {
+        requests
+            .iter()
+            .filter_map(|request| match request {
+                WireMessage::EntryPush(push) => Some(push.entries.clone()),
+                _ => None,
+            })
+            .flatten()
+            .map(|bytes| Entry::from_wire(&bytes).unwrap())
+            .collect()
+    };
+    let first = pushed(&relay.requests());
+    assert!(
+        first
+            .iter()
+            .any(|entry| entry.channel == pair && !entry.delete)
+    );
+
+    // What it writes in a channel of its own waits. The device is then
+    // closed: a key it knows to be removed holds the secret it follows,
+    // set so by hand.
+    laptop.writes("notes", "a.md", "waits while closed");
+    cordelia_storage::person::keep_removed(&laptop.db(), &[desktop.key()], 2).unwrap();
+    assert_eq!(laptop.stands(), Stands::Closed);
+    laptop.passes().await;
+    laptop.sends().await;
+    laptop.passes().await;
+    let sent = pushed(&relay.requests());
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(sent[0].delete && sent[0].channel == pair && sent[0].author == laptop.key());
+    assert_eq!(laptop.has_leave("relay"), Err(NoLeave::Closed));
+}
+
+// ── A change in what a device keeps wakes its pass (rule 19) ─────────
+
+/// Whatever asked the device for a whole pass before now is let go, so
+/// that [`woken`] says what happened after.
+async fn drained(device: &Device) {
+    while tokio::time::timeout(
+        Duration::from_millis(20),
+        device.state.own_channels.wait_asked(),
+    )
+    .await
+    .is_ok()
+    {}
+}
+
+/// Whether something asked the device for a whole pass since it was
+/// [`drained`]: the wake of decision 2026-10-24 (removal), rule 19.
+async fn woken(device: &Device) -> bool {
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        device.state.own_channels.wait_asked(),
+    )
+    .await
+    .is_ok()
+}
+
+/// Rule 19 where a device applies a change a relay hands it (the review of
+/// the whole build, its M5): it shows at every relay at once.
+///
+/// Taken out: the wake after an apply (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_apply_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let [maker, other, third] = three_in_step(&relay).await;
+    let change = maker.changes(&phrase(), &[&maker, &other, &third], &[]);
+    maker.passes().await;
+    drained(&other).await;
+    other.passes().await;
+    assert_eq!(other.latest().id(), change.id());
+    assert!(woken(&other).await, "an apply did not wake the pass");
+}
+
+/// Rule 19 where a device sets a head aside: a change made apart from the
+/// one it follows, both clear.
+///
+/// Taken out: the wake after a head set aside (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_head_set_aside_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let (mut one, mut other) = (Device::new("desktop"), Device::new("laptop"));
+    one.makes_the_phrase(&phrase());
+    one.adds(&other);
+    for device in [&mut one, &mut other] {
+        device.holds("notes");
+        device.connects("relay", &relay).await;
+    }
+    all_pass(&[&one, &other], 2).await;
+    let by_one = one.changes(&phrase(), &[&one, &other], &[]);
+    other.changes(&phrase(), &[&one, &other], &[]);
+    one.passes().await;
+    drained(&other).await;
+    other.passes().await;
+    let shows = at_relays::to_show(&other.db()).unwrap().unwrap();
+    assert_eq!(shows.set_aside, vec![by_one.id()]);
+    assert!(
+        woken(&other).await,
+        "a head set aside did not wake the pass"
+    );
+}
+
+/// Rule 19 where a device closes: two removals made apart, each of a
+/// device the other lists.
+///
+/// Taken out: both wakes of a close, the one where what the change removes
+/// commits and the one where it is kept closed (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_close_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let mut devices = [
+        Device::new("desktop"),
+        Device::new("laptop"),
+        Device::new("tablet"),
+        Device::new("phone"),
+    ];
+    devices[0].makes_the_phrase(&phrase());
+    for n in 1..4 {
+        devices[0].adds(&devices[n]);
+    }
+    for device in &mut devices {
+        device.holds("notes");
+        device.connects("relay", &relay).await;
+    }
+    let [desktop, laptop, tablet, phone] = &devices;
+    all_pass(&[desktop, laptop, tablet, phone], 3).await;
+    desktop.changes(&phrase(), &[desktop, laptop, phone], &[tablet]);
+    laptop.changes(&phrase(), &[desktop, laptop, tablet], &[phone]);
+    desktop.passes().await;
+    drained(laptop).await;
+    laptop.passes().await;
+    assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+    assert!(woken(laptop).await, "a close did not wake the pass");
+}
+
+/// Rule 19 where a device moves at the start of a pass: closed by what it
+/// knows of removals growing, it keeps a clear head that counts it.
+///
+/// Taken out: the wake after a move (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_move_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let [desktop, laptop, tablet] = three_in_step(&relay).await;
+    // The desktop's change lists the tablet no more; the laptop's, made
+    // apart, still does. Both are clear: the laptop sets the desktop's
+    // aside and goes on.
+    let by_desktop = desktop.changes(&phrase(), &[&desktop, &laptop], &[]);
+    laptop.changes(&phrase(), &[&desktop, &laptop, &tablet], &[]);
+    desktop.passes().await;
+    laptop.passes().await;
+    assert_eq!(laptop.stands(), Stands::Applied);
+    // It comes to know the tablet removed: the change it follows lists
+    // it, and is not clear. Its next pass moves it to the desktop's.
+    cordelia_storage::person::keep_removed(&laptop.db(), &[tablet.key()], laptop.now()).unwrap();
+    assert_eq!(laptop.stands(), Stands::Closed);
+    drained(&laptop).await;
+    laptop.passes().await;
+    assert_eq!(laptop.latest().id(), by_desktop.id());
+    assert!(woken(&laptop).await, "a move did not wake the pass");
+}
+
+/// Rule 19 where what a pull takes changes what the device keeps: an
+/// entry of a removed key's that opens under the secret it follows closes
+/// it at the door (the review of the whole build, its M3 and M5).
+///
+/// Taken out: the wake after the pull (the second fails).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pull_that_closes_the_device_wakes_the_pass() {
+    let relay = relay_started("relay", None);
+    let [desktop, laptop, _tablet] = three_in_step(&relay).await;
+    // A key the laptop knows to be removed, which holds the secret it
+    // follows: a branch that never heard of its removal added it again.
+    let stolen = NodeIdentity::generate().unwrap();
+    cordelia_storage::person::keep_removed(&laptop.db(), &[stolen.public_key()], laptop.now())
+        .unwrap();
+    assert_eq!(laptop.stands(), Stands::Applied);
+    let by_stolen = sealed(
+        &stolen,
+        &laptop.name_secret("notes"),
+        1,
+        "s.md",
+        Value::Text("written with a secret it was handed again".into()),
+    );
+    assert_eq!(
+        pushed_by_hand(&desktop, "relay", &[&by_stolen]).await,
+        [PushAnswer::Stored]
+    );
+    drained(&laptop).await;
+    laptop.passes().await;
+    assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
+    assert!(
+        woken(&laptop).await,
+        "a pull that closed the device did not wake the pass"
+    );
 }

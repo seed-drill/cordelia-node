@@ -18,15 +18,22 @@
 //!   signatures are checked before the store is looked at (§16). The
 //!   answer is the store's: it holds that entry; it took it; or it holds
 //!   another from that author in that slot, and here it is. The
-//!   connection remembers, for each author's slot, the last entry that it
-//!   showed whole there whose signatures held, up to a bound and for as
-//!   long as it lasts. It may then show that same entry in short: by its
-//!   channel, slot, author, revision and ID. A short show of anything else
-//!   is answered "show it whole" from what the connection remembers,
-//!   before the store is looked at and with no lock on the database
-//!   taken. One of the entry remembered is answered from the store: held,
-//!   "show it whole", or the revision and ID of another. The answer to a
-//!   short show never carries an entry.
+//!   connection remembers, for each author's slot, each entry that it
+//!   showed whole there whose signatures held, and each it was handed
+//!   whole there, up to bounds and for as long as it lasts. It may then
+//!   show any of those in short: by its channel, slot, author, revision
+//!   and ID. A short show of anything else is answered "show it whole"
+//!   from what the connection remembers, before the store is looked at
+//!   and with no lock on the database taken. One of an entry remembered is
+//!   answered from the store: held, "show it whole", or the revision and
+//!   ID of another. The answer to a short show never carries an entry.
+//!   **Every head before "held"** (decision 2026-10-24 (removal), rule
+//!   16): where the relay keeps more than one entry of that author in that
+//!   slot, it takes the entry shown first, and then hands each the
+//!   connection does not remember, one in each answer, the lowest number
+//!   first, before it says that it holds the entry, took it, or refused
+//!   it. Only a whole hand is remembered: to a short show it says the
+//!   revision and ID, and the whole show that follows is handed the entry.
 //! - **Prove** (§2.4 items 3 and 4). The proof is checked against the
 //!   value that this connection's TLS session exports, and against the
 //!   node key of the peer as its certificate says it: nothing that says
@@ -114,7 +121,11 @@
 //! pulls what it lacks ([`RelayEntries::pull_from`]). An entry that it
 //! takes, from anyone, is passed on to the listed relays that are
 //! connected, but for the one it came from ([`RelayEntries::pass_on`]).
-//! Nothing is tried again: what did not arrive is pulled.
+//! Nothing is tried again: what did not arrive is pulled. **But a head**
+//! (decision 2026-10-24 (removal), rule 17): an entry with a lineage that
+//! the relay keeps, beside another or alone, is offered at each offer to
+//! each relay it works with that has not answered for it, connected or not
+//! when the relay took it, for as long as the relay keeps it.
 //!
 //! A pass reads only so many pages of a relay's list, and the next goes
 //! on from where it stopped: a list that never ends does not keep a
@@ -133,12 +144,14 @@ use cordelia_core::load::{Answered, Kind, Refusal, Stream, StreamCounts};
 use cordelia_core::lock::{LockWhole, Nested, TimedGuard, TimedLock, take_as, taking};
 use cordelia_core::protocol::{
     ENTRY_OVERHEAD_BYTES, ENTRY_PAGE_MAX_BYTES, ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES,
-    FRAME_LENGTH_BYTES, MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES,
-    MAX_SLOTS_SHOWN_ON_A_CONNECTION, MIN_ENTRY_CONTENT_BYTES, RELAY_CHANNEL_PAGES_PER_PASS,
-    RELAY_CHANNELS_PAGE_MAX, RELAY_CHECKPOINT_LOG_PAGES, RELAY_ENTRY_PULL_PAGES,
-    SESSION_VALUE_BYTES, SMALL_PAGE_BYTES, SMALL_WINDOWS_PULL_ENTRIES, entry_cost,
+    FRAME_LENGTH_BYTES, LINEAGE_HASH_BYTES, MAX_CHANGE_HEADS, MAX_CHANNELS_PROVED_ON_A_CONNECTION,
+    MAX_ITEM_BYTES, MAX_SLOTS_SHOWN_ON_A_CONNECTION, MIN_ENTRY_CONTENT_BYTES,
+    RELAY_CHANNEL_PAGES_PER_PASS, RELAY_CHANNELS_PAGE_MAX, RELAY_CHECKPOINT_LOG_PAGES,
+    RELAY_ENTRY_PULL_PAGES, SESSION_VALUE_BYTES, SMALL_PAGE_BYTES, SMALL_WINDOWS_PULL_ENTRIES,
+    entry_cost,
 };
-use cordelia_crypto::entry::CheckedEntry;
+use cordelia_crypto::change_entry::{self, Lineage};
+use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::codec;
 use cordelia_network::messages::{
     ChannelProve, ChannelProved, EntryPull, EntryPulled, EntryPush, EntryPushed, EntryRefused,
@@ -146,9 +159,7 @@ use cordelia_network::messages::{
     RelayChannelsHeld, RelayEntry, RelayPull, RelayPush, ShowAnswer, WireMessage,
 };
 use cordelia_network::transport;
-use cordelia_storage::relay::{
-    self, Asker, Mark, Proof, Refused, Room, Shown, ShownShort, Taken, Uses,
-};
+use cordelia_storage::relay::{self, Asker, Mark, Proof, Refused, Room, Shown, Taken, Uses};
 use rusqlite::Connection;
 
 use crate::p2p::{OverLimit, Rates, RelayAddrs};
@@ -241,59 +252,132 @@ impl Proved {
     }
 }
 
+/// The entries a connection is remembered to have shown whole or been
+/// handed whole in one slot: the heads a relay keeps there, and the
+/// change a device follows with the heads it sets aside, which are as
+/// many (decision 2026-10-24 (removal), rule 16). Fewer, and a device
+/// that shows entries the relay does not keep would put out a head it was
+/// handed, and be handed it again at each show.
+const ENTRIES_SHOWN_IN_A_SLOT: usize = 2 * MAX_CHANGE_HEADS;
+
 /// What a relay remembers of one connection besides: for each author's
-/// slot in a channel, the last entry that the connection showed whole
-/// there whose two signatures held, by its revision and its ID, whatever
-/// the relay answered (decision 2026-10-04 §2.4 item 5).
+/// slot in a channel, each entry that the connection showed whole there
+/// whose two signatures held, and each that the relay handed it whole
+/// there, by its revision and its ID, whatever the relay answered (decision
+/// 2026-10-04 §2.4 item 5; decision 2026-10-24 (removal), rule 16).
 ///
-/// The connection may show that same entry in short, and is answered from
+/// The connection may show any of those in short, and is answered from
 /// the store. A short show of anything else, a slot that is not remembered
 /// included, is answered "show it whole" from here alone: so the short
-/// form tells nothing, and hands nothing, to anyone who has not shown that
-/// very entry whole.
+/// form tells nothing, and hands nothing, to anyone who has not shown or
+/// been handed that very entry whole. And the relay hands the connection no
+/// entry that it remembers here: each head is handed whole once on a
+/// connection.
 ///
 /// It lives and goes as [`Proved`] does. At most
 /// MAX_SLOTS_SHOWN_ON_A_CONNECTION slots are remembered: one more is not,
-/// and is shown whole each time. None is put out for it.
+/// and is shown whole each time, and handed the same lowest head at each
+/// show. None is put out for it. That costs only the connection that shows
+/// them: a device chooses what it shows on its own connection, and shows
+/// its person's channel, one slot. In a slot, at most
+/// [`ENTRIES_SHOWN_IN_A_SLOT`]: one more puts out the one remembered
+/// longest.
+///
+/// **An entry handed is remembered only once its answer is written
+/// whole** (the review of the whole build, its H2): one whose answer could
+/// not be written, or was dropped, is handed again at the next show on the
+/// connection. Remembered before, a lost answer would have the relay say
+/// "held" to the change followed with a removal never handed, and the
+/// device would have leave without it.
 #[derive(Debug, Default)]
 pub struct ShownWhole {
     slots: Vec<ShownSlot>,
+    /// The entry handed whole in the answer being made, by its slot, its
+    /// revision and its ID: remembered once that answer is written.
+    handing: Option<Handing>,
 }
 
-/// An author's slot in a channel, and the entry that a connection last
-/// showed whole there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// An entry handed whole in an answer: its slot (its channel, its slot and
+/// its author), its revision and its ID.
+type Handing = ([[u8; 32]; 3], (u64, [u8; 32]));
+
+/// An author's slot in a channel, and the entries that a connection showed
+/// whole there or was handed whole there.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ShownSlot {
     /// The slot: its channel, its slot and its author.
     place: [[u8; 32]; 3],
-    /// The entry's revision.
-    rev: u64,
-    /// The entry's ID.
-    id: [u8; 32],
+    /// Each entry, by its revision and its ID, the one remembered longest
+    /// first.
+    entries: Vec<(u64, [u8; 32])>,
 }
 
 impl ShownWhole {
-    /// Whether `show` is of the very entry that the connection last
-    /// showed whole in that author's slot.
+    /// Whether `show` is of an entry that the connection showed whole in
+    /// that author's slot, or was handed whole there.
     pub fn is_of(&self, show: &EntryShowShort) -> bool {
-        self.slots.contains(&ShownSlot {
-            place: [show.channel, show.slot, show.author],
-            rev: show.rev,
-            id: show.id,
+        self.slots.iter().any(|kept| {
+            kept.place == [show.channel, show.slot, show.author]
+                && kept.entries.contains(&(show.rev, show.id))
         })
+    }
+
+    /// The IDs of the entries that the connection showed whole, or was
+    /// handed whole, in the author's slot that `place` names.
+    fn known(&self, place: [[u8; 32]; 3]) -> Vec<[u8; 32]> {
+        self.slots
+            .iter()
+            .find(|kept| kept.place == place)
+            .map(|kept| kept.entries.iter().map(|(_, id)| *id).collect())
+            .unwrap_or_default()
     }
 
     /// The connection showed `entry` whole, and both its signatures held.
     fn remember(&mut self, entry: &CheckedEntry) {
-        let shown = ShownSlot {
-            place: [entry.channel, entry.slot, entry.author],
-            rev: entry.rev,
-            id: entry.id(),
-        };
-        if let Some(kept) = self.slots.iter_mut().find(|kept| kept.place == shown.place) {
-            *kept = shown;
+        self.remember_at(
+            [entry.channel, entry.slot, entry.author],
+            (entry.rev, entry.id()),
+        );
+    }
+
+    /// The answer being made hands `entry` whole: it is remembered once
+    /// that answer is written whole ([`Self::written`]).
+    fn handing(&mut self, entry: &CheckedEntry) {
+        self.handing = Some((
+            [entry.channel, entry.slot, entry.author],
+            (entry.rev, entry.id()),
+        ));
+    }
+
+    /// What the answer just made hands, taken out: nothing is remembered
+    /// of it unless it is given back to [`Self::written`].
+    fn take_handing(&mut self) -> Option<Handing> {
+        self.handing.take()
+    }
+
+    /// The answer that handed `handed` was written whole: the entry is
+    /// remembered as handed on the connection.
+    fn written(&mut self, handed: Option<Handing>) {
+        if let Some((place, shown)) = handed {
+            self.remember_at(place, shown);
+        }
+    }
+
+    /// The connection showed the entry `shown` whole in the slot `place`,
+    /// or was handed it whole there.
+    fn remember_at(&mut self, place: [[u8; 32]; 3], shown: (u64, [u8; 32])) {
+        if let Some(kept) = self.slots.iter_mut().find(|kept| kept.place == place) {
+            if !kept.entries.contains(&shown) {
+                if kept.entries.len() >= ENTRIES_SHOWN_IN_A_SLOT {
+                    kept.entries.remove(0);
+                }
+                kept.entries.push(shown);
+            }
         } else if self.slots.len() < MAX_SLOTS_SHOWN_ON_A_CONNECTION {
-            self.slots.push(shown);
+            self.slots.push(ShownSlot {
+                place,
+                entries: vec![shown],
+            });
         }
     }
 
@@ -426,6 +510,115 @@ struct TakenEntry {
     from: Option<NodeId>,
 }
 
+/// A head that this relay keeps, waiting to be offered to the relays it
+/// works with until each has answered for it (decision 2026-10-24
+/// (removal), rule 17). Not the entry: its place and ID, by which it is
+/// read from the store at each offer, so that what waits is small, and a
+/// head that the relay no longer keeps is offered to nobody.
+struct WaitingHead {
+    /// Its channel, its slot and its author.
+    place: [[u8; 32]; 3],
+    /// Its ID.
+    id: [u8; 32],
+    /// Its revision: of more heads of one place than a relay keeps, the
+    /// lowest go first.
+    rev: u64,
+    /// The first bytes of its statement's hash, by which a head that
+    /// replaces it is known.
+    statement: [u8; LINEAGE_HASH_BYTES],
+    /// The relays it waits for: each that this relay works with, but the
+    /// one it came from, that has not answered for it.
+    to: HashSet<NodeId>,
+}
+
+/// A head by its place (its channel, its slot and its author) and its ID.
+type HeadAt = ([[u8; 32]; 3], [u8; 32]);
+
+/// Each channel's two times as this relay holds it: since when it has held
+/// it, and when it was last used.
+type ChannelTimes = HashMap<[u8; 32], (i64, i64)>;
+
+/// The heads that wait to be offered, and the relays an offer of them is
+/// on its way to (decision 2026-10-24 (removal), rule 17).
+#[derive(Default)]
+struct WaitingHeads {
+    heads: Vec<WaitingHead>,
+    /// The relays an offer is on its way to: none more is made to them
+    /// until it ends.
+    offered: HashSet<NodeId>,
+}
+
+impl WaitingHeads {
+    /// The relay took `entry`, whose lineage is `lineage`, as a head: it
+    /// waits for each of `to`. A head waiting at its place that it was made
+    /// after is kept no more, and waits no more. Of one place, at most
+    /// MAX_CHANGE_HEADS wait, the highest numbers first, as a relay keeps.
+    fn took(&mut self, entry: &CheckedEntry, lineage: &Lineage, to: HashSet<NodeId>) {
+        let place = [entry.channel, entry.slot, entry.author];
+        let id = entry.id();
+        self.heads
+            .retain(|head| head.place != place || !lineage.chain.contains(&head.statement));
+        if let Some(head) = self.heads.iter_mut().find(|head| head.id == id) {
+            head.to.extend(to);
+            return;
+        }
+        self.heads.push(WaitingHead {
+            place,
+            id,
+            rev: entry.rev,
+            statement: lineage.statement,
+            to,
+        });
+        let mut of_place: Vec<(u64, [u8; 32])> = self
+            .heads
+            .iter()
+            .filter(|head| head.place == place)
+            .map(|head| (head.rev, head.id))
+            .collect();
+        if of_place.len() > MAX_CHANGE_HEADS {
+            of_place.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            let out: Vec<[u8; 32]> = of_place[MAX_CHANGE_HEADS..]
+                .iter()
+                .map(|(_, id)| *id)
+                .collect();
+            self.heads.retain(|head| !out.contains(&head.id));
+        }
+    }
+
+    /// The heads to offer `relay` now: each that waits for it, where no
+    /// offer is on its way to it.
+    fn to_offer(&self, relay: &NodeId) -> Vec<HeadAt> {
+        if self.offered.contains(relay) {
+            return Vec::new();
+        }
+        self.heads
+            .iter()
+            .filter(|head| head.to.contains(relay))
+            .map(|head| (head.place, head.id))
+            .collect()
+    }
+
+    /// `relay` answered for the heads named `ids`: they wait for it no
+    /// more, and a head that waits for nobody goes.
+    fn answered(&mut self, relay: &NodeId, ids: &[[u8; 32]]) {
+        for head in self.heads.iter_mut().filter(|head| ids.contains(&head.id)) {
+            head.to.remove(relay);
+        }
+        self.heads.retain(|head| !head.to.is_empty());
+    }
+
+    /// The heads named `ids` are kept here no more: they wait for nobody.
+    fn gone(&mut self, ids: &[[u8; 32]]) {
+        self.heads.retain(|head| !ids.contains(&head.id));
+    }
+
+    /// The offer on its way to `relay` ended, answered or not: what it
+    /// was not answered for is offered again at the next offer.
+    fn ended(&mut self, relay: &NodeId) {
+        self.offered.remove(relay);
+    }
+}
+
 /// A relay's place in a channel that a relay it works with holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Place {
@@ -539,6 +732,10 @@ pub struct RelayEntries {
     relays: RelayAddrs,
     /// The entries it took, waiting to be passed on to the listed relays.
     taken: Mutex<Vec<TakenEntry>>,
+    /// The heads it keeps, offered at each offer to each listed relay
+    /// until that relay has answered for them (decision 2026-10-24
+    /// (removal), rule 17). Shared with the offers on their way.
+    heads: Arc<Mutex<WaitingHeads>>,
     /// Its places in the channels of the relays it pulls from.
     places: Mutex<Places>,
     /// The relays a pull is running from.
@@ -616,6 +813,7 @@ impl RelayEntries {
             room: Mutex::new(Room::new(max_bytes)),
             relays,
             taken: Mutex::default(),
+            heads: Arc::default(),
             places: Mutex::default(),
             pulling: Mutex::default(),
             stopped_at: Mutex::default(),
@@ -952,25 +1150,28 @@ impl RelayEntries {
             }
         };
         // Its signatures held: from now on the connection may show this
-        // entry in short, and no other of its slot.
+        // entry in short, and is handed nothing it knows of its slot.
         whole.remember(&entry);
-        let found = {
+        let known = whole.known([entry.channel, entry.slot, entry.author]);
+        let showing = {
             let Ok(db) = db.lock() else {
                 return Answer::Nothing;
             };
-            let found = {
+            let showing = {
                 let mut room = db.nested(Nested::Room, &self.room);
-                relay::show(&db, &mut room, &entry, &who.asker(), now)
+                relay::show_handing(&db, &mut room, &entry, &who.asker(), now, &known)
             };
-            let found = match found {
-                Ok(found) => found,
+            let showing = match showing {
+                Ok(showing) => showing,
                 Err(e) => {
                     tracing::warn!(peer = %who.peer, error = %e, "could not answer an entry shown");
                     return Answer::Nothing;
                 }
             };
-            // An entry held: use of its channel, kept and not written.
-            if found == Shown::Held {
+            let found = &showing.answer;
+            // An entry held, and not taken now: use of its channel, kept
+            // and not written.
+            if showing.holds && !showing.stored {
                 self.used(&db, &entry.channel, now);
             }
             // The entry that goes back counts against the asker's limits
@@ -980,22 +1181,38 @@ impl RelayEntries {
             // is over is told "not now", and that is no breach: whoever
             // shows an earlier entry again and again is handed one entry
             // beyond its bytes for the minute, and no more.
+            let mut not_now = false;
             if !who.listed
                 && let Shown::Another { cost, .. } = &found
             {
                 let mut rates = db.nested(Nested::Rates, rates);
                 if rates.fetch_room(who.peer, who.address) == 0 {
-                    return Answer::NotNow;
+                    not_now = true;
+                } else {
+                    rates.answered(who.peer, who.address, *cost);
                 }
-                rates.answered(who.peer, who.address, *cost);
             }
-            found
+            (showing, not_now)
         };
-        if found == Shown::Taken {
+        let (showing, not_now) = showing;
+        // What was stored is passed on, whatever the answer hands, and
+        // also where the asker is told "not now": it is stored all the
+        // same, and a later show of it is answered "held", which passes
+        // nothing on (decision 2026-10-24 (removal), rule 17).
+        if showing.stored {
             self.took(std::iter::once(&entry), who.listed.then_some(who.peer));
         }
+        if not_now {
+            return Answer::NotNow;
+        }
+        // An entry handed whole is not handed again on this connection
+        // (decision 2026-10-24 (removal), rule 16), once the answer that
+        // hands it is written whole ([`ShownWhole::written`]).
+        if let Shown::Another { entry, .. } = &showing.answer {
+            whole.handing(entry);
+        }
         Answer::of(WireMessage::EntryShown(EntryShown {
-            answer: (&found).into(),
+            answer: (&showing.answer).into(),
         }))
     }
 
@@ -1035,26 +1252,27 @@ impl RelayEntries {
                 answer: ShowAnswer::Whole,
             }));
         }
+        let place = [show.channel, show.slot, show.author];
+        let known = whole.known(place);
         let found = {
             let Ok(db) = db.lock() else {
                 return Answer::Nothing;
             };
-            let found = relay::show_short(
+            let found = relay::show_short_handing(
                 &db,
-                &show.channel,
-                &show.slot,
-                &show.author,
+                (&show.channel, &show.slot, &show.author),
                 show.rev,
                 &show.id,
+                &known,
             );
             // An entry held: use of its channel, kept and not written.
-            if matches!(found, Ok(ShownShort::Held)) {
+            if matches!(found, Ok((_, true))) {
                 self.used(&db, &show.channel, now);
             }
             found
         };
         match found {
-            Ok(found) => Answer::of(WireMessage::EntryShown(EntryShown {
+            Ok((found, _)) => Answer::of(WireMessage::EntryShown(EntryShown {
                 answer: (&found).into(),
             })),
             Err(e) => {
@@ -1333,15 +1551,33 @@ impl RelayEntries {
     /// The relay took these entries, from `from` where that is a relay it
     /// works with: they wait to be passed on to the others. Where the
     /// operator lists no relay, nothing waits.
+    ///
+    /// **A head waits until it is taken** (decision 2026-10-24 (removal),
+    /// rule 17). An entry with a lineage, which the relay keeps as a head,
+    /// beside another or alone, is offered at each offer to each relay it
+    /// works with, but the one it came from, until that relay has answered
+    /// for it: connected or not when this relay took it. Any other entry is
+    /// passed on once, to the relays connected then, as before: what did
+    /// not arrive is pulled.
     fn took<'a>(&self, entries: impl Iterator<Item = &'a CheckedEntry>, from: Option<&NodeId>) {
-        if self.listed().is_empty() {
+        let listed = self.listed();
+        if listed.is_empty() {
             return;
         }
-        lock(&self.taken).extend(entries.map(|entry| TakenEntry {
-            bytes: entry.to_wire(),
-            channel: entry.channel,
-            from: from.cloned(),
-        }));
+        let to: HashSet<NodeId> = listed
+            .into_iter()
+            .filter(|relay| Some(relay) != from)
+            .collect();
+        for entry in entries {
+            match change_entry::lineage(&entry.content).ok().flatten() {
+                Some(lineage) => lock(&*self.heads).took(entry, &lineage, to.clone()),
+                None => lock(&self.taken).push(TakenEntry {
+                    bytes: entry.to_wire(),
+                    channel: entry.channel,
+                    from: from.cloned(),
+                }),
+            }
+        }
     }
 
     // ── Between relays that work together ──────────────────────────────
@@ -1569,7 +1805,15 @@ impl RelayEntries {
     /// The entries that wait to be passed on, as the messages for each of
     /// `relays`: every entry but those that came from that relay, each
     /// with the two times of its channel as this relay holds it, a small
-    /// page's worth to a message. Nothing waits afterwards.
+    /// page's worth to a message. Nothing waits afterwards of what was
+    /// passed on once.
+    ///
+    /// **And each head that waits for a relay of them** (decision
+    /// 2026-10-24 (removal), rule 17), read from the store: a head the
+    /// relay no longer keeps waits no more, and is offered to nobody. A
+    /// relay that heads are offered to is offered none more until that
+    /// offer ends ([`Self::heads_answered`], [`Self::offer_ended`]): what
+    /// it did not answer for is offered again at the next offer.
     ///
     /// A small page, not a full one (decision 2026-10-22 (memory), rule
     /// 12): a push crosses the other relay's receive windows, which this
@@ -1583,16 +1827,93 @@ impl RelayEntries {
         relays: &[NodeId],
     ) -> Vec<(NodeId, Vec<RelayPush>)> {
         let taken = std::mem::take(&mut *lock(&self.taken));
-        if taken.is_empty() || relays.is_empty() {
+        let offers: Vec<(NodeId, Vec<HeadAt>)> = {
+            let heads = lock(&*self.heads);
+            relays
+                .iter()
+                .map(|relay| (relay.clone(), heads.to_offer(relay)))
+                .filter(|(_, heads)| !heads.is_empty())
+                .collect()
+        };
+        if (taken.is_empty() && offers.is_empty()) || relays.is_empty() {
             return Vec::new();
         }
+        // Each head that is offered, as it is kept: at most a page of them
+        // to each relay at an offer (ENTRY_PAGE_MAX_BYTES), the ones that
+        // waited longest first, read MAX_CHANGE_HEADS at a time with the
+        // lock taken for each (the review of the whole build, its M1).
+        // What is not offered now waits for the next offer, in its place.
+        // So an offer holds no more than a page for each relay, however
+        // many heads wait, and no read of them holds the lock for long.
+        let mut kept: HashMap<[u8; 32], Vec<u8>> = HashMap::new();
+        let mut gone: Vec<[u8; 32]> = Vec::new();
+        let mut paged: Vec<(NodeId, Vec<HeadAt>)> = Vec::new();
+        for (relay, heads) in offers {
+            let mut page: Vec<HeadAt> = Vec::new();
+            let mut bytes = 0usize;
+            let mut full = false;
+            for batch in heads.chunks(MAX_CHANGE_HEADS) {
+                {
+                    let Ok(db) = db.lock() else {
+                        return Vec::new();
+                    };
+                    for (place, id) in batch {
+                        if kept.contains_key(id) || gone.contains(id) {
+                            continue;
+                        }
+                        match relay::kept_entry(&db, (&place[0], &place[1], &place[2]), id) {
+                            Ok(Some(entry)) => {
+                                kept.insert(*id, entry.to_wire());
+                            }
+                            Ok(None) => gone.push(*id),
+                            Err(e) => {
+                                tracing::debug!(error = %e, "could not read a head to offer");
+                            }
+                        }
+                    }
+                }
+                for head in batch {
+                    let Some(entry) = kept.get(&head.1) else {
+                        continue;
+                    };
+                    if !page.is_empty() && bytes + entry.len() > ENTRY_PAGE_MAX_BYTES {
+                        full = true;
+                        break;
+                    }
+                    bytes += entry.len();
+                    page.push(*head);
+                }
+                if full {
+                    break;
+                }
+            }
+            if !page.is_empty() {
+                paged.push((relay, page));
+            }
+        }
+        lock(&*self.heads).gone(&gone);
+        // A head read and not offered to any relay now is not held.
+        kept.retain(|id, _| {
+            paged
+                .iter()
+                .any(|(_, page)| page.iter().any(|head| head.1 == *id))
+        });
+        let offers = paged;
         // The two times of each channel. An entry of a channel that was
         // dropped since is passed on to nobody.
-        let times: HashMap<[u8; 32], (i64, i64)> = {
+        let times: ChannelTimes = {
             let Ok(db) = db.lock() else {
                 return Vec::new();
             };
-            let channels: HashSet<[u8; 32]> = taken.iter().map(|taken| taken.channel).collect();
+            let channels: HashSet<[u8; 32]> = taken
+                .iter()
+                .map(|taken| taken.channel)
+                .chain(
+                    offers
+                        .iter()
+                        .flat_map(|(_, heads)| heads.iter().map(|(place, _)| place[0])),
+                )
+                .collect();
             channels
                 .into_iter()
                 .filter_map(|channel| {
@@ -1601,21 +1922,32 @@ impl RelayEntries {
                 })
                 .collect()
         };
-        relays
+        let passed: Vec<(NodeId, Vec<RelayPush>)> = relays
             .iter()
             .filter_map(|relay| {
-                let mut messages: Vec<RelayPush> = Vec::new();
-                let mut bytes = 0;
-                for entry in taken
+                let heads = offers
+                    .iter()
+                    .find(|(to, _)| to == relay)
+                    .map(|(_, heads)| heads.as_slice())
+                    .unwrap_or_default();
+                let entries = taken
                     .iter()
                     .filter(|taken| taken.from.as_ref() != Some(relay))
-                {
-                    let Some((held_since, used_at)) = times.get(&entry.channel) else {
+                    .map(|taken| (&taken.bytes, taken.channel))
+                    .chain(
+                        heads
+                            .iter()
+                            .filter_map(|(place, id)| kept.get(id).map(|bytes| (bytes, place[0]))),
+                    );
+                let mut messages: Vec<RelayPush> = Vec::new();
+                let mut bytes = 0;
+                for (entry, channel) in entries {
+                    let Some((held_since, used_at)) = times.get(&channel) else {
                         continue;
                     };
                     let full = messages.last().is_none_or(|message| {
                         message.entries.len() >= ENTRY_PAGE_MAX_ENTRIES as usize
-                            || bytes + entry.bytes.len() > SMALL_PAGE_BYTES
+                            || bytes + entry.len() > SMALL_PAGE_BYTES
                     });
                     if full {
                         messages.push(RelayPush {
@@ -1623,10 +1955,10 @@ impl RelayEntries {
                         });
                         bytes = 0;
                     }
-                    bytes += entry.bytes.len();
+                    bytes += entry.len();
                     if let Some(message) = messages.last_mut() {
                         message.entries.push(RelayEntry {
-                            entry: entry.bytes.clone(),
+                            entry: entry.clone(),
                             held_since: *held_since,
                             used_at: *used_at,
                         });
@@ -1634,7 +1966,34 @@ impl RelayEntries {
                 }
                 (!messages.is_empty()).then(|| (relay.clone(), messages))
             })
-            .collect()
+            .collect();
+        // An offer of heads is on its way to each relay that has one.
+        let mut heads = lock(&*self.heads);
+        for (relay, _) in offers {
+            if passed.iter().any(|(to, _)| *to == relay) {
+                heads.offered.insert(relay);
+            }
+        }
+        passed
+    }
+
+    /// `relay` answered for each entry of `message`, which was passed on
+    /// to it: a head among them waits for it no more (decision 2026-10-24
+    /// (removal), rule 17).
+    fn heads_answered(heads: &Mutex<WaitingHeads>, relay: &NodeId, message: &RelayPush) {
+        let ids: Vec<[u8; 32]> = message
+            .entries
+            .iter()
+            .filter_map(|passed| Entry::from_wire(&passed.entry).ok())
+            .map(|entry| entry.id())
+            .collect();
+        lock(heads).answered(relay, &ids);
+    }
+
+    /// The offer on its way to `relay` ended: what it did not answer for
+    /// is offered again at the next offer.
+    fn offer_ended(heads: &Mutex<WaitingHeads>, relay: &NodeId) {
+        lock(heads).ended(relay);
     }
 }
 
@@ -1829,6 +2188,9 @@ impl RelayEntries {
             serving.rates,
             unix_now(),
         );
+        // What the answer hands is remembered only once it is written
+        // whole: an answer not made, or not written, hands nothing.
+        let handed = whole.take_handing();
         // The answer is made, and needs nothing more of the request, which
         // is large where its answer is small (a push of a page of
         // entries), nor of its frame, which a pull may pad to a message
@@ -1881,6 +2243,9 @@ impl RelayEntries {
                 .then_some(written.len()),
             Err(_) => None,
         };
+        if wrote.is_some() {
+            whole.written(handed);
+        }
         match (wrote, stream) {
             (Some(bytes), Some(stream)) => {
                 self.counts.wrote(stream, FRAME_LENGTH_BYTES + bytes);
@@ -1944,26 +2309,31 @@ impl RelayEntries {
 
     /// Pass the entries that wait on to `relays`, the listed relays that
     /// are connected, each on its connection. What a relay does not take
-    /// is not tried again: it pulls what it lacks.
+    /// is not tried again, but for a head: it pulls what it lacks. A head
+    /// is offered again at the next offer until the relay has answered for
+    /// it (decision 2026-10-24 (removal), rule 17).
     pub fn pass_on(&self, db: &TimedLock<Connection>, relays: Vec<(NodeId, quinn::Connection)>) {
         let _relays = taking(Kind::Relays);
         let keys: Vec<NodeId> = relays.iter().map(|(relay, _)| relay.clone()).collect();
         for (relay, messages) in self.to_pass_on(db, &keys) {
             let Some((_, conn)) = relays.iter().find(|(key, _)| *key == relay) else {
+                Self::offer_ended(&self.heads, &relay);
                 continue;
             };
             let conn = conn.clone();
+            let heads = self.heads.clone();
             tokio::spawn(async move {
                 for message in messages {
                     let entries = message.entries.len();
-                    match ask(
+                    let answered = ask(
                         &conn,
                         Protocol::RelayEntries,
-                        &WireMessage::RelayPush(message),
+                        &WireMessage::RelayPush(message.clone()),
                     )
-                    .await
-                    {
-                        Ok(WireMessage::EntryPushed(pushed)) => {
+                    .await;
+                    match answered {
+                        Ok(WireMessage::EntryPushed(pushed)) if pushed.answers.len() == entries => {
+                            Self::heads_answered(&heads, &relay, &message);
                             let stored = pushed
                                 .answers
                                 .iter()
@@ -1981,6 +2351,7 @@ impl RelayEntries {
                         }
                     }
                 }
+                Self::offer_ended(&heads, &relay);
             });
         }
     }
@@ -2479,6 +2850,21 @@ mod tests {
         /// connection that has shown `whole` so far: of the entry whole,
         /// or in short.
         fn show_on(&self, n: u8, whole: &mut ShownWhole, request: WireMessage) -> ShowAnswer {
+            let answer = self.show_unwritten(n, whole, request);
+            // The answer is written whole: what it hands is remembered.
+            let handed = whole.take_handing();
+            whole.written(handed);
+            answer
+        }
+
+        /// As [`Self::show_on`], where the answer is made and never
+        /// written: what it hands is not remembered as handed.
+        fn show_unwritten(
+            &self,
+            n: u8,
+            whole: &mut ShownWhole,
+            request: WireMessage,
+        ) -> ShowAnswer {
             let peer = peer(n);
             shown(self.entries.answer(
                 Protocol::EntryShow,
@@ -2872,15 +3258,16 @@ mod tests {
         })
     }
 
-    /// A short show is only ever of the entry that this connection last
-    /// showed whole in that slot. Of that entry, the relay looks, and
-    /// answers held, "show it whole", or the revision and ID of another.
-    /// Of anything else it answers "show it whole", whatever it holds: an
+    /// A short show is only ever of an entry that this connection showed
+    /// whole in that slot, or was handed whole there (decision 2026-10-24
+    /// (removal), rule 16). Of such an entry, the relay looks, and answers
+    /// held, "show it whole", or the revision and ID of another. Of
+    /// anything else it answers "show it whole", whatever it holds: an
     /// entry that it holds and the connection never showed, another
     /// revision in a slot the connection did show, another entry at that
     /// revision, the same entry on another connection.
     #[test]
-    fn a_short_show_is_only_ever_of_the_entry_last_shown_whole_on_the_connection() {
+    fn a_short_show_is_only_ever_of_an_entry_shown_or_handed_whole_on_the_connection() {
         let at = relay();
         let first = small(1, 1, 5);
         at.hold(&first, NOW);
@@ -2951,29 +3338,19 @@ mod tests {
             at.show_on(1, &mut whole, whole_of(&first)),
             ShowAnswer::Another(later.to_wire())
         );
-        // What it was answered with is not what it showed: the entry
-        // remembered is still its own, and a short show of the later one
-        // is to be shown whole.
+        // What it was handed whole is remembered beside its own (rule 16):
+        // the short show of its own is told of the later one still, and a
+        // short show of the later one is answered from the store.
         assert_eq!(at.show_on(1, &mut whole, short_of(&first)), word);
         assert_eq!(
             at.show_on(1, &mut whole, short_of(&later)),
-            ShowAnswer::Whole
+            ShowAnswer::Held
         );
-        // It shows the later one whole: that is the one remembered now,
-        // and the first is not.
         assert_eq!(
             at.show_on(1, &mut whole, whole_of(&later)),
             ShowAnswer::Held
         );
-        assert_eq!(
-            at.show_on(1, &mut whole, short_of(&later)),
-            ShowAnswer::Held
-        );
-        assert_eq!(
-            at.show_on(1, &mut whole, short_of(&first)),
-            ShowAnswer::Whole
-        );
-        assert_eq!(whole.len(), 1);
+        assert_eq!(whole.len(), 1, "one slot, with the two entries in it");
     }
 
     /// What is remembered is the last entry shown whole whose signatures
@@ -7107,5 +7484,410 @@ mod tests {
             ShowAnswer::Taken
         );
         assert_eq!(nested(&at), (1, 2));
+    }
+
+    // ── Every head (decision 2026-10-24 (removal), rules 16 and 17) ──
+
+    /// A change entry of channel `c` by device `d`, numbered `rev`, whose
+    /// statement is named `name` and whose chain is the statements named
+    /// `chain`: what a relay reads of it is its lineage alone.
+    fn change(c: u16, d: u8, rev: u64, name: u8, chain: &[u8]) -> CheckedEntry {
+        use cordelia_core::protocol::{
+            CHANGE_ENTRY_BYTES, LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL,
+        };
+        let lineage = Lineage {
+            made_at: NOW as u64,
+            statement: [name; 8],
+            chain: chain.iter().map(|link| [*link; 8]).collect(),
+        };
+        let tail = lineage.to_bytes().unwrap();
+        let mut content = vec![0u8; CHANGE_ENTRY_BYTES - tail.len()];
+        content.extend(tail);
+        let key = derive::signing_key(&secret(c)).unwrap();
+        let mut entry = Entry {
+            channel: channel(c),
+            slot: [0x33; 32],
+            author: device(d).public_key(),
+            rev,
+            delete: false,
+            content,
+            author_signature: [0; 64],
+            channel_signature: [0; 64],
+        };
+        let form = entry.signed_bytes();
+        entry.author_signature = device(d).sign(&[LABEL_ENTRY_AUTHOR, form.as_slice()].concat());
+        entry.channel_signature = key.sign(&[LABEL_ENTRY_CHANNEL, form.as_slice()].concat());
+        entry.check().unwrap()
+    }
+
+    /// The laptop's change 3 and the desktop's, each made after change 2
+    /// and apart from each other (the record's section 0).
+    fn made_apart(c: u16) -> (CheckedEntry, CheckedEntry) {
+        (
+            change(c, 1, 3, 0x13, &[0x01, 0x02]),
+            change(c, 1, 3, 0x23, &[0x01, 0x02]),
+        )
+    }
+
+    /// The ID of the entry a show was answered with whole.
+    fn handed_whole(answer: &ShowAnswer) -> Option<[u8; 32]> {
+        match answer {
+            ShowAnswer::Another(bytes) => Some(Entry::from_wire(bytes).unwrap().id()),
+            _ => None,
+        }
+    }
+
+    /// Rule 16 on a connection: the relay hands each head whole once on
+    /// it, and remembers it as handed, so that it may be shown in short; a
+    /// short show answered `Other` hands nothing, and the whole show that
+    /// follows is handed the head; "held" comes only after. Another
+    /// connection is handed each again.
+    #[test]
+    fn a_connection_is_handed_each_head_whole_once_before_it_is_told_held() {
+        let at = relay();
+        let (laptop, desktop) = made_apart(1);
+        let short = |entry: &CheckedEntry| short_of(entry);
+
+        // The tablet's connection: it showed the laptop's change whole when
+        // the relay kept that alone.
+        let mut tablet = ShownWhole::default();
+        assert_eq!(
+            at.show_on(1, &mut tablet, whole_of(&laptop)),
+            ShowAnswer::Taken
+        );
+        assert_eq!(at.show_on(1, &mut tablet, short(&laptop)), ShowAnswer::Held);
+        // The desktop's change comes, from another, which is handed the
+        // laptop's before the relay says it took it.
+        let mut desktops = ShownWhole::default();
+        let answer = at.show_on(2, &mut desktops, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+        assert_eq!(
+            at.show_on(2, &mut desktops, whole_of(&desktop)),
+            ShowAnswer::Held
+        );
+        // Told of it in short, again and again: that hands nothing.
+        for _ in 0..3 {
+            assert_eq!(
+                at.show_on(1, &mut tablet, short(&laptop)),
+                ShowAnswer::Other {
+                    rev: 3,
+                    id: desktop.id()
+                }
+            );
+        }
+        // The whole show after it is handed it whole, and then the relay
+        // says that it holds the entry shown.
+        let answer = at.show_on(1, &mut tablet, whole_of(&laptop));
+        assert_eq!(handed_whole(&answer), Some(desktop.id()));
+        assert_eq!(at.show_on(1, &mut tablet, short(&laptop)), ShowAnswer::Held);
+        assert_eq!(
+            at.show_on(1, &mut tablet, whole_of(&laptop)),
+            ShowAnswer::Held
+        );
+        // What it was handed whole it may show in short.
+        assert_eq!(
+            at.show_on(1, &mut tablet, short(&desktop)),
+            ShowAnswer::Held
+        );
+
+        // A new connection is handed it again, whole once.
+        let mut again = ShownWhole::default();
+        assert_eq!(at.show_on(1, &mut again, short(&laptop)), ShowAnswer::Whole);
+        let answer = at.show_on(1, &mut again, whole_of(&laptop));
+        assert_eq!(handed_whole(&answer), Some(desktop.id()));
+        assert_eq!(
+            at.show_on(1, &mut again, whole_of(&laptop)),
+            ShowAnswer::Held
+        );
+    }
+
+    /// A head is remembered as handed only once the answer that hands it
+    /// is written whole (the review of the whole build, its H2). A show
+    /// whose answer cannot be written, the device gone or its stream reset,
+    /// is handed the head again at the next show on the same connection,
+    /// and the relay says "held" only after that: so a lost answer gives
+    /// the device no leave without the removal.
+    #[tokio::test]
+    async fn a_head_whose_answer_was_not_written_is_handed_again() {
+        let at = relay();
+        let (laptop, desktop) = made_apart(1);
+        // The relay keeps the laptop's change, and then the desktop's
+        // beside it; the second connection was handed the laptop's.
+        let mut first = ShownWhole::default();
+        assert_eq!(
+            at.show_on(1, &mut first, whole_of(&laptop)),
+            ShowAnswer::Taken
+        );
+        let mut second = ShownWhole::default();
+        let answer = at.show_on(2, &mut second, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+
+        // A third connection shows the desktop's change, as a device that
+        // follows it does, on a stream whose answer cannot be written: the
+        // device has gone from it.
+        let peer3 = peer(3);
+        let serving = Serving {
+            conn: None,
+            peer: &peer3,
+            address: address(3),
+            db: &at.db,
+            rates: &at.rates,
+            permits: None,
+        };
+        let mut proved = Proved::default();
+        let mut third = ShownWhole::default();
+        let (mut relay_w, peer_r) = tokio::io::duplex(1 << 20);
+        drop(peer_r);
+        let (mut peer_w, mut relay_r) = tokio::io::duplex(1 << 20);
+        let frame = codec::encode_message(&whole_of(&desktop)).unwrap();
+        codec::write_raw_frame(&mut peer_w, &frame).await.unwrap();
+        at.entries
+            .serve(
+                Protocol::EntryShow,
+                &mut relay_w,
+                &mut relay_r,
+                &serving,
+                &mut proved,
+                &mut third,
+            )
+            .await;
+        // The next show on the same connection is handed the laptop's
+        // change, whose first answer was lost, and only then told "held".
+        let answer = at.show_on(3, &mut third, whole_of(&desktop));
+        assert_eq!(
+            handed_whole(&answer),
+            Some(laptop.id()),
+            "a head whose answer was never written counted as handed: {answer:?}"
+        );
+        assert_eq!(
+            at.show_on(3, &mut third, whole_of(&desktop)),
+            ShowAnswer::Held
+        );
+
+        // An answer made and dropped before its write hands nothing either.
+        let mut fourth = ShownWhole::default();
+        let answer = at.show_unwritten(4, &mut fourth, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+        let _ = fourth.take_handing();
+        let answer = at.show_on(4, &mut fourth, whole_of(&desktop));
+        assert_eq!(handed_whole(&answer), Some(laptop.id()));
+    }
+
+    /// Rule 17: a head that a relay keeps, beside another or alone, is
+    /// offered to each relay it works with, but the one it came from, at
+    /// each offer until that relay has answered for it: one connected then
+    /// or not, and one whose offer was not answered. A head that the relay
+    /// keeps no more waits no more. An entry that is no head is passed on
+    /// once, as before.
+    #[test]
+    fn a_head_is_offered_again_until_each_relay_it_works_with_has_answered_for_it() {
+        let at = relay_of(u64::MAX, &[8, 9]);
+        let (laptop, desktop) = made_apart(1);
+        let heads_in = |passed: &[(NodeId, Vec<RelayPush>)], n: u8| -> Vec<[u8; 32]> {
+            let mut ids: Vec<[u8; 32]> = waiting_for(passed, n)
+                .iter()
+                .flatten()
+                .map(|passed| Entry::from_wire(&passed.entry).unwrap().id())
+                .collect();
+            ids.sort();
+            ids
+        };
+        let mut both = vec![laptop.id(), desktop.id()];
+        both.sort();
+        pushed(at.push(1, vec![laptop.to_wire()]));
+        // The desktop's change from relay 8: not offered back to it.
+        let from_8 = WireMessage::RelayPush(RelayPush {
+            entries: vec![RelayEntry {
+                entry: desktop.to_wire(),
+                held_since: NOW,
+                used_at: NOW,
+            }],
+        });
+        let answer = at.answer(
+            8,
+            Protocol::RelayEntries,
+            from_8,
+            None,
+            &mut Proved::default(),
+        );
+        assert_eq!(pushed(answer), [PushAnswer::Stored]);
+        let text = small(2, 1, 5);
+        pushed(at.push(1, vec![text.to_wire()]));
+
+        // Relay 9 alone is connected: offered both heads and the text.
+        let first = at.entries.to_pass_on(&at.db, &[peer(9)]);
+        assert_eq!(heads_in(&first, 9).len(), 3);
+        // While that offer is on its way, nothing more is offered to it.
+        assert!(at.entries.to_pass_on(&at.db, &[peer(9)]).is_empty());
+        // The offer ends unanswered: both heads are offered again, and the
+        // text is not.
+        RelayEntries::offer_ended(&at.entries.heads, &peer(9));
+        let again = at.entries.to_pass_on(&at.db, &[peer(9)]);
+        assert_eq!(heads_in(&again, 9), both);
+        // Answered: offered to it no more.
+        for message in &again[0].1 {
+            RelayEntries::heads_answered(&at.entries.heads, &peer(9), message);
+        }
+        RelayEntries::offer_ended(&at.entries.heads, &peer(9));
+        assert!(at.entries.to_pass_on(&at.db, &[peer(9)]).is_empty());
+
+        // Relay 8, not connected when the relay took them, is offered the
+        // laptop's change when it is: not the desktop's, which came from
+        // it.
+        let to_8 = at.entries.to_pass_on(&at.db, &[peer(8), peer(9)]);
+        assert_eq!(heads_in(&to_8, 8), [laptop.id()]);
+        assert!(heads_in(&to_8, 9).is_empty());
+        RelayEntries::offer_ended(&at.entries.heads, &peer(8));
+
+        // A settlement replaces both: they wait no more, and it does.
+        let settles = change(1, 1, 4, 0x04, &[0x01, 0x02, 0x13, 0x23]);
+        pushed(at.push(1, vec![settles.to_wire()]));
+        let after = at.entries.to_pass_on(&at.db, &[peer(8), peer(9)]);
+        assert_eq!(heads_in(&after, 8), [settles.id()]);
+        assert_eq!(heads_in(&after, 9), [settles.id()]);
+        RelayEntries::offer_ended(&at.entries.heads, &peer(8));
+        RelayEntries::offer_ended(&at.entries.heads, &peer(9));
+
+        // A head of a channel the relay dropped waits no more.
+        relay::make_room(&lock(&at.db), 0).unwrap();
+        assert!(
+            at.entries
+                .to_pass_on(&at.db, &[peer(8), peer(9)])
+                .is_empty()
+        );
+        assert!(lock(&*at.entries.heads).heads.is_empty());
+    }
+
+    /// An offer of heads holds at most a page for each relay (the review
+    /// of the whole build, its M1): of 40 heads that wait, each a change
+    /// entry of 32 KB, an offer carries no more than ENTRY_PAGE_MAX_BYTES
+    /// of them, those that waited longest first, and the rest are offered
+    /// at the offers after, in order, until each is answered.
+    ///
+    /// Taken out: the page (all 40 go in one offer: the first fails).
+    #[test]
+    fn an_offer_of_heads_holds_at_most_a_page_for_each_relay() {
+        let at = relay_of(u64::MAX, &[9]);
+        let heads: Vec<CheckedEntry> = (0..40u16)
+            .map(|n| change(100 + n, 1, 3, 0x13, &[0x01, 0x02]))
+            .collect();
+        for head in &heads {
+            assert_eq!(
+                pushed(at.push(1, vec![head.to_wire()])),
+                [PushAnswer::Stored]
+            );
+        }
+        let mut offered: Vec<[u8; 32]> = Vec::new();
+        for _ in 0..heads.len() {
+            let passed = at.entries.to_pass_on(&at.db, &[peer(9)]);
+            if passed.is_empty() {
+                break;
+            }
+            let messages = waiting_for(&passed, 9);
+            let bytes: usize = messages
+                .iter()
+                .flatten()
+                .map(|passed| passed.entry.len())
+                .sum();
+            assert!(
+                bytes <= ENTRY_PAGE_MAX_BYTES,
+                "an offer of {bytes} bytes of heads to one relay"
+            );
+            for message in &passed[0].1 {
+                offered.extend(
+                    message
+                        .entries
+                        .iter()
+                        .map(|passed| Entry::from_wire(&passed.entry).unwrap().id()),
+                );
+                RelayEntries::heads_answered(&at.entries.heads, &peer(9), message);
+            }
+            RelayEntries::offer_ended(&at.entries.heads, &peer(9));
+        }
+        let ids: Vec<[u8; 32]> = heads.iter().map(|head| head.id()).collect();
+        assert_eq!(
+            offered, ids,
+            "every head is offered once, in the order it waited"
+        );
+    }
+
+    /// Rule 17, where the asker is over its allowance (the review of slice
+    /// 6, its medium): the relay keeps the laptop's change 3, and a device
+    /// whose address has been handed all it may be in the minute shows the
+    /// desktop's removal. The removal is stored, and the device is told
+    /// "not now", since the answer would hand it the laptop's change. The
+    /// removal waits for the relay it works with all the same: a later show
+    /// of it is answered "held", which passes nothing on.
+    #[test]
+    fn a_head_stored_by_a_show_answered_not_now_waits_to_be_offered() {
+        let at = relay_of(u64::MAX, &[9]);
+        let (laptop, desktop) = made_apart(1);
+        pushed(at.push(1, vec![laptop.to_wire()]));
+        let first = at.entries.to_pass_on(&at.db, &[peer(9)]);
+        for message in &first[0].1 {
+            RelayEntries::heads_answered(&at.entries.heads, &peer(9), message);
+        }
+        RelayEntries::offer_ended(&at.entries.heads, &peer(9));
+        assert!(at.entries.to_pass_on(&at.db, &[peer(9)]).is_empty());
+
+        // The device's address has been handed all it may be.
+        lock(&at.rates).fetched(&peer(2), address(2), MINUTE);
+        assert_eq!(at.fetch_room(2), 0);
+        assert!(matches!(at.show(2, desktop.to_wire()), Answer::NotNow));
+        // It was stored, and waits for relay 9.
+        let offered: Vec<[u8; 32]> = waiting_for(&at.entries.to_pass_on(&at.db, &[peer(9)]), 9)
+            .iter()
+            .flatten()
+            .map(|passed| Entry::from_wire(&passed.entry).unwrap().id())
+            .collect();
+        assert_eq!(offered, [desktop.id()]);
+    }
+
+    /// Rule 16 where the relay keeps eight heads (the review of slice 6,
+    /// its second low): a device shows an entry that the relay does not
+    /// keep, below all eight and made apart from them. It is handed each
+    /// head once, and then, at every show, the first of them again: no
+    /// head is put out of what the connection remembers, so none is handed
+    /// anew. And a device that shows its eight, none of them kept, is
+    /// handed the relay's eight once each.
+    #[test]
+    fn a_connection_that_shows_entries_not_kept_is_handed_each_head_once() {
+        let at = relay();
+        let heads: Vec<CheckedEntry> = (0..MAX_CHANGE_HEADS as u8)
+            .map(|n| change(1, 1, 3 + u64::from(n), 0x30 + n, &[0x01, 0x02]))
+            .collect();
+        for head in &heads {
+            pushed(at.push(1, vec![head.to_wire()]));
+        }
+        let mut order: Vec<[u8; 32]> = heads.iter().map(|head| head.id()).collect();
+        let shown = change(1, 1, 2, 0x99, &[0x01]);
+        let mut whole = ShownWhole::default();
+        let handed: Vec<Option<[u8; 32]>> = (0..2 * MAX_CHANGE_HEADS)
+            .map(|_| handed_whole(&at.show_on(2, &mut whole, whole_of(&shown))))
+            .collect();
+        let mut expected: Vec<Option<[u8; 32]>> = order.iter().copied().map(Some).collect();
+        expected.extend(std::iter::repeat_n(Some(order[0]), MAX_CHANGE_HEADS));
+        assert_eq!(handed, expected);
+
+        // A device's own eight, the change it follows and seven set aside.
+        let own: Vec<CheckedEntry> = (0..MAX_CHANGE_HEADS as u8)
+            .map(|n| change(1, 1, 2, 0x90 + n, &[0x01]))
+            .collect();
+        let mut whole = ShownWhole::default();
+        let mut handed = Vec::new();
+        for _ in 0..2 {
+            for entry in &own {
+                if let Some(id) = handed_whole(&at.show_on(3, &mut whole, whole_of(entry))) {
+                    if !handed.contains(&id) {
+                        handed.push(id);
+                    } else {
+                        assert_eq!(id, order[0], "only the first is handed again");
+                    }
+                }
+            }
+        }
+        handed.sort();
+        order.sort();
+        assert_eq!(handed, order);
     }
 }

@@ -287,7 +287,7 @@ So each of the gaps of 4.1 closes by the same rule. A relay that the device is n
 
 ### 4.4 A device that has stopped
 
-A device that has stopped (it was removed, is in no list, could not open a change, or is in a fork) has no leave anywhere, and reads none of its channels. It cannot ask the relays.
+A device that has stopped (it was removed, is in no list, could not open a change, or is closed: decision 2026-10-24, rule 10) has no leave anywhere, and reads none of its channels. It cannot ask the relays.
 
 - **`cordelia sync unmap <name>` there lets a carried name go only after the typed word of section 5,** where the device's own notes say that it holds a version of the name that it signed and sent to no relay. Where they say none, it lets the name go at once, as today.
 - **The node keeps the count it took from its notes under an ID,** as it keeps a read (4.2), for `LET_GO_READ_STANDS_SECS`. A `discard` there is bound to that ID and that number, and to a store that has taken nothing of the channel since, as anywhere.

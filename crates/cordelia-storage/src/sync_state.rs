@@ -188,7 +188,130 @@ pub fn save(
         ],
     )
     .map_err(storage)?;
+    // A record saved is what the folder and the channel agree on: a file
+    // that a carry left out is put back no more (decision 2026-10-24
+    // (removal), rule 7). Put back again, it would overwrite every later
+    // edit with the version the carry went back to.
+    conn.execute(
+        "DELETE FROM file_put_back WHERE folder = ?1 AND channel_id = ?2 AND key = ?3",
+        params![folder, channel_id, key],
+    )
+    .map_err(storage)?;
     Ok(())
+}
+
+/// Record that a carry left out what `folder` holds of `key` in
+/// `channel_id` (decision 2026-10-24 (removal), rule 7), with `agreed`, the
+/// version the file goes back to (`hash` `None` and `rev` 0 where it goes
+/// back to none): the next cycle puts that version into the file, whatever
+/// is there, and keeps what was there in local history alone. A record
+/// saved after ([`save`]) is put back no more.
+pub fn save_put_back(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+    key: &str,
+    agreed: &Agreed,
+) -> Result<(), CordeliaError> {
+    save(conn, folder, channel_id, key, agreed)?;
+    conn.execute(
+        "INSERT INTO file_put_back (folder, channel_id, key) VALUES (?1, ?2, ?3)
+         ON CONFLICT DO NOTHING",
+        params![folder, channel_id, key],
+    )
+    .map_err(storage)?;
+    note_cut(conn, folder, key)
+}
+
+/// Note that a carry cut `file` of `folder` (decision 2026-10-24
+/// (removal), rule 7), whether or not it changes what the folder
+/// holds: `cordelia restore` then puts back no version of it but one this
+/// device writes itself from now on ([`restore_refused`]; the review of
+/// the fixes of the whole build, its H1 and M2). What it wrote before is
+/// no longer its own, for a later cut may have cut it.
+pub fn note_cut(conn: &Connection, folder: &str, file: &str) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO file_cut (folder, file) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+        params![folder, file],
+    )
+    .map_err(storage)?;
+    conn.execute(
+        "DELETE FROM file_cut_written WHERE folder = ?1 AND file = ?2",
+        params![folder, file],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Note that this device published the text whose SHA-256 is `sha256` (in
+/// hex, as local history names a text) of `file` in `folder` itself, at
+/// `now` (Unix seconds): where a carry has cut the file, `cordelia
+/// restore` may put that text back. Nothing is noted of a file never cut.
+/// A row older than local history keeps a record (`HISTORY_DAYS`) goes:
+/// one that goes early, on a clock set back, only refuses a restore.
+pub fn note_written(
+    conn: &Connection,
+    folder: &str,
+    file: &str,
+    sha256: &str,
+    now: i64,
+) -> Result<(), CordeliaError> {
+    let kept = i64::from(cordelia_core::protocol::HISTORY_DAYS) * 86_400;
+    conn.execute(
+        "DELETE FROM file_cut_written WHERE folder = ?1 AND file = ?2 AND at < ?3",
+        params![folder, file, now.saturating_sub(kept)],
+    )
+    .map_err(storage)?;
+    conn.execute(
+        "INSERT INTO file_cut_written (folder, file, sha256, at)
+         SELECT ?1, ?2, ?3, ?4 WHERE EXISTS
+             (SELECT 1 FROM file_cut WHERE folder = ?1 AND file = ?2)
+         ON CONFLICT DO UPDATE SET at = excluded.at",
+        params![folder, file, sha256, now],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Whether `cordelia restore` refuses a version of `file` in `folder`
+/// whose text has the SHA-256 `sha256` (`None`: a record of no text): a
+/// carry cut the file, and this is not a text this device published itself
+/// after the latest cut (the review of the fixes of the whole build, its
+/// H1 and M2). It asks no record's time, so no clock orders anything.
+pub fn restore_refused(
+    conn: &Connection,
+    folder: &str,
+    file: &str,
+    sha256: Option<&str>,
+) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM file_cut WHERE folder = ?1 AND file = ?2)
+            AND NOT EXISTS (SELECT 1 FROM file_cut_written
+                            WHERE folder = ?1 AND file = ?2 AND sha256 = ?3)",
+        params![folder, file, sha256],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
+/// The files of `folder` in `channel_id` that a carry left out, and that
+/// the folder is to take back ([`save_put_back`]).
+pub fn put_back(
+    conn: &Connection,
+    folder: &str,
+    channel_id: &str,
+) -> Result<std::collections::HashSet<String>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.key FROM file_put_back p JOIN sync_files f
+                 ON f.folder = p.folder AND f.channel_id = p.channel_id AND f.key = p.key
+             WHERE p.folder = ?1 AND p.channel_id = ?2",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![folder, channel_id], |row| row.get(0))
+        .map_err(storage)?;
+    rows.collect::<Result<_, _>>().map_err(storage)
 }
 
 /// Every folder's records in `channel_id`: each folder with a key it has a
@@ -203,6 +326,25 @@ pub fn files(conn: &Connection, channel_id: &str) -> Result<Vec<(String, String)
     rows.collect::<Result<Vec<_>, _>>().map_err(storage)
 }
 
+/// [`files`], each with the revision its folder agreed.
+pub fn files_at(
+    conn: &Connection,
+    channel_id: &str,
+) -> Result<Vec<(String, String, u64)>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT folder, key, rev FROM sync_files WHERE channel_id = ?1 ORDER BY folder, key",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(params![channel_id], |row| {
+            let rev: i64 = row.get(2)?;
+            Ok((row.get(0)?, row.get(1)?, rev.max(0) as u64))
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
 /// Forget what `folder` agreed with `channel_id` for `key`, and nothing
 /// else. Returns whether there was a record.
 pub fn forget_file(
@@ -211,6 +353,11 @@ pub fn forget_file(
     channel_id: &str,
     key: &str,
 ) -> Result<bool, CordeliaError> {
+    conn.execute(
+        "DELETE FROM file_put_back WHERE folder = ?1 AND channel_id = ?2 AND key = ?3",
+        params![folder, channel_id, key],
+    )
+    .map_err(storage)?;
     conn.execute(
         "DELETE FROM sync_files WHERE folder = ?1 AND channel_id = ?2 AND key = ?3",
         params![folder, channel_id, key],
@@ -247,11 +394,16 @@ pub fn move_channel(
         .collect::<Result<_, _>>()
         .map_err(storage)?
     };
-    for table in ["sync_files", "index_lines"] {
+    for (table, of) in [
+        ("sync_files", "sync_files"),
+        ("index_lines", "index_lines"),
+        ("file_put_back", "sync_files"),
+        ("file_line_from", "index_lines"),
+    ] {
         conn.execute(
             &format!(
                 "DELETE FROM {table} WHERE channel_id = ?2
-                 AND folder IN (SELECT folder FROM {table} WHERE channel_id = ?1)"
+                 AND folder IN (SELECT folder FROM {of} WHERE channel_id = ?1)"
             ),
             params![from, to],
         )
@@ -272,11 +424,13 @@ pub fn move_channel(
         )
         .map_err(storage)?;
     }
-    conn.execute(
-        "UPDATE index_lines SET channel_id = ?2 WHERE channel_id = ?1",
-        params![from, to],
-    )
-    .map_err(storage)?;
+    for table in ["index_lines", "file_put_back", "file_line_from"] {
+        conn.execute(
+            &format!("UPDATE {table} SET channel_id = ?2 WHERE channel_id = ?1"),
+            params![from, to],
+        )
+        .map_err(storage)?;
+    }
     Ok(rows.len())
 }
 
@@ -311,11 +465,13 @@ pub fn forget_except(conn: &Connection, keep: &[(String, String)]) -> Result<usi
                 params![folder, channel_id],
             )
             .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-        conn.execute(
-            "DELETE FROM index_lines WHERE folder = ?1 AND channel_id = ?2",
-            params![folder, channel_id],
-        )
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        for table in ["index_lines", "file_put_back", "file_line_from"] {
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE folder = ?1 AND channel_id = ?2"),
+                params![folder, channel_id],
+            )
+            .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+        }
     }
     Ok(forgotten)
 }
@@ -323,8 +479,13 @@ pub fn forget_except(conn: &Connection, keep: &[(String, String)]) -> Result<usi
 /// Forget what one folder agreed, with every channel. Returns the number
 /// of keys forgotten.
 pub fn forget_folder(conn: &Connection, folder: &str) -> Result<usize, CordeliaError> {
-    conn.execute("DELETE FROM index_lines WHERE folder = ?1", params![folder])
+    for table in ["index_lines", "file_put_back", "file_line_from"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE folder = ?1"),
+            params![folder],
+        )
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;
+    }
     conn.execute("DELETE FROM sync_files WHERE folder = ?1", params![folder])
         .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
@@ -337,11 +498,13 @@ pub fn forget_folder(conn: &Connection, folder: &str) -> Result<usize, CordeliaE
 /// a folder that comes to sync the name again meets the channel as on any
 /// first sync, and what it lost in between is not taken for deletes.
 pub fn forget_channel(conn: &Connection, channel_id: &str) -> Result<usize, CordeliaError> {
-    conn.execute(
-        "DELETE FROM index_lines WHERE channel_id = ?1",
-        params![channel_id],
-    )
-    .map_err(storage)?;
+    for table in ["index_lines", "file_put_back", "file_line_from"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE channel_id = ?1"),
+            params![channel_id],
+        )
+        .map_err(storage)?;
+    }
     conn.execute(
         "DELETE FROM sync_files WHERE channel_id = ?1",
         params![channel_id],

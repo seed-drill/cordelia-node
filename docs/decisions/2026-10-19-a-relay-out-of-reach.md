@@ -51,7 +51,7 @@ Each is used in the rules below only as defined here.
 **Relays and entries**
 
 - **A relay** is one relay that the device is set up with, counted once (the record of relays, §1). A name listed as "same relay" is not one. A relay listed with the wrong key is one.
-- **The kept entry** is the latest change entry that the device keeps (the record of 2026-10-04, 4.6).
+- **The kept entry** is the change entry of the change that the device follows (decision 2026-10-24).
 
 **What the device knows of which relay holds which change**
 
@@ -60,6 +60,7 @@ Each is used in the rules below only as defined here.
   - **it says that the relay does not:** `Refused(NoRoom)`, `Refused(OverLimit)`, `Other` (it holds another; to a short show or to a whole one, `device_entries.rs:1468-1477`), and `Another` (it holds another, here it is), whether or not what it hands is an entry;
   - **it says neither:** `Refused(NotSigned)`; `Whole` to a whole show; a reply that is not `EntryShown` ("a show was not answered as one"); a stream that is reset ("not now"), that times out, or that fails; a short show not answered and then a whole one not answered; and a round of shows that runs out (`SHOWS_IN_A_PASS`) with no answer of the first two kinds. **Each of these is a failed attempt** (below).
   - `Whole` to a short show is no answer: the device shows the entry whole, and the answer to that is what counts.
+  - A relay of decision 2026-10-24 may hold the entry shown and hand another first (its rule 16). Only the last answer of a round counts, and only the answer to the show of the kept entry is the latest answer (its rule 18).
 - **The latest answer.** For each relay, the device keeps the latest answer of the first two kinds that the relay gave to a show of the kept entry: the entry's ID, whether it says that the relay holds it or does not, the key that gave it, and the wall-clock time.
   - **Each such answer writes over the one before,** in the transaction that notes it. So a relay that held the entry and then answers "no room" about it no longer holds it (this record's second review, finding 2). An answer of the third kind writes nothing.
   - **Where it is kept:** in the database, in one key of `node_meta` (`person.relays_known`), by the relay's name and key together, as the record of relays finds a relay. So it is kept across starts, wakes and connections. The same key holds the two times that rule 11 needs: **when the kept entry came to be kept** (written when the key first sees an entry ID other than the one it holds), and **when this version first started** on this database.

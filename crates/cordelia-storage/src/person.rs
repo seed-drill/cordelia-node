@@ -1,6 +1,6 @@
 //! What a device holds of its person (decision 2026-10-04 §3 to §6).
 //!
-//! Seven tables, in the node's database, so that everything here changes in
+//! Ten tables, in the node's database, so that everything here changes in
 //! one transaction with a statement (§3):
 //!
 //! - **What it follows, and where it stands** (`person`, one row). The
@@ -12,9 +12,12 @@
 //!   has applied, and each one it left with the time it left it. A secret
 //!   that was left is kept 90 days by the device's own clock, and then
 //!   forgotten ([`forget_left_secrets`]).
-//! - **The change entries it keeps** (`person_change_entries`). The latest
-//!   it has seen, whole, to show to a relay; and, where it is in a fork,
-//!   the one that was made apart (§4.5).
+//! - **The change entries it keeps** (`person_change_entries`, decision
+//!   2026-10-24 (removal), rule 1). The change it follows, whole, to show
+//!   to a relay, and up to seven heads set aside, each with when it was
+//!   set aside: eight in all. And the time of each change it has applied
+//!   or kept, by the change's own lineage, kept after the change goes
+//!   (`person_change_times`, rule 2).
 //! - **The records of additions it has seen** under the applied statement
 //!   (`person_additions`), in the order it saw them, each counted or not
 //!   (§6).
@@ -30,6 +33,13 @@
 //!   made, and whether the store still holds it. Never the hand-over,
 //!   which holds the secret (§6).
 //!
+//! - **What it knows of removals** (`person_removed_keys`,
+//!   `person_holders`, `person_holders_past`; decision 2026-10-24
+//!   (removal), rules 2 and 3): every key that a change it has seen lists
+//!   as removed, which only grow; and for a change, each key that a record
+//!   of an addition under it adds, kept apart from the records and their
+//!   bound, with whether more were added than are kept.
+//!
 //! Nothing here decides anything: what a statement is to a device, who
 //! counts and what is carried are decided where these are read. A function
 //! that writes more than one row does so as one, with a savepoint, so that
@@ -40,7 +50,7 @@ use std::fmt;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use cordelia_core::CordeliaError;
-use cordelia_core::protocol::LEFT_SECRET_KEPT_DAYS;
+use cordelia_core::protocol::{LEFT_SECRET_KEPT_DAYS, MAX_KNOWN_HOLDERS, MAX_KNOWN_REMOVED};
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 
 /// How long a secret that was left is kept, in seconds.
@@ -57,8 +67,10 @@ fn storage(e: rusqlite::Error) -> CordeliaError {
 pub enum State {
     /// It has applied a statement, and is a device under it.
     Applied,
-    /// It has seen a statement that was made apart from the one it has
-    /// applied. It keeps both change entries until the two are settled.
+    /// It is closed (decision 2026-10-24 (removal), rule 10): it follows
+    /// no clear change. It seals nothing, sends nothing and takes nothing
+    /// in a channel of its own, until it is shown a clear change that
+    /// counts it. Stored under the name a fork had.
     Fork,
     /// A statement made after the one it has applied lists its key as
     /// removed.
@@ -128,22 +140,17 @@ pub struct Secret {
     pub left_at: Option<i64>,
 }
 
-/// Which of the change entries a device keeps.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kept {
-    /// The latest it has seen: the one it shows to a relay.
-    Latest,
-    /// The one that was made apart from it, where the device is in a fork.
-    Apart,
-}
-
-impl Kept {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Latest => "latest",
-            Self::Apart => "apart",
-        }
-    }
+/// A head that a device keeps set aside (decision 2026-10-24 (removal),
+/// rule 1): a change entry that no other change it keeps was made after,
+/// and that it does not follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAside {
+    /// Its row: what it is dropped by.
+    pub place: i64,
+    /// The entry, as it was stored: whoever reads it checks it.
+    pub entry: Entry,
+    /// When the device set it aside, in seconds, by its own clock.
+    pub set_aside_at: i64,
 }
 
 /// A record of an addition, as the device keeps it.
@@ -249,7 +256,7 @@ pub fn set_state(conn: &Connection, state: State) -> Result<(), CordeliaError> {
 ///
 /// What else a device holds of its person is forgotten by the functions
 /// of its own tables: its secrets ([`forget_secrets`]), the change
-/// entries it keeps ([`drop_change_entry`]), its records of additions
+/// entries it keeps ([`drop_change_entries`]), its records of additions
 /// ([`clear_additions`]) and what it keeps of its hand-overs
 /// ([`forget_hand_overs`]). The names it holds stay: they are its
 /// folders' names.
@@ -372,53 +379,69 @@ pub fn forget_secrets(conn: &Connection) -> Result<usize, CordeliaError> {
 
 // ── The change entries it keeps ──────────────────────────────────────
 
-/// A change entry the device keeps, as it was stored: whoever reads it
-/// checks it.
-pub fn change_entry(conn: &Connection, kept: Kept) -> Result<Option<Entry>, CordeliaError> {
+/// The change entry of the change the device follows, as it was stored:
+/// whoever reads it checks it. On a device that has stopped, the entry
+/// that stopped it; on a closed one, the change it applied last.
+pub fn followed_entry(conn: &Connection) -> Result<Option<Entry>, CordeliaError> {
     conn.query_row(
         "SELECT channel, slot, author, rev, content, author_sig, channel_sig
-         FROM person_change_entries WHERE kept = ?1",
-        params![kept.as_str()],
-        |row| {
-            Ok(Entry {
-                channel: row.get(0)?,
-                slot: row.get(1)?,
-                author: row.get(2)?,
-                rev: row.get::<_, i64>(3)?.max(0) as u64,
-                delete: false,
-                content: row.get(4)?,
-                author_signature: row.get(5)?,
-                channel_signature: row.get(6)?,
-            })
-        },
+         FROM person_change_entries WHERE followed = 1",
+        [],
+        entry_from_row,
     )
     .optional()
     .map_err(storage)
 }
 
-/// Keep a change entry, whole, in the place of the one kept there. Only
-/// an entry that passed the check is kept. An entry that says it is a
-/// delete is no change entry, and is refused.
-pub fn keep_change_entry(
-    conn: &Connection,
-    kept: Kept,
-    entry: &CheckedEntry,
-) -> Result<(), CordeliaError> {
+fn entry_from_row(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
+    Ok(Entry {
+        channel: row.get(0)?,
+        slot: row.get(1)?,
+        author: row.get(2)?,
+        rev: row.get::<_, i64>(3)?.max(0) as u64,
+        delete: false,
+        content: row.get(4)?,
+        author_signature: row.get(5)?,
+        channel_signature: row.get(6)?,
+    })
+}
+
+/// Keep `entry` as the change entry of the change the device follows, in
+/// the place of the one kept there. The heads set aside stay. Only an
+/// entry that passed the check is kept; one that says it is a delete is
+/// no change entry, and is refused.
+pub fn keep_followed(conn: &Connection, entry: &CheckedEntry) -> Result<(), CordeliaError> {
     if entry.delete {
         return Err(CordeliaError::Validation(
             "a change entry is no delete".into(),
         ));
     }
+    conn.execute_batch("SAVEPOINT person_followed")
+        .map_err(storage)?;
+    let kept = conn
+        .execute("DELETE FROM person_change_entries WHERE followed = 1", [])
+        .and_then(|_| insert_entry(conn, entry, None));
+    let end = match kept {
+        Ok(()) => "RELEASE person_followed",
+        Err(_) => "ROLLBACK TO person_followed; RELEASE person_followed",
+    };
+    conn.execute_batch(end).map_err(storage)?;
+    kept.map_err(storage)
+}
+
+fn insert_entry(
+    conn: &Connection,
+    entry: &CheckedEntry,
+    set_aside_at: Option<i64>,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO person_change_entries
-             (kept, channel, slot, author, rev, content, author_sig, channel_sig)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-         ON CONFLICT(kept) DO UPDATE SET
-             channel = excluded.channel, slot = excluded.slot, author = excluded.author,
-             rev = excluded.rev, content = excluded.content,
-             author_sig = excluded.author_sig, channel_sig = excluded.channel_sig",
+             (followed, set_aside_at, channel, slot, author, rev, content, author_sig,
+              channel_sig)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
-            kept.as_str(),
+            set_aside_at.is_none(),
+            set_aside_at,
             entry.channel.as_slice(),
             entry.slot.as_slice(),
             entry.author.as_slice(),
@@ -428,18 +451,298 @@ pub fn keep_change_entry(
             entry.channel_signature.as_slice(),
         ],
     )
-    .map_err(storage)?;
-    Ok(())
+    .map(|_| ())
 }
 
-/// Keep a change entry no longer. Returns whether one was kept there.
-pub fn drop_change_entry(conn: &Connection, kept: Kept) -> Result<bool, CordeliaError> {
+/// Every head the device keeps set aside, the highest number first, and
+/// of two at one number the one set aside first.
+pub fn set_aside_entries(conn: &Connection) -> Result<Vec<SetAside>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT place, set_aside_at, channel, slot, author, rev, content, author_sig,
+                    channel_sig
+             FROM person_change_entries WHERE followed = 0
+             ORDER BY rev DESC, place ASC",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SetAside {
+                place: row.get(0)?,
+                set_aside_at: row.get(1)?,
+                entry: Entry {
+                    channel: row.get(2)?,
+                    slot: row.get(3)?,
+                    author: row.get(4)?,
+                    rev: row.get::<_, i64>(5)?.max(0) as u64,
+                    delete: false,
+                    content: row.get(6)?,
+                    author_signature: row.get(7)?,
+                    channel_signature: row.get(8)?,
+                },
+            })
+        })
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// Keep `entry` as a head set aside at `now` (decision 2026-10-24
+/// (removal), rule 1). Whether it may be kept, and which heads it puts
+/// out, is decided where it is read: this keeps it, and refuses only a
+/// delete and an entry it keeps already, as the change followed or set
+/// aside. Returns its place.
+pub fn set_aside(conn: &Connection, entry: &CheckedEntry, now: i64) -> Result<i64, CordeliaError> {
+    if entry.delete {
+        return Err(CordeliaError::Validation(
+            "a change entry is no delete".into(),
+        ));
+    }
+    let kept: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM person_change_entries
+                           WHERE author_sig = ?1 AND channel_sig = ?2)",
+            params![
+                entry.author_signature.as_slice(),
+                entry.channel_signature.as_slice()
+            ],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if kept {
+        return Err(CordeliaError::Validation(
+            "the device keeps that change entry already".into(),
+        ));
+    }
+    insert_entry(conn, entry, Some(now)).map_err(storage)?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Keep no longer the head set aside at `place`. Returns whether one was
+/// there. The change followed is never dropped here.
+pub fn drop_set_aside(conn: &Connection, place: i64) -> Result<bool, CordeliaError> {
     conn.execute(
-        "DELETE FROM person_change_entries WHERE kept = ?1",
-        params![kept.as_str()],
+        "DELETE FROM person_change_entries WHERE place = ?1 AND followed = 0",
+        params![place],
     )
     .map(|rows| rows > 0)
     .map_err(storage)
+}
+
+/// Keep no head set aside. Returns how many went.
+pub fn drop_all_set_aside(conn: &Connection) -> Result<usize, CordeliaError> {
+    conn.execute("DELETE FROM person_change_entries WHERE followed = 0", [])
+        .map_err(storage)
+}
+
+/// Keep no change entry at all: the device leaves its phrase. Returns
+/// how many went.
+pub fn drop_change_entries(conn: &Connection) -> Result<usize, CordeliaError> {
+    conn.execute("DELETE FROM person_change_entries", [])
+        .map_err(storage)
+}
+
+/// Note the time of the change whose statement is numbered `number` and
+/// hashes to `hash`, as its lineage says it was made (decision 2026-10-24
+/// (removal), rule 2): `None` for a change made on the version before,
+/// which has no lineage. A change noted already stays as it was. It is
+/// kept after the change goes, for the cut time of rule 7.
+pub fn note_change_time(
+    conn: &Connection,
+    number: u64,
+    hash: &[u8; 16],
+    made_at: Option<i64>,
+) -> Result<(), CordeliaError> {
+    note_change(conn, number, hash, made_at, None, None, None, None).map(|_| ())
+}
+
+/// A change as the device noted it ([`note_change`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotedChange {
+    pub number: u64,
+    pub hash: [u8; 16],
+    /// The time its lineage says it was made; `None` where it has none,
+    /// or none was known when it was noted.
+    pub made_at: Option<i64>,
+    /// The keys its statement lists as removed, where they were noted.
+    pub removed: Option<Vec<[u8; 32]>>,
+    /// Its statement's chain, each link by number and hash, where it was
+    /// noted.
+    pub chain: Option<Vec<(u64, [u8; 16])>>,
+    /// The keys its statement lists as devices, where they were noted.
+    pub devices: Option<Vec<[u8; 32]>>,
+    /// Its statement's commitment to its secret, where it was noted.
+    pub commitment: Option<[u8; 32]>,
+}
+
+/// Note the change whose statement is numbered `number` and hashes to
+/// `hash` (decision 2026-10-24 (removal), rule 2): its time, as its
+/// lineage says it (`None` for a change of the version before, or where
+/// the entry is not at hand), the keys its statement lists as removed and
+/// its chain. What was noted of it before stays; what was not is filled.
+/// It is kept after the change goes, for the cut time of rules 6 and 7.
+/// Says whether anything was filled that was not noted before, its time or
+/// its lists: a cut time may then have moved, and records are judged again.
+/// With its lists, `commitment` is its statement's commitment to its
+/// secret, noted where it was not.
+#[allow(clippy::too_many_arguments)]
+pub fn note_change(
+    conn: &Connection,
+    number: u64,
+    hash: &[u8; 16],
+    made_at: Option<i64>,
+    removed: Option<&[[u8; 32]]>,
+    chain: Option<&[(u64, [u8; 16])]>,
+    devices: Option<&[[u8; 32]]>,
+    commitment: Option<&[u8; 32]>,
+) -> Result<bool, CordeliaError> {
+    let number = i64::try_from(number).unwrap_or(i64::MAX);
+    let had: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT made_at FROM person_change_times WHERE number = ?1 AND hash = ?2",
+            params![number, hash.as_slice()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(storage)?;
+    let mut filled = made_at.is_some() && had.flatten().is_none();
+    conn.execute(
+        "INSERT INTO person_change_times (number, hash, made_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(number, hash) DO UPDATE SET made_at = COALESCE(made_at, excluded.made_at)",
+        params![number, hash.as_slice(), made_at],
+    )
+    .map_err(storage)?;
+    if let (Some(removed), Some(chain), Some(devices)) = (removed, chain, devices) {
+        let mut row = Vec::with_capacity(chain.len() * 24);
+        for (number, hash) in chain {
+            row.extend_from_slice(&number.to_be_bytes());
+            row.extend_from_slice(hash);
+        }
+        filled |= conn
+            .execute(
+                "INSERT INTO person_change_times_lists (number, hash, removed, chain, devices)
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(number, hash) DO NOTHING",
+                params![
+                    number,
+                    hash.as_slice(),
+                    removed.concat(),
+                    row,
+                    devices.concat()
+                ],
+            )
+            .map_err(storage)?
+            > 0;
+        if let Some(commitment) = commitment {
+            conn.execute(
+                "UPDATE person_change_times_lists SET commitment = ?3
+                 WHERE number = ?1 AND hash = ?2 AND commitment IS NULL",
+                params![number, hash.as_slice(), commitment.as_slice()],
+            )
+            .map_err(storage)?;
+        }
+    }
+    Ok(filled)
+}
+
+/// Every change the device noted ([`note_change`]), in order of number
+/// and hash. A list that does not read as one is taken as not noted.
+pub fn changes_noted(conn: &Connection) -> Result<Vec<NotedChange>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT t.number, t.hash, t.made_at, l.removed, l.chain, l.devices, l.commitment
+             FROM person_change_times t
+             LEFT JOIN person_change_times_lists l ON l.number = t.number AND l.hash = t.hash
+             ORDER BY t.number, t.hash",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<Vec<u8>>>(3)?,
+                row.get::<_, Option<Vec<u8>>>(4)?,
+                row.get::<_, Option<Vec<u8>>>(5)?,
+                row.get::<_, Option<Vec<u8>>>(6)?,
+            ))
+        })
+        .map_err(storage)?;
+    let mut noted = Vec::new();
+    for row in rows {
+        let (number, hash, made_at, removed, chain, devices, commitment) = row.map_err(storage)?;
+        let Ok(hash) = <[u8; 16]>::try_from(hash) else {
+            continue;
+        };
+        let keys = |row: Vec<u8>| {
+            let (keys, rest) = row.as_chunks::<32>();
+            rest.is_empty().then(|| keys.to_vec())
+        };
+        let removed = removed.and_then(keys);
+        let devices = devices.and_then(keys);
+        let chain = chain.and_then(|row| {
+            let (links, rest) = row.as_chunks::<24>();
+            rest.is_empty().then(|| {
+                links
+                    .iter()
+                    .map(|link| {
+                        let (number, hash) = link.split_at(8);
+                        (
+                            u64::from_be_bytes(number.try_into().unwrap_or_default()),
+                            hash.try_into().unwrap_or_default(),
+                        )
+                    })
+                    .collect()
+            })
+        });
+        noted.push(NotedChange {
+            number: number.max(0) as u64,
+            hash,
+            made_at,
+            removed,
+            chain,
+            devices,
+            commitment: commitment.and_then(|bytes| bytes.try_into().ok()),
+        });
+    }
+    Ok(noted)
+}
+
+/// The time of the change whose statement is numbered `number` and hashes
+/// to `hash`, as the device noted it: `None` where it noted none, and
+/// `Some(None)` where it noted the change, which has no time.
+pub fn change_time(
+    conn: &Connection,
+    number: u64,
+    hash: &[u8; 16],
+) -> Result<Option<Option<i64>>, CordeliaError> {
+    conn.query_row(
+        "SELECT made_at FROM person_change_times WHERE number = ?1 AND hash = ?2",
+        params![i64::try_from(number).unwrap_or(i64::MAX), hash.as_slice()],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(storage)
+}
+
+/// Forget the time of every change: the device leaves its phrase, and
+/// under another they would be another person's. Returns how many went.
+pub fn forget_change_times(conn: &Connection) -> Result<usize, CordeliaError> {
+    conn.execute("DELETE FROM person_change_times_lists", [])
+        .map_err(storage)?;
+    conn.execute("DELETE FROM person_change_times", [])
+        .map_err(storage)
+}
+
+/// Whether the device is to judge what it kept at its first start on
+/// this version (decision 2026-10-24 (removal), rule 12): step 22 marks a
+/// device that follows a phrase (`meta::PERSON_JUDGE_KEPT`).
+pub fn to_judge_kept(conn: &Connection) -> Result<bool, CordeliaError> {
+    Ok(crate::meta::get(conn, crate::meta::PERSON_JUDGE_KEPT)?.is_some())
+}
+
+/// The device has judged what it kept at its first start on this version.
+pub fn judged_kept(conn: &Connection) -> Result<(), CordeliaError> {
+    crate::meta::remove(conn, crate::meta::PERSON_JUDGE_KEPT)
 }
 
 // ── The records of additions it has seen ─────────────────────────────
@@ -509,6 +812,24 @@ pub fn count_addition(conn: &Connection, seen: i64) -> Result<(), CordeliaError>
     Ok(())
 }
 
+/// A record that counted counts no more (decision 2026-10-24 (removal),
+/// rule 6): a removed key signed it after its cut time. `seen` is its
+/// place, which it keeps. A place that holds no record is refused.
+pub fn uncount_addition(conn: &Connection, seen: i64) -> Result<(), CordeliaError> {
+    let changed = conn
+        .execute(
+            "UPDATE person_additions SET counted = 0 WHERE seen = ?1",
+            params![seen],
+        )
+        .map_err(storage)?;
+    if changed != 1 {
+        return Err(CordeliaError::Storage(format!(
+            "the device keeps no record at place {seen}"
+        )));
+    }
+    Ok(())
+}
+
 /// Keep no longer a record that is not counted: `seen` is its place in
 /// the order the device saw the records. The records that stay keep
 /// their places. A record that counts is never dropped here: a place
@@ -533,6 +854,301 @@ pub fn drop_not_counted(conn: &Connection, seen: i64) -> Result<(), CordeliaErro
 pub fn clear_additions(conn: &Connection) -> Result<usize, CordeliaError> {
     conn.execute("DELETE FROM person_additions", [])
         .map_err(storage)
+}
+
+// ── What it knows of removals ────────────────────────────────────────
+
+/// Keep `keys` as removed (decision 2026-10-24 (removal), rule 2): each
+/// that the device does not keep already, with `now`, its own clock. A key
+/// is never taken out here. Where keeping them would pass
+/// `MAX_KNOWN_REMOVED`, those beyond it are not kept and the device is
+/// marked past the bound (`meta::PERSON_REMOVED_PAST_BOUND`): it is then
+/// closed. Returns how many were kept anew. In the caller's transaction,
+/// or whole by itself.
+pub fn keep_removed(
+    conn: &Connection,
+    keys: &[[u8; 32]],
+    now: i64,
+) -> Result<usize, CordeliaError> {
+    let mut kept = 0;
+    for key in keys {
+        let held: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM person_removed_keys WHERE key = ?1)",
+                params![key.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(storage)?;
+        if held {
+            continue;
+        }
+        if removed_count(conn)? >= MAX_KNOWN_REMOVED {
+            crate::meta::set(conn, crate::meta::PERSON_REMOVED_PAST_BOUND, "1")?;
+            continue;
+        }
+        conn.execute(
+            "INSERT INTO person_removed_keys (key, seen_at) VALUES (?1, ?2)",
+            params![key.as_slice(), now],
+        )
+        .map_err(storage)?;
+        kept += 1;
+    }
+    Ok(kept)
+}
+
+/// Keep `key` as removed because a record that `adder`, a removed key,
+/// signed added it after `adder`'s cut time, or in a generation made apart
+/// from its removal (decision 2026-10-24 (removal), rule 6). Its cut is
+/// `adder`'s. As [`keep_removed`]: a key kept already stays as it was.
+/// Returns whether it was kept anew.
+pub fn keep_removed_added_by(
+    conn: &Connection,
+    key: &[u8; 32],
+    adder: &[u8; 32],
+    now: i64,
+) -> Result<bool, CordeliaError> {
+    if keep_removed(conn, &[*key], now)? == 0 {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO person_removed_keys_by (key, added_by) VALUES (?1, ?2)
+         ON CONFLICT(key) DO NOTHING",
+        params![key.as_slice(), adder.as_slice()],
+    )
+    .map_err(storage)?;
+    Ok(true)
+}
+
+/// Keep `key` as one that the person said, at the terminal of the
+/// recovery numbered `number` made on this device, is a device they still
+/// have (decision 2026-10-24 (removal), rule 6): it was shown to the
+/// person with the phrase, so a record of a removed key's that added it
+/// does not remove it. The first answer stays.
+pub fn keep_by_answer(conn: &Connection, key: &[u8; 32], number: u64) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO person_removed_keys_spared (key, number) VALUES (?1, ?2)
+         ON CONFLICT(key) DO NOTHING",
+        params![key.as_slice(), i64::try_from(number).unwrap_or(i64::MAX)],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Whether the person said, at the terminal of a recovery made on this
+/// device, that `key` is a device they still have ([`keep_by_answer`]).
+pub fn is_kept_by_answer(conn: &Connection, key: &[u8; 32]) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM person_removed_keys_spared WHERE key = ?1)",
+        params![key.as_slice()],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
+/// A key the device keeps as removed, with the removed key whose record
+/// added it where rule 6 removed it.
+pub type RemovedBy = ([u8; 32], Option<[u8; 32]>);
+
+/// Every key the device keeps as removed, in order of key, each with the
+/// removed key whose record added it where rule 6 removed it.
+pub fn removed_with_adders(conn: &Connection) -> Result<Vec<RemovedBy>, CordeliaError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT k.key, b.added_by FROM person_removed_keys k
+             LEFT JOIN person_removed_keys_by b ON b.key = k.key ORDER BY k.key ASC",
+        )
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// How many keys the device keeps as removed.
+fn removed_count(conn: &Connection) -> Result<usize, CordeliaError> {
+    conn.query_row("SELECT COUNT(*) FROM person_removed_keys", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map(|count| count.max(0) as usize)
+    .map_err(storage)
+}
+
+/// Every key the device keeps as removed, in order of key.
+pub fn removed_keys(conn: &Connection) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT key FROM person_removed_keys ORDER BY key ASC")
+        .map_err(storage)?;
+    let rows = stmt.query_map([], |row| row.get(0)).map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// Whether a change the device saw would have had it keep more keys as
+/// removed than it keeps ([`keep_removed`]).
+pub fn removed_past_bound(conn: &Connection) -> Result<bool, CordeliaError> {
+    Ok(crate::meta::get(conn, crate::meta::PERSON_REMOVED_PAST_BOUND)?.is_some())
+}
+
+/// Keep `key` as holding the secret of the change whose statement is
+/// numbered `number` and hashes to `hash` (decision 2026-10-24 (removal),
+/// rule 3): a record of an addition under that change adds it. Where the
+/// change has `MAX_KNOWN_HOLDERS` already and this key is not among them,
+/// it is not kept, and the change is marked past the bound: it is then not
+/// clear. Returns whether it was kept anew.
+pub fn keep_holder(
+    conn: &Connection,
+    number: u64,
+    hash: &[u8; 16],
+    key: &[u8; 32],
+) -> Result<bool, CordeliaError> {
+    let number = i64::try_from(number).unwrap_or(i64::MAX);
+    let held: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM person_holders
+                           WHERE number = ?1 AND hash = ?2 AND key = ?3)",
+            params![number, hash.as_slice(), key.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if held {
+        return Ok(false);
+    }
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM person_holders WHERE number = ?1 AND hash = ?2",
+            params![number, hash.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    if count.max(0) as usize >= MAX_KNOWN_HOLDERS {
+        conn.execute(
+            "INSERT INTO person_holders_past (number, hash) VALUES (?1, ?2)
+             ON CONFLICT(number, hash) DO NOTHING",
+            params![number, hash.as_slice()],
+        )
+        .map_err(storage)?;
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO person_holders (number, hash, key) VALUES (?1, ?2, ?3)",
+        params![number, hash.as_slice(), key.as_slice()],
+    )
+    .map_err(storage)?;
+    Ok(true)
+}
+
+/// The keys the device keeps as holding the secret of the change whose
+/// statement is numbered `number` and hashes to `hash`, by the records it
+/// has seen under it, in order of key.
+pub fn holders(
+    conn: &Connection,
+    number: u64,
+    hash: &[u8; 16],
+) -> Result<Vec<[u8; 32]>, CordeliaError> {
+    let mut stmt = conn
+        .prepare("SELECT key FROM person_holders WHERE number = ?1 AND hash = ?2 ORDER BY key ASC")
+        .map_err(storage)?;
+    let rows = stmt
+        .query_map(
+            params![i64::try_from(number).unwrap_or(i64::MAX), hash.as_slice()],
+            |row| row.get(0),
+        )
+        .map_err(storage)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(storage)
+}
+
+/// Whether a record would have given the change whose statement is
+/// numbered `number` and hashes to `hash` more holders than are kept
+/// ([`keep_holder`]).
+pub fn holders_past_bound(
+    conn: &Connection,
+    number: u64,
+    hash: &[u8; 16],
+) -> Result<bool, CordeliaError> {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM person_holders_past WHERE number = ?1 AND hash = ?2)",
+        params![i64::try_from(number).unwrap_or(i64::MAX), hash.as_slice()],
+        |row| row.get(0),
+    )
+    .map_err(storage)
+}
+
+/// Keep the holders, and the mark past their bound, of no change but
+/// those in `kept`, each by its statement's number and hash: the change
+/// the device comes to follow and every change it keeps as a head set
+/// aside (decision 2026-10-24 (removal), rule 3). A head is judged by them
+/// for as long as it is kept, so what made it not clear stays. Returns how
+/// many rows went.
+pub fn forget_holders_but(
+    conn: &Connection,
+    kept: &[(u64, [u8; 16])],
+) -> Result<usize, CordeliaError> {
+    let kept: Vec<(i64, [u8; 16])> = kept
+        .iter()
+        .map(|(number, hash)| (i64::try_from(*number).unwrap_or(i64::MAX), *hash))
+        .collect();
+    let mut gone = 0;
+    for table in ["person_holders", "person_holders_past"] {
+        let mut stmt = conn
+            .prepare(&format!("SELECT DISTINCT number, hash FROM {table}"))
+            .map_err(storage)?;
+        let held = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(storage)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage)?;
+        for (number, hash) in held {
+            if kept
+                .iter()
+                .any(|(n, h)| *n == number && h.as_slice() == hash.as_slice())
+            {
+                continue;
+            }
+            gone += conn
+                .execute(
+                    &format!("DELETE FROM {table} WHERE number = ?1 AND hash = ?2"),
+                    params![number, hash],
+                )
+                .map_err(storage)?;
+        }
+    }
+    Ok(gone)
+}
+
+/// The mark that every write of what says whether the change followed is
+/// clear makes anew (schema step 21, `person_clear_mark`): the row of the
+/// person, its records, the removed keys, the holders, the changes past
+/// the bound of holders, and the mark past the bound of removed keys. What
+/// is worked out from them under one mark holds for as long as the
+/// database holds that mark. `None` where the row is not there, and then
+/// nothing is to be taken as worked out.
+pub fn clear_mark(conn: &Connection) -> Result<Option<[u8; 16]>, CordeliaError> {
+    conn.prepare_cached("SELECT mark FROM person_clear_mark WHERE one = 1")
+        .and_then(|mut stmt| stmt.query_row([], |row| row.get(0)).optional())
+        .map_err(storage)
+}
+
+/// Forget what the device knows of removals: the keys it keeps as
+/// removed, with the mark past their bound, every holder, and the time of
+/// every change (decision 2026-10-24 (removal), rule 2). Only a
+/// device that leaves its phrase does this: under another phrase they are
+/// another person's.
+pub fn forget_removals(conn: &Connection) -> Result<(), CordeliaError> {
+    for table in [
+        "person_removed_keys",
+        "person_removed_keys_by",
+        "person_removed_keys_spared",
+        "person_holders",
+        "person_holders_past",
+        "person_change_times",
+        "person_change_times_lists",
+    ] {
+        conn.execute(&format!("DELETE FROM {table}"), [])
+            .map_err(storage)?;
+    }
+    crate::meta::remove(conn, crate::meta::PERSON_REMOVED_PAST_BOUND)?;
+    Ok(())
 }
 
 // ── The names it holds ───────────────────────────────────────────────
@@ -902,6 +1518,164 @@ mod tests {
         entry(secret, rev, Value::Text("what it holds".to_string()))
     }
 
+    // ── What it knows of removals ────────────────────────────────────
+
+    /// The removed keys only grow (decision 2026-10-24 (removal), rule 2):
+    /// a key kept is kept once, with the time it was first kept, and none
+    /// is taken out but where the device leaves its phrase. Past their
+    /// bound none more is kept, and the device is marked past it.
+    #[test]
+    fn test_the_removed_keys_only_grow_and_are_marked_past_their_bound() {
+        let conn = db::open_in_memory().unwrap();
+        assert!(removed_keys(&conn).unwrap().is_empty());
+        assert!(!removed_past_bound(&conn).unwrap());
+        assert_eq!(keep_removed(&conn, &[[2; 32], [1; 32]], NOW).unwrap(), 2);
+        assert_eq!(
+            keep_removed(&conn, &[[1; 32], [3; 32]], NOW + 9).unwrap(),
+            1
+        );
+        assert_eq!(
+            removed_keys(&conn).unwrap(),
+            vec![[1; 32], [2; 32], [3; 32]]
+        );
+        let seen_at: i64 = conn
+            .query_row(
+                "SELECT seen_at FROM person_removed_keys WHERE key = ?1",
+                params![[1u8; 32].as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seen_at, NOW);
+        assert!(!removed_past_bound(&conn).unwrap());
+
+        // To the bound, and one past it.
+        let many: Vec<[u8; 32]> = (0..MAX_KNOWN_REMOVED as u32)
+            .map(|n| {
+                let mut key = [0xee; 32];
+                key[..4].copy_from_slice(&n.to_be_bytes());
+                key
+            })
+            .collect();
+        keep_removed(&conn, &many, NOW).unwrap();
+        assert_eq!(removed_keys(&conn).unwrap().len(), MAX_KNOWN_REMOVED);
+        assert!(removed_past_bound(&conn).unwrap());
+        // One it keeps already is no more than it was.
+        assert_eq!(keep_removed(&conn, &[[1; 32]], NOW).unwrap(), 0);
+
+        forget_removals(&conn).unwrap();
+        assert!(removed_keys(&conn).unwrap().is_empty());
+        assert!(!removed_past_bound(&conn).unwrap());
+    }
+
+    /// The holders of a change are kept by its number and hash (decision
+    /// 2026-10-24 (removal), rule 3): each key once, at most
+    /// `MAX_KNOWN_HOLDERS`, and a change that a record would take past that
+    /// is marked so. The device keeps those of one change when it comes to
+    /// follow it, and none once it leaves its phrase.
+    #[test]
+    fn test_the_holders_of_a_change_are_kept_to_their_bound_and_marked_past_it() {
+        let conn = db::open_in_memory().unwrap();
+        let (three, four) = ([3; 16], [4; 16]);
+        assert!(keep_holder(&conn, 3, &three, &[1; 32]).unwrap());
+        assert!(!keep_holder(&conn, 3, &three, &[1; 32]).unwrap());
+        assert!(keep_holder(&conn, 3, &four, &[2; 32]).unwrap());
+        assert!(keep_holder(&conn, 4, &four, &[5; 32]).unwrap());
+        assert_eq!(holders(&conn, 3, &three).unwrap(), vec![[1; 32]]);
+        assert_eq!(holders(&conn, 3, &four).unwrap(), vec![[2; 32]]);
+        assert!(!holders_past_bound(&conn, 3, &three).unwrap());
+
+        for n in 1..MAX_KNOWN_HOLDERS as u32 {
+            let mut key = [0xdd; 32];
+            key[..4].copy_from_slice(&n.to_be_bytes());
+            assert!(keep_holder(&conn, 3, &three, &key).unwrap());
+        }
+        assert_eq!(holders(&conn, 3, &three).unwrap().len(), MAX_KNOWN_HOLDERS);
+        assert!(!holders_past_bound(&conn, 3, &three).unwrap());
+        // One it keeps is no more; one more is not kept, and marks it.
+        assert!(!keep_holder(&conn, 3, &three, &[1; 32]).unwrap());
+        assert!(!holders_past_bound(&conn, 3, &three).unwrap());
+        assert!(!keep_holder(&conn, 3, &three, &[9; 32]).unwrap());
+        assert!(holders_past_bound(&conn, 3, &three).unwrap());
+        assert!(!holders_past_bound(&conn, 3, &four).unwrap());
+
+        // A change still kept keeps its holders and its mark past the
+        // bound; one that is not loses both.
+        forget_holders_but(&conn, &[(4, four), (3, three)]).unwrap();
+        assert_eq!(holders(&conn, 3, &three).unwrap().len(), MAX_KNOWN_HOLDERS);
+        assert!(holders_past_bound(&conn, 3, &three).unwrap());
+        assert!(holders(&conn, 3, &four).unwrap().is_empty());
+        forget_holders_but(&conn, &[(4, four)]).unwrap();
+        assert!(holders(&conn, 3, &three).unwrap().is_empty());
+        assert!(!holders_past_bound(&conn, 3, &three).unwrap());
+        assert_eq!(holders(&conn, 4, &four).unwrap(), vec![[5; 32]]);
+        forget_removals(&conn).unwrap();
+        assert!(holders(&conn, 4, &four).unwrap().is_empty());
+    }
+
+    /// Every write of what says whether the change followed is clear makes
+    /// the mark anew, whatever writes it (schema step 21): an insert, an
+    /// update and a delete of the person's row, its records, the removed
+    /// keys, the holders and the changes past their bound, and of the mark
+    /// past the bound of removed keys. A write undone puts back the mark
+    /// with what it undid. A write of anything else leaves it.
+    #[test]
+    fn test_every_write_that_can_change_whether_a_change_is_clear_makes_a_new_mark() {
+        let conn = db::open_in_memory().unwrap();
+        let mark = || clear_mark(&conn).unwrap().unwrap();
+        let writes = [
+            "INSERT INTO person (one, state, phrase_key, statement_key, phrase_channel, statement)
+                 VALUES (1, 'applied', zeroblob(32), zeroblob(32), zeroblob(32), X'01')",
+            "UPDATE person SET statement = X'02'",
+            "INSERT INTO person_additions (record, key, adder, counted, seen_at)
+                 VALUES (X'01', zeroblob(32), zeroblob(32), 0, 9)",
+            "UPDATE person_additions SET counted = 1",
+            "DELETE FROM person_additions",
+            "INSERT INTO person_removed_keys (key, seen_at) VALUES (zeroblob(32), 9)",
+            "UPDATE person_removed_keys SET seen_at = 10",
+            "DELETE FROM person_removed_keys",
+            "INSERT INTO person_holders (number, hash, key) VALUES (3, zeroblob(16), zeroblob(32))",
+            "UPDATE person_holders SET number = 4",
+            "DELETE FROM person_holders",
+            "INSERT INTO person_holders_past (number, hash) VALUES (3, zeroblob(16))",
+            "UPDATE person_holders_past SET number = 4",
+            "DELETE FROM person_holders_past",
+            "DELETE FROM person",
+        ];
+        for write in writes {
+            let before = mark();
+            conn.execute_batch("SAVEPOINT one").unwrap();
+            conn.execute_batch(write).unwrap();
+            let after = mark();
+            assert_ne!(after, before, "{write}");
+            conn.execute_batch("ROLLBACK TO one").unwrap();
+            assert_eq!(mark(), before, "undone: {write}");
+            conn.execute_batch(write).unwrap();
+            conn.execute_batch("RELEASE one").unwrap();
+            assert_ne!(mark(), before, "{write}");
+        }
+        // The mark past the bound, by the key that `meta` names.
+        let key = crate::meta::PERSON_REMOVED_PAST_BOUND;
+        let before = mark();
+        crate::meta::set(&conn, key, "1").unwrap();
+        assert_ne!(mark(), before);
+        let before = mark();
+        crate::meta::set(&conn, key, "2").unwrap();
+        assert_ne!(mark(), before);
+        let before = mark();
+        crate::meta::remove(&conn, key).unwrap();
+        assert_ne!(mark(), before);
+        // Anything else leaves it.
+        let before = mark();
+        crate::meta::set(&conn, "person.something_else", "1").unwrap();
+        crate::meta::remove(&conn, "person.something_else").unwrap();
+        conn.execute(
+            "INSERT INTO person_names (name, channel, held_at) VALUES ('notes', zeroblob(32), 9)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(mark(), before);
+    }
+
     // ── What it follows, and where it stands ─────────────────────────
 
     #[test]
@@ -910,8 +1684,8 @@ mod tests {
         assert_eq!(person(&conn).unwrap(), None);
         assert_eq!(applied_secret(&conn).unwrap(), None);
         assert!(secrets(&conn).unwrap().is_empty());
-        assert_eq!(change_entry(&conn, Kept::Latest).unwrap(), None);
-        assert_eq!(change_entry(&conn, Kept::Apart).unwrap(), None);
+        assert_eq!(followed_entry(&conn).unwrap(), None);
+        assert!(set_aside_entries(&conn).unwrap().is_empty());
         assert!(additions(&conn).unwrap().is_empty());
         assert!(names(&conn).unwrap().is_empty());
         // It has no state to change.
@@ -1273,31 +2047,136 @@ mod tests {
     #[test]
     fn test_a_change_entry_is_kept_whole_and_read_back_as_it_was() {
         let conn = db::open_in_memory().unwrap();
-        let (latest, apart) = (text(0x51, 3), text(0x51, 4));
-        keep_change_entry(&conn, Kept::Latest, &latest).unwrap();
-        let read = change_entry(&conn, Kept::Latest).unwrap().unwrap();
-        assert_eq!(read, *latest);
+        let (followed, apart) = (text(0x51, 3), text(0x51, 4));
+        keep_followed(&conn, &followed).unwrap();
+        let read = followed_entry(&conn).unwrap().unwrap();
+        assert_eq!(read, *followed);
         // It is whole: it passes the check again, as it must to be shown
         // to a relay.
-        assert_eq!(read.check().unwrap(), latest);
-        assert_eq!(change_entry(&conn, Kept::Apart).unwrap(), None);
+        assert_eq!(read.check().unwrap(), followed);
+        assert!(set_aside_entries(&conn).unwrap().is_empty());
 
-        // The second one, where the device is in a fork: each is kept in
-        // its own place.
-        keep_change_entry(&conn, Kept::Apart, &apart).unwrap();
-        assert_eq!(change_entry(&conn, Kept::Latest).unwrap().unwrap(), *latest);
-        assert_eq!(change_entry(&conn, Kept::Apart).unwrap().unwrap(), *apart);
+        // A head set aside is kept beside it, with when it was set aside.
+        let place = set_aside(&conn, &apart, NOW).unwrap();
+        assert_eq!(followed_entry(&conn).unwrap().unwrap(), *followed);
+        let aside = set_aside_entries(&conn).unwrap();
+        assert_eq!(
+            aside,
+            vec![SetAside {
+                place,
+                entry: (*apart).clone(),
+                set_aside_at: NOW,
+            }]
+        );
+        assert_eq!(aside[0].entry.clone().check().unwrap(), apart);
 
-        // A later one takes the place of the latest, and no other's.
+        // A later one takes the place of the change followed, and no
+        // other's.
         let later = text(0x51, 5);
-        keep_change_entry(&conn, Kept::Latest, &later).unwrap();
-        assert_eq!(change_entry(&conn, Kept::Latest).unwrap().unwrap(), *later);
-        assert_eq!(change_entry(&conn, Kept::Apart).unwrap().unwrap(), *apart);
+        keep_followed(&conn, &later).unwrap();
+        assert_eq!(followed_entry(&conn).unwrap().unwrap(), *later);
+        assert_eq!(set_aside_entries(&conn).unwrap().len(), 1);
 
-        assert!(drop_change_entry(&conn, Kept::Apart).unwrap());
-        assert!(!drop_change_entry(&conn, Kept::Apart).unwrap());
-        assert_eq!(change_entry(&conn, Kept::Apart).unwrap(), None);
-        assert_eq!(change_entry(&conn, Kept::Latest).unwrap().unwrap(), *later);
+        assert!(drop_set_aside(&conn, place).unwrap());
+        assert!(!drop_set_aside(&conn, place).unwrap());
+        assert!(set_aside_entries(&conn).unwrap().is_empty());
+        assert_eq!(followed_entry(&conn).unwrap().unwrap(), *later);
+        assert_eq!(drop_change_entries(&conn).unwrap(), 1);
+        assert_eq!(followed_entry(&conn).unwrap(), None);
+    }
+
+    /// The heads set aside are listed the highest number first, and of
+    /// two at one number the first set aside first (decision 2026-10-24
+    /// (removal), rule 1). One kept already, as followed or set aside, is
+    /// not kept twice; the change followed is never dropped as one set
+    /// aside; and there is one change followed at most.
+    #[test]
+    fn test_the_heads_set_aside_are_listed_by_number_and_kept_once() {
+        let conn = db::open_in_memory().unwrap();
+        let followed = text(0x51, 3);
+        keep_followed(&conn, &followed).unwrap();
+        let (three, five, five_again) = (text(0x52, 3), text(0x53, 5), text(0x54, 5));
+        let p3 = set_aside(&conn, &three, NOW).unwrap();
+        let p5 = set_aside(&conn, &five, NOW + 1).unwrap();
+        let p5b = set_aside(&conn, &five_again, NOW + 2).unwrap();
+        let places: Vec<i64> = set_aside_entries(&conn)
+            .unwrap()
+            .iter()
+            .map(|head| head.place)
+            .collect();
+        assert_eq!(places, vec![p5, p5b, p3]);
+        assert!(set_aside(&conn, &five, NOW + 3).is_err());
+        assert!(set_aside(&conn, &followed, NOW + 3).is_err());
+        assert!(set_aside(&conn, &entry(0x55, 4, Value::Delete), NOW).is_err());
+        let followed_place: i64 = conn
+            .query_row(
+                "SELECT place FROM person_change_entries WHERE followed = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!drop_set_aside(&conn, followed_place).unwrap());
+        assert!(
+            conn.execute(
+                "UPDATE person_change_entries SET followed = 1, set_aside_at = NULL
+                 WHERE place = ?1",
+                params![p3],
+            )
+            .is_err(),
+            "a second change followed"
+        );
+        assert_eq!(drop_all_set_aside(&conn).unwrap(), 3);
+        assert_eq!(followed_entry(&conn).unwrap().unwrap(), *followed);
+    }
+
+    /// A change noted says whether it filled what was not noted before:
+    /// its time, or its lists (decision 2026-10-24 (removal), rule 6, where
+    /// records are judged again).
+    #[test]
+    fn test_a_change_noted_says_whether_it_filled_anything() {
+        let conn = db::open_in_memory().unwrap();
+        let lists = |conn: &Connection, made_at| {
+            note_change(
+                conn,
+                3,
+                &[3; 16],
+                made_at,
+                Some(&[[9; 32]]),
+                Some(&[(2, [2; 16])]),
+                Some(&[]),
+                Some(&[5; 32]),
+            )
+            .unwrap()
+        };
+        assert!(!note_change(&conn, 3, &[3; 16], None, None, None, None, None).unwrap());
+        assert!(lists(&conn, None));
+        assert!(!lists(&conn, None));
+        assert!(lists(&conn, Some(NOW)));
+        assert!(!lists(&conn, Some(NOW + 9)));
+        assert!(note_change(&conn, 4, &[4; 16], Some(NOW), None, None, None, None).unwrap());
+        // The commitment is noted with the lists.
+        let noted = changes_noted(&conn).unwrap();
+        assert_eq!(noted[0].commitment, Some([5; 32]));
+        assert_eq!(noted[1].commitment, None);
+    }
+
+    /// The time of each change is kept by its number and hash, once, as
+    /// its lineage says it, or as none (decision 2026-10-24 (removal), rule
+    /// 2); it goes only where the device leaves its phrase.
+    #[test]
+    fn test_the_time_of_each_change_is_kept_once_until_the_phrase_is_left() {
+        let conn = db::open_in_memory().unwrap();
+        assert_eq!(change_time(&conn, 3, &[3; 16]).unwrap(), None);
+        note_change_time(&conn, 3, &[3; 16], Some(NOW)).unwrap();
+        note_change_time(&conn, 3, &[3; 16], Some(NOW + 9)).unwrap();
+        note_change_time(&conn, 2, &[2; 16], None).unwrap();
+        assert_eq!(change_time(&conn, 3, &[3; 16]).unwrap(), Some(Some(NOW)));
+        assert_eq!(change_time(&conn, 2, &[2; 16]).unwrap(), Some(None));
+        assert_eq!(change_time(&conn, 3, &[4; 16]).unwrap(), None);
+        forget_removals(&conn).unwrap();
+        assert_eq!(change_time(&conn, 3, &[3; 16]).unwrap(), None);
+        note_change_time(&conn, 3, &[3; 16], Some(NOW)).unwrap();
+        assert_eq!(forget_change_times(&conn).unwrap(), 1);
     }
 
     #[test]
@@ -1305,15 +2184,16 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         // A delete.
         let delete = entry(0x51, 3, Value::Delete);
-        assert!(keep_change_entry(&conn, Kept::Latest, &delete).is_err());
+        assert!(keep_followed(&conn, &delete).is_err());
         // A revision that no statement's number is.
-        assert!(keep_change_entry(&conn, Kept::Latest, &text(0x51, 257)).is_err());
-        assert_eq!(change_entry(&conn, Kept::Latest).unwrap(), None);
+        assert!(keep_followed(&conn, &text(0x51, 257)).is_err());
+        assert_eq!(followed_entry(&conn).unwrap(), None);
 
-        // The table takes two rows, each in a place it names.
-        keep_change_entry(&conn, Kept::Latest, &text(0x51, 256)).unwrap();
+        keep_followed(&conn, &text(0x51, 256)).unwrap();
+        // A change followed has no time it was set aside, and a head set
+        // aside has one.
         assert!(
-            conn.execute("UPDATE person_change_entries SET kept = 'third'", [])
+            conn.execute("UPDATE person_change_entries SET set_aside_at = 9", [])
                 .is_err()
         );
         for column in ["channel", "slot", "author", "author_sig", "channel_sig"] {

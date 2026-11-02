@@ -855,7 +855,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
             409,
         ),
         (json!({ "entry": entry, "over": over }), 400),
-        (json!({ "entry": kept, "over": over, "apart": over }), 409),
+        (json!({ "entry": kept, "over": over, "heads": [over] }), 409),
     ] {
         let (status, said) = asks(&laptop, "/api/v1/change/make", body.clone());
         assert_eq!(status, refused_as, "{body}: {said}");
@@ -1941,10 +1941,12 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
 
 /// Two devices each make a change while neither can hear the other: the
 /// relay comes to hold one, and the device that made the other sees both.
-/// It is in a fork: it says so, with both lists, adds nothing and accepts
-/// nothing. `cordelia settle`, there, shows both statements, asks of the
-/// other device whether it stays, and makes the settlement with the
-/// phrase. Both devices apply it.
+/// Both are clear, so it sets the other aside and goes on (decision
+/// 2026-10-24 (removal), rules 8 and 11): it says so, with both lists, and
+/// is amber. Any change made there joins the two (rule 21): `cordelia
+/// renew`, there, shows both statements, asks of the other device whether
+/// it stays, and makes the settlement with the phrase, as `cordelia
+/// settle` does. Both devices apply it.
 #[test]
 fn two_changes_made_apart_are_settled_with_the_phrase() {
     let mut relay = relay_started();
@@ -1980,61 +1982,52 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
     let all = [&relay, &laptop, &desktop];
 
-    // One of the two sees both.
-    let in_a_fork = |device: &Node| text(&look(device), "state") == "fork";
+    // One of the two sees both, and sets the other aside.
+    let sets_aside = |device: &Node| {
+        look(device)["set_aside"]
+            .as_array()
+            .is_some_and(|heads| !heads.is_empty())
+    };
     wait_for("one device sees both changes", &all, 180, || {
-        (in_a_fork(&laptop) || in_a_fork(&desktop)).then_some(())
+        (sets_aside(&laptop) || sets_aside(&desktop)).then_some(())
     });
-    let (forked, other) = match in_a_fork(&laptop) {
+    let (forked, other) = match sets_aside(&laptop) {
         true => (&laptop, &desktop),
         false => (&desktop, &laptop),
     };
-    assert!(!in_a_fork(other), "the relay holds one of the two");
-    let fork = "two changes were made apart: settle it with the phrase (`cordelia settle`)";
+    assert!(!sets_aside(other), "the relay holds one of the two");
+    // It goes on: it is not stopped.
+    assert_eq!(text(&look(forked), "state"), "applied");
+    let set_aside = "is set aside: settle it with the phrase (`cordelia settle`)";
     let status = forked.cli(&["status"]);
     assert!(
-        status.contains("Devices:   two changes were made apart"),
+        status.contains("Devices:   a change made apart is set aside"),
         "{status}"
     );
-    assert!(status.contains(fork), "{status}");
+    assert!(status.contains(set_aside), "{status}");
     let listed = forked.cli(&["devices"]);
-    assert!(listed.contains(fork), "{listed}");
+    assert!(listed.contains(set_aside), "{listed}");
     assert!(
         listed.contains("The change made apart (change 3, made on"),
         "{listed}"
     );
-    // In a fork a device adds nothing, is handed nothing, and makes no
-    // change but the settlement.
-    let said = forked
-        .at_terminal(&["add-device", &key_of(&relay)])
-        .refused();
-    assert!(said.contains("two changes were made apart"), "{said}");
-    // (It asks nothing, and so ends at once.)
-    let said = forked
-        .at_terminal(&["accept", &key_of(other)])
-        .refused_within(std::time::Duration::from_secs(60));
-    assert!(said.contains("the fork is settled"), "{said}");
-    let said = forked.at_terminal(&["renew"]).refused();
-    assert!(said.contains("two changes were made apart"), "{said}");
-    // The routes refuse the same, whoever asks.
-    let (status, said) = asks(
-        forked,
-        "/api/v1/devices/accept",
-        typed_on(forked, &key_of(other)),
+    // A change made there is the settlement (rule 21): the route hands
+    // the head set aside to a renewal as to `cordelia settle`.
+    let handed = forked.post("/api/v1/change/prepare", json!({}));
+    assert_eq!(
+        handed["heads"].as_array().map(Vec::len),
+        Some(1),
+        "{handed}"
     );
-    assert_eq!(status, 400, "{said}");
-    assert!(said.contains("two changes were made apart"), "{said}");
-    let (status, _) = asks(forked, "/api/v1/change/prepare", json!({}));
-    assert_eq!(status, 400);
 
-    // The settlement.
-    let mut at = forked.at_terminal(&["settle"]);
-    at.says("Two changes were made apart. Each is shown from its signed bytes.");
-    at.says("Change 3 (this device had applied):");
-    at.says("Change 3 (made apart):");
-    at.says("It undoes no removal");
+    // The settlement, made by `cordelia renew`.
+    let mut at = forked.at_terminal(&["renew"]);
+    at.says("2 changes were made apart. Each is shown from its signed bytes.");
+    at.says("Change 3 (this device follows):");
+    at.says("Change 3 (set aside):");
+    at.says("undoes no removal");
     at.says(&format!(
-        "({}) {:?}, a device of both changes:",
+        "({}) {:?}, a device of every change shown:",
         words_of(&key_of(other)),
         other.name
     ));
@@ -4091,7 +4084,8 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
     at.says("The change is made (change 2).");
 
     // The wait: the same process, and another image of the program in
-    // it, which was given the change's number and nothing else.
+    // it, which was given the change's number and its entry, and nothing
+    // else.
     let began = std::time::Instant::now();
     let waits = loop {
         let line = command_line(pid);
@@ -4100,8 +4094,11 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
+    let entry = waits
+        .split_once(" change-made 2 --entry ")
+        .map_or("", |(_, entry)| entry);
     assert!(
-        waits.ends_with(" change-made 2"),
+        entry.len() == 64 && entry.chars().all(|c| c.is_ascii_hexdigit()),
         "{waits:?} after {signs:?}"
     );
     assert!(!waits.contains("renew"), "{waits}");

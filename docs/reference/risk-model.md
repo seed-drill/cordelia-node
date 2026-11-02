@@ -69,8 +69,9 @@ more than the oversight it gives up.
    Such an operator can be made to hand over ciphertext and the metadata the
    whitepaper lists (§4), or to stop. That metadata includes one identifier
    that stays the same for a person for as long as their recovery phrase
-   does, and which of a person's channels change together when a device is
-   removed. It cannot hand over what it does not hold: a key, a recovery
+   does, which of a person's channels change together when a device is
+   removed, and how a person's changes of devices follow each other and when
+   each was made. It cannot hand over what it does not hold: a key, a recovery
    phrase, or the list of a person's devices.
 
 ## What would change our view
