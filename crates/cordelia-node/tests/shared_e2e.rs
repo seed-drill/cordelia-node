@@ -2944,3 +2944,148 @@ fn a_device_of_the_version_before_ignores_shared_lists() {
     assert!(said.status.success(), "{}", err_of(&said));
     assert_eq!(not_messages_from(&desktop, &desktop_notes, "laptop"), 0);
 }
+
+/// What `msg send --channel <name>` on `n` in `dir` comes to, once the
+/// device has the subscription and has read its own messages back: `None`
+/// where it is sent, or what it said where it is refused.
+fn send_comes_to(all: &[&Node], n: &Node, dir: &Path, name: &str, body: &str) -> Option<String> {
+    wait_for("the send is sent or refused", all, 300, || {
+        let said = msg_in(n, dir, &["send", "--channel", name], body.as_bytes());
+        if said.status.success() {
+            return Some(None);
+        }
+        let err = err_of(&said);
+        let waits = err.contains("has not yet read its own messages back")
+            || err.contains("does not subscribe to");
+        (!waits).then_some(Some(err))
+    })
+}
+
+/// Wait until `n` files `name` as `channel`.
+fn files_as(all: &[&Node], n: &Node, name: &str, channel: [u8; 32]) {
+    wait_for("the device files the channel", all, 300, || {
+        (id_filed(n, name)? == channel).then_some(())
+    });
+}
+
+/// After a removal each device makes a shared channel anew once (issue
+/// #279, its second part; item 66; decision 2026-10-24, rules 23 and 25):
+/// Alice's laptop, desktop, phone and tablet hold "review", and the
+/// desktop removes the tablet, making the channel anew. The laptop and the
+/// phone send nothing there until each runs `shared anew`: the laptop's
+/// making leaves the desktop clean and the phone not, and the phone's,
+/// the third, leaves the first two clean; each then sends. A channel Bob
+/// shares with the laptop after the removal is not clean there: `share`
+/// and `send --channel` are refused with `not_clean`.
+#[test]
+fn after_a_removal_each_device_makes_a_shared_channel_anew_once() {
+    let relay = relay_started();
+    let laptop = device_started_with_its_relays_key("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let desktop = device_started_with_its_relays_key("desktop", &relay);
+    let phone = device_started_with_its_relays_key("phone", &relay);
+    let tablet = device_started_with_its_relays_key("tablet", &relay);
+    let bob = person("bob", &relay);
+    let all = [&relay, &laptop, &desktop, &phone, &tablet, &bob];
+    for (device, label) in [(&desktop, "desktop"), (&phone, "phone"), (&tablet, "tablet")] {
+        adds(&laptop, device, label);
+        has_applied(device, 1, &all);
+        sync_on(device);
+    }
+    makes(&laptop, "review", &[]);
+    for device in [&desktop, &phone, &tablet] {
+        holds_in_the_end(&all, device, "review");
+    }
+    let dirs: Vec<std::path::PathBuf> = [&laptop, &desktop, &phone]
+        .iter()
+        .map(|device| maps_folder(device, "repo", AGENT))
+        .collect();
+    subscribes(&laptop, &dirs[0], "review");
+
+    // The phone, added since change 1 too, is asked of: it stays.
+    let mut at = desktop.at_terminal(&["remove-device", &key_of(&tablet)]);
+    at.says("Type `list` to list this machine").types("list");
+    at.says("Type `stays` or `removed`").types("stays");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says(ASKS_THE_PHRASE).types(&words);
+    at.says("The change is made (change 2)");
+    at.says("The wait has ended.")
+        .says("\"review\" is made anew without the device removed: it is channel ");
+    drop(at);
+    let after = [&relay, &laptop, &desktop, &phone, &bob];
+    let first = id_filed(&desktop, "review").unwrap();
+    for device in [&laptop, &phone] {
+        has_applied(device, 2, &after);
+        files_as(&after, device, "review", first);
+    }
+    let not_clean = "\"review\" is not clean: after a removal, each shared channel is made \
+                     anew once on this device before it sends there";
+    // The desktop made it anew: it sends there. The laptop and the phone
+    // send nothing until each makes it anew once.
+    assert_eq!(
+        send_comes_to(&after, &desktop, &dirs[1], "review", "from the desktop"),
+        None
+    );
+    for (device, dir) in [(&laptop, &dirs[0]), (&phone, &dirs[2])] {
+        let refused = send_comes_to(&after, device, dir, "review", "not yet")
+            .unwrap_or_else(|| panic!("{} sent in a channel not clean", device.name));
+        assert!(refused.contains(not_clean), "{refused}");
+    }
+
+    // The laptop makes it anew: clean there and on the desktop, which held
+    // the one it was made out of clean; not on the phone.
+    makes_anew(&laptop, "review", &[], &[]);
+    let second = id_filed(&laptop, "review").unwrap();
+    for device in [&desktop, &phone] {
+        files_as(&after, device, "review", second);
+    }
+    for (device, dir) in [(&laptop, &dirs[0]), (&desktop, &dirs[1])] {
+        assert_eq!(
+            send_comes_to(&after, device, dir, "review", "after the second"),
+            None,
+            "{}",
+            device.name
+        );
+    }
+    let refused = send_comes_to(&after, &phone, &dirs[2], "review", "not yet")
+        .expect("the phone sent in a channel not clean");
+    assert!(refused.contains(not_clean), "{refused}");
+
+    // The phone, the third, makes it anew: the first two hold it clean,
+    // and each device sends.
+    makes_anew(&phone, "review", &[], &[]);
+    let third = id_filed(&phone, "review").unwrap();
+    for device in [&laptop, &desktop] {
+        files_as(&after, device, "review", third);
+    }
+    for (device, dir) in [(&laptop, &dirs[0]), (&desktop, &dirs[1]), (&phone, &dirs[2])] {
+        assert_eq!(
+            send_comes_to(&after, device, dir, "review", "after the third"),
+            None,
+            "{}",
+            device.name
+        );
+    }
+
+    // A channel taken after the removal is not clean where it is taken.
+    makes(&bob, "bobs", &[]);
+    shares(&bob, "bobs", &key_of(&laptop));
+    accepting(&laptop, &key_of(&bob), "bobs").ends();
+    holds_in_the_end(&after, &laptop, "bobs");
+    let (ended, _, err) = laptop.at_terminal_into_a_pipe(&["share", "bobs", &key_of(&bob)]);
+    assert_eq!(ended, Some(false));
+    assert!(
+        err.contains("\"bobs\" is not clean: after a removal"),
+        "{err}"
+    );
+    subscribes(&laptop, &dirs[0], "bobs");
+    let refused = send_comes_to(&after, &laptop, &dirs[0], "bobs", "taken after")
+        .expect("the laptop sent in a channel taken after a removal");
+    assert!(
+        refused.contains("\"bobs\" is not clean: after a removal"),
+        "{refused}"
+    );
+}
