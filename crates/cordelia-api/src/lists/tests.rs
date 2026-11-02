@@ -2940,12 +2940,12 @@ fn a_statement_applied_writes_the_list_again() {
     assert_eq!(list, kept(&s, 1));
 }
 
-/// When this device took an act, by its signature.
+/// When this device took an act, by [`AnyAct::taking`].
 fn taken_of(s: &Several, n: usize, act: &AnyAct) -> Option<Taken> {
     kept_rows::taken(&s[n].conn)
         .unwrap()
         .into_iter()
-        .find_map(|(signature, taken)| (signature == act.signature()).then_some(taken.taken))
+        .find_map(|(signature, taken)| (signature == act.taking()).then_some(taken.taken))
 }
 
 /// An act's time of taking is when the door first stored a list that
