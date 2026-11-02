@@ -1636,6 +1636,28 @@ pub fn make_move(
         agents: to.agents.clone(),
     };
     in_one(conn, || -> Result<Out<()>, PersonError> {
+        // Checked again where the move is made: a removal may have come
+        // since the plan, and made the channel not clean or the offer a
+        // fault (the review of #281, low 3).
+        if is_not_clean(conn, &to.from)? {
+            return Ok(refused("not_clean", not_clean_line(&to.to.name)));
+        }
+        let still = match st(kept::channel(conn, &to.from))? {
+            Some(row) => judged(conn, identity, &row, Some(now))?.iter().any(|one| {
+                one.offer.new_channel == to.to.channel
+                    && matches!(one.is, OfferIs::ForThisDevice(_))
+            }),
+            None => false,
+        };
+        if !still {
+            return Ok(refused(
+                "no_offer",
+                format!(
+                    "\"{}\" has not been made anew by a key this device shows.",
+                    crate::messages::cleaned(&to.to.name)
+                ),
+            ));
+        }
         if let Err(failed) = sharing::act(conn, identity, &held, what, now) {
             return Ok(Err(failed));
         }

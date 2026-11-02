@@ -2163,3 +2163,44 @@ fn a_closed_device_takes_nothing_in_a_shared_channel() {
         Taken::Refused(NotTaken::Closed)
     );
 }
+
+/// `shared move` checks again after its yes (the review of #281, low 3):
+/// the desktop plans a move to Alice's offer before it has read the
+/// laptop's removal of the tablet; it reads the removal before the yes,
+/// and the move is refused `not_clean`.
+#[test]
+fn shared_move_checks_again_after_its_yes() {
+    let mut s = bob(3);
+    let (channel, alice) = removed_the_tablet(&mut s, 1);
+    let now = s.now + 20;
+    stores(
+        &s,
+        1,
+        &offer_by(
+            &alice,
+            &channel,
+            30,
+            &[alice.public_key(), s.key(1)],
+            now,
+            2,
+        ),
+        now,
+    );
+    let plan = move_plan(
+        &s[1].conn,
+        &s[1].identity,
+        &relays(),
+        "review",
+        None,
+        None,
+        now,
+    )
+    .unwrap();
+    s.pass(0, 1);
+    assert!(is_not_clean(&s[1].conn, &channel.id).unwrap());
+    assert_eq!(
+        refusal_word(make_move(&s[1].conn, &s[1].identity, &plan.what, now)),
+        "not_clean"
+    );
+    assert_eq!(row(&s, 1, &channel).state, State::Held);
+}
