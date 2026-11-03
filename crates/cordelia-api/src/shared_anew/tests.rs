@@ -2361,3 +2361,45 @@ fn a_share_waiting_at_a_pause_is_written_over() {
     );
     writes_over_its_shares(&s, 0, 1, now);
 }
+
+/// **An offer made past the bound is no offer, and stops nothing** (the
+/// read of #281 for the shared gate, high): Carol's offer says it was made
+/// at u64::MAX. Before, the door stored it as a negative time, which the
+/// store's check refused: the take failed, the shared pass stopped at that
+/// relay before its pushes, and every later pass failed there the same
+/// way. Now the reader refuses it as no anew record: the entry is stored
+/// and counted, nothing is kept of it as an offer, and the door takes what
+/// follows.
+#[test]
+fn an_offer_made_past_the_bound_is_no_offer_and_stops_nothing() {
+    use crate::shared::tests::{given, message};
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let carol = member(2);
+    stores(&s, 0, &anew(&carol, &channel, 1), now);
+    let mut value =
+        Anew::Offer(Offer::make(9, &channel.id, &new_card(20), &[carol.public_key()]).unwrap())
+            .to_value()
+            .unwrap();
+    value[1..9].copy_from_slice(&u64::MAX.to_be_bytes());
+    let late = anew_of(&carol, &channel, 2, value);
+    let taken = given(&s, 0, &late, now);
+    assert!(
+        matches!(
+            taken,
+            crate::take::Taken::Shared {
+                stored: cordelia_storage::entries::Outcome::Stored,
+                read: Some(Read::NotAMessage(_)),
+            }
+        ),
+        "{taken:?}"
+    );
+    assert!(
+        st(rows::offers_in(&s[0].conn, &channel.id))
+            .unwrap()
+            .is_empty()
+    );
+    let after = message(&carol, &channel, 1, "after", now);
+    assert!(stores(&s, 0, &after, now).is_some());
+}
