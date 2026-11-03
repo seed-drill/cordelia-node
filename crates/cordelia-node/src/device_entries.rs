@@ -2011,7 +2011,7 @@ impl DeviceEntries {
     /// held from before step 20 (decision 2026-10-25, rule 1;
     /// [`cordelia_api::reader::read_held_lists`]): at the first pass at
     /// which the device stands applied, where the start did not.
-    /// And the `sread/` lists held from before step 25. Once both are known
+    /// And the `sread/` lists held from before step 31. Once both are known
     /// to be read, a pass does nothing here, and takes no lock (issue #221).
     fn read_held_lists(&self) {
         if self.held_lists_read.load(Ordering::Relaxed) {
@@ -2023,7 +2023,7 @@ impl DeviceEntries {
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "could not read the lists of messages held"),
         }
-        // And the `sread/` lists held from before step 25 (decision
+        // And the `sread/` lists held from before step 31 (decision
         // 2026-10-10 §14).
         let read =
             cordelia_api::reader::read_held_shared_lists(&db, &self.state.identity, self.unix());
@@ -5237,7 +5237,7 @@ mod tests {
     }
 
     /// Once the lists that the store held from before step 20, and the
-    /// `sread/` lists held from before step 25, are known to have been
+    /// `sread/` lists held from before step 31, are known to have been
     /// read, a pass asks no more, and takes no lock for them (issue #221).
     /// Before, and while only one of them is, each pass asks.
     #[test]

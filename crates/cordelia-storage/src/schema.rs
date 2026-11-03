@@ -1413,8 +1413,10 @@ CREATE TABLE file_cut_written (
 ///   revision it wrote it at, at most `MAX_REV`: a device brought back from
 ///   a copy of its data reads its own entry where that is at a higher
 ///   revision.
-/// - `shared_list_taken`: for each act the lists it reads carry, by its
-///   signature, the generation it was taken in and when this device first
+/// - `shared_list_taken`: for each act whose signature holds that the
+///   lists it reads carry, by a SHA-512 hash of the act as a list writes it
+///   (in the column named `signature`, 64 bytes as a signature is), the
+///   generation it was taken in and when this device first
 ///   took it, by its clock; and the latest generation whose lists carried
 ///   it, so that a row outlives the change from one generation to the
 ///   next, before the lists of the new one arrive. No rule of order reads

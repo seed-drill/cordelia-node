@@ -4,7 +4,7 @@
 //!
 //! - **An offer** is an anew record that is not empty, in the slot of a key
 //!   this device shows. The reader keeps what each says once for each
-//!   revision of it ([`read`]), apart from the store (schema step 26), and
+//!   revision of it ([`read`]), apart from the store (schema step 32), and
 //!   each is judged where it is shown or acted on ([`judged`]): a fault
 //!   (of a channel the person holds or held, by a key the person's
 //!   statement removed, or whose seal for this device does not open),
@@ -196,7 +196,7 @@ impl Judged {
 /// The channels the person holds, or held and dropped while the drop is
 /// kept, as the list this device last wrote says (§3.4), with those a
 /// bound left out where `worked_out` gives them.
-fn held_or_dropped(
+pub(crate) fn held_or_dropped(
     conn: &Connection,
     worked_out: Option<(&[u8; 32], i64)>,
 ) -> Result<Vec<[u8; 32]>, PersonError> {
@@ -344,6 +344,56 @@ pub fn pause_of(
     Ok(judged(conn, identity, row, None)?
         .into_iter()
         .find(|judged| judged.offer.maker != identity.public_key() && judged.pauses()))
+}
+
+/// The keys whose messages this device shows nothing of in the channel of
+/// `row`, though it shows the keys (the review of #281, medium 1): while
+/// offers pause it there, the keys any of them leaves out (two removals
+/// by two people leave out two devices: the review of #282, medium 2); in a channel
+/// it moved from, each key that wrote there that the offer it moved to
+/// does not seal to, but the person's own devices. What such a key sent
+/// before the offer is hidden too: the store does not say which of its
+/// messages came after it. `shared stay` ends a pause, and brings them
+/// back.
+pub fn hidden_by_an_offer(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    row: &Channel,
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    match row.state {
+        State::Held => {
+            let own = identity.public_key();
+            let mut hidden: Vec<[u8; 32]> = Vec::new();
+            for judged in judged(conn, identity, row, None)? {
+                if judged.offer.maker != own && judged.pauses() {
+                    for key in judged.left_out {
+                        if !hidden.contains(&key) {
+                            hidden.push(key);
+                        }
+                    }
+                }
+            }
+            Ok(hidden)
+        }
+        State::Moved => {
+            let own = identity.public_key();
+            let counting = crate::person::who_counts(conn)?;
+            for offer in st(rows::offers_in(conn, &row.channel))? {
+                let moved_there = st(kept::channel(conn, &offer.new_channel))?
+                    .is_some_and(|new| new.came == kept::Came::Moved(row.channel));
+                if moved_there {
+                    return Ok(st(kept::index_signers(conn, row.id))?
+                        .into_iter()
+                        .filter(|key| {
+                            !offer.sealed_to.contains(key) && *key != own && !counting.counts(key)
+                        })
+                        .collect());
+                }
+            }
+            Ok(Vec::new())
+        }
+        _ => Ok(Vec::new()),
+    }
 }
 
 /// Whether the shared channel `channel` is not yet clean (decision
@@ -1598,6 +1648,28 @@ pub fn make_move(
         agents: to.agents.clone(),
     };
     in_one(conn, || -> Result<Out<()>, PersonError> {
+        // Checked again where the move is made: a removal may have come
+        // since the plan, and made the channel not clean or the offer a
+        // fault (the review of #281, low 3).
+        if is_not_clean(conn, &to.from)? {
+            return Ok(refused("not_clean", not_clean_line(&to.to.name)));
+        }
+        let still = match st(kept::channel(conn, &to.from))? {
+            Some(row) => judged(conn, identity, &row, Some(now))?.iter().any(|one| {
+                one.offer.new_channel == to.to.channel
+                    && matches!(one.is, OfferIs::ForThisDevice(_))
+            }),
+            None => false,
+        };
+        if !still {
+            return Ok(refused(
+                "no_offer",
+                format!(
+                    "\"{}\" has not been made anew by a key this device shows.",
+                    crate::messages::cleaned(&to.to.name)
+                ),
+            ));
+        }
         if let Err(failed) = sharing::act(conn, identity, &held, what, now) {
             return Ok(Err(failed));
         }

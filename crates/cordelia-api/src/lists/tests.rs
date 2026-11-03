@@ -316,7 +316,7 @@ fn the_items_in_force_are_a_function_of_the_lists() {
             // One history took every other act long before.
             for act in acts.iter().step_by(2) {
                 earlier.record(
-                    act.signature(),
+                    act,
                     Taken {
                         generation: 1,
                         taken_at: 1,
@@ -652,21 +652,21 @@ fn an_act_of_a_removed_key_after_its_cut_time_counts_for_nothing() {
         taken_at: cut_at + 5,
     });
     takings.record(
-        before.signature(),
+        &before,
         Taken {
             generation: 3,
             taken_at: cut_at - 1,
         },
     );
     takings.record(
-        after.signature(),
+        &after,
         Taken {
             generation: 3,
             taken_at: cut_at,
         },
     );
     takings.record(
-        apart.signature(),
+        &apart,
         Taken {
             generation: 2,
             taken_at: 1,
@@ -711,6 +711,64 @@ fn an_act_of_a_removed_key_after_its_cut_time_counts_for_nothing() {
         generation: 0,
         taken_at: i64::MAX
     }));
+}
+
+/// A removed key cannot have an act it kept back counted as taken before
+/// its cut (the review of #281, high 1): while the tablet counts, its list
+/// carries a decoy, an act that is never valid, with the signature of act
+/// A, which it keeps back. The decoy is given no time of taking. After the
+/// removal its list carries A, which is taken then, after the cut, and
+/// passed over.
+#[test]
+fn a_decoy_with_a_kept_back_acts_signature_gives_it_no_time_before_the_cut() {
+    let (laptop, tablet) = (device(1), device(3));
+    let kept_back = sub(6, true, &tablet, 30);
+    let mut decoy = label(5, Some("decoy")).by(&tablet, 20, 0);
+    if let AnyAct::Label(act) = &mut decoy {
+        act.signature = kept_back.signature();
+    }
+    let cut_at = 1_000;
+    // Before the removal: the tablet counts, and its list carries the decoy.
+    let counting = makers(&[&laptop, &tablet], &[]);
+    let before = compute(
+        &lists(&[(&tablet, vec![decoy.clone()])]),
+        &counting,
+        &Takings::now(Taken {
+            generation: 2,
+            taken_at: cut_at - 100,
+        }),
+        Bounds::OF_A_LIST,
+    );
+    assert!(before.taken.is_empty(), "the decoy is given a time");
+    let mut takings = Takings::now(Taken {
+        generation: 3,
+        taken_at: cut_at + 5,
+    });
+    for kept in &before.taken {
+        takings.known.insert(
+            *kept,
+            Taken {
+                generation: 3,
+                taken_at: cut_at - 100,
+            },
+        );
+    }
+    // After it: the tablet is removed with its cut, and its list carries A.
+    struct Removed;
+    impl Removals for Removed {
+        fn removal(&self, key: &[u8; 32]) -> Option<Cut> {
+            (*key == device(3).public_key()).then(|| Cut::Times(vec![(3, Some(1_000))]))
+        }
+    }
+    let removed = Makers::new(Counting::of_devices(&[laptop.public_key()]), Removed);
+    let after = compute(
+        &lists(&[(&tablet, vec![kept_back.clone()])]),
+        &removed,
+        &takings,
+        Bounds::OF_A_LIST,
+    );
+    assert!(!in_force_of(&after, &kept_back));
+    assert!(after.passed_over.contains(&tablet.public_key()));
 }
 
 /// What is kept of when each act was taken: every act the lists read
@@ -2882,12 +2940,12 @@ fn a_statement_applied_writes_the_list_again() {
     assert_eq!(list, kept(&s, 1));
 }
 
-/// When this device took an act, by its signature.
+/// When this device took an act, by [`AnyAct::taking`].
 fn taken_of(s: &Several, n: usize, act: &AnyAct) -> Option<Taken> {
     kept_rows::taken(&s[n].conn)
         .unwrap()
         .into_iter()
-        .find_map(|(signature, taken)| (signature == act.signature()).then_some(taken.taken))
+        .find_map(|(signature, taken)| (signature == act.taking()).then_some(taken.taken))
 }
 
 /// An act's time of taking is when the door first stored a list that

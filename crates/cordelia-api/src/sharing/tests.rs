@@ -268,6 +268,23 @@ fn accept_takes_only_the_typed_keys_share_for_this_device_within_the_hour_at_its
             .unwrap()
             .contains("as \"review\"")
     );
+
+    // Dropped, while the lists keep its drop, it is not taken back (the
+    // review of #281, low 2).
+    let done = lists::act(
+        &s[0].conn,
+        &s[0].identity,
+        Do::Drop(good_card.channel_id().unwrap()),
+        now + 2,
+    )
+    .unwrap();
+    assert!(matches!(done, Done::Made(_)), "{done:?}");
+    assert!(filed(&s[0].conn).unwrap().is_empty());
+    let dropped = typed(&s, 0, &alice.public_key(), "review-back", now + 3);
+    assert_eq!(
+        taken(&s, 0, &dropped, std::slice::from_ref(&good), now + 3),
+        Became::Refused("already_held")
+    );
 }
 
 /// The 16 channels of rule 9: a share of a 17th is not taken.

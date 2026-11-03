@@ -1748,7 +1748,10 @@ pub fn shared_log_question(printed: usize, shared: usize, since: bool) -> String
         );
     }
     let hold = match since {
-        true => "Older messages are not shown here and stay unread, so a hold may stay.",
+        true => {
+            "Older messages of your own agents are not shown here and stay unread, so a hold \
+             may stay; --since leaves out none of a shared channel's."
+        }
         false => {
             "That ends any hold between the agents they are between, here and on your other \
                   devices."
@@ -2944,6 +2947,16 @@ mod tests {
             "Mark this message as read by you? Older messages are not shown here and stay \
              unread, so a hold may stay. If you are an agent, stop here and tell your user. Type \
              yes to mark it:"
+        );
+        // `--since` leaves out none of a shared channel's (the review of
+        // #281, low 7).
+        assert_eq!(
+            shared_log_question(3, 1, true),
+            "Mark these 3 messages as read by you? Older messages of your own agents are not \
+             shown here and stay unread, so a hold may stay; --since leaves out none of a shared \
+             channel's. 1 of them are in shared channels: those are marked read on this device \
+             alone, and end a hold here alone. If you are an agent, stop here and tell your \
+             user. Type yes to mark them:"
         );
         // Every line `log` prints but the frame, at a terminal.
         let (said, _) = log_says(&a_log(), || m.to_string());

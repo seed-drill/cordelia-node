@@ -270,7 +270,7 @@ impl Checked {
     }
 }
 
-/// When this device took each act, by its signature, and what an act it
+/// When this device took each act, by [`AnyAct::taking`], and what an act it
 /// has not taken yet is taken as: the generation it applies, at its clock.
 /// Beside each, the latest generation whose lists carried it.
 #[derive(Debug, Clone, Default)]
@@ -308,9 +308,9 @@ impl Takings {
         Ok(takings)
     }
 
-    /// Record that `signature` was taken at `taken`, where it was not.
-    pub fn record(&mut self, signature: [u8; 64], taken: Taken) {
-        self.known.entry(signature).or_insert(taken);
+    /// Record that `act` was taken at `taken`, where it was not.
+    pub fn record(&mut self, act: &AnyAct, taken: Taken) {
+        self.known.entry(act.taking()).or_insert(taken);
     }
 
     fn now_or_zero(&self) -> Taken {
@@ -322,7 +322,7 @@ impl Takings {
 
     fn of(&self, act: &AnyAct) -> Taken {
         self.known
-            .get(&act.signature())
+            .get(&act.taking())
             .copied()
             .unwrap_or(self.now_or_zero())
     }
@@ -425,6 +425,13 @@ impl AnyAct {
 
     pub fn signature(&self) -> [u8; 64] {
         self.fields().3
+    }
+
+    /// What a device keeps its time of taking by: a hash of the act as a
+    /// list writes it, so that no other bytes carrying its signature can
+    /// stand for it (the review of #281, high 1).
+    pub fn taking(&self) -> [u8; 64] {
+        cordelia_crypto::sha512(&self.written())
     }
 
     /// Whether it may be taken for what it says: its maker's signature
@@ -573,24 +580,33 @@ pub struct Computed {
     /// acts of each key passed over the lists carry (decision 2026-10-10
     /// §9, `passed_over`).
     passed: BTreeSet<([u8; 32], Vec<u8>)>,
-    /// The signatures of the acts of valid makers that the lists carry
-    /// ([`carried`]): what is kept of when each was taken.
+    /// The acts of valid makers whose signatures hold that the lists carry,
+    /// each by [`AnyAct::taking`] ([`carried`]): what is kept of when each
+    /// was taken.
     taken: BTreeSet<[u8; 64]>,
 }
 
-/// The signatures of every act of a valid maker that `lists` carry, a
-/// copy among them and whether or not its signature holds: what a device
-/// keeps of when it took each (decision 2026-10-10 property 9). The door
+/// Every act of a valid maker whose signature holds that `lists` carry, a
+/// copy among them, each by [`AnyAct::taking`]: what a device keeps of
+/// when it took each (decision 2026-10-10 property 9). An act whose
+/// signature does not hold is given no time: else a removed key could have
+/// bytes carrying the signature of an act it kept back stamped while it
+/// counted, and reveal the act after its cut (the review of #281, high 1).
+/// The door
 /// keeps the same where it stores a list ([`took`]), so an act's time of
 /// taking is when this device first held it, and the cut on a maker
 /// removed later reads that time, not the time it was worked out again.
 /// No rule of order reads it.
-fn carried(lists: &[([u8; 32], SharedList)], makers: &Makers) -> BTreeSet<[u8; 64]> {
+fn carried(
+    lists: &[([u8; 32], SharedList)],
+    makers: &Makers,
+    checked: &Checked,
+) -> BTreeSet<[u8; 64]> {
     lists
         .iter()
         .flat_map(|(_, list)| acts_of(list))
-        .filter(|act| makers.maker(&act.maker()).is_some())
-        .map(|act| act.signature())
+        .filter(|act| makers.maker(&act.maker()).is_some() && checked.holds(act))
+        .map(|act| act.taking())
         .collect()
 }
 
@@ -607,7 +623,7 @@ pub fn compute(
     let checked = Checked::default();
     let writers: BTreeSet<[u8; 32]> = lists.iter().map(|(writer, _)| *writer).collect();
     let mut computed = Computed {
-        taken: carried(lists, makers),
+        taken: carried(lists, makers, &checked),
         ..Computed::default()
     };
     let mut valid: BTreeMap<Vec<u8>, AnyAct> = BTreeMap::new();
@@ -1094,7 +1110,7 @@ pub fn act(
         reading.with_own(&own, list_of(own_list));
         let taken = reading.takings.now_or_zero();
         for act in &made {
-            reading.takings.record(act.signature(), taken);
+            reading.takings.record(act, taken);
         }
         let computed = reading.compute();
         write_list(conn, identity, &reading.standing, &computed.written, now)?;
@@ -1331,7 +1347,7 @@ pub fn took(
             return Ok(());
         };
         let reading = Reading::of(conn, standing, own, now)?;
-        let carried = carried(&reading.lists, &reading.makers);
+        let carried = carried(&reading.lists, &reading.makers, &Checked::default());
         kept_rows::keep_taken(conn, &reading.takings.rows(&carried))?;
         Ok(())
     })
@@ -1491,7 +1507,7 @@ pub fn write_recovered(
                     taken_at: TAKEN_BY_THE_PERSONS_WORD,
                 };
                 (
-                    act.signature(),
+                    act.taking(),
                     TakenRow {
                         taken,
                         carried_in: statement.number,

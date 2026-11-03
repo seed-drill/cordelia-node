@@ -797,7 +797,7 @@ fn a_reply_goes_only_where_its_message_came_from() {
     }
 }
 
-/// The `sread/` lists that the store held before step 25 are read once
+/// The `sread/` lists that the store held before step 31 are read once
 /// (decision 2026-10-10 §14): an `sread/` list that a device stored while
 /// it was of the version before, counted then among its signer's entries
 /// that were not messages, is read through the reader at the first start
@@ -1508,5 +1508,29 @@ fn a_refusals_counts_are_said_with_their_nouns() {
     assert!(
         paused.contains(" without 1 key, so your devices send nothing more there"),
         "{paused}"
+    );
+}
+
+/// `subscribe`'s question counts only other people's keys among those
+/// that wrote there (the review of #281, low 6): Bob's laptop wrote in
+/// "review", and his desktop's question counts no key.
+#[test]
+fn subscribe_counts_no_device_of_your_own_among_other_peoples_agents() {
+    let (s, channel) = devices(2);
+    let now = s.now + 10;
+    crate::shared::tests::stores(
+        &s,
+        1,
+        &crate::shared::tests::anew(&s[0].identity, &channel, 1),
+        now,
+    );
+    let plan = subscribe_plan(&s[1].conn, &s[1].identity, &folder("notes"), "review", None)
+        .unwrap()
+        .unwrap();
+    assert!(
+        plan.asks
+            .contains("other people's agents: 0 keys wrote there, 0 of them labelled by you."),
+        "{}",
+        plan.asks
     );
 }

@@ -77,7 +77,7 @@ pub struct TakenRow {
     pub carried_in: u64,
 }
 
-/// Every act this device has taken, by its signature.
+/// Every act this device has taken, by a hash of its written bytes.
 pub fn taken(conn: &Connection) -> Result<Vec<([u8; 64], TakenRow)>, CordeliaError> {
     let mut stmt = conn
         .prepare(

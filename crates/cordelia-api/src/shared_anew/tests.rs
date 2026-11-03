@@ -1972,7 +1972,392 @@ fn an_act_taken_on_a_clock_stepped_back_is_taken_no_earlier_than_the_last() {
     let kept = cordelia_storage::shared_lists::taken(&s[1].conn).unwrap();
     let (_, own) = kept
         .iter()
-        .find(|(signature, _)| *signature == made[0].signature())
+        .find(|(taking, _)| *taking == made[0].taking())
         .unwrap();
     assert_eq!(own.taken.taken_at, newest, "not {back}");
+}
+
+// ── The review of #281 ───────────────────────────────────────────────
+
+/// What `share` says of the channel named `name` on device `n` for Alice:
+/// the word of its refusal, or "ok".
+fn share_word(s: &Several, n: usize, name: &str, now: i64) -> &'static str {
+    let alice = encode_public_key(&member(1).public_key()).unwrap();
+    match sharing::share_plan(
+        &s[n].conn,
+        &s[n].identity,
+        &relays(),
+        name,
+        &alice,
+        None,
+        now,
+    ) {
+        Ok(_) => "ok",
+        Err(Failed::Refused(refusal)) => refusal.word,
+        Err(Failed::Error(e)) => panic!("{e}"),
+    }
+}
+
+/// `share` hands out no channel a removed key may read (the review of
+/// #281, high 2; §5.5): after the laptop removes the tablet, the desktop
+/// refuses to share "review" (`not_clean`), a share planned before the
+/// removal and made after it is refused where it is written, and a share
+/// made before the removal that waits to be sent is not sent. Once the
+/// desktop makes the channel anew, the new one is shared.
+#[test]
+fn share_hands_out_no_channel_that_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    // Before the removal, the desktop makes a share, and plans another.
+    let alice = encode_public_key(&member(1).public_key()).unwrap();
+    let (conn, identity) = (&s[1].conn, &s[1].identity);
+    let to = sharing::share_plan(conn, identity, &relays(), "review", &alice, None, now).unwrap();
+    sharing::make_share(conn, identity, &relays(), &to.what, now).unwrap();
+    assert_eq!(
+        sharing::shares_to_push(conn, identity, &AT).unwrap().len(),
+        1
+    );
+    let carol = encode_public_key(&member(2).public_key()).unwrap();
+    let later =
+        sharing::share_plan(conn, identity, &relays(), "review", &carol, None, now).unwrap();
+
+    s.change(0, &[0, 1], &[2]);
+    s.pass(0, 1);
+    let now = s.now + 20;
+    let (conn, identity) = (&s[1].conn, &s[1].identity);
+    assert_eq!(share_word(&s, 1, "review", now), "not_clean");
+    assert_eq!(
+        refusal_word(sharing::make_share(
+            conn,
+            identity,
+            &relays(),
+            &later.what,
+            now
+        )),
+        "not_clean"
+    );
+    assert!(
+        sharing::shares_to_push(conn, identity, &AT)
+            .unwrap()
+            .is_empty()
+    );
+    // Made anew here, the new channel is shared.
+    made_anew_on(&s, 1, "review", now);
+    assert_eq!(share_word(&s, 1, "review", now), "ok");
+}
+
+/// `share` hands out no channel paused by an offer (the review of #281,
+/// high 2; §5.5): Alice makes "review" anew without Carol, sealed to Bob;
+/// Bob's device refuses to share it (`paused`) until he stays.
+#[test]
+fn share_hands_out_no_channel_that_is_paused() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    assert_eq!(share_word(&s, 0, "review", now), "ok");
+    stores(
+        &s,
+        0,
+        &offer_by(
+            &alice,
+            &channel,
+            21,
+            &[alice.public_key(), s.key(0)],
+            now,
+            2,
+        ),
+        now,
+    );
+    assert_eq!(share_word(&s, 0, "review", now), "paused");
+    make_stay(&s[0].conn, &channel.id, "review").unwrap();
+    assert_eq!(share_word(&s, 0, "review", now), "ok");
+}
+
+/// The signers of what device `n` shows in `channel` at `now`.
+fn shown_signers(s: &Several, n: usize, channel: &Shared, now: i64) -> Vec<[u8; 32]> {
+    crate::shared::shown(&s[n].conn, &s[n].identity, &channel.id, now)
+        .unwrap()
+        .into_iter()
+        .map(|shown| shown.signer)
+        .collect()
+}
+
+/// While an offer pauses a device, it shows nothing of the keys the offer
+/// leaves out, and after a move nothing of those the offer moved to leaves
+/// out (the review of #281, medium 1): Alice makes "review" anew without
+/// Carol (a device Carol removed, say), sealed to Bob. Carol's messages,
+/// before the offer and after it, are not shown on Bob's device; `shared
+/// stay` brings them back. A later offer without Carol pauses it again,
+/// and once Bob moves to it, the old channel shows nothing of Carol's.
+#[test]
+fn a_paused_device_shows_nothing_of_a_key_its_offer_leaves_out() {
+    use crate::shared::tests::message;
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    stores(&s, 0, &message(&carol, &channel, 1, "before", now), now);
+    stores(&s, 0, &message(&alice, &channel, 1, "hello", now), now);
+    let both = vec![alice.public_key(), carol.public_key()];
+    let mut seen = shown_signers(&s, 0, &channel, now);
+    seen.sort();
+    let mut want = both.clone();
+    want.sort();
+    assert_eq!(seen, want);
+    let without_carol = |seed: u8, rev: u64| {
+        offer_by(
+            &alice,
+            &channel,
+            seed,
+            &[alice.public_key(), s.key(0)],
+            now,
+            rev,
+        )
+    };
+    stores(&s, 0, &without_carol(21, 2), now);
+    stores(
+        &s,
+        0,
+        &message(&carol, &channel, 2, "after", now + 1),
+        now + 1,
+    );
+    assert_eq!(
+        shown_signers(&s, 0, &channel, now + 1),
+        vec![alice.public_key()]
+    );
+    make_stay(&s[0].conn, &channel.id, "review").unwrap();
+    let shown = shown_signers(&s, 0, &channel, now + 1);
+    assert_eq!(
+        shown
+            .iter()
+            .filter(|key| **key == carol.public_key())
+            .count(),
+        2
+    );
+    // A later offer pauses it again; Bob moves to it.
+    stores(&s, 0, &without_carol(22, 3), now + 2);
+    assert_eq!(
+        shown_signers(&s, 0, &channel, now + 2),
+        vec![alice.public_key()]
+    );
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let plan = move_plan(conn, identity, &relays(), "review", None, None, now + 2).unwrap();
+    make_move(conn, identity, &plan.what, now + 2).unwrap();
+    assert_eq!(row(&s, 0, &channel).state, State::Moved);
+    assert_eq!(
+        shown_signers(&s, 0, &channel, now + 2),
+        vec![alice.public_key()]
+    );
+}
+
+/// A closed device's door takes nothing in a shared channel (the review of
+/// #281, low 1; decision 2026-10-24 (removal), rule 10): the device keeps
+/// a key as removed that holds its change's secret, and Alice's message is
+/// refused as `Closed`, not stored.
+#[test]
+fn a_closed_device_takes_nothing_in_a_shared_channel() {
+    use crate::shared::tests::{given, message};
+    use crate::take::{NotTaken, Taken};
+    let s = bob(3);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let alice = member(1);
+    written_by(&s, 0, &channel, &[&alice], now);
+    let conn = &s[0].conn;
+    cordelia_storage::person::keep_removed(conn, &[s.key(2)], now).unwrap();
+    assert!(!crate::person::follows_a_clear_change(conn).unwrap());
+    assert_eq!(
+        given(&s, 0, &message(&alice, &channel, 1, "hello", now), now),
+        Taken::Refused(NotTaken::Closed)
+    );
+}
+
+/// `shared move` checks again after its yes (the review of #281, low 3):
+/// the desktop plans a move to Alice's offer before it has read the
+/// laptop's removal of the tablet; it reads the removal before the yes,
+/// and the move is refused `not_clean`.
+#[test]
+fn shared_move_checks_again_after_its_yes() {
+    let mut s = bob(3);
+    let (channel, alice) = removed_the_tablet(&mut s, 1);
+    let now = s.now + 20;
+    stores(
+        &s,
+        1,
+        &offer_by(
+            &alice,
+            &channel,
+            30,
+            &[alice.public_key(), s.key(1)],
+            now,
+            2,
+        ),
+        now,
+    );
+    let plan = move_plan(
+        &s[1].conn,
+        &s[1].identity,
+        &relays(),
+        "review",
+        None,
+        None,
+        now,
+    )
+    .unwrap();
+    s.pass(0, 1);
+    assert!(is_not_clean(&s[1].conn, &channel.id).unwrap());
+    assert_eq!(
+        refusal_word(make_move(&s[1].conn, &s[1].identity, &plan.what, now)),
+        "not_clean"
+    );
+    assert_eq!(row(&s, 1, &channel).state, State::Held);
+}
+
+/// The status names no device for a channel first held after a removal
+/// (issue #279, its first part): the laptop removes the tablet, holding no
+/// shared channel; an hour on it files one, which is not clean, and the
+/// status's `removed_device_holds` lists it with no `device` field.
+#[test]
+fn the_status_names_no_device_for_a_channel_first_held_after_a_removal() {
+    let mut s = bob(3);
+    s.meet(&[0, 1, 2]);
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + HOUR_SECS;
+    let channel = holds(&s, 0, 9, "later", now);
+    assert!(is_not_clean(&s[0].conn, &channel.id).unwrap());
+    let own = relays();
+    let said = crate::state::SharedSaid::default();
+    let beside = crate::shared_status::Beside {
+        own_relays: &own,
+        connected: &[AT],
+        said: &said,
+    };
+    let shared = crate::shared_status::status_of(&s[0].conn, &s[0].identity, &beside, now)
+        .unwrap()
+        .unwrap();
+    let groups = shared["removed_device_holds"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{groups:?}");
+    assert_eq!(groups[0]["channels"], serde_json::json!(["later"]));
+    assert!(groups[0].get("device").is_none(), "{groups:?}");
+}
+
+const HOUR_SECS: i64 = 3600;
+
+/// A paused device hides the keys every offer that pauses it leaves out,
+/// not the first offer's alone (the review of #282, medium 2): Alice
+/// removes her tablet and makes "review" anew without it; later Carol
+/// removes hers and makes it anew without hers. Bob stays on neither:
+/// what either tablet sends is shown on Bob's device no more.
+#[test]
+fn a_paused_device_hides_what_every_offer_that_pauses_it_leaves_out() {
+    use crate::shared::tests::message;
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    let (alice_tablet, carol_tablet) = (member(3), member(4));
+    let all = [&alice, &carol, &alice_tablet, &carol_tablet];
+    written_by(&s, 0, &channel, &all, now);
+    for (n, key) in all.iter().enumerate() {
+        stores(&s, 0, &message(key, &channel, 1, "before", now), now);
+        assert_eq!(shown_signers(&s, 0, &channel, now).len(), n + 1);
+    }
+    let without = |maker: &NodeIdentity, left_out: &NodeIdentity, seed: u8, at: i64| {
+        let keys: Vec<[u8; 32]> = all
+            .iter()
+            .map(|key| key.public_key())
+            .filter(|key| *key != left_out.public_key())
+            .chain([s.key(0)])
+            .collect();
+        offer_by(maker, &channel, seed, &keys, at, 2)
+    };
+    stores(&s, 0, &without(&alice, &alice_tablet, 21, now), now);
+    stores(&s, 0, &without(&carol, &carol_tablet, 22, now + 1), now + 1);
+    stores(
+        &s,
+        0,
+        &message(&carol_tablet, &channel, 2, "after", now + 2),
+        now + 2,
+    );
+    let mut seen = shown_signers(&s, 0, &channel, now + 2);
+    seen.sort();
+    let mut want = vec![alice.public_key(), carol.public_key()];
+    want.sort();
+    assert_eq!(seen, want);
+}
+
+// ── The review of #282 ───────────────────────────────────────────────
+
+/// Device `n` shares "review" with `to` at `now`.
+fn shares_review(s: &Several, n: usize, to: &NodeIdentity, now: i64) {
+    let to = encode_public_key(&to.public_key()).unwrap();
+    let (conn, identity) = (&s[n].conn, &s[n].identity);
+    let plan = sharing::share_plan(conn, identity, &relays(), "review", &to, None, now).unwrap();
+    sharing::make_share(conn, identity, &relays(), &plan.what, now).unwrap();
+}
+
+/// Device `n`'s pass writes over the shares it does not send, and then
+/// sends only deletes: one for each share of `shares`.
+fn writes_over_its_shares(s: &Several, n: usize, shares: usize, now: i64) {
+    let (conn, identity) = (&s[n].conn, &s[n].identity);
+    assert_eq!(
+        sharing::drop_old_shares(conn, identity, now).unwrap(),
+        shares
+    );
+    let pushed = sharing::shares_to_push(conn, identity, &AT).unwrap();
+    assert_eq!(pushed.len(), shares);
+    assert!(pushed.iter().all(|(_, _, entry)| entry.delete));
+}
+
+/// A share waiting when its channel becomes not clean is written over
+/// with a delete, which is sent (the review of #282, low 2): the desktop
+/// shares "review" with Alice, the laptop removes the tablet, and the
+/// desktop's next pass deletes the share at its relays, though its two
+/// hours have not ended, so a removed device's channel is not taken.
+#[test]
+fn a_share_waiting_at_a_removal_is_written_over() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    shares_review(&s, 1, &member(1), now);
+    let (conn, identity) = (&s[1].conn, &s[1].identity);
+    assert_eq!(sharing::drop_old_shares(conn, identity, now).unwrap(), 0);
+    s.change(0, &[0, 1], &[2]);
+    s.pass(0, 1);
+    writes_over_its_shares(&s, 1, 1, s.now + 20);
+}
+
+/// A share waiting when an offer pauses its channel is written over with
+/// a delete, which is sent (the review of #282, low 2): Bob shares
+/// "review" with Dave; Alice makes it anew without Carol, sealed to Bob.
+#[test]
+fn a_share_waiting_at_a_pause_is_written_over() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    shares_review(&s, 0, &member(3), now);
+    let without_carol = &[alice.public_key(), s.key(0)];
+    stores(
+        &s,
+        0,
+        &offer_by(&alice, &channel, 21, without_carol, now, 2),
+        now,
+    );
+    writes_over_its_shares(&s, 0, 1, now);
 }

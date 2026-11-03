@@ -2875,12 +2875,13 @@ No prefix of the channel begins another, which `protocol.rs` tests.
 
 **Rationale:** A device's slots for its messages (record §2.3), the live
 numbers of one signer at a reader (§2.5), and the places a reader gives one
-signer in an hour (§6). With its three lists (of what its agents read, of
-what a person read on it, and of the bounds a person set on it, decision
-2026-10-25), a device has 67 slots of 3,072 bytes as counted: 205,824
-bytes, and at the cap of 64 devices that count 13,172,736 bytes (12.6 MiB),
+signer in an hour (§6). With its four lists (of what its agents read, of
+what a person read on it, of the bounds a person set on it, decision
+2026-10-25, and of the shared messages it read, `sread/`, decision
+2026-10-10), a device has 68 slots of 3,072 bytes as counted: 208,896
+bytes, and at the cap of 64 devices that count 13,369,344 bytes (12.75 MiB),
 under a channel's 16 MiB at a relay, so no honest device's first message is
-refused for room. `protocol.rs` checks `AGENT_MESSAGE_RING + 3`. It is above
+refused for room. `protocol.rs` checks `AGENT_MESSAGE_RING + 4`. It is above
 the device's hourly limit, so an honest device's hour of messages is never
 overwritten within the hour, and a reader that was away is shown a whole
 ring at once.

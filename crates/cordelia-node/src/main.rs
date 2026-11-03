@@ -587,8 +587,9 @@ enum MsgCommand {
     /// says so and asks nothing. Anywhere else it shows only those of this
     /// folder's agent, and marks nothing.
     Log {
-        /// Only messages sent since a time (2026-10-03T09:00:00Z), or in
-        /// the last while (30m, 2h, 3d)
+        /// Only your own agents' messages sent since a time
+        /// (2026-10-03T09:00:00Z), or in the last while (30m, 2h, 3d); a
+        /// shared channel's are all shown
         #[arg(long)]
         since: Option<String>,
     },
@@ -3025,7 +3026,7 @@ fn messages_at_start(state: &cordelia_api::state::AppState) {
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %e, "messages: could not read the lists held"),
     }
-    // And the lists of shared marks held from before step 25 (decision
+    // And the lists of shared marks held from before step 31 (decision
     // 2026-10-10 §14), before the first pass.
     match cordelia_api::reader::read_held_shared_lists(&db, &state.identity, now) {
         Ok(true) => tracing::info!("messages: read the lists of shared marks held"),

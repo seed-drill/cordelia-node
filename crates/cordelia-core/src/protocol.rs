@@ -2404,8 +2404,9 @@ pub const AGENT_MESSAGE_PAIR_BOUNDS_PREFIX: &str = "hold/";
 /// How many slots a device has for its messages (decision 2026-10-09
 /// §2.3), how many numbers of one signer are live at a reader (§2.5), and
 /// how many places a reader gives one signer in an hour (§6). With its
-/// three lists (of what its agents read, of what a person read on it, and
-/// of the bounds a person set on it, decision 2026-10-25), a device has 67
+/// four lists (of what its agents read, of what a person read on it, of
+/// the bounds a person set on it, decision 2026-10-25, and of the shared
+/// messages it read, `sread/`, decision 2026-10-10), a device has 68
 /// slots of the messages channel, and 64 devices' are within what a relay
 /// holds of one channel. It is above the device's hourly limit, so an
 /// honest device's hour of messages is never overwritten within the hour.

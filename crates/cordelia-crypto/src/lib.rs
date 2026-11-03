@@ -69,7 +69,7 @@ pub use ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt, hkdf_sha256, hkdf_s
 pub use identity::{NodeIdentity, verify_swarm_child, x25519_from_ed25519_seed};
 
 use ring::rand::{SecureRandom, SystemRandom};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -114,6 +114,13 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     let result = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
+    out
+}
+
+/// SHA-512 hash, returned as raw bytes.
+pub fn sha512(data: &[u8]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&Sha512::digest(data));
     out
 }
 
