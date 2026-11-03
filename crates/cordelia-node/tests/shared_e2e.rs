@@ -2119,7 +2119,7 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
     );
     // There it is not clean until the laptop makes it anew once itself
     // (rule 23, as the person ruled on 2 November), and its status says so.
-    removed_device_holds_review(&laptop, "tablet");
+    removed_device_holds_review(&laptop, "tablet", Named::AtMost);
     // The offer is the desktop's one entry there since; nothing of the
     // laptop's.
     let offer = offer_at(&relay, &old_card, &key_of(&desktop));
@@ -2285,12 +2285,12 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     // The desktop holds a channel not clean that the tablet held: its
     // status is amber for it, from the node to the command (§9, property
     // 16), and names the tablet as the device removed.
-    removed_device_holds_review(&desktop, "tablet");
+    removed_device_holds_review(&desktop, "tablet", Named::Always);
     let after = [&one, &two, &laptop, &desktop, &bob];
     has_applied(&laptop, 2, &after);
     // So is the laptop's, which applied the removal and has not made the
     // channel anew.
-    removed_device_holds_review(&laptop, "tablet");
+    removed_device_holds_review(&laptop, "tablet", Named::Always);
 
     // Bob makes the channel anew, keeping the laptop and the tablet.
     makes_anew(
@@ -2348,19 +2348,37 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     assert!(!plain.contains("Shared:"), "{plain}");
 }
 
+/// Whether the status names the removed device of a channel not clean:
+/// `Always` where the device held it when it applied the removal;
+/// `AtMost` where it came to hold it after, which names no device, or the
+/// removal's keys where both fell in the same second (the mark keeps only
+/// its time; the review of #282, medium 1).
+#[derive(Clone, Copy)]
+enum Named {
+    Always,
+    AtMost,
+}
+
 /// `n` applied a removal of the device labelled `removed` and holds
 /// "review" not clean: `cordelia status --json` has the amber hold
-/// `shared_removed_device_holds` and names the device of that removal, and
-/// the plain status says it on its `Shared:` line (decision 2026-10-10 §9).
-fn removed_device_holds_review(n: &Node, removed: &str) {
+/// `shared_removed_device_holds` and names the device of that removal as
+/// `named` says, and the plain status says it on its `Shared:` line
+/// (decision 2026-10-10 §9).
+fn removed_device_holds_review(n: &Node, removed: &str, named: Named) {
     let status = status_json(n);
     let holds_it = status["shared"]["removed_device_holds"]
         .as_array()
         .unwrap_or_else(|| panic!("{status}"));
     assert_eq!(holds_it.len(), 1, "{status}");
     assert_eq!(holds_it[0]["channels"], json!(["review"]), "{status}");
-    let device = holds_it[0]["device"].as_str().unwrap();
-    assert!(device.starts_with(&format!("\"{removed}\" (")), "{device}");
+    match (holds_it[0].get("device"), named) {
+        (None, Named::AtMost) => {}
+        (Some(device), _) => {
+            let device = device.as_str().unwrap();
+            assert!(device.starts_with(&format!("\"{removed}\" (")), "{device}");
+        }
+        (None, Named::Always) => panic!("no device named: {status}"),
+    }
     assert!(
         holds_of(&status).contains(&"shared_removed_device_holds".to_string()),
         "{status}"
