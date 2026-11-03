@@ -3180,6 +3180,9 @@ above the last second that a time in RFC 3339 can be
 act is dated one above the newest it holds, and never above this; at this
 time alone the item's count orders acts, so the next act on an item still
 goes above the last of a maker that counts. No act is refused for a clock.
+It is also the latest time an anew offer may say it was made (record §7): an
+offer that says later is no offer, so that its time fits a device's store,
+whose integers end at 2^63 - 1.
 
 #### SHARED_MAX_KEYS = 64
 
