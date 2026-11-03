@@ -3219,4 +3219,55 @@ pub(crate) mod tests {
         stores(&s, 0, &two, later);
         assert_eq!(bodies(&s, 0, &channel, later), ["two"]);
     }
+
+    /// A key let go takes its index's rows with it (the read of #281 for
+    /// the shared gate, low): a member's message is read and cleared, so
+    /// that the index holds nothing of it, and its key comes to store
+    /// nothing. When the table lets the key's row go, its rows of first
+    /// holding and of its numbers go too; while the index holds a message
+    /// of a key, they stay.
+    #[test]
+    fn a_key_let_go_takes_its_index_rows_with_it() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let id = row(&s, 0, &channel).id;
+        let (carol, dave) = (member(2), member(3));
+        stores(&s, 0, &message(&carol, &channel, 1, "carol's", now), now);
+        stores(&s, 0, &message(&dave, &channel, 1, "dave's", now), now);
+        let name = message_name(&carol.public_key(), 1).unwrap();
+        let clearing = entry_by(
+            &carol,
+            &channel.secret,
+            clearing_rev(1).unwrap(),
+            &name,
+            Value::Other(cordelia_crypto::message::clearing_value()),
+            &[],
+        );
+        stores(&s, 0, &clearing, now);
+        assert_eq!(bodies(&s, 0, &channel, now), ["dave's"]);
+        let rows_of = |key: &NodeIdentity| -> (i64, i64) {
+            let count = |table: &str| -> i64 {
+                conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE channel = ?1 AND signer = ?2"),
+                    rusqlite::params![id, &key.public_key()[..]],
+                    |row| row.get(0),
+                )
+                .unwrap()
+            };
+            (count("shared_first_held"), count("shared_signers"))
+        };
+        assert_eq!(rows_of(&carol), (1, 1));
+        // Each key comes to store nothing, as when its entries are taken
+        // out, and the table keeps no row of a key that stores nothing.
+        conn.execute(
+            "UPDATE shared_keys SET bytes_stored = 0 WHERE channel = ?1 AND key != ?2",
+            rusqlite::params![id, &s.key(0)[..]],
+        )
+        .unwrap();
+        assert_eq!(kept::keep_rows_within(conn, id, 0).unwrap(), 2);
+        assert_eq!(rows_of(&carol), (0, 0));
+        assert_eq!(rows_of(&dave), (1, 1));
+    }
 }

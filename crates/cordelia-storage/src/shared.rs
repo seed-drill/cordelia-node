@@ -876,8 +876,11 @@ pub fn take_out_whole_step(
 /// The channel of row `id` keeps the rows of at most `kept` keys that
 /// store nothing (decision 2026-10-10 §6.3): past that, the rows whose
 /// keys last wrote or were last refused least lately go, and are counted
-/// as let go. Every row of a key that stores an entry stays. Returns how
-/// many went.
+/// as let go, and with each its index's rows of first holding and of its
+/// numbers, but for those of a message the index still holds (the read of
+/// #281 for the shared gate: they outlived their key, outside the room
+/// stated for a channel). Every row of a key that stores an entry stays.
+/// Returns how many went.
 pub fn keep_rows_within(conn: &Connection, id: i64, kept: usize) -> Result<usize, CordeliaError> {
     let gone = conn
         .execute(
@@ -893,6 +896,17 @@ pub fn keep_rows_within(conn: &Connection, id: i64, kept: usize) -> Result<usize
             params![id, to_sql(gone as u64)],
         )
         .map_err(storage)?;
+        for table in ["shared_first_held", "shared_signers"] {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE channel = ?1
+                         AND signer NOT IN (SELECT key FROM shared_keys WHERE channel = ?1)
+                         AND signer NOT IN (SELECT signer FROM shared_index WHERE channel = ?1)"
+                ),
+                [id],
+            )
+            .map_err(storage)?;
+        }
     }
     Ok(gone)
 }
