@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 26;
+pub const SCHEMA_VERSION: u32 = 32;
 
 /// The schema version of 0.2.0-alpha.8, the last release before the
 /// entries of a channel from its secret: what the tests of the first start
@@ -1377,11 +1377,13 @@ UPDATE file_arrivals_stored SET unknown = 1 WHERE full_signers IS NOT NULL;
 /// It was step 28 while rule 27 of that record was built: steps 26 and 27
 /// held that rule's columns and tables, and went with it. No released
 /// version had any step after 20, and a database of an unreleased build at
-/// step 27 or 28 is refused as one from a later version. One at that
-/// build's step 26 (rule 27's columns and tables, and no `file_cut`) is
-/// taken as current: a carry that would cut a file fails at the missing
-/// table, so nothing is applied, and every restore is refused. It fails
-/// closed, and no such build was released.
+/// step 27 or 28 is refused: the shared channels' steps are 27 to 32 now,
+/// and it holds none of them ([`refuse_steps_numbered_otherwise`]). One at
+/// that build's step 26 (rule 27's columns and tables, and no `file_cut`)
+/// is taken as at step 26, and is given the shared steps: a carry that
+/// would cut a file fails at the missing table, so nothing is applied, and
+/// every restore is refused. It fails closed, and no such build was
+/// released.
 const MIGRATION_V26: &str = r#"
 CREATE TABLE file_cut (
     folder  TEXT NOT NULL,
@@ -1395,6 +1397,473 @@ CREATE TABLE file_cut_written (
     sha256  TEXT NOT NULL CHECK(typeof(sha256) = 'text' AND length(sha256) = 64),
     at      INTEGER NOT NULL CHECK(typeof(at) = 'integer'),
     PRIMARY KEY (folder, file, sha256)
+);
+"#;
+
+/// Migration v27: what a device holds of the person's lists of shared
+/// channels (decision 2026-10-10 §3.4, §14, §20). Its list itself is an
+/// entry of the personal channel, as every word of a device is; what is in
+/// force is worked out from the lists each time, and nothing of when the
+/// device first held a list or an act is kept for any rule of 3.4 to read.
+/// What is here:
+///
+/// - `shared_lists`: one row, or none where the device has written no
+///   list. `list` is the value of the list this device last wrote
+///   (`Kept.list`), at most `SHARED_LIST_MAX_VALUE_BYTES`, and `rev` the
+///   revision it wrote it at, at most `MAX_REV`: a device brought back from
+///   a copy of its data reads its own entry where that is at a higher
+///   revision.
+/// - `shared_list_taken`: for each act whose signature holds that the
+///   lists it reads carry, by a SHA-512 hash of the act as a list writes it
+///   (in the column named `signature`, 64 bytes as a signature is), the
+///   generation it was taken in and when this device first
+///   took it, by its clock; and the latest generation whose lists carried
+///   it, so that a row outlives the change from one generation to the
+///   next, before the lists of the new one arrive. No rule of order reads
+///   it: it is what the removal record's cut asks of an act of a removed
+///   key (decision 2026-10-24, rule 6; decision 2026-10-10 property 9).
+///
+/// Each column takes only its type and its bound. A relay keeps nothing in
+/// either.
+const MIGRATION_V27: &str = r#"
+CREATE TABLE shared_lists (
+    one   INTEGER PRIMARY KEY CHECK(one = 1),
+    list  BLOB NOT NULL CHECK(typeof(list) = 'blob'
+                              AND length(list) >= 5 AND length(list) <= 41333),
+    rev   INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                 AND rev >= 0 AND rev <= 9007199254740991)
+);
+
+CREATE TABLE shared_list_taken (
+    signature   BLOB PRIMARY KEY CHECK(typeof(signature) = 'blob' AND length(signature) = 64),
+    generation  INTEGER NOT NULL CHECK(typeof(generation) = 'integer'
+                                       AND generation >= 0 AND generation <= 256),
+    taken_at    INTEGER NOT NULL CHECK(typeof(taken_at) = 'integer'),
+    carried_in  INTEGER NOT NULL CHECK(typeof(carried_in) = 'integer'
+                                       AND carried_in >= 0 AND carried_in <= 256)
+);
+"#;
+
+/// Migration v28: what a device keeps of the shared channels it holds
+/// (decision 2026-10-10 §2.2, §2.3, §2.4, §6.3, §14). Each column takes
+/// only its type and its bound.
+///
+/// - `shared_channels`: each shared channel by its ID, with its card (a
+///   seed and one or two relays: 65 or 97 bytes), the name the person
+///   files it under (a name, at most `AGENT_MESSAGE_NAME_MAX_BYTES`), how
+///   it came (1 made, 2 taken from the share of the key in `came_from`, 3
+///   moved to from the channel in `came_from`), its state (1 held, 2
+///   dropped, 3 moved from, 4 filed by no act in force), when the device
+///   first held it and when it left it, the room taken by the keys the
+///   person does not know, how many rows of keys the table let go, and when
+///   a read again was asked and when the last began.
+/// - `shared_keys`: a row for each key that stored an entry in a channel or
+///   was refused one for room, as `cordelia_storage::shared::Key` holds it.
+///   A revision kept of a key let go is in the bottom half of band 0.
+/// - `shared_unopened`: the slots of a key beyond the 64 shown whose entries
+///   wait to be opened.
+/// - `shared_labelled`: the keys labelled when the device last kept its
+///   channels.
+/// - `shared_index`, `shared_numbers`, `shared_first_held`,
+///   `shared_signers` and `shared_places`: the index of shared messages and
+///   its rows, of the shape of step 19's, keyed by the channel's row
+///   (decision 2026-10-10 §14: `message_generations` takes only a channel
+///   of a statement). A row of first holding of a message taken out with
+///   its key's entries keeps its place, to be read again as it was.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V28: &str = r#"
+CREATE TABLE shared_channels (
+    id          INTEGER PRIMARY KEY,
+    channel     BLOB NOT NULL UNIQUE CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    card        BLOB NOT NULL CHECK(typeof(card) = 'blob' AND length(card) IN (65, 97)),
+    name        TEXT NOT NULL CHECK(typeof(name) = 'text'
+                                    AND length(CAST(name AS BLOB)) >= 1
+                                    AND length(CAST(name AS BLOB)) <= 200),
+    came        INTEGER NOT NULL CHECK(came IN (1, 2, 3)),
+    came_from   BLOB CHECK((came = 1) = (came_from IS NULL)
+                           AND (came_from IS NULL
+                                OR (typeof(came_from) = 'blob' AND length(came_from) = 32))),
+    state       INTEGER NOT NULL CHECK(state IN (1, 2, 3, 4)),
+    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    left_at     INTEGER CHECK(left_at IS NULL OR typeof(left_at) = 'integer'),
+    room        INTEGER NOT NULL DEFAULT 0 CHECK(typeof(room) = 'integer' AND room >= 0),
+    let_go      INTEGER NOT NULL DEFAULT 0 CHECK(typeof(let_go) = 'integer' AND let_go >= 0),
+    read_asked  INTEGER CHECK(read_asked IS NULL OR typeof(read_asked) = 'integer'),
+    read_begun  INTEGER CHECK(read_begun IS NULL OR typeof(read_begun) = 'integer')
+);
+
+CREATE TABLE shared_keys (
+    channel           INTEGER NOT NULL REFERENCES shared_channels(id),
+    key               BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    known             INTEGER NOT NULL CHECK(known IN (0, 1)),
+    unknown_since     INTEGER CHECK(unknown_since IS NULL
+                                    OR (typeof(unknown_since) = 'integer' AND known = 0)),
+    held_order        INTEGER CHECK(held_order IS NULL
+                                    OR (typeof(held_order) = 'integer' AND held_order >= 1)),
+    first_held        INTEGER CHECK(first_held IS NULL OR typeof(first_held) = 'integer'),
+    last_held         INTEGER CHECK(last_held IS NULL OR typeof(last_held) = 'integer'),
+    first_refused     INTEGER CHECK(first_refused IS NULL OR typeof(first_refused) = 'integer'),
+    last_refused      INTEGER CHECK(last_refused IS NULL OR typeof(last_refused) = 'integer'),
+    last_seq          INTEGER NOT NULL CHECK(typeof(last_seq) = 'integer' AND last_seq >= 1),
+    bytes_stored      INTEGER NOT NULL DEFAULT 0
+                          CHECK(typeof(bytes_stored) = 'integer' AND bytes_stored >= 0),
+    bytes_refused     INTEGER NOT NULL DEFAULT 0
+                          CHECK(typeof(bytes_refused) = 'integer' AND bytes_refused >= 0),
+    kept_message_rev  INTEGER CHECK(kept_message_rev IS NULL
+                                    OR (typeof(kept_message_rev) = 'integer'
+                                        AND kept_message_rev >= 0
+                                        AND kept_message_rev < 8796093022208)),
+    kept_anew_rev     INTEGER CHECK(kept_anew_rev IS NULL
+                                    OR (typeof(kept_anew_rev) = 'integer'
+                                        AND kept_anew_rev >= 0
+                                        AND kept_anew_rev < 8796093022208)),
+    CHECK((held_order IS NULL) = (first_held IS NULL)),
+    CHECK((first_held IS NULL) = (last_held IS NULL)),
+    CHECK((first_refused IS NULL) = (last_refused IS NULL)),
+    CHECK(first_held IS NOT NULL OR first_refused IS NOT NULL),
+    PRIMARY KEY (channel, key)
+);
+
+CREATE INDEX idx_shared_keys_held_order ON shared_keys(channel, held_order);
+CREATE INDEX idx_shared_keys_last_seq ON shared_keys(channel, last_seq);
+
+CREATE TABLE shared_unopened (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id),
+    key      BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    slot     BLOB NOT NULL CHECK(typeof(slot) = 'blob' AND length(slot) = 32),
+    PRIMARY KEY (channel, key, slot)
+);
+
+CREATE TABLE shared_labelled (
+    key  BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32)
+);
+
+CREATE TABLE shared_index (
+    channel     INTEGER NOT NULL REFERENCES shared_channels(id),
+    id          BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    sent        INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
+    subject     TEXT NOT NULL,
+    thread      BLOB NOT NULL CHECK(typeof(thread) = 'blob' AND length(thread) = 16),
+    answers     BLOB NOT NULL CHECK(typeof(answers) = 'blob' AND length(answers) = 16),
+    asks        INTEGER NOT NULL CHECK(asks IN (0, 1)),
+    link        TEXT,
+    body        TEXT NOT NULL,
+    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    placed_at   INTEGER CHECK(placed_at IS NULL OR typeof(placed_at) = 'integer'),
+    PRIMARY KEY (channel, id)
+);
+
+CREATE INDEX idx_shared_index_signer ON shared_index(channel, signer);
+
+CREATE TABLE shared_numbers (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id),
+    signer   BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer'
+                                    AND number >= 1 AND number <= 4398046511103),
+    id       BLOB NOT NULL,
+    FOREIGN KEY (channel, id) REFERENCES shared_index(channel, id) ON DELETE CASCADE,
+    PRIMARY KEY (channel, signer, number)
+);
+
+CREATE INDEX idx_shared_numbers_id ON shared_numbers(channel, id);
+
+CREATE TABLE shared_first_held (
+    channel     INTEGER NOT NULL REFERENCES shared_channels(id),
+    signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    number      INTEGER NOT NULL CHECK(typeof(number) = 'integer'
+                                       AND number >= 1 AND number <= 4398046511103),
+    id          BLOB CHECK(id IS NULL OR (typeof(id) = 'blob' AND length(id) = 16)),
+    sent        INTEGER CHECK(sent IS NULL OR typeof(sent) = 'integer'),
+    first_held  INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    taken_out   INTEGER NOT NULL DEFAULT 0 CHECK(taken_out IN (0, 1)),
+    placed_at   INTEGER CHECK(placed_at IS NULL
+                              OR (typeof(placed_at) = 'integer' AND taken_out = 1)),
+    CHECK((id IS NULL) = (sent IS NULL)),
+    CHECK(id IS NOT NULL OR taken_out = 0),
+    PRIMARY KEY (channel, signer, number)
+);
+
+CREATE INDEX idx_shared_first_held_id ON shared_first_held(channel, id);
+
+CREATE TABLE shared_signers (
+    channel       INTEGER NOT NULL REFERENCES shared_channels(id),
+    signer        BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    highest       INTEGER NOT NULL CHECK(typeof(highest) = 'integer'
+                                         AND highest >= 0 AND highest <= 4398046511103),
+    overwritten   INTEGER NOT NULL DEFAULT 0
+                      CHECK(typeof(overwritten) = 'integer' AND overwritten >= 0),
+    not_messages  INTEGER NOT NULL DEFAULT 0
+                      CHECK(typeof(not_messages) = 'integer' AND not_messages >= 0),
+    counted_from  INTEGER CHECK(counted_from IS NULL
+                                OR (typeof(counted_from) = 'integer'
+                                    AND counted_from >= 1 AND counted_from <= highest)),
+    PRIMARY KEY (channel, signer)
+);
+
+CREATE TABLE shared_places (
+    channel     INTEGER NOT NULL REFERENCES shared_channels(id),
+    signer      BLOB NOT NULL CHECK(typeof(signer) = 'blob' AND length(signer) = 32),
+    placed_at   INTEGER NOT NULL CHECK(typeof(placed_at) = 'integer'),
+    unlabelled  INTEGER NOT NULL CHECK(unlabelled IN (0, 1))
+);
+
+CREATE INDEX idx_shared_places ON shared_places(channel, signer, placed_at);
+"#;
+
+/// Migration v29: what the shared pass keeps (decision 2026-10-10 §8.4,
+/// §6.3, §14, and §19, item 19). Each column takes only its type and its
+/// bound.
+///
+/// - `shared_relay_places`: the place the device keeps at each relay of a
+///   shared channel, as a relay's mark and the place in its holding.
+/// - `shared_relay_sent`: what each relay answered a push of an entry of
+///   this device's own in a shared channel with, by the entry's slot and
+///   revision (1 holds it, 2 holds a later one, 3 holds another at that
+///   revision, 4 refused it as not signed): what waits at a relay is what
+///   it has not answered so. A revision is in the bottom half of band 0.
+/// - `shared_take_out_channels` and `shared_take_out_keys`: a take-out of a
+///   channel's entries (1 dropped, 2 moved from, 3 forgotten) and of one
+///   key's (as refused, or not), begun and not ended: each is ended in
+///   steps of one key's entries, each under a hold of the lock of its own,
+///   and one cut short by a stop goes on at the next start.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V29: &str = r#"
+CREATE TABLE shared_relay_places (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id),
+    relay    BLOB NOT NULL CHECK(typeof(relay) = 'blob' AND length(relay) = 32),
+    mark     BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 8),
+    next     INTEGER NOT NULL CHECK(typeof(next) = 'integer' AND next >= 0),
+    PRIMARY KEY (channel, relay)
+);
+
+CREATE TABLE shared_relay_sent (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id),
+    relay    BLOB NOT NULL CHECK(typeof(relay) = 'blob' AND length(relay) = 32),
+    slot     BLOB NOT NULL CHECK(typeof(slot) = 'blob' AND length(slot) = 32),
+    rev      INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                    AND rev >= 0 AND rev < 8796093022208),
+    answer   INTEGER NOT NULL CHECK(answer IN (1, 2, 3, 4)),
+    PRIMARY KEY (channel, relay, slot)
+);
+
+CREATE TABLE shared_take_out_channels (
+    channel  INTEGER PRIMARY KEY REFERENCES shared_channels(id),
+    how      INTEGER NOT NULL CHECK(how IN (1, 2, 3))
+);
+
+CREATE TABLE shared_take_out_keys (
+    channel      INTEGER NOT NULL REFERENCES shared_channels(id),
+    key          BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    as_refused   INTEGER NOT NULL CHECK(as_refused IN (0, 1)),
+    PRIMARY KEY (channel, key)
+);
+"#;
+
+/// Migration v30: what a device keeps of making, sharing and taking a
+/// shared channel (decision 2026-10-10 §3.1, §3.2, §14). Each column takes
+/// only its type and its bound.
+///
+/// - `shared_typed_keys`: each key a person typed at `cordelia accept
+///   --channel`, with the name it is to be filed under, when it was typed,
+///   when a share was taken under it and of which channel, and what became
+///   of it (a word, and what the line of that word names): counted apart
+///   from the keys typed to join devices.
+/// - `shared_shares`: each share this device wrote, by the key it is for
+///   and the channel it hands: its share pair channel, the card's relays
+///   (in their one form: 33 or 65 bytes), its revision, the time it says,
+///   and whether a delete was written over it.
+/// - `shared_share_sent`: what each relay answered a push of a share, or of
+///   the delete over it, at which revision.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V30: &str = r#"
+CREATE TABLE shared_typed_keys (
+    key       BLOB PRIMARY KEY CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    name      TEXT NOT NULL CHECK(typeof(name) = 'text'
+                                  AND length(CAST(name AS BLOB)) >= 1
+                                  AND length(CAST(name AS BLOB)) <= 200),
+    typed_at  INTEGER NOT NULL CHECK(typeof(typed_at) = 'integer'),
+    taken_at  INTEGER CHECK(taken_at IS NULL OR typeof(taken_at) = 'integer'),
+    channel   BLOB CHECK(channel IS NULL OR (typeof(channel) = 'blob' AND length(channel) = 32)),
+    became    TEXT CHECK(became IS NULL
+                         OR (typeof(became) = 'text' AND length(CAST(became AS BLOB)) <= 64)),
+    detail    TEXT CHECK(detail IS NULL
+                         OR (typeof(detail) = 'text' AND length(CAST(detail AS BLOB)) <= 1024)),
+    CHECK((taken_at IS NULL) = (channel IS NULL))
+);
+
+CREATE TABLE shared_shares (
+    key      BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    channel  BLOB NOT NULL CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    pair     BLOB NOT NULL CHECK(typeof(pair) = 'blob' AND length(pair) = 32),
+    relays   BLOB NOT NULL CHECK(typeof(relays) = 'blob' AND length(relays) IN (33, 65)),
+    rev      INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                    AND rev >= 0 AND rev <= 9007199254740991),
+    made     INTEGER NOT NULL CHECK(typeof(made) = 'integer'),
+    gone     INTEGER NOT NULL DEFAULT 0 CHECK(gone IN (0, 1)),
+    PRIMARY KEY (key, channel)
+);
+
+CREATE TABLE shared_share_sent (
+    key      BLOB NOT NULL,
+    channel  BLOB NOT NULL,
+    relay    BLOB NOT NULL CHECK(typeof(relay) = 'blob' AND length(relay) = 32),
+    rev      INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                    AND rev >= 0 AND rev <= 9007199254740991),
+    FOREIGN KEY (key, channel) REFERENCES shared_shares(key, channel) ON DELETE CASCADE,
+    PRIMARY KEY (key, channel, relay)
+);
+"#;
+
+/// Migration v31: what a device keeps of subscribing and of messages in a
+/// shared channel (decision 2026-10-10 §4.1, §6.1, §6.2, §6.4, §14). Each
+/// column takes only its type and its bound.
+///
+/// - `shared_msg_subscribed`: each subscription in force on this device, by the
+///   channel's ID and the agent's name, with its start: when this device
+///   first took it in that state (§4.1). It goes when the subscription is
+///   no longer in force, so one taken again starts again.
+/// - `shared_msg_marks`: this device's own table of the marks of shared
+///   messages read and sent by its agents (§6.1), each binding the channel,
+///   in the order made, with when.
+/// - `shared_msg_lists`: the latest `sread/` list of each other device, one
+///   list for each key, as `message_lists` keeps the `read/` lists.
+/// - `shared_msg_read_by_a_person`: the shared messages a person read on this
+///   device (§6.1: never said to the other devices), going with the
+///   message's row.
+/// - `shared_msg_sends`: each number this device wrote in a shared channel, by
+///   its clock, a send again among them: the channel's hour (§6.4).
+/// - `shared_msg_kept`, `shared_msg_kept_numbers`: each message of the device's own
+///   in a shared channel that not every relay of its card has taken, its
+///   value as it was sent and the numbers it was sent under, and whether it
+///   waits to be sent again (§6.1, as step 19's `message_kept`).
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V31: &str = r#"
+CREATE TABLE shared_msg_subscribed (
+    channel  BLOB NOT NULL CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    agent    TEXT NOT NULL CHECK(typeof(agent) = 'text'
+                                 AND length(CAST(agent AS BLOB)) >= 1
+                                 AND length(CAST(agent AS BLOB)) <= 200),
+    start    INTEGER NOT NULL CHECK(typeof(start) = 'integer'),
+    PRIMARY KEY (channel, agent)
+);
+
+CREATE TABLE shared_msg_marks (
+    mark     BLOB PRIMARY KEY CHECK(typeof(mark) = 'blob' AND length(mark) = 16),
+    seq      INTEGER NOT NULL UNIQUE CHECK(typeof(seq) = 'integer'),
+    made_at  INTEGER NOT NULL CHECK(typeof(made_at) = 'integer')
+);
+
+CREATE TABLE shared_msg_lists (
+    key   BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    mark  BLOB NOT NULL CHECK(typeof(mark) = 'blob' AND length(mark) = 16),
+    PRIMARY KEY (key, mark)
+);
+
+CREATE INDEX idx_shared_msg_lists_mark ON shared_msg_lists(mark);
+
+CREATE TABLE shared_msg_read_by_a_person (
+    channel  INTEGER NOT NULL,
+    id       BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    FOREIGN KEY (channel, id) REFERENCES shared_index(channel, id) ON DELETE CASCADE,
+    PRIMARY KEY (channel, id)
+);
+
+CREATE TABLE shared_msg_sends (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id) ON DELETE CASCADE,
+    sent_at  INTEGER NOT NULL CHECK(typeof(sent_at) = 'integer'),
+    again    INTEGER NOT NULL CHECK(again IN (0, 1))
+);
+
+CREATE INDEX idx_shared_msg_sends ON shared_msg_sends(channel, sent_at);
+
+CREATE TABLE shared_msg_kept (
+    channel  INTEGER NOT NULL REFERENCES shared_channels(id) ON DELETE CASCADE,
+    id       BLOB NOT NULL CHECK(typeof(id) = 'blob' AND length(id) = 16),
+    value    BLOB NOT NULL CHECK(typeof(value) = 'blob' AND length(value) = 1936),
+    sent     INTEGER NOT NULL CHECK(typeof(sent) = 'integer'),
+    kept_at  INTEGER NOT NULL CHECK(typeof(kept_at) = 'integer'),
+    again    INTEGER NOT NULL DEFAULT 0 CHECK(again IN (0, 1)),
+    PRIMARY KEY (channel, id)
+);
+
+CREATE TABLE shared_msg_kept_numbers (
+    channel  INTEGER NOT NULL,
+    id       BLOB NOT NULL,
+    number   INTEGER NOT NULL CHECK(typeof(number) = 'integer'
+                                    AND number >= 1 AND number <= 4398046511103),
+    FOREIGN KEY (channel, id) REFERENCES shared_msg_kept(channel, id) ON DELETE CASCADE,
+    PRIMARY KEY (channel, id, number)
+);
+"#;
+
+/// Migration v32: what a device keeps of channels made anew (decision
+/// 2026-10-10 §3.5, §7; decision 2026-10-24, rules 23 to 26). Each column
+/// takes only its type and its bound.
+///
+/// - `shared_anew_offers`: for each shared channel, by its ID, and each key
+///   whose offer there this device read: the record's revision, the time it
+///   says, the new channel, the new card's relays, the keys it seals to
+///   (32 bytes each, 1 to 64), the seal for this device's key where it
+///   seals to it, when this device first held it, and whether a person
+///   stayed after it. Kept apart from the store (§6.3).
+/// - `shared_anew_made`: each channel this device made anew, with the new
+///   channel, the offer's revision, when, whether a removal made it,
+///   whether the old channel's entries wait for the offer to be at each
+///   relay, and, at a removal, how many keys it left out past the 64,
+///   how many rows the table had let go, and whether the old channel was
+///   past a bound.
+/// - `shared_anew_not_clean`: each channel this device held when it applied
+///   a statement that removed a key, with when, whether it makes the
+///   channel anew itself once read (a recovery), and whether the removal
+///   left it so because this device does not reach its relays.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V32: &str = r#"
+CREATE TABLE shared_anew_offers (
+    channel      BLOB NOT NULL CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    maker        BLOB NOT NULL CHECK(typeof(maker) = 'blob' AND length(maker) = 32),
+    rev          INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                        AND rev >= 0 AND rev <= 9007199254740991),
+    made         INTEGER NOT NULL CHECK(typeof(made) = 'integer' AND made >= 0),
+    new_channel  BLOB NOT NULL CHECK(typeof(new_channel) = 'blob' AND length(new_channel) = 32),
+    relays       BLOB NOT NULL CHECK(typeof(relays) = 'blob'
+                                     AND length(relays) IN (33, 65)),
+    sealed_to    BLOB NOT NULL CHECK(typeof(sealed_to) = 'blob'
+                                     AND length(sealed_to) >= 32
+                                     AND length(sealed_to) <= 2048
+                                     AND length(sealed_to) % 32 = 0),
+    own_seal     BLOB CHECK(own_seal IS NULL
+                            OR (typeof(own_seal) = 'blob' AND length(own_seal) = 92)),
+    first_held   INTEGER NOT NULL CHECK(typeof(first_held) = 'integer'),
+    stayed       INTEGER NOT NULL DEFAULT 0 CHECK(stayed IN (0, 1)),
+    PRIMARY KEY (channel, maker)
+);
+
+CREATE INDEX idx_shared_anew_offers_new ON shared_anew_offers(new_channel);
+
+CREATE TABLE shared_anew_made (
+    channel      BLOB PRIMARY KEY CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    new_channel  BLOB NOT NULL CHECK(typeof(new_channel) = 'blob' AND length(new_channel) = 32),
+    rev          INTEGER NOT NULL CHECK(typeof(rev) = 'integer'
+                                        AND rev >= 0 AND rev <= 9007199254740991),
+    made_at      INTEGER NOT NULL CHECK(typeof(made_at) = 'integer'),
+    at_removal   INTEGER NOT NULL CHECK(at_removal IN (0, 1)),
+    delivering   INTEGER NOT NULL CHECK(delivering IN (0, 1)),
+    past_64      INTEGER NOT NULL DEFAULT 0 CHECK(typeof(past_64) = 'integer' AND past_64 >= 0),
+    let_go       INTEGER NOT NULL DEFAULT 0 CHECK(typeof(let_go) = 'integer' AND let_go >= 0),
+    past_bound   INTEGER NOT NULL DEFAULT 0 CHECK(past_bound IN (0, 1))
+);
+
+CREATE TABLE shared_anew_not_clean (
+    channel  BLOB PRIMARY KEY CHECK(typeof(channel) = 'blob' AND length(channel) = 32),
+    since    INTEGER NOT NULL CHECK(typeof(since) = 'integer'),
+    owed     INTEGER NOT NULL CHECK(owed IN (0, 1)),
+    unreached INTEGER NOT NULL DEFAULT 0 CHECK(unreached IN (0, 1))
 );
 "#;
 
@@ -1436,9 +1905,45 @@ fn migrate_in_one(conn: &Connection, sql: &str, version: u32) -> Result<(), Stor
 /// done, and nothing is changed: no pragma is set, and no step is run.
 /// Whoever opens the database is told both versions
 /// ([`StorageError::LaterVersion`]).
+///
+/// **A database that an unreleased build numbered otherwise is refused**
+/// too ([`refuse_steps_numbered_otherwise`]).
 pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     refuse_a_later_version(conn, SCHEMA_VERSION)?;
+    refuse_steps_numbered_otherwise(conn)?;
     run_steps(conn, SCHEMA_VERSION)
+}
+
+/// Refuse a database that a build which no release made left at a step
+/// that this build numbers otherwise, before any pragma is set or any step
+/// is run; nothing of it is changed
+/// ([`StorageError::NumberedOtherwise`]). Each is told by the table of
+/// this build's step 27, `shared_lists`, which no step drops:
+///
+/// - **At 21 to 26, with `shared_lists`:** the shared channels' build
+///   before the removal build came first. It numbered its own steps 21 to
+///   26, which are 27 to 32 now. This build would read it as at one of the
+///   removal's steps, with none of the removal's tables, and would not run
+///   the shared steps it lacks.
+/// - **At 27 to 32, without `shared_lists`:** the removal build while its
+///   rule 27 stood, which reached steps 27 and 28 with that rule's tables.
+///   This build would read it as at one of the shared steps, which it never
+///   ran. (Before the shared steps came after the removal's, such a
+///   database was refused as one from a later version.)
+fn refuse_steps_numbered_otherwise(conn: &Connection) -> Result<(), StorageError> {
+    let found: u32 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(21..=32).contains(&found) {
+        return Ok(());
+    }
+    let shared: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shared_lists')",
+        [],
+        |row| row.get(0),
+    )?;
+    if shared == (found <= 26) {
+        return Err(StorageError::NumberedOtherwise { found });
+    }
+    Ok(())
 }
 
 /// Refuse a database whose version is above `own`, as a schema at version
@@ -1643,6 +2148,38 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 26 {
         tracing::info!("applying migration v26 (what a cut touched)");
         migrate_in_one(conn, MIGRATION_V26, 26)?;
+    }
+
+    // The steps of the shared channels' record follow the removal's 26,
+    // from 27 (decision 2026-10-10 §14, "the upgrade").
+    if current < 27 {
+        tracing::info!("applying migration v27 (the person's lists of shared channels)");
+        migrate_in_one(conn, MIGRATION_V27, 27)?;
+    }
+
+    if current < 28 {
+        tracing::info!("applying migration v28 (the shared channels a device holds)");
+        migrate_in_one(conn, MIGRATION_V28, 28)?;
+    }
+
+    if current < 29 {
+        tracing::info!("applying migration v29 (what the shared pass keeps)");
+        migrate_in_one(conn, MIGRATION_V29, 29)?;
+    }
+
+    if current < 30 {
+        tracing::info!("applying migration v30 (making, sharing and taking a shared channel)");
+        migrate_in_one(conn, MIGRATION_V30, 30)?;
+    }
+
+    if current < 31 {
+        tracing::info!("applying migration v31 (subscribing, and messages in a shared channel)");
+        migrate_in_one(conn, MIGRATION_V31, 31)?;
+    }
+
+    if current < 32 {
+        tracing::info!("applying migration v32 (channels made anew)");
+        migrate_in_one(conn, MIGRATION_V32, 32)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -2241,6 +2778,7 @@ mod tests {
                    AND name NOT LIKE 'items_counted%'
                    AND name NOT LIKE '%at_relays%'
                    AND name NOT LIKE '%message%'
+                   AND name NOT LIKE '%shared%'
                    AND substr(name, 1, 5) != 'file_'
                    AND name NOT LIKE 'sqlite_autoindex_file_%'
                  ORDER BY name",
@@ -2510,6 +3048,7 @@ mod tests {
                AND name NOT LIKE '%person_change_times%'
                AND name NOT LIKE '%idx_person_change_entries_followed%'
                AND name NOT LIKE '%message%'
+               AND name NOT LIKE '%shared%'
                AND substr(name, 1, 5) != 'file_'
                    AND name NOT LIKE 'sqlite_autoindex_file_%'
                AND name NOT LIKE 'sqlite_autoindex%'
@@ -2725,6 +3264,7 @@ mod tests {
                    AND name NOT LIKE '%person_clear%'
                    AND name NOT LIKE '%person_change%'
                    AND name NOT LIKE '%message%'
+                   AND name NOT LIKE '%shared%'
                    AND substr(name, 1, 5) != 'file_'
                    AND name NOT LIKE 'sqlite_autoindex_file_%'
                  ORDER BY name",
@@ -3703,7 +4243,8 @@ mod tests {
 
     /// Everything a database holds: each definition, and each row of each
     /// table, in the order of their names, but what the step to version 20
-    /// adds.
+    /// adds and what the steps after it add (the removal's 21 and 22, and
+    /// the shared channels', 27 to 32).
     fn everything_but_v20(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
             .prepare(
@@ -3719,7 +4260,7 @@ mod tests {
         let mut held = Vec::new();
         for (kind, name, sql) in names {
             // What the step to version 21 adds is no row of a step before
-            // it either.
+            // it either, nor what the shared channels' steps (27 to 32) add.
             let later = NEW_IN_V20
                 .iter()
                 .chain(NEW_IN_V21.iter())
@@ -3727,6 +4268,7 @@ mod tests {
             if later
                 .clone()
                 .any(|new| *new == name || name == format!("sqlite_autoindex_{new}_1"))
+                || name.contains("shared")
             {
                 continue;
             }
@@ -3991,9 +4533,11 @@ mod tests {
             .unwrap();
         let mut held = Vec::new();
         for (kind, name, sql) in names {
-            // Nor what the steps to versions 21 and 22 make.
+            // Nor what the steps to versions 21 and 22 make, nor the shared
+            // channels' steps (27 to 32).
             if NEW_IN_V19.contains(&name.as_str())
                 || name.contains("message")
+                || name.contains("shared")
                 || NEW_IN_V21
                     .iter()
                     .chain(NEW_IN_V22.iter())
@@ -5115,13 +5659,15 @@ mod tests {
     }
 
     /// Everything a database holds, each definition and each row of each
-    /// table, but what the step to version 21 adds.
+    /// table, but what the step to version 21 adds, and what the shared
+    /// channels' steps (27 to 32) add.
     fn everything_but_v21(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
             .prepare(
                 "SELECT type, name, sql FROM sqlite_master
                      WHERE substr(name, 1, 5) != 'file_'
-                       AND name NOT LIKE 'sqlite_autoindex_file_%' ORDER BY name",
+                       AND name NOT LIKE 'sqlite_autoindex_file_%'
+                       AND name NOT LIKE '%shared%' ORDER BY name",
             )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -5293,13 +5839,15 @@ mod tests {
     }
 
     /// Everything a database holds, each definition and each row of each
-    /// table, but what the step to version 22 makes or writes.
+    /// table, but what the step to version 22 makes or writes, and what the
+    /// shared channels' steps (27 to 32) add.
     fn everything_but_v22(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
             .prepare(
                 "SELECT type, name, sql FROM sqlite_master
                      WHERE substr(name, 1, 5) != 'file_'
-                       AND name NOT LIKE 'sqlite_autoindex_file_%' ORDER BY name",
+                       AND name NOT LIKE 'sqlite_autoindex_file_%'
+                       AND name NOT LIKE '%shared%' ORDER BY name",
             )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -5626,10 +6174,14 @@ mod tests {
     }
 
     /// Everything a database holds, each definition and each row of each
-    /// table, but what the step to version 24 adds.
+    /// table, but what the step to version 24 adds, and what the shared
+    /// channels' steps (27 to 32) add.
     fn everything_but_v24(conn: &Connection) -> Vec<String> {
         let names: Vec<(String, String, Option<String>)> = conn
-            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                     WHERE name NOT LIKE '%shared%' ORDER BY name",
+            )
             .unwrap()
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
@@ -5882,7 +6434,7 @@ mod tests {
         assert!(migrate_in_one(&conn, &failing, 26).is_err());
         assert_eq!(version(&conn), 25);
         init_db(&conn).unwrap();
-        assert_eq!(version(&conn), 26);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
         migrate_in_one(&conn, MIGRATION_V26, 26).unwrap();
         let sha = "ab".repeat(32);
         for (sql, taken) in [
@@ -6040,6 +6592,1197 @@ mod tests {
         assert!(refuse_a_later_version(&at_19, 18).is_err());
     }
 
+    /// A database at version 26, as the removal build's steps leave one
+    /// before the steps of the shared channels' record, 27 to 32: what
+    /// [`at_v20`] holds, stepped through the removal's 21 to 26.
+    fn at_v26() -> Connection {
+        let conn = at_v20();
+        for (sql, at) in [
+            (MIGRATION_V21, 21),
+            (MIGRATION_V22, 22),
+            (MIGRATION_V23, 23),
+            (MIGRATION_V24, 24),
+            (MIGRATION_V25, 25),
+            (MIGRATION_V26, 26),
+        ] {
+            migrate_in_one(&conn, sql, at).unwrap();
+        }
+        conn
+    }
+
+    /// A version before, whose schema is at step 20 (0.2.0-alpha.17,
+    /// decision 2026-10-25) or at step 26 (the removal build, decision
+    /// 2026-10-24), stops on a database that was stepped past it (decision
+    /// 2026-10-10 §14, "going back"), as every version stops on one from a
+    /// later version: it is refused with both versions, and nothing of it
+    /// is changed. A database at its own step it opens.
+    #[test]
+    fn the_version_before_stops_on_a_database_stepped_past_its_own_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        drop(crate::db::open(&path).unwrap());
+        let before = std::fs::read(&path).unwrap();
+
+        let conn = Connection::open(&path).unwrap();
+        for own in [20, 26] {
+            let refused = refuse_a_later_version(&conn, own);
+            assert!(
+                matches!(
+                    refused,
+                    Err(StorageError::LaterVersion { found, own: o }) if found == SCHEMA_VERSION && o == own
+                ),
+                "{refused:?}"
+            );
+        }
+        drop(conn);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+
+        let at_20 = at_v20();
+        assert!(refuse_a_later_version(&at_20, 20).is_ok());
+        assert!(refuse_a_later_version(&at_20, 19).is_err());
+        let at_26 = at_v26();
+        assert!(refuse_a_later_version(&at_26, 26).is_ok());
+        assert!(refuse_a_later_version(&at_26, 25).is_err());
+    }
+
+    /// A database that a build which no release made left at a step that
+    /// this version numbers otherwise is refused, before any pragma is set
+    /// or any step is run, and nothing of it is changed: the shared
+    /// channels' build at its steps 21 to 26, which this version reads as
+    /// the removal's, and the removal build at its steps 27 and 28 while
+    /// its rule 27 stood, which this version reads as the shared channels'.
+    /// A database of the removal build at its own steps is stepped on, and
+    /// so is one of this version's at any shared step.
+    #[test]
+    fn a_database_whose_steps_an_unreleased_build_numbered_otherwise_is_refused() {
+        let as_that_build_numbered = [
+            (21, MIGRATION_V27),
+            (22, MIGRATION_V28),
+            (23, MIGRATION_V29),
+            (24, MIGRATION_V30),
+            (25, MIGRATION_V31),
+            (26, MIGRATION_V32),
+        ];
+        for (old, _) in as_that_build_numbered {
+            // As that build left it: alpha.17's step 20, then the shared
+            // steps as it numbered them, and none of the removal's.
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cordelia.db");
+            at_v20()
+                .execute_batch(&format!("VACUUM INTO '{}'", path.display()))
+                .unwrap();
+            let conn = Connection::open(&path).unwrap();
+            for (at, step) in as_that_build_numbered {
+                if at <= old {
+                    migrate_in_one(&conn, step, at).unwrap();
+                }
+            }
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
+
+            let conn = Connection::open(&path).unwrap();
+            let refused = init_db(&conn);
+            assert!(
+                matches!(
+                    refused,
+                    Err(StorageError::NumberedOtherwise { found }) if found == old
+                ),
+                "{refused:?}"
+            );
+            drop(conn);
+            assert_eq!(std::fs::read(&path).unwrap(), before, "at {old}");
+            let conn = crate::db::open(&path);
+            assert!(
+                matches!(conn, Err(StorageError::NumberedOtherwise { .. })),
+                "at {old}"
+            );
+        }
+
+        // The removal build while its rule 27 stood: at its step 27 or 28,
+        // with that rule's tables and none of the shared steps.
+        for old in [27, 28] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cordelia.db");
+            at_v26()
+                .execute_batch(&format!("VACUUM INTO '{}'", path.display()))
+                .unwrap();
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE file_own_dropped (folder TEXT NOT NULL, file TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", old).unwrap();
+            drop(conn);
+            let before = std::fs::read(&path).unwrap();
+            let refused = crate::db::open(&path);
+            assert!(
+                matches!(refused, Err(StorageError::NumberedOtherwise { found }) if found == old),
+                "{:?}",
+                refused.err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), before, "at {old}");
+        }
+
+        // The removal build's database at its step 21 and at its step 26
+        // is stepped on to this version's, and one of this version's at
+        // any step of the shared channels opens.
+        for conn in [at_v21(), at_v26()] {
+            init_db(&conn).unwrap();
+            let at: u32 = conn
+                .pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap();
+            assert_eq!(at, SCHEMA_VERSION);
+        }
+        for at in 27..=31 {
+            let conn = at_v26();
+            for (step, to) in [
+                (MIGRATION_V27, 27),
+                (MIGRATION_V28, 28),
+                (MIGRATION_V29, 29),
+                (MIGRATION_V30, 30),
+                (MIGRATION_V31, 31),
+            ] {
+                if to <= at {
+                    migrate_in_one(&conn, step, to).unwrap();
+                }
+            }
+            init_db(&conn).unwrap();
+        }
+    }
+
+    /// What the step to version 27 adds: two tables.
+    const NEW_IN_V27: [&str; 2] = ["shared_list_taken", "shared_lists"];
+
+    /// What a database holds of the step to version 27, by name.
+    fn new_in_v27(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE name LIKE 'shared_list%' AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// What the step to version 28 adds: nine tables and their indexes.
+    const NEW_IN_V28: [&str; 15] = [
+        "idx_shared_first_held_id",
+        "idx_shared_index_signer",
+        "idx_shared_keys_held_order",
+        "idx_shared_keys_last_seq",
+        "idx_shared_numbers_id",
+        "idx_shared_places",
+        "shared_channels",
+        "shared_first_held",
+        "shared_index",
+        "shared_keys",
+        "shared_labelled",
+        "shared_numbers",
+        "shared_places",
+        "shared_signers",
+        "shared_unopened",
+    ];
+
+    /// What a database holds of the step to version 28, by name.
+    fn new_in_v28(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE (name LIKE 'shared%' OR name LIKE 'idx_shared%')
+               AND name NOT LIKE 'shared_list%' AND name NOT LIKE 'sqlite_autoindex%'
+               AND name NOT LIKE 'shared_relay_%' AND name NOT LIKE 'shared_take_out_%'
+               AND name NOT LIKE 'shared_typed_%' AND name NOT LIKE 'shared_share%'
+               AND name NOT LIKE '%shared_msg_%' AND name NOT LIKE '%shared_anew_%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// Everything a database holds, each definition and each row, but
+    /// what the steps of the shared channels' record add, from step 27 on.
+    fn everything_but_v27(conn: &Connection) -> Vec<String> {
+        everything_but(conn, |name| name.contains("shared"))
+    }
+
+    /// Everything a database holds, each definition and each row, but
+    /// what the step to version 28 adds.
+    fn everything_but_v28(conn: &Connection) -> Vec<String> {
+        everything_but(conn, |name| {
+            NEW_IN_V28.contains(&name)
+                || NEW_IN_V29.contains(&name)
+                || NEW_IN_V30.contains(&name)
+                || name.contains("shared_msg_")
+                || name.contains("shared_anew_")
+                || (name.starts_with("sqlite_autoindex_shared_") && !name.contains("shared_list"))
+        })
+    }
+
+    /// What the step to version 29 adds: four tables.
+    const NEW_IN_V29: [&str; 4] = [
+        "shared_relay_places",
+        "shared_relay_sent",
+        "shared_take_out_channels",
+        "shared_take_out_keys",
+    ];
+
+    /// What a database holds of the step to version 29, by name.
+    fn new_in_v29(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE (name LIKE 'shared_relay_%' OR name LIKE 'shared_take_out_%')
+               AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// Everything a database holds, each definition and each row, but
+    /// what the step to version 29 adds.
+    fn everything_but_v29(conn: &Connection) -> Vec<String> {
+        everything_but(conn, |name| {
+            NEW_IN_V29.contains(&name)
+                || NEW_IN_V30.contains(&name)
+                || name.contains("shared_msg_")
+                || name.contains("shared_anew_")
+                || name.starts_with("sqlite_autoindex_shared_relay_")
+                || name.starts_with("sqlite_autoindex_shared_typed_")
+                || name.starts_with("sqlite_autoindex_shared_share")
+                || name.starts_with("sqlite_autoindex_shared_take_out_")
+        })
+    }
+
+    /// The step to version 29 (decision 2026-10-10 §8.4, §6.3, §14 and
+    /// §19, item 19): from a database at step 28 that holds rows of it, it
+    /// adds the tables of the shared pass and of a take-out in steps,
+    /// empty, and changes no older row or definition; a failure leaves
+    /// none of it, and the step asked for twice is run once. Each column
+    /// takes only its type and its bound.
+    fn step_29_adds_its_tables_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v26();
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
+        migrate_in_one(&conn, MIGRATION_V28, 28).unwrap();
+        conn.execute_batch(
+            "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                          first_held)
+                 VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9);",
+        )
+        .unwrap();
+        let before = everything_but_v29(&conn);
+        assert!(
+            before
+                .iter()
+                .any(|row| row.starts_with("shared_channels: "))
+        );
+        assert!(new_in_v29(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V29} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 29).is_err());
+        assert_eq!(version(&conn), 28);
+        assert!(
+            new_in_v29(&conn).is_empty(),
+            "the tables go with the version"
+        );
+        migrate_in_one(&conn, MIGRATION_V29, 29).unwrap();
+        assert_eq!(version(&conn), 29);
+        assert_eq!(new_in_v29(&conn), NEW_IN_V29);
+        assert_eq!(everything_but_v29(&conn), before);
+
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V29
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0; 4]);
+        conn.execute_batch(
+            "INSERT INTO shared_relay_places (channel, relay, mark, next)
+                 VALUES (1, zeroblob(32), zeroblob(8), 0);
+             INSERT INTO shared_relay_sent (channel, relay, slot, rev, answer)
+                 VALUES (1, zeroblob(32), zeroblob(32), 8796093022207, 4);
+             INSERT INTO shared_take_out_channels (channel, how) VALUES (1, 3);
+             INSERT INTO shared_take_out_keys (channel, key, as_refused)
+                 VALUES (1, zeroblob(32), 1);",
+        )
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [1; 4]);
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V29, 29).unwrap();
+        assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
+        assert_eq!(everything_but_v29(&conn), before);
+
+        conn.execute_batch(
+            "DELETE FROM shared_relay_places; DELETE FROM shared_relay_sent;
+             DELETE FROM shared_take_out_channels; DELETE FROM shared_take_out_keys;",
+        )
+        .unwrap();
+        let refused = [
+            "INSERT INTO shared_relay_places VALUES (2, zeroblob(32), zeroblob(8), 0)",
+            "INSERT INTO shared_relay_places VALUES (1, zeroblob(31), zeroblob(8), 0)",
+            "INSERT INTO shared_relay_places VALUES (1, zeroblob(32), zeroblob(7), 0)",
+            "INSERT INTO shared_relay_places VALUES (1, zeroblob(32), zeroblob(8), -1)",
+            "INSERT INTO shared_relay_places VALUES (1, zeroblob(32), zeroblob(8), 'one')",
+            "INSERT INTO shared_relay_sent VALUES (1, zeroblob(32), zeroblob(31), 0, 1)",
+            "INSERT INTO shared_relay_sent VALUES (1, zeroblob(32), zeroblob(32), 8796093022208, 1)",
+            "INSERT INTO shared_relay_sent VALUES (1, zeroblob(32), zeroblob(32), -1, 1)",
+            "INSERT INTO shared_relay_sent VALUES (1, zeroblob(32), zeroblob(32), 0, 5)",
+            "INSERT INTO shared_relay_sent VALUES (1, zeroblob(32), zeroblob(32), 0, 0)",
+            "INSERT INTO shared_take_out_channels VALUES (1, 4)",
+            "INSERT INTO shared_take_out_channels VALUES (2, 1)",
+            "INSERT INTO shared_take_out_keys VALUES (1, zeroblob(33), 0)",
+            "INSERT INTO shared_take_out_keys VALUES (1, zeroblob(32), 2)",
+        ];
+        for refused in refused {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        for taken in [
+            "INSERT INTO shared_relay_places VALUES (1, zeroblob(32), zeroblob(8), 9)",
+            "INSERT INTO shared_relay_sent VALUES (1, zeroblob(32), zeroblob(32), 0, 1)",
+            "INSERT INTO shared_take_out_channels VALUES (1, 1)",
+            "INSERT INTO shared_take_out_keys VALUES (1, zeroblob(32), 0)",
+        ] {
+            assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// What the step to version 30 adds: three tables.
+    const NEW_IN_V30: [&str; 3] = ["shared_share_sent", "shared_shares", "shared_typed_keys"];
+
+    /// What a database holds of the step to version 30, by name.
+    fn new_in_v30(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE (name LIKE 'shared_typed_%' OR name LIKE 'shared_share%')
+               AND name NOT LIKE 'sqlite_autoindex%'
+             ORDER BY name",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap()
+    }
+
+    /// The step to version 30 (decision 2026-10-10 §3.1, §3.2, §14): from a
+    /// database at step 29 that holds rows of the steps before it, it adds
+    /// the tables of the keys typed for channels and of the shares this
+    /// device wrote, empty, and changes no older row or definition; a
+    /// failure leaves none of it, and the step asked for twice is run once.
+    /// Each column takes only its type and its bound.
+    #[test]
+    fn step_30_adds_its_tables_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v26();
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
+        migrate_in_one(&conn, MIGRATION_V28, 28).unwrap();
+        migrate_in_one(&conn, MIGRATION_V29, 29).unwrap();
+        conn.execute_batch(
+            "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                          first_held)
+                 VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9);
+             INSERT INTO shared_take_out_channels (channel, how) VALUES (1, 3);",
+        )
+        .unwrap();
+        let but = |conn: &Connection| {
+            everything_but(conn, |name| {
+                NEW_IN_V30.contains(&name)
+                    || name.contains("shared_msg_")
+                    || name.contains("shared_anew_")
+                    || name.starts_with("sqlite_autoindex_shared_typed_")
+                    || name.starts_with("sqlite_autoindex_shared_share")
+            })
+        };
+        let before = but(&conn);
+        assert!(new_in_v30(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V30} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 30).is_err());
+        assert_eq!(version(&conn), 29);
+        assert!(
+            new_in_v30(&conn).is_empty(),
+            "the tables go with the version"
+        );
+        migrate_in_one(&conn, MIGRATION_V30, 30).unwrap();
+        assert_eq!(version(&conn), 30);
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v30(&conn), NEW_IN_V30);
+        assert_eq!(but(&conn), before);
+
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V30
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0; 3]);
+        conn.execute_batch(
+            "INSERT INTO shared_typed_keys (key, name, typed_at) VALUES (zeroblob(32), 'r', 9);
+             INSERT INTO shared_shares (key, channel, pair, relays, rev, made)
+                 VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9, 9);
+             INSERT INTO shared_share_sent (key, channel, relay, rev)
+                 VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9);",
+        )
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [1; 3]);
+        migrate_in_one(&conn, MIGRATION_V30, 30).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
+        assert_eq!(but(&conn), before);
+
+        conn.execute_batch(
+            "DELETE FROM shared_share_sent; DELETE FROM shared_shares;
+             DELETE FROM shared_typed_keys;",
+        )
+        .unwrap();
+        let refused = [
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(31), 'r', 9, NULL, NULL, NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), '', 9, NULL, NULL, NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 'nine', NULL, NULL, NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, NULL, NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, NULL, zeroblob(32), NULL, NULL)",
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, zeroblob(31), NULL, NULL)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(34), 9, 9, 0)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), -1, 9, 0)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9007199254740992, 9, 0)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9, 9, 2)",
+            "INSERT INTO shared_share_sent VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9)",
+        ];
+        for refused in refused {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        for taken in [
+            "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, zeroblob(32), 'taken', NULL)",
+            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(65), 9, 9, 1)",
+            "INSERT INTO shared_share_sent VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9)",
+        ] {
+            assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// What the step to version 31 adds: seven tables.
+    const NEW_IN_V31: [&str; 7] = [
+        "shared_msg_kept",
+        "shared_msg_kept_numbers",
+        "shared_msg_lists",
+        "shared_msg_marks",
+        "shared_msg_read_by_a_person",
+        "shared_msg_sends",
+        "shared_msg_subscribed",
+    ];
+
+    /// What a database holds of the step to version 31, by name.
+    fn new_in_v31(conn: &Connection) -> Vec<String> {
+        let mut names: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names.retain(|name: &String| NEW_IN_V31.contains(&name.as_str()));
+        names
+    }
+
+    /// The step to version 31 (decision 2026-10-10 §4.1, §6.1, §6.4, §14):
+    /// from a database at step 30 that holds rows of the steps before it, it
+    /// adds the tables of subscriptions, shared marks, a person's reads of
+    /// shared messages, the channel's hour and the kept values, empty, and
+    /// changes no older row or definition; a failure leaves none of it, and
+    /// the step asked for twice is run once. Each column takes only its type
+    /// and its bound.
+    #[test]
+    fn step_31_adds_its_tables_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v26();
+        for (sql, at) in [
+            (MIGRATION_V27, 27),
+            (MIGRATION_V28, 28),
+            (MIGRATION_V29, 29),
+            (MIGRATION_V30, 30),
+        ] {
+            migrate_in_one(&conn, sql, at).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                          first_held)
+                 VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9);
+             INSERT INTO shared_index (channel, id, signer, sent, subject, thread, answers,
+                                       asks, link, body, first_held, placed_at)
+                 VALUES (1, zeroblob(16), zeroblob(32), 9, 's', zeroblob(16), zeroblob(16), 0,
+                         NULL, 'b', 9, 9);
+             INSERT INTO shared_typed_keys (key, name, typed_at) VALUES (zeroblob(32), 'r', 9);",
+        )
+        .unwrap();
+        let but = |conn: &Connection| {
+            everything_but(conn, |name| {
+                name.contains("shared_msg_") || name.contains("shared_anew_")
+            })
+        };
+        let before = but(&conn);
+        assert!(new_in_v31(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V31} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 31).is_err());
+        assert_eq!(version(&conn), 30);
+        assert!(
+            new_in_v31(&conn).is_empty(),
+            "the tables go with the version"
+        );
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v31(&conn), NEW_IN_V31);
+        assert_eq!(but(&conn), before);
+
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V31
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0; 7]);
+        conn.execute_batch(
+            "INSERT INTO shared_msg_kept (channel, id, value, sent, kept_at)
+                 VALUES (1, zeroblob(16), zeroblob(1936), 9, 9);
+             INSERT INTO shared_msg_kept_numbers (channel, id, number) VALUES (1, zeroblob(16), 1);
+             INSERT INTO shared_msg_lists (key, mark) VALUES (zeroblob(32), zeroblob(16));
+             INSERT INTO shared_msg_marks (mark, seq, made_at) VALUES (zeroblob(16), 1, 9);
+             INSERT INTO shared_msg_read_by_a_person (channel, id) VALUES (1, zeroblob(16));
+             INSERT INTO shared_msg_sends (channel, sent_at, again) VALUES (1, 9, 0);
+             INSERT INTO shared_msg_subscribed (channel, agent, start) VALUES (zeroblob(32), 'r', 9);"
+        )
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [1; 7]);
+        migrate_in_one(&conn, MIGRATION_V31, 31).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
+        assert_eq!(but(&conn), before);
+
+        // A person's read goes with the message's row; a number kept goes
+        // with its kept value.
+        conn.execute("DELETE FROM shared_index", []).unwrap();
+        conn.execute("DELETE FROM shared_msg_kept", []).unwrap();
+        assert_eq!(counted(&conn), [0, 0, 1, 1, 0, 1, 1]);
+
+        conn.execute_batch(
+            "DELETE FROM shared_msg_lists; DELETE FROM shared_msg_marks; DELETE FROM shared_msg_sends;
+             DELETE FROM shared_msg_subscribed;",
+        )
+        .unwrap();
+        let refused = [
+            "INSERT INTO shared_msg_subscribed VALUES (zeroblob(31), 'r', 9)",
+            "INSERT INTO shared_msg_subscribed VALUES (zeroblob(32), '', 9)",
+            "INSERT INTO shared_msg_subscribed VALUES (zeroblob(32), 'r', 'nine')",
+            "INSERT INTO shared_msg_marks VALUES (zeroblob(15), 1, 9)",
+            "INSERT INTO shared_msg_lists VALUES (zeroblob(32), zeroblob(17))",
+            "INSERT INTO shared_msg_read_by_a_person VALUES (1, zeroblob(16))",
+            "INSERT INTO shared_msg_sends VALUES (2, 9, 0)",
+            "INSERT INTO shared_msg_sends VALUES (1, 9, 2)",
+            "INSERT INTO shared_msg_kept VALUES (1, zeroblob(16), zeroblob(1935), 9, 9, 0)",
+            "INSERT INTO shared_msg_kept VALUES (2, zeroblob(16), zeroblob(1936), 9, 9, 0)",
+            "INSERT INTO shared_msg_kept_numbers VALUES (1, zeroblob(16), 1)",
+        ];
+        for refused in refused {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        conn.execute(
+            "INSERT INTO shared_msg_kept VALUES (1, zeroblob(16), zeroblob(1936), 9, 9, 1)",
+            [],
+        )
+        .unwrap();
+        for refused in [
+            "INSERT INTO shared_msg_kept_numbers VALUES (1, zeroblob(16), 0)",
+            "INSERT INTO shared_msg_kept_numbers VALUES (1, zeroblob(16), 4398046511104)",
+        ] {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        for taken in [
+            "INSERT INTO shared_msg_subscribed VALUES (zeroblob(32), 'github.com/owner/repo', 9)",
+            "INSERT INTO shared_msg_marks VALUES (zeroblob(16), 1, 9)",
+            "INSERT INTO shared_msg_sends VALUES (1, 9, 1)",
+            "INSERT INTO shared_msg_kept_numbers VALUES (1, zeroblob(16), 4398046511103)",
+        ] {
+            assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// What the step to version 32 adds: three tables.
+    const NEW_IN_V32: [&str; 3] = [
+        "shared_anew_made",
+        "shared_anew_not_clean",
+        "shared_anew_offers",
+    ];
+
+    /// The step to version 32 (decision 2026-10-10 §3.5, §7, §14): from a
+    /// database at step 31 that holds rows of the steps before it, it adds
+    /// the tables of the offers read, the channels made anew here and the
+    /// channels not yet clean, empty, and changes no older row or
+    /// definition; a failure leaves none of it, and the step asked for twice
+    /// is run once. Each column takes only its type and its bound.
+    #[test]
+    fn step_32_adds_its_tables_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v26();
+        for (sql, at) in [
+            (MIGRATION_V27, 27),
+            (MIGRATION_V28, 28),
+            (MIGRATION_V29, 29),
+            (MIGRATION_V30, 30),
+            (MIGRATION_V31, 31),
+        ] {
+            migrate_in_one(&conn, sql, at).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                          first_held)
+                 VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9);
+             INSERT INTO shared_msg_subscribed (channel, agent, start) VALUES (zeroblob(32), 'r', 9);",
+        )
+        .unwrap();
+        let new_in_v32 = |conn: &Connection| -> Vec<String> {
+            let mut names: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            names.retain(|name: &String| NEW_IN_V32.contains(&name.as_str()));
+            names
+        };
+        let but = |conn: &Connection| everything_but(conn, |name| name.contains("shared_anew_"));
+        let before = but(&conn);
+        assert!(new_in_v32(&conn).is_empty());
+        let failing = format!("{MIGRATION_V32} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 32).is_err());
+        assert_eq!(version(&conn), 31);
+        assert!(
+            new_in_v32(&conn).is_empty(),
+            "the tables go with the version"
+        );
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 32);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v32(&conn), NEW_IN_V32);
+        assert_eq!(but(&conn), before);
+        conn.execute_batch(
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32),
+                 zeroblob(33), zeroblob(64), NULL, 9, 0);
+             INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 0, 0, 0);
+             INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 1, 0);",
+        )
+        .unwrap();
+        migrate_in_one(&conn, MIGRATION_V32, 32).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!(but(&conn), before);
+        for table in NEW_IN_V32 {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 1, "{table}");
+        }
+        conn.execute_batch(
+            "DELETE FROM shared_anew_offers; DELETE FROM shared_anew_made;
+             DELETE FROM shared_anew_not_clean;",
+        )
+        .unwrap();
+        for refused in [
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(31), zeroblob(32), 1, 9, zeroblob(32), zeroblob(33), zeroblob(64), NULL, 9, 0)",
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), -1, 9, zeroblob(32), zeroblob(33), zeroblob(64), NULL, 9, 0)",
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(34), zeroblob(64), NULL, 9, 0)",
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(33), zeroblob(33), NULL, 9, 0)",
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(33), zeroblob(2080), NULL, 9, 0)",
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(33), zeroblob(64), zeroblob(91), 9, 0)",
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(33), zeroblob(64), NULL, 9, 2)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 2, 1, 0, 0, 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, -1, 0, 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 0, 'one', 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(31), 1, 9, 0, 1, 0, 0, 0)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 0, 0, 2)",
+            "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 'nine', 1, 0)",
+            "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 2, 0)",
+            "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 0, 2)",
+        ] {
+            assert!(conn.execute(refused, []).is_err(), "{refused}");
+        }
+        for taken in [
+            "INSERT INTO shared_anew_offers VALUES (zeroblob(32), zeroblob(32), 1, 9, zeroblob(32), zeroblob(65), zeroblob(2048), zeroblob(92), 9, 1)",
+            "INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 1, 0, 3, 5, 1)",
+            "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 0, 1)",
+        ] {
+            assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// The bound that step 29 writes as a number in its SQL is that of
+    /// protocol.rs: a revision of a shared channel is below the half of
+    /// band 0.
+    #[test]
+    fn the_bounds_of_step_29_are_those_of_protocol_rs() {
+        use cordelia_core::protocol::REV_BAND_HALF;
+        let count = |text: &str| MIGRATION_V29.matches(text).count();
+        assert_eq!(count(&format!("rev < {REV_BAND_HALF})")), 1);
+        assert_eq!(count(&REV_BAND_HALF.to_string()), 1);
+    }
+
+    /// Everything a database holds, each definition and each row, but what
+    /// `left_out` names.
+    fn everything_but(conn: &Connection, left_out: impl Fn(&str) -> bool) -> Vec<String> {
+        let names: Vec<(String, String, Option<String>)> = conn
+            .prepare("SELECT type, name, sql FROM sqlite_master ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = Vec::new();
+        for (kind, name, sql) in names {
+            if left_out(&name) {
+                continue;
+            }
+            held.push(format!("{name}: {}", sql.unwrap_or_default()));
+            if kind != "table" {
+                continue;
+            }
+            let mut rows = conn.prepare(&format!("SELECT * FROM \"{name}\"")).unwrap();
+            let columns = rows.column_count();
+            let mut found = rows.query([]).unwrap();
+            while let Some(row) = found.next().unwrap() {
+                let values: Vec<String> = (0..columns)
+                    .map(|i| format!("{:?}", row.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect();
+                held.push(format!("{name}: {}", values.join(", ")));
+            }
+        }
+        held
+    }
+
+    /// The step to version 27 adds the tables of the person's lists,
+    /// empty, and changes no older row or definition (decision 2026-10-10
+    /// §14, "the upgrade", and §20, item 8): it is made in one step with its
+    /// version, so a failure between them leaves none of it, and the step
+    /// asked for twice is run once. It keeps the list this device last
+    /// wrote with its revision, and when each act was taken, and nothing of
+    /// a list's freshness or of acts freed. What the tables keep stays
+    /// across a start, and each takes no row that cannot be what a device
+    /// keeps: a list's value that is no blob, shorter than an empty list or
+    /// longer than a list at every bound; a revision past `MAX_REV` or below
+    /// 0; a signature of another length; a generation past the last
+    /// statement; a time that is no integer; a second row for the list, or
+    /// for an act.
+    #[test]
+    fn each_step_of_this_record_adds_its_tables_and_changes_no_older_row() {
+        let conn = at_v26();
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let before = everything_but_v27(&conn);
+        assert!(before.len() > 40, "{before:?}");
+        assert_eq!(version(&conn), 26);
+        assert!(new_in_v27(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V27} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 27).is_err());
+        assert_eq!(version(&conn), 26);
+        assert!(
+            new_in_v27(&conn).is_empty(),
+            "the tables go with the version"
+        );
+
+        // The next start runs the step from the beginning, and the steps
+        // after it.
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v27(&conn), NEW_IN_V27);
+        assert_eq!(new_in_v28(&conn), NEW_IN_V28);
+        assert_eq!(new_in_v29(&conn), NEW_IN_V29);
+        assert_eq!(everything_but_v27(&conn), before);
+        let counted = |conn: &Connection| -> Vec<i64> {
+            NEW_IN_V27
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0, 0]);
+        // Nothing of a list's freshness, of when a list or an act was first
+        // held, or of an act freed (§20, items 1, 2 and 8).
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('shared_lists') ORDER BY cid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(columns, ["one", "list", "rev"]);
+
+        // What the device keeps, at the bounds of each column.
+        conn.execute_batch(
+            "INSERT INTO shared_lists (one, list, rev) VALUES (1, zeroblob(41333), 9007199254740991);
+             INSERT INTO shared_list_taken (signature, generation, taken_at, carried_in)
+                 VALUES (zeroblob(64), 256, 9, 256), (X'01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000', 0, -9, 0);",
+        )
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [2, 1]);
+        // A start after that, and the step asked for again, change
+        // nothing: what the device keeps stays.
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
+        assert_eq!(
+            (version(&conn), counted(&conn)),
+            (SCHEMA_VERSION, kept.clone())
+        );
+        assert_eq!(everything_but_v27(&conn), before);
+
+        let lists =
+            |values: &str| format!("INSERT INTO shared_lists (one, list, rev) VALUES ({values})");
+        let taken = |values: &str| {
+            format!(
+                "INSERT INTO shared_list_taken (signature, generation, taken_at, carried_in) VALUES ({values})"
+            )
+        };
+        let another = format!("X'02{}'", "00".repeat(63));
+        conn.execute("DELETE FROM shared_lists", []).unwrap();
+        let refused = [
+            lists("2, zeroblob(5), 0"),
+            lists("1, zeroblob(4), 0"),
+            lists("1, zeroblob(41334), 0"),
+            lists("1, 'a list of five', 0"),
+            lists("1, NULL, 0"),
+            lists("1, zeroblob(5), -1"),
+            lists("1, zeroblob(5), 9007199254740992"),
+            lists("1, zeroblob(5), 1.5"),
+            lists("1, zeroblob(5), NULL"),
+            taken("zeroblob(64), 0, 9, 0"),
+            taken("zeroblob(63), 0, 9, 0"),
+            taken("zeroblob(65), 0, 9, 0"),
+            taken(&format!("{another}, 257, 9, 0")),
+            taken(&format!("{another}, -1, 9, 0")),
+            taken(&format!("{another}, 0, 'nine', 0")),
+            taken(&format!("{another}, 0, NULL, 0")),
+            taken(&format!("{another}, 'one', 9, 0")),
+            taken(&format!("{another}, 0, 9, 257")),
+            taken(&format!("{another}, 0, 9, -1")),
+            taken(&format!("{another}, 0, 9, 'one'")),
+            taken(&format!("{another}, 0, 9, NULL")),
+        ];
+        for refused in refused {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+        }
+        // Each refused in its place is taken where it is of its type and
+        // within its bound.
+        for taken in [
+            lists("1, zeroblob(5), 0"),
+            taken(&format!("{another}, 1, 9, 1")),
+        ] {
+            assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
+        }
+
+        step_27_adds_its_tables_and_changes_no_older_row();
+        step_29_adds_its_tables_and_changes_no_older_row();
+    }
+
+    /// The step to version 28 (decision 2026-10-10 §2.2, §6.3, §14): from a
+    /// database at step 27 that holds rows of it, it adds the tables of the
+    /// shared channels a device holds, empty, and changes no older row or
+    /// definition; a failure leaves none of it, and the step asked for
+    /// twice is run once. Each column takes only its type and its bound: a
+    /// channel's ID, a card, a name and how a channel came; a key's row,
+    /// held or refused, with revisions kept below the half of band 0; a
+    /// message's ID, number and place.
+    fn step_27_adds_its_tables_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v26();
+        migrate_in_one(&conn, MIGRATION_V27, 27).unwrap();
+        conn.execute_batch("INSERT INTO shared_lists (one, list, rev) VALUES (1, zeroblob(5), 9);")
+            .unwrap();
+        let before = everything_but_v28(&conn);
+        assert!(before.iter().any(|row| row.starts_with("shared_lists: ")));
+        assert!(new_in_v28(&conn).is_empty());
+
+        let failing = format!("{MIGRATION_V28} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 28).is_err());
+        assert_eq!(version(&conn), 27);
+        assert!(
+            new_in_v28(&conn).is_empty(),
+            "the tables go with the version"
+        );
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(new_in_v28(&conn), NEW_IN_V28);
+        assert_eq!(everything_but_v28(&conn), before);
+
+        let tables = [
+            "shared_channels",
+            "shared_keys",
+            "shared_unopened",
+            "shared_labelled",
+            "shared_index",
+            "shared_numbers",
+            "shared_first_held",
+            "shared_signers",
+            "shared_places",
+        ];
+        let counted = |conn: &Connection| -> Vec<i64> {
+            tables
+                .iter()
+                .map(|table| {
+                    conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+                })
+                .collect()
+        };
+        assert_eq!(counted(&conn), [0; 9]);
+
+        // What the device keeps, at the bounds of each column.
+        let name = "n".repeat(200);
+        conn.execute_batch(&format!(
+            "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                          first_held)
+                 VALUES (1, zeroblob(32), zeroblob(65), 'review', 1, NULL, 1, 9),
+                        (2, X'{one}', zeroblob(97), '{name}', 3, zeroblob(32), 4, 9),
+                        (3, X'{two}', zeroblob(97), 'r', 2, zeroblob(32), 2, 9);
+             INSERT INTO shared_keys (channel, key, known, held_order, first_held, last_held,
+                                      last_seq, bytes_stored, kept_message_rev, kept_anew_rev)
+                 VALUES (1, zeroblob(32), 0, 1, 9, 9, 1, 214016, 8796093022207, 0);
+             INSERT INTO shared_keys (channel, key, known, unknown_since, first_refused,
+                                      last_refused, last_seq, bytes_refused)
+                 VALUES (1, X'{one}', 0, 9, 9, 9, 2, 3072);
+             INSERT INTO shared_unopened (channel, key, slot)
+                 VALUES (1, zeroblob(32), zeroblob(32));
+             INSERT INTO shared_labelled (key) VALUES (zeroblob(32));
+             INSERT INTO shared_index (channel, id, signer, sent, subject, thread, answers,
+                                       asks, link, body, first_held, placed_at)
+                 VALUES (1, zeroblob(16), zeroblob(32), 9, 's', zeroblob(16), zeroblob(16), 1,
+                         'owner/repo#1', 'b', 9, NULL);
+             INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 4398046511103, zeroblob(16));
+             INSERT INTO shared_first_held (channel, signer, number, id, sent, first_held,
+                                            taken_out, placed_at)
+                 VALUES (1, zeroblob(32), 1, zeroblob(16), 9, 9, 1, 9),
+                        (1, zeroblob(32), 2, NULL, NULL, 9, 0, NULL);
+             INSERT INTO shared_signers (channel, signer, highest, overwritten, not_messages,
+                                         counted_from)
+                 VALUES (1, zeroblob(32), 4398046511103, 0, 0, 1);
+             INSERT INTO shared_places (channel, signer, placed_at, unlabelled)
+                 VALUES (1, zeroblob(32), 9, 1);",
+            one = "01".repeat(32),
+            two = "02".repeat(32),
+        ))
+        .unwrap();
+        let kept = counted(&conn);
+        assert_eq!(kept, [3, 2, 1, 1, 1, 1, 2, 1, 1]);
+        init_db(&conn).unwrap();
+        migrate_in_one(&conn, MIGRATION_V28, 28).unwrap();
+        assert_eq!((version(&conn), counted(&conn)), (SCHEMA_VERSION, kept));
+        assert_eq!(everything_but_v28(&conn), before);
+
+        let channel = |values: &str| {
+            format!(
+                "INSERT INTO shared_channels (id, channel, card, name, came, came_from, state,
+                                              first_held)
+                 VALUES (9, {values})"
+            )
+        };
+        let key = |columns: &str, values: &str| {
+            format!("INSERT INTO shared_keys (channel, key, last_seq, {columns}) VALUES ({values})")
+        };
+        let held = "known, held_order, first_held, last_held";
+        let three = "X'".to_string() + &"03".repeat(32) + "'";
+        let refused = [
+            channel("zeroblob(31), zeroblob(65), 'r', 1, NULL, 1, 9"),
+            channel("zeroblob(32), zeroblob(65), 'r', 1, NULL, 1, 9"),
+            channel(&format!("{three}, zeroblob(64), 'r', 1, NULL, 1, 9")),
+            channel(&format!("{three}, zeroblob(98), 'r', 1, NULL, 1, 9")),
+            channel(&format!("{three}, zeroblob(65), '', 1, NULL, 1, 9")),
+            channel(&format!("{three}, zeroblob(65), '{name}n', 1, NULL, 1, 9")),
+            channel(&format!(
+                "{three}, zeroblob(65), zeroblob(1), 1, NULL, 1, 9"
+            )),
+            channel(&format!(
+                "{three}, zeroblob(65), 'r', 4, zeroblob(32), 1, 9"
+            )),
+            channel(&format!(
+                "{three}, zeroblob(65), 'r', 1, zeroblob(32), 1, 9"
+            )),
+            channel(&format!("{three}, zeroblob(65), 'r', 2, NULL, 1, 9")),
+            channel(&format!(
+                "{three}, zeroblob(65), 'r', 3, zeroblob(31), 1, 9"
+            )),
+            channel(&format!("{three}, zeroblob(65), 'r', 1, NULL, 5, 9")),
+            channel(&format!("{three}, zeroblob(65), 'r', 1, NULL, 1, 'nine'")),
+            key(held, "1, zeroblob(31), 1, 0, 2, 9, 9"),
+            key(held, &format!("9, {three}, 1, 0, 2, 9, 9")),
+            key(held, &format!("1, {three}, 1, 2, 2, 9, 9")),
+            key(held, &format!("1, {three}, 0, 0, 0, 9, 9")),
+            key(held, &format!("1, {three}, 1, 0, NULL, 9, 9")),
+            key(held, &format!("1, {three}, 1, 0, 2, 9, NULL")),
+            key(held, &format!("1, {three}, 1, 0, 2, NULL, NULL")),
+            key("known", &format!("1, {three}, 1, 0")),
+            key(
+                "known, unknown_since, first_refused, last_refused",
+                &format!("1, {three}, 1, 1, 9, 9, 9"),
+            ),
+            key("known, first_refused", &format!("1, {three}, 1, 0, 9")),
+            key(
+                &format!("{held}, bytes_stored"),
+                &format!("1, {three}, 1, 0, 2, 9, 9, -1"),
+            ),
+            key(
+                &format!("{held}, kept_message_rev"),
+                &format!("1, {three}, 1, 0, 2, 9, 9, 8796093022208"),
+            ),
+            key(
+                &format!("{held}, kept_anew_rev"),
+                &format!("1, {three}, 1, 0, 2, 9, 9, -1"),
+            ),
+            "INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 0, zeroblob(16))"
+                .into(),
+            "INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 4398046511104, zeroblob(16))"
+                .into(),
+            "INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 7, X'01010101010101010101010101010101')"
+                .into(),
+            "INSERT INTO shared_index (channel, id, signer, sent, subject, thread, answers,
+                                       asks, link, body, first_held, placed_at)
+                 VALUES (1, zeroblob(15), zeroblob(32), 9, 's', zeroblob(16), zeroblob(16), 0,
+                         NULL, 'b', 9, NULL)"
+                .into(),
+            "INSERT INTO shared_first_held (channel, signer, number, id, sent, first_held,
+                                            taken_out, placed_at)
+                 VALUES (1, zeroblob(32), 3, zeroblob(16), 9, 9, 0, 9)"
+                .into(),
+            "INSERT INTO shared_first_held (channel, signer, number, id, sent, first_held,
+                                            taken_out, placed_at)
+                 VALUES (1, zeroblob(32), 3, NULL, NULL, 9, 1, NULL)"
+                .into(),
+            "INSERT INTO shared_signers (channel, signer, highest, overwritten, not_messages,
+                                         counted_from)
+                 VALUES (1, X'0101010101010101010101010101010101010101010101010101010101010101',
+                         4398046511104, 0, 0, NULL)"
+                .into(),
+            "INSERT INTO shared_places (channel, signer, placed_at, unlabelled)
+                 VALUES (1, zeroblob(32), 9, 2)"
+                .into(),
+        ];
+        for refused in refused {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+        }
+        // Each refused in its place is taken where it is of its type and
+        // within its bound.
+        for taken in [
+            channel(&format!("{three}, zeroblob(65), 'r', 1, NULL, 1, 9")),
+            key(held, &format!("1, {three}, 1, 0, 2, 9, 9")),
+            "INSERT INTO shared_numbers (channel, signer, number, id)
+                 VALUES (1, zeroblob(32), 7, zeroblob(16))"
+                .into(),
+        ] {
+            assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// The bounds that step 28 writes as numbers in its SQL are those of
+    /// protocol.rs (decision 2026-10-10 §2.1, §2.3, §6.3): a card of one
+    /// relay and of two, a name at its longest, a revision kept below the
+    /// half of band 0, and a message's highest number.
+    #[test]
+    fn step_27s_bounds_are_those_of_protocol_rs() {
+        use cordelia_core::protocol::{
+            AGENT_MESSAGE_NAME_MAX_BYTES, AGENT_MESSAGE_NUMBER_MAX, REV_BAND_HALF,
+            SHARED_MAX_RELAYS, SHARED_SEED_BYTES,
+        };
+        let count = |text: &str| MIGRATION_V28.matches(text).count();
+        let card = |relays: usize| SHARED_SEED_BYTES + 1 + 32 * relays;
+        assert_eq!(SHARED_MAX_RELAYS, 2);
+        assert_eq!(
+            count(&format!("length(card) IN ({}, {}))", card(1), card(2))),
+            1
+        );
+        assert_eq!(
+            count(&format!(
+                "length(CAST(name AS BLOB)) <= {AGENT_MESSAGE_NAME_MAX_BYTES})"
+            )),
+            1
+        );
+        assert_eq!(count(&format!("_rev < {REV_BAND_HALF}))")), 2);
+        assert_eq!(count(&REV_BAND_HALF.to_string()), 2);
+        assert_eq!(count(&format!("number <= {AGENT_MESSAGE_NUMBER_MAX})")), 2);
+        assert_eq!(count(&format!("highest <= {AGENT_MESSAGE_NUMBER_MAX})")), 1);
+    }
+
+    /// The bounds that step 27 writes as numbers in its SQL are those of
+    /// protocol.rs (decision 2026-10-10 §3.4): a list's value at every
+    /// bound and an empty list, a revision's most, and the last statement.
+    #[test]
+    fn the_bounds_of_step_27_are_those_of_protocol_rs() {
+        use cordelia_core::protocol::{MAX_REV, MAX_STATEMENT_NUMBER, SHARED_LIST_MAX_VALUE_BYTES};
+        let count = |text: &str| MIGRATION_V27.matches(text).count();
+        assert_eq!(
+            count(&format!("length(list) <= {SHARED_LIST_MAX_VALUE_BYTES})")),
+            1
+        );
+        assert_eq!(count(&SHARED_LIST_MAX_VALUE_BYTES.to_string()), 1);
+        // An empty list: its form and four counts of nothing.
+        assert_eq!(count("length(list) >= 5 "), 1);
+        assert_eq!(count(&format!("rev <= {MAX_REV})")), 1);
+        assert_eq!(count(&format!("generation <= {MAX_STATEMENT_NUMBER})")), 1);
+    }
+
     /// A database that is stepped from any version has what every later
     /// step makes: each step runs, and sets its own version and no later
     /// one. (A step that set the next one's version would leave the next
@@ -6060,7 +7803,7 @@ mod tests {
             .unwrap()
                 == 1
         };
-        let from: [(u32, Connection); 14] = [
+        let from: [(u32, Connection); 15] = [
             (0, Connection::open_in_memory().unwrap()),
             (8, at_v8()),
             (10, at_v10()),
@@ -6075,6 +7818,7 @@ mod tests {
             (19, at_v19()),
             (20, at_v20()),
             (21, at_v21()),
+            (26, at_v26()),
         ];
         for (at, conn) in from {
             assert_eq!(version(&conn), at);
@@ -6131,6 +7875,13 @@ mod tests {
             ] {
                 assert!(conn.prepare(gone).is_err(), "from version {at}: {gone}");
             }
+            // Steps 27 to 32: the shared channels' (decision 2026-10-10 §14).
+            assert_eq!(new_in_v27(&conn), NEW_IN_V27, "from version {at}");
+            assert_eq!(new_in_v28(&conn), NEW_IN_V28, "from version {at}");
+            assert_eq!(new_in_v29(&conn), NEW_IN_V29, "from version {at}");
+            assert_eq!(new_in_v30(&conn), NEW_IN_V30, "from version {at}");
+            assert_eq!(new_in_v31(&conn), NEW_IN_V31, "from version {at}");
+            assert!(table_of(&conn, "shared_anew_made"), "from version {at}");
         }
     }
 

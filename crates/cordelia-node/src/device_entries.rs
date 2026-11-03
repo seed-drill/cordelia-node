@@ -102,6 +102,24 @@
 //! and it marks nothing as sent. It reads round by round, as it is
 //! asked, outside the database's lock.
 //!
+//! ## The pass of shared channels
+//!
+//! A shared channel (decision 2026-10-10 §8.4) has a pass of its own, at
+//! each relay after the turn of the device's own channels there, through
+//! doors of their own ([`Leave::shared`], [`Leave::share_pair`]), with no
+//! show and no leave, on a device that stands applied with sync on. It
+//! goes through the shared channels whose card names the relay by a key
+//! that the device's configuration knows it by, and nothing else: at a
+//! whole pass a proof of each, after every channel of the device's own,
+//! and pages in turn; at every pass a push of what waits. It counts its
+//! requests against a counter of its own, the bytes a relay hands it
+//! against a quarter of what a relay hands a connection, and what it
+//! pushes against a quarter of what a device pushes, each beside the
+//! device's whole count: so the device's own channels always have three
+//! quarters. Nothing it is refused sets the status. A whole pass also
+//! begins the reads again from the start that are due, and ends in steps
+//! every take-out of shared entries that is begun.
+//!
 //! ## What it keeps
 //!
 //! In its database, for each relay and channel: its place there, and how
@@ -131,12 +149,13 @@ use cordelia_api::at_relays::{
     Which,
 };
 use cordelia_api::person::{PersonError, Shown};
+use cordelia_api::sharing::{self, Became, OwnRelay};
 use cordelia_api::state::{
     AppState, AtRelay, AtRelays, Came, CannotGoOn, DoorAsk, Holds, LeftAt, LeftPlace, LeftRead,
     NoRoom, ProvedBy, RefusedOf,
 };
 use cordelia_api::take::Taken;
-use cordelia_api::{marks, sender};
+use cordelia_api::{marks, sender, shared_pass};
 use cordelia_core::load::Kind as TakeKind;
 use cordelia_core::lock::{LockWhole, take_as, taking};
 use cordelia_core::protocol::{
@@ -144,8 +163,8 @@ use cordelia_core::protocol::{
     ENTRY_PAGE_MAX_ENTRIES, ENTRY_WIRE_OVERHEAD_BYTES, MAX_CHANGE_HEADS,
     MAX_CHANNELS_PROVED_ON_A_CONNECTION, MAX_ITEM_BYTES, OUTBOX_BYTES_PER_MINUTE,
     OUTBOX_FLUSH_INTERVAL_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS, PUSH_BYTES_PER_PEER_PER_MINUTE,
-    RELAY_ENTRY_PULL_PAGES, SHOW_ANSWER_ROOM_BYTES, SMALL_PAGE_BYTES, entry_cost,
-    left_proofs_kept_back,
+    RELAY_ENTRY_PULL_PAGES, SHARED_BYTES_PER_MINUTE, SHARED_PUSH_BYTES_PER_MINUTE,
+    SHOW_ANSWER_ROOM_BYTES, SMALL_PAGE_BYTES, entry_cost, left_proofs_kept_back,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry};
 use cordelia_network::messages::{
@@ -160,6 +179,7 @@ use rusqlite::Connection;
 
 pub use leave::{
     Asked, Clock, Leave, LeftPage, LeftRefused, Link, LinkId, NoLeave, PairRead, Refused,
+    SharePairRead, SharedAsk, SharedDone, SharedRefused,
 };
 pub use reach::{Reach, Said};
 
@@ -304,6 +324,29 @@ pub struct Counts {
     pub pushes: u64,
     /// Entries of those pushes.
     pub pushed: u64,
+}
+
+/// What the shared pass has asked of one relay since the node started
+/// (decision 2026-10-10 §8.4), for tests: its own, apart from [`Counts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SharedCounts {
+    /// Proofs of shared channels that were answered.
+    pub proofs: u64,
+    /// Pages of shared channels that were taken.
+    pub pages: u64,
+    /// Entries of those pages.
+    pub pulled: u64,
+    /// What the relay handed in those pages, as it counts it.
+    pub handed: u64,
+    /// Pushes that were answered.
+    pub pushes: u64,
+    /// Entries of those pushes.
+    pub pushed: u64,
+    /// Entries of those pushes that the relay refused for room or for the
+    /// address's allowance: they wait for a later pass.
+    pub refused: u64,
+    /// Requests the shared pass did not ask, its counter being spent.
+    pub asked_enough: u64,
 }
 
 /// Where a pass asks: a connection to a relay, and what the change entry
@@ -457,6 +500,19 @@ struct OfRelay {
     /// What it handed in pages in the last minute: a device takes from
     /// one relay no more than a relay may hand a connection.
     taken: Option<ByteCounter>,
+    /// Of that, what it handed the shared pass: a quarter of what a relay
+    /// may hand a connection (decision 2026-10-10 §8.4).
+    shared_taken: Option<ByteCounter>,
+    /// Of what was pushed to it, what the shared pass pushed: a quarter of
+    /// what a device pushes (§8.4).
+    shared_sent: Option<ByteCounter>,
+    /// The shared channel at which the next pass begins its pages here:
+    /// where the last one stopped (§8.4, channels in turn).
+    shared_next: Option<[u8; 32]>,
+    /// The shared channel at which the next pass begins its pushes here:
+    /// the one after the channel that last pushed (§8.4, channels in turn).
+    shared_push_next: Option<[u8; 32]>,
+    shared: SharedCounts,
 }
 
 /// What became of the shows of one round at a relay.
@@ -627,6 +683,26 @@ impl DeviceEntries {
         &self.leave
     }
 
+    /// What the shared pass has asked of the relay called `relay` since
+    /// the node started.
+    pub fn shared_counts(&self, relay: &str) -> SharedCounts {
+        lock(&self.kept)
+            .relays
+            .get(relay)
+            .map(|of| of.shared)
+            .unwrap_or_default()
+    }
+
+    /// What the relay called `relay` handed the device in pages in the last
+    /// minute, and what the device pushed to it, as each is counted: the
+    /// device's whole counts, what the shared pass took and pushed among
+    /// them (decision 2026-10-10 §8.4). For tests and a status.
+    pub fn in_the_last_minute(&self, relay: &str) -> (u64, u64) {
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(relay.to_string()).or_default();
+        (taken_from(of).total(), paced(of).total())
+    }
+
     /// What the device has asked of the relay called `relay` since the
     /// node started.
     pub fn counts(&self, relay: &str) -> Counts {
@@ -675,6 +751,19 @@ impl DeviceEntries {
         }
         let whole = kind == Pass::Whole;
         let number = whole.then(|| self.state.own_channels.whole_pass_begins());
+        if whole {
+            // Off the runtime's threads: a take-out of many keys is many
+            // steps, each a short hold of the lock, and the turns wait for
+            // them all. Its takes of the lock are of the pass.
+            let engine = Arc::clone(self);
+            let before = tokio::task::spawn_blocking(move || {
+                let _pass = taking(TakeKind::Pass);
+                engine.shared_before_turns();
+            });
+            if let Err(e) = before.await {
+                tracing::warn!(error = %e, "the shared channels' work before a pass failed");
+            }
+        }
         let links: Vec<&Link> = relays
             .iter()
             .filter_map(|relay| relay.link.as_ref())
@@ -692,8 +781,37 @@ impl DeviceEntries {
                     engine.asks_for_hand_overs(&link, &typed).await
                 }));
             }
+            // The keys typed for a channel are read at every relay of the
+            // device's own by key, one after another, so that the shares
+            // found at each are judged together (decision 2026-10-10 §3.2).
+            let typed = sharing::keys_that_read(&lock(&self.state.db), self.unix());
+            let typed = typed.unwrap_or_default();
+            if !typed.is_empty() {
+                let engine = Arc::clone(self);
+                let links: Vec<Link> = links.iter().map(|link| (*link).clone()).collect();
+                asking.spawn(take_as(TakeKind::Pass, async move {
+                    engine.asks_for_shares(&links, &typed).await
+                }));
+            }
         }
         let read_all = self.pass_at(relays, &links, kind).await;
+        // At a whole fetch of the device's own channels, the personal
+        // channel's among them, the device works out the person's lists of
+        // shared channels again, and writes its own where it differs
+        // (decision 2026-10-10 §3.4, "what a device writes").
+        if whole && read_all {
+            let now = self.unix();
+            let followed = cordelia_api::lists::fetched_whole(
+                &lock(&self.state.db),
+                &self.state.identity,
+                now,
+            );
+            match followed {
+                Ok(true) => self.state.own_channels.written(),
+                Ok(false) => {}
+                Err(e) => tracing::debug!(error = %e, "could not work the shared lists out"),
+            }
+        }
         self.say_no_place(&links);
         self.taken_everywhere(relays);
         let mut taken = false;
@@ -1062,13 +1180,20 @@ impl DeviceEntries {
     fn room_for_left(&self, link: &Link, channel: &[u8; 32]) -> bool {
         let own = at_relays::channels(&lock(&self.state.db), &self.state.identity);
         let own = own.unwrap_or_default();
+        let shared = self.shared_at(link);
         let kept = lock(&self.kept);
         let none = HashMap::new();
         let proved = kept.links.get(&link.id()).map_or(&none, |of| &of.proved);
         if proved.contains_key(channel) {
             return true;
         }
-        let not_proved = own.iter().filter(|own| !proved.contains_key(&own.id));
+        // A shared channel that lives at this relay is one the device still
+        // proves: it keeps its place back too (decision 2026-10-10 §8.4).
+        let not_proved = own
+            .iter()
+            .map(|own| own.id)
+            .chain(shared)
+            .filter(|channel| !proved.contains_key(channel));
         let kept_back = left_proofs_kept_back(not_proved.count(), self.most_proved);
         proved.len() + kept_back < self.most_proved
     }
@@ -1511,10 +1636,16 @@ impl DeviceEntries {
         // that a pass goes through. And one that wakes while this turn
         // runs has no leave from then on, anywhere: the one way in
         // refuses what the turn asks.)
-        if whole && gave_leave != Some(true) {
-            return false;
-        }
-        self.relay_pass(link, kind).await
+        let read_all = match whole && gave_leave != Some(true) {
+            true => false,
+            false => self.relay_pass(link, kind).await,
+        };
+        // The shared channels have their pass at each relay after the turn
+        // of the device's own there, through doors of their own, with no
+        // show and no leave (decision 2026-10-10 §8.4): a shared channel
+        // holds nothing of the device's own up.
+        self.shared_pass(link, kind).await;
+        read_all
     }
 
     /// A closed device's turn at `link`: it pushes the delete it wrote
@@ -1653,6 +1784,57 @@ impl DeviceEntries {
             }
             Err(e) => tracing::warn!(error = %e, "could not drop the messages that went"),
         }
+        drop(db);
+        // The device's own messages in shared channels whose 30 days are up
+        // are cleared there (decision 2026-10-10 §6.1).
+        let fetched = cordelia_api::shared_sender::fetched_of(&self.state, self.clock.now());
+        let db = lock(&self.state.db);
+        match cordelia_api::shared_sender::clear_expired(&db, identity, now, &fetched) {
+            Ok(0) => {}
+            Ok(cleared) => {
+                tracing::info!(cleared, "shared messages whose 30 days are up were cleared")
+            }
+            Err(e) => tracing::warn!(error = %e, "could not clear shared messages"),
+        }
+        drop(db);
+        // What the hourly task began to take out of the shared channels
+        // (quiet keys) goes in steps, each under a hold of the lock of its
+        // own, of the hourly task's kind (decision 2026-10-10 §6.3, §8.4).
+        self.take_out_in_steps(now);
+    }
+
+    /// End every take-out of shared channels' entries that is begun and not
+    /// ended, in steps of one key's entries, each under a hold of the lock
+    /// of its own (decision 2026-10-10 §6.3; §19, item 19): a drop, a move,
+    /// a key that stopped being known, a quiet key, and one that a stop cut
+    /// short. A node that is held up does nothing.
+    pub fn take_out_in_steps(&self, now: i64) {
+        if self.state.held.why().is_some() {
+            return;
+        }
+        let own = self.state.identity.public_key();
+        match cordelia_api::shared::take_out_in_steps(&self.state.db, &own, now) {
+            Ok(done) => {
+                // A channel is held again only once its take-out has ended:
+                // what was fetched of each whose take-out ended is
+                // forgotten here, after the steps, so that one held again
+                // is fetched again before its first send there (decision
+                // 2026-10-10 §3.4, `not_fetched`). A fetch that a pass
+                // records after this is of the channel as it is now: a
+                // page asked from a place since forgotten keeps no place
+                // and says no end (`shared_pass::take_page`).
+                for channel in &done.ended {
+                    self.state.own_channels.forget_fetched(channel);
+                }
+                if done.steps > 0 {
+                    tracing::info!(
+                        steps = done.steps,
+                        "shared channels' entries were taken out"
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not take shared channels' entries out"),
+        }
     }
 
     /// Write again, each under the next number, the device's own messages
@@ -1759,12 +1941,78 @@ impl DeviceEntries {
         }
     }
 
+    /// Write the device's list of the shared messages its agents read and
+    /// sent, where its table holds a mark that the list lacks (decision
+    /// 2026-10-10 §6.1; [`cordelia_api::shared_messages::write_list`]): only
+    /// once the messages channel was fetched since the node started. Says
+    /// whether it wrote one.
+    ///
+    /// As [`Self::write_person_list`], what decides it is read without
+    /// opening or checking anything first (issue #221).
+    fn write_shared_list(&self) -> bool {
+        let db = lock(&self.state.db);
+        let mut seen = lock(&self.lists_seen);
+        let fetched = |channel: &[u8; 32]| {
+            let now = self.clock.now();
+            self.state.own_channels.first_fetch_done(channel, now)
+        };
+        let identity = &self.state.identity;
+        let written = cordelia_api::shared_messages::write_list_where_changed(
+            &db,
+            identity,
+            self.unix(),
+            fetched,
+            &mut seen,
+        );
+        match written {
+            Ok(written) => written.is_some(),
+            Err(e) => {
+                tracing::debug!(error = %e, "could not write the list of shared marks");
+                false
+            }
+        }
+    }
+
+    /// Write again, each under the next number, the device's own messages in
+    /// shared channels that wait to be sent again (decision 2026-10-10 §6.1,
+    /// §6.4; [`cordelia_api::shared_sender::write_again`]): only in a channel
+    /// fetched since the node started, each counted in its channel's hour
+    /// alone.
+    fn shared_write_again(&self) {
+        let fetched = cordelia_api::shared_sender::fetched_of(&self.state, self.clock.now());
+        let db = lock(&self.state.db);
+        let identity = &self.state.identity;
+        if let Err(e) =
+            cordelia_api::shared_sender::write_again(&db, identity, self.unix(), &fetched)
+        {
+            tracing::debug!(error = %e, "could not send shared messages again");
+        }
+    }
+
+    /// On the machine of a recovery, make anew each shared channel it owes
+    /// that, once it was read since the node started (decision 2026-10-10
+    /// §3.5; [`cordelia_api::shared_anew::make_owed`]): so that every key
+    /// of its table stays.
+    fn shared_make_owed(&self) {
+        let fetched = cordelia_api::shared_sender::fetched_of(&self.state, self.clock.now());
+        let db = lock(&self.state.db);
+        match cordelia_api::shared_anew::make_owed(&db, &self.state.identity, self.unix(), &fetched)
+        {
+            Ok(0) => {}
+            Ok(made) => {
+                tracing::info!(made, "made shared channels anew after a recovery");
+                self.state.own_channels.written();
+            }
+            Err(e) => tracing::debug!(error = %e, "could not make a shared channel anew"),
+        }
+    }
+
     /// Read once the lists of a person's reads and of bounds that the store
     /// held from before step 20 (decision 2026-10-25, rule 1;
     /// [`cordelia_api::reader::read_held_lists`]): at the first pass at
     /// which the device stands applied, where the start did not.
-    /// Once they are known to be read, a pass does nothing here, and takes
-    /// no lock (issue #221).
+    /// And the `sread/` lists held from before step 31. Once both are known
+    /// to be read, a pass does nothing here, and takes no lock (issue #221).
     fn read_held_lists(&self) {
         if self.held_lists_read.load(Ordering::Relaxed) {
             return;
@@ -1775,7 +2023,19 @@ impl DeviceEntries {
             Ok(false) => {}
             Err(e) => tracing::warn!(error = %e, "could not read the lists of messages held"),
         }
-        if cordelia_api::reader::held_lists_were_read(&db) {
+        // And the `sread/` lists held from before step 31 (decision
+        // 2026-10-10 §14).
+        let read =
+            cordelia_api::reader::read_held_shared_lists(&db, &self.state.identity, self.unix());
+        match read {
+            Ok(true) => tracing::info!("read the lists of shared marks held from before"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!(error = %e, "could not read the lists of shared marks held"),
+        }
+        // Only once both are read does a pass stop asking (issue #221).
+        if cordelia_api::reader::held_lists_were_read(&db)
+            && cordelia_api::reader::held_shared_lists_were_read(&db)
+        {
             self.held_lists_read.store(true, Ordering::Relaxed);
         }
     }
@@ -2761,11 +3021,14 @@ impl DeviceEntries {
             if messages {
                 self.read_held_lists();
             }
+            // And its list of shared marks, `sread/`, by the same rules
+            // (decision 2026-10-10 §6.1).
             if messages
                 && (self.write_again()
                     | self.write_list()
                     | self.write_person_list()
-                    | self.write_bounds_list())
+                    | self.write_bounds_list()
+                    | self.write_shared_list())
             {
                 sent = match self.push(&at, channel, Which::Since).await {
                     Step::Done(sent) => sent,
@@ -3011,13 +3274,18 @@ impl DeviceEntries {
         let Ok(listed) = at_relays::listed(&lock(&self.state.db), self.most_proved) else {
             return Remade::No;
         };
+        // A shared channel is one that the device still proves (decision
+        // 2026-10-10 §8.4).
+        let shared = shared_pass::held(&lock(&self.state.db)).unwrap_or_default();
         let (answer, answered) = tokio::sync::oneshot::channel();
         let left = {
             let mut kept = lock(&self.kept);
             let Some(of) = kept.links.get_mut(&link.id()) else {
                 return Remade::No;
             };
-            let proves = |channel: &[u8; 32]| own.iter().chain(&listed).any(|o| o.id == *channel);
+            let proves = |channel: &[u8; 32]| {
+                own.iter().chain(&listed).any(|o| o.id == *channel) || shared.contains(channel)
+            };
             let left = of.proved.keys().filter(|channel| !proves(channel)).count();
             if left > 0 {
                 of.made_again = Some(MadeAgain {
@@ -3556,6 +3824,615 @@ impl DeviceEntries {
         left.wait.until = now + refused_wait(left.wait.refusals);
     }
 
+    // ── The pass of shared channels ─────────────────────────────────
+
+    /// What a whole pass does of the shared channels before the turns at
+    /// its relays (decision 2026-10-10 §6.3, §8.4): the reads again from
+    /// the start that may begin now begin (once a day for each channel at
+    /// most), and every take-out begun is ended in steps, each under a
+    /// hold of the lock of its own.
+    fn shared_before_turns(&self) {
+        let now = self.unix();
+        let begun = shared_pass::begin_reads_again(&lock(&self.state.db), now);
+        match begun {
+            Ok(begun) if !begun.is_empty() => tracing::debug!(
+                channels = begun.len(),
+                "shared channels are read again from their start"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::debug!(error = %e, "could not begin a read again"),
+        }
+        {
+            // A share is kept two hours, and then written over (decision
+            // 2026-10-10 §3.1); a channel the device comes to hold has its
+            // empty anew record written (§6.1, §7).
+            let conn = lock(&self.state.db);
+            let identity = &self.state.identity;
+            if let Err(e) = sharing::drop_old_shares(&conn, identity, now) {
+                tracing::debug!(error = %e, "could not write over old shares");
+            }
+            if let Err(e) = sharing::write_empty_anew_records(&conn, identity, now) {
+                tracing::debug!(error = %e, "could not write an empty anew record");
+            }
+        }
+        self.take_out_in_steps(now);
+    }
+
+    /// The relays the device is set up with that it knows by their keys
+    /// (decision 2026-10-10 §8.2): the only relays of a card that are its
+    /// own.
+    fn own_by_key(&self) -> Vec<OwnRelay> {
+        let mut own: Vec<OwnRelay> = Vec::new();
+        for id in lock(&self.set_up).iter() {
+            if let Some(key) = id.key
+                && !own.iter().any(|one| one.key == key)
+            {
+                own.push(OwnRelay {
+                    name: id.name.clone(),
+                    key,
+                });
+            }
+        }
+        own
+    }
+
+    /// Whether the relay of `link` is one the device knows by the key that
+    /// answered there (decision 2026-10-10 §8.2).
+    fn is_own_by_key(&self, link: &Link) -> bool {
+        self.id_of(link).key == Some(link.relay().0)
+    }
+
+    /// Ask, at each relay of `links` that is the device's own by key, the
+    /// share pair channel of each key in `typed`, through its one door
+    /// ([`Leave::share_pair`]), and take the one share found of each key
+    /// where there is one (decision 2026-10-10 §3.2, §8.4). What each relay
+    /// hands is counted in the device's whole count and in the shared
+    /// pass's quarter, each page asked with a `limit` sized to that quarter;
+    /// a share pair channel is proved only where the connection has room
+    /// for its proof beside every channel of the device's own. Says whether
+    /// a share was taken.
+    async fn asks_for_shares(
+        &self,
+        links: &[Link],
+        typed: &[cordelia_storage::shared_sharing::TypedForChannel],
+    ) -> bool {
+        let identity = &self.state.identity;
+        let largest = entry_cost(MAX_ITEM_BYTES);
+        let own_relays = self.own_by_key();
+        let mut taken = false;
+        for typing in typed {
+            let mut found: Vec<CheckedEntry> = Vec::new();
+            for link in links.iter().filter(|link| self.is_own_by_key(link)) {
+                if !self.room_for_a_share_pair(link, &typing.key) {
+                    continue;
+                }
+                let share = self.shared_room_to_take(link);
+                if !self.room_to_take(link) || share < largest {
+                    continue;
+                }
+                let limit = (share / largest).min(u64::from(ENTRY_PAGE_MAX_ENTRIES));
+                let counted = |handed: u64| {
+                    self.took(link, handed);
+                    let mut kept = lock(&self.kept);
+                    let of = kept.relays.entry(link.name().to_string()).or_default();
+                    shared_taken_from(of).record(handed);
+                };
+                let reads = |conn: &Connection, now: i64| {
+                    sharing::keys_that_read(conn, now).is_ok_and(|keys| {
+                        keys.iter()
+                            .any(|key| key.key == typing.key && key.typed_at == typing.typed_at)
+                    })
+                };
+                let accept = |conn: &Connection, entry: &CheckedEntry, now: i64| {
+                    cordelia_api::shared::accept_typed(
+                        conn,
+                        identity,
+                        &typing.key,
+                        typing.typed_at,
+                        entry,
+                        now,
+                    )
+                    .map_err(|e| e.to_string())
+                };
+                let read = self
+                    .leave
+                    .share_pair(
+                        &self.state,
+                        link,
+                        &typing.key,
+                        u32::try_from(limit).unwrap_or(ENTRY_PAGE_MAX_ENTRIES),
+                        counted,
+                        reads,
+                        accept,
+                    )
+                    .await;
+                match read {
+                    Ok(SharePairRead::Read(judged)) => {
+                        self.share_pair_proved(link, &typing.key);
+                        for judged in judged {
+                            match judged {
+                                cordelia_api::shared::Judged::Share(entry) => found.push(*entry),
+                                cordelia_api::shared::Judged::Not(why) => tracing::debug!(
+                                    relay = link.name(),
+                                    ?why,
+                                    "an entry of a share pair channel is no share to take"
+                                ),
+                            }
+                        }
+                    }
+                    Ok(SharePairRead::NotHeld) => self.share_pair_proved(link, &typing.key),
+                    Ok(SharePairRead::NotNow) => {}
+                    Err(refused) => self.shared_refused(link, &refused),
+                }
+            }
+            let now = self.unix();
+            let became = sharing::take_share(
+                &lock(&self.state.db),
+                identity,
+                typing,
+                &found,
+                &own_relays,
+                now,
+            );
+            match became {
+                Ok(Became::Taken(_)) => {
+                    tracing::info!("a shared channel was taken with a key typed for it");
+                    taken = true;
+                }
+                Ok(Became::Refused(word)) => {
+                    tracing::info!(word, "a share was found and not taken");
+                }
+                Ok(Became::Nothing | Became::NotNow) => {}
+                Err(e) => tracing::warn!(error = %e, "could not take a share"),
+            }
+        }
+        taken
+    }
+
+    /// Whether the connection at `link` has room for the proof of the share
+    /// pair channel of `key` (decision 2026-10-10 §8.4, §19 item 29): one
+    /// proved there already has its place; otherwise a place is kept back for
+    /// each channel of the device's own not yet proved there.
+    fn room_for_a_share_pair(&self, link: &Link, key: &[u8; 32]) -> bool {
+        let Some((pair, _)) = shared_pass::share_pair(&self.state.identity, key) else {
+            return false;
+        };
+        let own: Vec<[u8; 32]> = at_relays::channels(&lock(&self.state.db), &self.state.identity)
+            .unwrap_or_default()
+            .iter()
+            .filter(|own| own.is_pulled())
+            .map(|own| own.id)
+            .collect();
+        let kept = lock(&self.kept);
+        let none = HashMap::new();
+        let proved = kept.links.get(&link.id()).map_or(&none, |of| &of.proved);
+        if proved.contains_key(&pair) {
+            return true;
+        }
+        let own_not_proved = own.iter().filter(|own| !proved.contains_key(*own)).count();
+        proved.len() + own_not_proved < self.most_proved
+    }
+
+    /// The share pair channel of `key` was proved on the connection at
+    /// `link`: it keeps its place among the connection's proofs.
+    fn share_pair_proved(&self, link: &Link, key: &[u8; 32]) {
+        if let Some((pair, _)) = shared_pass::share_pair(&self.state.identity, key) {
+            let now = self.clock.now();
+            lock(&self.kept)
+                .links
+                .entry(link.id())
+                .or_default()
+                .proved
+                .insert(pair, now);
+        }
+    }
+
+    /// Push what waits of the shares this device wrote, and of the deletes
+    /// over them, to the relay at `link` (decision 2026-10-10 §3.1, §8.4):
+    /// only where that relay is the device's own by key and the share's card
+    /// names it; each within what the device pushes to the relay and the
+    /// shared pass's quarter of it, and counted in both. A share the relay
+    /// refused for room waits for a later pass.
+    async fn share_pushes(&self, link: &Link) {
+        if !self.is_own_by_key(link) {
+            return;
+        }
+        let relay = link.relay().0;
+        let waiting = sharing::shares_to_push(&lock(&self.state.db), &self.state.identity, &relay);
+        let waiting = match waiting {
+            Ok(waiting) => waiting,
+            Err(e) => {
+                tracing::debug!(error = %e, "could not read the shares that wait");
+                return;
+            }
+        };
+        for (key, channel, entry) in waiting {
+            let cost = entry_cost(entry.content.len());
+            let Some(whole) = self.room_to_push(link) else {
+                return;
+            };
+            if (whole as u64) < cost || self.shared_room_to_push(link) < cost {
+                return;
+            }
+            {
+                let mut kept = lock(&self.kept);
+                let of = kept.relays.entry(link.name().to_string()).or_default();
+                paced(of).record(cost);
+                shared_sent_to(of).record(cost);
+            }
+            match self
+                .leave
+                .share_pair_push(&self.state, link, &key, &channel, &entry)
+                .await
+            {
+                Ok(Pushed::NoRoom | Pushed::OverAllowance) => {}
+                Ok(_) => {
+                    let answered = sharing::share_pushed(
+                        &lock(&self.state.db),
+                        &key,
+                        &channel,
+                        &relay,
+                        entry.rev,
+                    );
+                    if let Err(e) = answered {
+                        tracing::debug!(error = %e, "could not keep what a relay answered a share");
+                    }
+                }
+                Err(refused) => {
+                    self.shared_refused(link, &refused);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The shared channels that live at the relay of `link`: none where
+    /// the device's configuration does not know that relay by the key that
+    /// answered there (decision 2026-10-10 §8.2), or where it does not
+    /// stand applied with sync on.
+    fn shared_at(&self, link: &Link) -> Vec<[u8; 32]> {
+        let key = link.relay().0;
+        if self.id_of(link).key != Some(key) {
+            return Vec::new();
+        }
+        shared_pass::at_relay(&lock(&self.state.db), &key).unwrap_or_default()
+    }
+
+    /// The pass of shared channels at the relay of `link` (decision
+    /// 2026-10-10 §8.4), after the turn of the device's own channels there,
+    /// through the door of their own ([`Leave::shared`]):
+    ///
+    /// - **At a whole pass,** for each shared channel that lives there: a
+    ///   proof, where it is not proved on the connection or was a day ago,
+    ///   and only where the connection has room for it beside every
+    ///   channel of the device's own; then pages, in turn, one for each
+    ///   channel at a time, each pass starting where the last one stopped,
+    ///   up to RELAY_ENTRY_PULL_PAGES for each, while each gets somewhere
+    ///   and while both byte counts have room ([`Self::shared_pages`]).
+    /// - **At every pass,** a push of what waits there, within both what
+    ///   the device pushes and the shared pass's quarter of it
+    ///   ([`Self::shared_pushes`]).
+    ///
+    /// Past its counter of requests, or where the relay does not answer,
+    /// it stops at that relay until the next pass; what it did not ask
+    /// waits. Nothing it is refused sets the status (§9).
+    async fn shared_pass(&self, link: &Link, kind: Pass) {
+        self.share_pushes(link).await;
+        // A shared message that waits to be sent again is written again
+        // under the next number before the pushes (decision 2026-10-10
+        // §6.1).
+        self.shared_write_again();
+        let channels = self.shared_at(link);
+        if channels.is_empty() && self.shared_delivering_at(link).is_empty() {
+            return;
+        }
+        if kind == Pass::Whole {
+            let own: Vec<[u8; 32]> =
+                at_relays::channels(&lock(&self.state.db), &self.state.identity)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|own| own.is_pulled())
+                    .map(|own| own.id)
+                    .collect();
+            let mut proved = Vec::with_capacity(channels.len());
+            for channel in &channels {
+                match self.shared_prove(link, channel, &own).await {
+                    Some(true) => proved.push(*channel),
+                    Some(false) => {}
+                    None => return,
+                }
+            }
+            if !self.shared_pages(link, &proved).await {
+                return;
+            }
+            self.shared_make_owed();
+        }
+        // A channel moved from whose offer waits to be at this relay is
+        // pushed there, its offer alone (decision 2026-10-10 §7).
+        let mut pushed = channels.clone();
+        pushed.extend(self.shared_delivering_at(link));
+        self.shared_pushes(link, &pushed).await;
+    }
+
+    /// The shared channels moved from whose offer waits to be at the relay
+    /// of `link`, known there by its key.
+    fn shared_delivering_at(&self, link: &Link) -> Vec<[u8; 32]> {
+        let key = link.relay().0;
+        if self.id_of(link).key != Some(key) {
+            return Vec::new();
+        }
+        shared_pass::delivering_at(&lock(&self.state.db), &key).unwrap_or_default()
+    }
+
+    /// Prove the key of the shared channel `channel` at `link`, where it was
+    /// not proved there within the day (decision 2026-10-10 §8.4). **Shared
+    /// channels are proved after every channel of the device's own** (`own`,
+    /// those it pulls): a proof's place is not taken from one of those that
+    /// is not yet proved on the connection. Says whether the channel may be
+    /// pulled there: `Some(false)` where it has no room for its proof, or
+    /// the door refused it; `None` where the pass at this relay stops.
+    async fn shared_prove(
+        &self,
+        link: &Link,
+        channel: &[u8; 32],
+        own: &[[u8; 32]],
+    ) -> Option<bool> {
+        let now = self.clock.now();
+        {
+            let kept = lock(&self.kept);
+            let none = HashMap::new();
+            let proved = kept.links.get(&link.id()).map_or(&none, |of| &of.proved);
+            let lately = proved
+                .get(channel)
+                .is_some_and(|at| now.saturating_duration_since(*at) < PROOF_AGAIN);
+            if lately {
+                return Some(true);
+            }
+            let own_not_proved = own.iter().filter(|own| !proved.contains_key(*own)).count();
+            if !proved.contains_key(channel) && proved.len() + own_not_proved >= self.most_proved {
+                tracing::debug!(
+                    relay = link.name(),
+                    "a shared channel is not proved: no room for more proofs on the connection"
+                );
+                // Said in the status's `shared` object (§8.4, §9).
+                self.state
+                    .own_channels
+                    .say_no_proof_room(channel, &link.relay().0, true);
+                return Some(false);
+            }
+        }
+        self.state
+            .own_channels
+            .say_no_proof_room(channel, &link.relay().0, false);
+        let done = self
+            .leave
+            .shared(&self.state, link, channel, SharedAsk::Prove, |_| ())
+            .await;
+        match done {
+            Ok(SharedDone::Proved(_)) => {
+                let mut kept = lock(&self.kept);
+                kept.links
+                    .entry(link.id())
+                    .or_default()
+                    .proved
+                    .insert(*channel, now);
+                kept.relays
+                    .entry(link.name().to_string())
+                    .or_default()
+                    .shared
+                    .proofs += 1;
+                Some(true)
+            }
+            Ok(_) | Err(SharedRefused::NotUsable(_)) => Some(false),
+            Err(refused) => {
+                self.shared_refused(link, &refused);
+                None
+            }
+        }
+    }
+
+    /// Pull pages of `channels` at `link`, in turn (decision 2026-10-10
+    /// §8.4): one page of each channel at a time, starting where the last
+    /// pass stopped, so that between two pages of one channel each other is
+    /// asked for at most one. A channel is read until a page holds nothing
+    /// or gets nowhere, or RELAY_ENTRY_PULL_PAGES pages were read. **A page
+    /// waits on the share:** it is asked only where what the relay handed in
+    /// the last minute leaves room as `room_to_take` asks it, and the shared
+    /// pass's quarter has room for one entry of the largest size; and it is
+    /// asked with a `limit` of no more entries of that size than the quarter
+    /// has room for. Where a page waits, the next pass begins with its
+    /// channel. Says whether the pass at this relay goes on.
+    async fn shared_pages(&self, link: &Link, channels: &[[u8; 32]]) -> bool {
+        let largest = entry_cost(MAX_ITEM_BYTES);
+        let order = self.shared_order(link, channels);
+        let mut pages: HashMap<[u8; 32], usize> = HashMap::new();
+        let mut read: HashSet<[u8; 32]> = HashSet::new();
+        loop {
+            let mut asked = false;
+            for channel in &order {
+                if read.contains(channel) {
+                    continue;
+                }
+                let share = self.shared_room_to_take(link);
+                if !self.room_to_take(link) || share < largest {
+                    self.shared_waits_at(link, Some(*channel));
+                    return true;
+                }
+                let limit = (share / largest).min(u64::from(ENTRY_PAGE_MAX_ENTRIES));
+                let ask = SharedAsk::Pull {
+                    limit: u32::try_from(limit).unwrap_or(ENTRY_PAGE_MAX_ENTRIES),
+                };
+                let counted = |handed: u64| {
+                    self.took(link, handed);
+                    let mut kept = lock(&self.kept);
+                    let of = kept.relays.entry(link.name().to_string()).or_default();
+                    shared_taken_from(of).record(handed);
+                };
+                let done = self
+                    .leave
+                    .shared(&self.state, link, channel, ask, counted)
+                    .await;
+                asked = true;
+                match done {
+                    Ok(SharedDone::Page {
+                        entries,
+                        handed,
+                        got_somewhere,
+                        end,
+                    }) => {
+                        let mut kept = lock(&self.kept);
+                        let of = kept.relays.entry(link.name().to_string()).or_default();
+                        of.shared.pages += 1;
+                        of.shared.pulled += entries as u64;
+                        of.shared.handed += handed;
+                        let read_here = pages.entry(*channel).or_default();
+                        *read_here += 1;
+                        // Read to its end at this relay: a device writes in a
+                        // shared channel only once it has read it there since
+                        // it started (decision 2026-10-10 §6.1, `not_fetched`).
+                        if end {
+                            self.state.own_channels.fetched_from(
+                                channel,
+                                link.name(),
+                                self.clock.now(),
+                            );
+                        }
+                        if end || !got_somewhere || *read_here >= RELAY_ENTRY_PULL_PAGES {
+                            read.insert(*channel);
+                        }
+                    }
+                    Ok(_) | Err(SharedRefused::NotUsable(_)) => {
+                        read.insert(*channel);
+                    }
+                    Err(refused) => {
+                        self.shared_refused(link, &refused);
+                        self.shared_waits_at(link, Some(*channel));
+                        return false;
+                    }
+                }
+            }
+            if !asked {
+                break;
+            }
+        }
+        self.shared_waits_at(link, None);
+        true
+    }
+
+    /// `channels` in the order the next pages are asked in at `link`: from
+    /// the channel where the last pass stopped, and round.
+    fn shared_order(&self, link: &Link, channels: &[[u8; 32]]) -> Vec<[u8; 32]> {
+        let next = lock(&self.kept)
+            .relays
+            .get(link.name())
+            .and_then(|of| of.shared_next);
+        in_turn(channels, next)
+    }
+
+    /// The next pass at `link` begins its pages with `channel`: where this
+    /// one stopped. `None` where it read every channel it could.
+    fn shared_waits_at(&self, link: &Link, channel: Option<[u8; 32]>) {
+        let mut kept = lock(&self.kept);
+        kept.relays
+            .entry(link.name().to_string())
+            .or_default()
+            .shared_next = channel;
+    }
+
+    /// Push what waits in each of `channels` at `link` (decision 2026-10-10
+    /// §8.4): each push within what the device pushes to the relay
+    /// (`room_to_push`, which counts it) and within the shared pass's
+    /// quarter of it. A push refused for room, or past either, waits for a
+    /// later pass. **The channels push in turn:** a pass begins with the
+    /// channel after the one that last pushed there, so that one channel
+    /// that a relay refuses for room, pushed again at every pass, does not
+    /// come first in each and take the quarter from the others.
+    async fn shared_pushes(&self, link: &Link, channels: &[[u8; 32]]) {
+        let next = lock(&self.kept)
+            .relays
+            .get(link.name())
+            .and_then(|of| of.shared_push_next);
+        for channel in &in_turn(channels, next) {
+            loop {
+                let Some(whole) = self.room_to_push(link) else {
+                    return;
+                };
+                let share = self.shared_room_to_push(link);
+                let most = Most {
+                    entries: ENTRY_PAGE_MAX_ENTRIES as usize,
+                    bytes: whole.min(usize::try_from(share).unwrap_or(usize::MAX)),
+                };
+                let counted = |cost: u64| {
+                    let mut kept = lock(&self.kept);
+                    let of = kept.relays.entry(link.name().to_string()).or_default();
+                    paced(of).record(cost);
+                    shared_sent_to(of).record(cost);
+                };
+                let done = self
+                    .leave
+                    .shared(
+                        &self.state,
+                        link,
+                        channel,
+                        SharedAsk::Push { most },
+                        counted,
+                    )
+                    .await;
+                match done {
+                    Ok(SharedDone::Pushed { sent, refused, .. }) => {
+                        let mut kept = lock(&self.kept);
+                        let of = kept.relays.entry(link.name().to_string()).or_default();
+                        let at = channels.iter().position(|one| one == channel);
+                        of.shared_push_next = at.map(|at| channels[(at + 1) % channels.len()]);
+                        of.shared.pushes += 1;
+                        of.shared.pushed += sent as u64;
+                        of.shared.refused += refused as u64;
+                        if refused > 0 {
+                            break;
+                        }
+                    }
+                    Ok(_) | Err(SharedRefused::NotUsable(_)) => break,
+                    Err(refused) => {
+                        self.shared_refused(link, &refused);
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    /// What the shared pass may still be handed by the relay at `link` in
+    /// this minute: its quarter, less what it was handed in the last one.
+    fn shared_room_to_take(&self, link: &Link) -> u64 {
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(link.name().to_string()).or_default();
+        shared_taken_from(of).room()
+    }
+
+    /// What the shared pass may still push to the relay at `link` in this
+    /// minute: its quarter, less what it pushed in the last one.
+    fn shared_room_to_push(&self, link: &Link) -> u64 {
+        let mut kept = lock(&self.kept);
+        let of = kept.relays.entry(link.name().to_string()).or_default();
+        shared_sent_to(of).room()
+    }
+
+    /// The shared pass stopped at `link` for `refused`: past its counter of
+    /// requests, that is counted; otherwise it is said in the log.
+    fn shared_refused(&self, link: &Link, refused: &SharedRefused) {
+        if *refused == SharedRefused::AskedEnough {
+            let mut kept = lock(&self.kept);
+            let of = kept.relays.entry(link.name().to_string()).or_default();
+            of.shared.asked_enough += 1;
+            return;
+        }
+        tracing::debug!(
+            relay = link.name(),
+            ?refused,
+            "the shared pass stops at a relay"
+        );
+    }
+
     // ── What is kept, and what is said ──────────────────────────────
 
     /// Forget what was kept of each connection that is gone: a proof, and
@@ -3752,6 +4629,21 @@ fn taken_from(of: &mut OfRelay) -> &mut ByteCounter {
     })
 }
 
+/// What a relay has handed the shared pass in the last minute, within its
+/// quarter of what a relay may hand a connection (decision 2026-10-10 §8.4).
+fn shared_taken_from(of: &mut OfRelay) -> &mut ByteCounter {
+    of.shared_taken
+        .get_or_insert_with(|| ByteCounter::new(Duration::from_secs(60), SHARED_BYTES_PER_MINUTE))
+}
+
+/// What the shared pass has pushed to a relay in the last minute, within
+/// its quarter of what a device pushes (decision 2026-10-10 §8.4).
+fn shared_sent_to(of: &mut OfRelay) -> &mut ByteCounter {
+    of.shared_sent.get_or_insert_with(|| {
+        ByteCounter::new(Duration::from_secs(60), SHARED_PUSH_BYTES_PER_MINUTE)
+    })
+}
+
 /// What a refusal of an entry of a channel of `kind` is kept as (decision
 /// 2026-10-19 §2, rule 6): which channel it was, as the device knows its
 /// channels. None for the messages channel, which sets no hold and
@@ -3796,6 +4688,19 @@ fn still_of_use(part: &Part, set_up: Option<&[[u8; 32]]>, own: &[[u8; 32]]) -> b
 /// a row, and a show after the `refusals`-th in a row that got no leave:
 /// the time between two sends, doubled each time, up to
 /// OUTBOX_REFUSED_RETRY_MAX_SECS.
+/// `channels` from `next`, and round: all of them from the first where
+/// `next` is none of them.
+fn in_turn(channels: &[[u8; 32]], next: Option<[u8; 32]>) -> Vec<[u8; 32]> {
+    let start = next
+        .and_then(|next| channels.iter().position(|channel| *channel == next))
+        .unwrap_or(0);
+    channels[start..]
+        .iter()
+        .chain(&channels[..start])
+        .copied()
+        .collect()
+}
+
 fn refused_wait(refusals: u32) -> Duration {
     let secs = OUTBOX_FLUSH_INTERVAL_SECS
         .saturating_mul(1u64 << refusals.min(16))
@@ -3902,6 +4807,62 @@ mod tests {
             held: Default::default(),
             history: Default::default(),
         })
+    }
+
+    /// **A shared channel held again is fetched again before its first
+    /// send there** (decision 2026-10-10 §3.4, §6.1, `not_fetched`): the
+    /// device fetched `review` at its relay, and a bound then left its
+    /// filing out. Once the node has ended its take-out, it keeps nothing of
+    /// that fetch: the closure that the send route gives `send_of` says the
+    /// channel is not fetched, which `send --channel` refuses as
+    /// `not_fetched`, until a pass reads the channel to its end again.
+    #[test]
+    fn a_shared_channel_held_again_is_fetched_again_before_it_is_sent_in() {
+        use cordelia_storage::shared::{self as kept, Came, State};
+        use cordelia_storage::shared_pass::{self as pass_rows, ChannelOut};
+        let state = a_node();
+        let channel = [7u8; 32];
+        let relay = [3u8; 32];
+        let mut card = vec![1u8; 32];
+        card.push(1);
+        card.extend_from_slice(&relay);
+        let now = 1_800_000_000;
+        let id = kept::hold(&lock(&state.db), &channel, &card, "review", Came::Made, now).unwrap();
+        state
+            .own_channels
+            .fetched_from(&channel, "relay.example.org:9474", Instant::now());
+        // The route's closure, as `shared_routes::send` builds it.
+        let fetched = |channel: &[u8; 32]| {
+            state
+                .own_channels
+                .shared_fetch_done(channel, 1, Instant::now())
+        };
+        assert!(fetched(&channel));
+        // A bound leaves its filing out: the first step of its take-out.
+        {
+            let conn = lock(&state.db);
+            kept::set_state(&conn, id, State::NotInForce, now).unwrap();
+            pass_rows::begin_channel(&conn, id, ChannelOut::Dropped).unwrap();
+        }
+        let device = DeviceEntries::new(state.clone(), Clock::system());
+        device.take_out_in_steps(now);
+        assert!(
+            pass_rows::channel_out(&lock(&state.db), id)
+                .unwrap()
+                .is_none(),
+            "the take-out ended"
+        );
+        // Held again, as the lists bring it back within the bound.
+        kept::hold(
+            &lock(&state.db),
+            &channel,
+            &card,
+            "review",
+            Came::Made,
+            now + 1,
+        )
+        .unwrap();
+        assert!(!fetched(&channel), "sent in before it was fetched again");
     }
 
     /// A change that the phrase signed, which undoes a removal of the
@@ -4275,9 +5236,10 @@ mod tests {
         );
     }
 
-    /// Once the lists that the store held from before step 20 are known to
-    /// have been read, a pass asks no more, and takes no lock for them
-    /// (issue #221). Before, each pass asks.
+    /// Once the lists that the store held from before step 20, and the
+    /// `sread/` lists held from before step 31, are known to have been
+    /// read, a pass asks no more, and takes no lock for them (issue #221).
+    /// Before, and while only one of them is, each pass asks.
     #[test]
     fn a_pass_takes_no_lock_for_the_held_lists_once_they_were_read() {
         let state = a_node();
@@ -4290,6 +5252,16 @@ mod tests {
         cordelia_storage::meta::set(
             &lock(&state.db),
             cordelia_storage::meta::MESSAGES_LISTS_READ,
+            "1",
+        )
+        .unwrap();
+        let before = takes();
+        device.read_held_lists();
+        device.read_held_lists();
+        assert_eq!(takes(), before + 2);
+        cordelia_storage::meta::set(
+            &lock(&state.db),
+            cordelia_storage::meta::MESSAGES_SREAD_LISTS_READ,
             "1",
         )
         .unwrap();

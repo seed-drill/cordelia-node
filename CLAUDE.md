@@ -45,9 +45,13 @@ cordelia-node/
                          #   current version), addition, hand_over, proof, fingerprint;
                          #   message (the value of a message, its ID and the ring);
                          #   reached (the value of the carried word, decision 2026-10-19);
-                         #   slots (a name's slot, for both kinds).
+                         #   slots (a name's slot, for both kinds). A shared channel
+                         #   (decision 2026-10-10): share (the card and
+                         #   the share), shared (forms 6 and 5, and the anew seal),
+                         #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 26). entries; arrivals (the arrivals of
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 32: the removal's 21 to 26, the shared
+                         #   channels' 27 to 32). entries; arrivals (the arrivals of
                          #   each file, decision 2026-10-24 rule 7); person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
@@ -57,7 +61,24 @@ cordelia-node/
                          #   of messages between its agents, a generation being a messages
                          #   channel it held; H and the live numbers, the index, places
                          #   and the shown time; a row overwritten before it goes, in the
-                         #   caller's write); db (secure_delete, set before the steps run,
+                         #   caller's write); shared_lists (step 27: what a device keeps
+                         #   beside its list of shared channels); shared (step 28: the
+                         #   shared channels a device holds, the table of keys of each
+                         #   with its room, and the index of shared messages);
+                         #   shared_pass (step 29: the places at each relay of a
+                         #   shared channel, what each relay answered of a push,
+                         #   and the take-outs begun and not ended); shared_sharing
+                         #   (step 30: the keys typed for a channel and what became of
+                         #   each, the shares this device wrote and what each relay
+                         #   answered of them); shared_messages (step 31:
+                         #   subscriptions' starts, the table of shared marks and
+                         #   the other devices' sread/ lists, a person's reads of
+                         #   shared messages, the channel's hour, the kept values);
+                         #   shared_anew (step 32: the offers read in each
+                         #   channel, the channels made anew here, those not
+                         #   yet clean); db
+                         #   (secure_delete, set
+                         #   before the steps run,
                          #   and the truncating checkpoint of a personal node); the older
                          #   kind: channels, items, psk, search
     cordelia-network/    # Governor, codec, rate limiting, mini-protocols; messages.rs has
@@ -65,8 +86,31 @@ cordelia-node/
                          #   exports the session's value for a proof
     cordelia-api/        # REST API (actix-web). A device: person (applying a statement, who
                          #   counts, carrying), adding, change, leaving, look, names, publish,
-                         #   take (the one door for an entry), at_relays (and known: what a
-                         #   device knows of which relay holds which change), local (the local
+                         #   take (the one door for an entry), lists (the person's lists
+                         #   of shared channels, decision 2026-10-10 §3.4), shared (the
+                         #   door's branch for a shared channel and its reader: the room,
+                         #   the keys shown, taking out in steps, reading again; the
+                         #   judge of a share), sharing and sharing_routes (`shared
+                         #   new`, `share`, `accept --channel`, `label`, `shared
+                         #   rename`, `drop` and `list`, the empty anew record, and
+                         #   their routes under /api/v1/shared/),
+                         #   shared_pass (what the shared pass reads and writes
+                         #   under the lock: where a channel lives, its door's
+                         #   checks, pages, places and what waits), shared_messages
+                         #   (subscriptions, who is shown what, the sread/ list, the
+                         #   hold), shared_sender (Address::Shared in sender::send:
+                         #   form 6 in the device's ring, the channel's hour, sending
+                         #   again, clearing) and shared_routes (`subscribe`,
+                         #   `unsubscribe`, and `read`, `send`, `summary` and `log`
+                         #   of shared channels, under /api/v1/shared/), shared_anew
+                         #   (offers read and judged, `shared anew`, `move` and
+                         #   `stay`, a channel made anew at a removal and after
+                         #   a recovery, not clean, paused, and what a removal,
+                         #   `devices` and `recover` name), shared_status (the
+                         #   status's `shared` object, decision 2026-10-10 §9),
+                         #   at_relays (and
+                         #   known: what a device knows of which relay holds which change),
+                         #   local (the local
                          #   API for the names a device holds), commands (the routes behind
                          #   the device commands), carry and carrying (a carry that a person
                          #   asks for, and the phrase's word for it), recover, swept (old
@@ -103,12 +147,18 @@ cordelia-node/
                          #   commands and their prompts), carry_cmd (`sync carry`),
                          #   msg_cmd (`msg summary`, `msg read`, `msg send` and `msg
                          #   log`: the folder, the frame, the cleaning, the lines and
-                         #   log's question),
+                         #   log's question), shared_cmd (the commands that make,
+                         #   share and take a shared channel, `subscribe`,
+                         #   `unsubscribe`, `shared anew`, `move` and `stay`,
+                         #   and `id --words`),
                          #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
                          #   relay_entries (a relay's side of the streams of entries),
-                         #   device_entries (a device's passes, and leave; reach: whether
+                         #   device_entries (a device's passes, the pass of shared
+                         #   channels, and leave with the doors of shared channels;
+                         #   reach: whether
                          #   each relay can be reached, and its class), indicator (the
-                         #   state and the level of a status)
+                         #   state and the level of a status; of a shared channel
+                         #   only a removed device that holds one)
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
     specs/               # Protocol and component specs + TLA+ model
@@ -144,7 +194,7 @@ Start here when working on a module:
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `removal_e2e.rs` (a removal fails safe, decision 2026-10-24 (removal), section 7; the window's test is ignored for its length), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `removal_e2e.rs` (a removal fails safe, decision 2026-10-24 (removal), section 7; the window's test is ignored for its length), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it; making anew, moving, a removal and a recovery; the status's `shared` object), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
@@ -225,7 +275,7 @@ marked "derived" is computed in `protocol.rs` from the ones it names:
 | `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
 | `PHRASE_TYPED_BACK_MISSES`, `PHRASE_MISS_PAUSE_SECS` | 3 (the third word typed back that is not the word shown stops `cordelia phrase`), 2s (before the first miss is said, and twice as long before the second) | parameter-rationale.md §12.5 |
 | `PHRASE_QUIET_AFTER_CROSS_SECS` | 1s (after a cross, what is typed is dropped until nothing has been typed for this long; then the same number is asked) | parameter-rationale.md §12.5 |
-| `LABEL_*` (29 of them, all in `LABELS`; `LABEL_CHANGE_LINEAGE` among them; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, and the three of messages below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
+| `LABEL_*` (35 of them, all in `LABELS`; `LABEL_CHANGE_LINEAGE` among them; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, the three of messages and the six of a shared channel below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
 | `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
 | `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
 | `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
@@ -317,6 +367,28 @@ The constants of what a relay holds across its connections (decision
 | `QUIC_LISTED_STREAM_RECEIVE_WINDOW`, `QUIC_LISTED_RECEIVE_WINDOW`, `QUIC_LISTED_SEND_WINDOW`, `QUIC_LISTED_MAX_BIDI_STREAMS` | 1MB, 2MB, 2MB, 64 (derived: today's values, for a connection with a relay listed by key, dialled with `connect_with` and accepted with `accept_with`) | parameter-rationale.md §13 |
 | `PUSH_RETRY_STREAMS_AT_ONCE` | 4 (derived: half of `QUIC_MAX_BIDI_STREAMS`; the older kind's push retries a node runs to one peer at once, the rest waiting for a later round without spending a try) | parameter-rationale.md §13 |
 | `SMALL_WINDOWS_PULL_ENTRIES` | 1 (derived: the entries of the largest size on the wire that a small page holds; what a relay asks a listed relay for in a page where its own end of their connection has every peer's windows, as behind a NAT) | parameter-rationale.md §13 |
+The constants of a shared channel, for messages between people (decision
+2026-10-10, made, shared and taken by the node from its slice 6 on), each with its reason in
+parameter-rationale.md §12.13:
+
+| Parameter | Value | Spec Section |
+|-----------|-------|-------------|
+| `LABEL_SHARED`, `LABEL_SHARED_RELAYS`, `LABEL_SHARE_PAIR` | `cordelia v2 shared`, `cordelia v2 relays`, `cordelia v2 share pair` | parameter-rationale.md §12.13 |
+| `LABEL_ANEW_SEAL`, `LABEL_SHARED_SENT`, `LABEL_SHARED_ACT` | `cordelia v2 anew seal`, `cordelia v2 message sent`, `cordelia v2 act` | parameter-rationale.md §12.13 |
+| `SHARED_SEED_BYTES`, `SHARED_MAX_RELAYS` | 32, 2 (a card is the seed and one or two relays by key: 97 bytes at most) | parameter-rationale.md §12.13 |
+| `SHARED_MAX_CHANNELS`, `SHARED_MAX_DROPPED`, `SHARED_MAX_SUBSCRIPTIONS`, `SHARED_MAX_LABELS` | 16, 64, 32, 64 | parameter-rationale.md §12.13 |
+| `SHARED_LABEL_MAX_BYTES` | 64 (derived: `MAX_DEVICE_LABEL_BYTES`) | parameter-rationale.md §12.13 |
+| `SHARED_LIST_MAX_VALUE_BYTES` | 41,333 (derived: a device's list at every bound, which seals at 65,536) | parameter-rationale.md §12.13 |
+| `SHARED_ACT_TIME_MAX` | 2^40 (the latest time and the highest count an act may say) | parameter-rationale.md §12.13 |
+| `SHARED_MAX_KEYS`, `SHARED_KEYS_KEPT` | 64, 1,024 | parameter-rationale.md §12.13 |
+| `SHARED_TAKE_OUT_STEP_ENTRIES` | 65 (derived: one key's entries, taken out of a device's store under one hold of its lock) | parameter-rationale.md §12.13 |
+| `SHARED_OFFER_DELIVERED_SECS` | 2,592,000 (derived: `AGENT_MESSAGE_KEPT_DAYS`; how long a channel moved from keeps its entries for its offer to reach each relay) | parameter-rationale.md §12.13 |
+| `SHARED_BYTES_PER_MINUTE`, `SHARED_PUSH_BYTES_PER_MINUTE` | 512KB, 384KB (derived: a quarter of what a relay hands, and of what a device pushes) | parameter-rationale.md §12.13 |
+| `SHARED_READ_AGAIN_SECS`, `SHARED_REQUESTS_PER_MINUTE` | 86400s, 600 (with the device's own 2,250 and its 72 shows, 2,922 of 3,000) | parameter-rationale.md §12.13 |
+| `SHARED_KEY_WORDS_SHOWN` | 6 (66 bits, as `CARRY_FROM_WORDS`) | parameter-rationale.md §12.13 |
+| `SHARED_ANEW_CONTENT_BYTES`, `SHARED_ANEW_VALUE_BYTES` | 16,384, 16,274 (derived) | parameter-rationale.md §12.13 |
+| `SHARE_VALUE_BYTES` | 407 (derived: a share seals at 512) | parameter-rationale.md §12.13 |
+| `SHARE_PREFIX`, `SHARED_ANEW_PREFIX`, `SHARED_READ_PREFIX`, `PERSONAL_SHARED_PREFIX` | `share/`, `anew/`, `sread/`, `shared/` | parameter-rationale.md §12.13 |
 
 ## Running Tests
 

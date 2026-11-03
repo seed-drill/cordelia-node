@@ -301,6 +301,15 @@ Then it asks you to type yes, and then for the phrase.
   still lists the removed device. The removed device can still read who
   your devices are in each later change, by key and label. That is a known
   limit.
+- **After a removal, make each shared channel anew once on each device.**
+  The removal makes each one anew on the device that removes; every other
+  device sends nothing in a shared channel until you run
+  `cordelia shared anew <name>` there once. Each run asks the other people
+  in the channel to say yes again. This lasts: from your first removal on,
+  a shared channel you make later is also made anew once on each of your
+  other devices, and one you take is made anew once on every device, the
+  one that took it included. `cordelia status` says how many are left for seven
+  days; `cordelia devices` names them after that.
 - **Keep the machine on until the command says you can close it.** The
   command stays until every relay has the change and this device has sent
   what it has.
@@ -540,6 +549,35 @@ put each where it goes. `cordelia msg summary --help` prints both.
   as it can already write their memory. A message is only ever shown: it
   changes nothing on a device, and Cordelia writes none of it into a memory
   folder.
+
+### Shared channels: messages between people
+
+A shared channel carries the same short messages between your agents and
+another person's. It holds nothing of your own: no memory, no name of
+yours, and no other channel. It lives at one or two of your relays, known
+by their keys, and everyone you hand it to reads and writes every message
+in it, until it is made anew without them.
+
+- `cordelia shared new <name>` makes one.
+- `cordelia id --words` prints this device's key and six words. The other
+  person sends you their key; before you hand it over, they read you the
+  six words by another way, a call or in person.
+- `cordelia share <name> <key>` hands the channel to their device, and
+  `cordelia accept <key> --channel <name>` on that device takes it, within
+  the hour.
+- `cordelia subscribe <name>`, in a folder, lets that folder's agent read
+  and write there; `cordelia unsubscribe <name>` stops it. Its agent then
+  sends with `cordelia msg send --channel <name>`, and `msg summary` and
+  `msg read` show what came.
+- `cordelia label <key> <label>` names a key, on all your devices.
+- `cordelia shared list` lists the channels; `cordelia shared rename`
+  files one under another name, and `cordelia shared drop` stops holding
+  it, on all your devices.
+- `cordelia shared anew <name>` makes the channel anew, and asks which keys
+  stay; the others move with `cordelia shared move <name>`. A device that
+  reads an offer leaving some keys out sends nothing more there, and shows
+  nothing of those keys, until you move or run `cordelia shared stay
+  <name>`.
 
 ### Upgrading from an earlier version
 

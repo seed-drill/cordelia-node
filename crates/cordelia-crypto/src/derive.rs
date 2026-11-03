@@ -17,13 +17,15 @@
 //! | Pair | HKDF(X25519(device a, device b), `cordelia v2 pair` + both keys, the lower first) |
 //! | The phrase's | HKDF(phrase, `cordelia v2 recovery`): see [`crate::phrase`] |
 //! | Locked | HKDF(person secret and the lock's key, `cordelia v2 locked` + length + name) |
+//! | Shared between people | HKDF(seed, `cordelia v2 shared` + the hash of its relays) (decision 2026-10-10 §2.1) |
+//! | Share pair | HKDF(X25519(device a, device b), `cordelia v2 share pair` + both keys, the lower first) (decision 2026-10-10 §3.1) |
 //!
 //! The labels are in `cordelia_core::protocol`. The salt is empty
 //! throughout.
 
 use cordelia_core::protocol::{
     LABEL_AGENT_MESSAGES, LABEL_CHANNEL_SIGN, LABEL_ENTRY_KEY, LABEL_LOCKED, LABEL_OWN, LABEL_PAIR,
-    LABEL_PERSONAL, LABEL_SLOT_KEY,
+    LABEL_PERSONAL, LABEL_SHARE_PAIR, LABEL_SHARED, LABEL_SLOT_KEY,
 };
 use cordelia_core::sync_name;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -31,6 +33,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use crate::CryptoError;
 use crate::ecies::{hkdf_sha256, hkdf_sha256_of};
 use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
+use crate::share::Relays;
 
 /// Why a channel's secret was not derived.
 #[derive(Debug, thiserror::Error)]
@@ -110,18 +113,41 @@ pub fn own_secret(person_secret: &[u8; 32], name: &str) -> Result<[u8; 32], Deri
 /// Both keys must be usable, and a shared secret that is all zeros is
 /// refused, as sealing to a key refuses them ([`crate::ecies`]).
 pub fn pair_secret(device: &NodeIdentity, other: &[u8; 32]) -> Result<[u8; 32], DeriveError> {
+    between(LABEL_PAIR, device, other)
+}
+
+/// The secret of the share pair channel between this device and the device
+/// whose key is `other`, which is another person's (decision 2026-10-10
+/// §3.1): where a share waits for the one key it is for. It is
+/// [`pair_secret`]'s derivation under a label of its own, and refuses what
+/// that refuses, so a share pair channel is never a pair channel.
+pub fn share_pair_secret(device: &NodeIdentity, other: &[u8; 32]) -> Result<[u8; 32], DeriveError> {
+    between(LABEL_SHARE_PAIR, device, other)
+}
+
+/// The secret of a channel between this device and the device whose key is
+/// `other`, under `label`: one's own key and a key with no X25519 form are
+/// refused.
+fn between(label: &[u8], device: &NodeIdentity, other: &[u8; 32]) -> Result<[u8; 32], DeriveError> {
     let own = device.public_key();
     if own == *other {
         return Err(DeriveError::OwnKey);
     }
     let other_x25519 = x25519_pub_from_ed25519_pub(other).ok_or(DeriveError::KeyNotUsable)?;
-    pair_secret_from(&device.x25519_private_key(), &other_x25519, &own, other)
+    pair_secret_from(
+        label,
+        &device.x25519_private_key(),
+        &other_x25519,
+        &own,
+        other,
+    )
 }
 
-/// [`pair_secret`] from the X25519 halves of the two keys: this device's
-/// private half and the other's public half. `a` and `b` are the two
-/// devices' public keys, in either order.
+/// [`pair_secret`] from the X25519 halves of the two keys, under `label`:
+/// this device's private half and the other's public half. `a` and `b` are
+/// the two devices' public keys, in either order.
 fn pair_secret_from(
+    label: &[u8],
     own_private: &[u8; 32],
     other_public: &[u8; 32],
     a: &[u8; 32],
@@ -135,11 +161,23 @@ fn pair_secret_from(
     }
     // The lower key first, so that both devices write the same input.
     let (lower, higher) = if a <= b { (a, b) } else { (b, a) };
-    let mut info = Vec::with_capacity(LABEL_PAIR.len() + 64);
-    info.extend_from_slice(LABEL_PAIR);
+    let mut info = Vec::with_capacity(label.len() + 64);
+    info.extend_from_slice(label);
     info.extend_from_slice(lower);
     info.extend_from_slice(higher);
     Ok(hkdf_sha256(shared.as_bytes(), &[], &info)?)
+}
+
+/// The secret of a shared channel, from its seed and its relays (decision
+/// 2026-10-10 §2.1): HKDF-SHA256 of the seed, under its label and the hash
+/// of the list of its relays ([`Relays::hash`]). A card with other relays
+/// is another channel. Only a card gives a shared channel's secret
+/// ([`crate::share::Card::secret`]), and the seed derives nothing else.
+pub(crate) fn shared_secret(seed: &[u8; 32], relays: &Relays) -> Result<[u8; 32], CryptoError> {
+    let mut info = Vec::with_capacity(LABEL_SHARED.len() + 32);
+    info.extend_from_slice(LABEL_SHARED);
+    info.extend_from_slice(&relays.hash());
+    hkdf_sha256(seed, &[], &info)
 }
 
 /// The secret of the locked channel called `name` (decision 2026-10-04
@@ -279,10 +317,16 @@ mod tests {
         }
         secrets.push(pair_secret(&a, &b.public_key()).unwrap());
         secrets.push(personal_secret(&LOCK).unwrap());
+        // A share pair channel of the same two devices, and a shared
+        // channel whose seed is the person secret's bytes (decision
+        // 2026-10-10 §2.2).
+        secrets.push(share_pair_secret(&a, &b.public_key()).unwrap());
+        let relays = Relays::new(&[[0x44; 32]]).unwrap();
+        secrets.push(crate::share::Card::of(PERSON, relays).secret().unwrap());
 
         let distinct: HashSet<[u8; 32]> = secrets.iter().copied().collect();
         assert_eq!(distinct.len(), secrets.len());
-        assert_eq!(secrets.len(), 4 + 5 * names.len());
+        assert_eq!(secrets.len(), 6 + 5 * names.len());
 
         // Nor are their channels the same: each secret has its own ID.
         let ids: HashSet<[u8; 32]> = secrets
@@ -494,7 +538,13 @@ mod tests {
         for key in small {
             assert!(
                 matches!(
-                    pair_secret_from(&a_private, &key, &a.public_key(), &b.public_key()),
+                    pair_secret_from(
+                        LABEL_PAIR,
+                        &a_private,
+                        &key,
+                        &a.public_key(),
+                        &b.public_key()
+                    ),
                     Err(DeriveError::SecretAnyoneCanWorkOut)
                 ),
                 "{key:02x?}"
@@ -503,9 +553,62 @@ mod tests {
         // The control: the same call with the other device's real key is
         // the pair's secret.
         assert_eq!(
-            pair_secret_from(&a_private, &b_public, &a.public_key(), &b.public_key()).unwrap(),
+            pair_secret_from(
+                LABEL_PAIR,
+                &a_private,
+                &b_public,
+                &a.public_key(),
+                &b.public_key()
+            )
+            .unwrap(),
             pair_secret(&a, &b.public_key()).unwrap()
         );
+    }
+
+    /// A share pair channel is the pair channel's derivation under its own
+    /// label (decision 2026-10-10 §3.1): the same from either side, never
+    /// the pair channel of the same two devices, and refused where a pair
+    /// channel is: one's own key, a key that is no device's, and a secret
+    /// that anyone can work out.
+    #[test]
+    fn a_share_pair_channel_is_the_pair_derivation_under_its_own_label() {
+        use curve25519_dalek::constants::EIGHT_TORSION;
+
+        let (a, b, c) = (device(1), device(2), device(3));
+        let ab = share_pair_secret(&a, &b.public_key()).unwrap();
+        assert_eq!(share_pair_secret(&b, &a.public_key()).unwrap(), ab);
+        assert_ne!(ab, share_pair_secret(&a, &c.public_key()).unwrap());
+        assert_ne!(ab, pair_secret(&a, &b.public_key()).unwrap());
+
+        let (private, _) = x25519_from_ed25519_seed(a.seed());
+        let (_, public) = x25519_from_ed25519_seed(b.seed());
+        let shared = StaticSecret::from(private).diffie_hellman(&PublicKey::from(public));
+        let mut keys = [a.public_key(), b.public_key()];
+        keys.sort_unstable();
+        let mut info = b"cordelia v2 share pair".to_vec();
+        info.extend_from_slice(&keys[0]);
+        info.extend_from_slice(&keys[1]);
+        assert_eq!(ab, hkdf_sha256(shared.as_bytes(), &[], &info).unwrap());
+
+        assert!(matches!(
+            share_pair_secret(&a, &a.public_key()),
+            Err(DeriveError::OwnKey)
+        ));
+        assert!(matches!(
+            share_pair_secret(&a, &[0; 32]),
+            Err(DeriveError::KeyNotUsable)
+        ));
+        let small = EIGHT_TORSION[1].to_montgomery().to_bytes();
+        assert!(matches!(
+            pair_secret_from(
+                LABEL_SHARE_PAIR,
+                &private,
+                &small,
+                &a.public_key(),
+                &b.public_key()
+            ),
+            Err(DeriveError::SecretAnyoneCanWorkOut)
+        ));
     }
 
     /// A locked channel needs both the person secret and the lock's key: a

@@ -110,6 +110,14 @@ pub const PERSON_RELAYS_KNOWN: &str = "person.relays_known";
 /// knew by a label is not in it.
 pub const PERSON_REMOVED_LABELS: &str = "person.removed_labels";
 
+/// JSON object of the latest removal or recovery that made this device's
+/// shared channels not yet clean (decision 2026-10-10 §9): `at`, the time
+/// of the marks it set, and `keys`, each key in hex that it removed and the
+/// statement before it did not (`cordelia_api::shared_anew`). The status
+/// names these as the device of `removed_device_holds`. 256 keys at most,
+/// as a statement removes. It goes when the device leaves its phrase.
+pub const PERSON_REMOVAL_KEYS: &str = "person.removal_keys";
+
 /// JSON array of the keys, each in hex, that a recovery made on this
 /// machine left out without showing them (decision 2026-10-04 §9, step
 /// 3): rows beyond the 256 that its prompt shows. Each is kept as left
@@ -190,6 +198,16 @@ pub const MESSAGES_START: &str = "messages.start";
 /// before step 20 were read once, with the time (`cordelia_api::reader::
 /// read_held_lists`, decision 2026-10-25, rule 1).
 pub const MESSAGES_LISTS_READ: &str = "messages.lists_read";
+
+/// How many times in a row the device's list of shared marks, `sread/`,
+/// was written again for a relay's answer of another (`cordelia_api::marks`,
+/// decision 2026-10-10 §6.1): counted apart from the other lists.
+pub const MESSAGES_SREAD_AGAIN: &str = "messages.sread_again";
+
+/// That the `sread/` lists that the store held before step 31 were read
+/// once, with the time (`cordelia_api::reader::read_held_shared_lists`,
+/// decision 2026-10-10 §14, "lists stored before the upgrade").
+pub const MESSAGES_SREAD_LISTS_READ: &str = "messages.sread_lists_read";
 
 /// Delete a metadata value.
 pub fn remove(conn: &Connection, key: &str) -> Result<(), CordeliaError> {

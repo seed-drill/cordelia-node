@@ -1,0 +1,1261 @@
+//! What the shared pass reads and writes under the database's lock
+//! (decision 2026-10-10 §8.4): which shared channels live at a relay, what
+//! the door to their streams refuses, a page taken and its place, what
+//! waits to be pushed at a relay, and what a relay answered of a push.
+//!
+//! Plain functions over the node's database, as `at_relays` is for the
+//! channels of the device's own: nothing here opens a stream or knows a
+//! connection. A relay is its node key. The node's side
+//! (`cordelia_node::device_entries`) asks these through its doors
+//! `Leave::shared` and `Leave::share_pair`, and through nothing else.
+//!
+//! - **Where a shared channel lives.** At each relay its card names, by
+//!   key, that is one of the device's own (§8.2): whoever asks gives the
+//!   relay's key only where its configuration knows the relay by that key.
+//! - **When.** Only on a device that stands applied under the latest
+//!   statement it has seen, with sync on (§2.3, rule 2; §6.1): otherwise no
+//!   stream of a shared channel is opened, and the door refuses.
+//! - **Places.** Each channel has its own place at each relay, kept in the
+//!   store (schema step 23). A page moves it past every entry it holds, an
+//!   entry the door refused for room among them (§6.3). A page of another
+//!   holding, or one that says the relay holds the channel no more, starts
+//!   the channel again there: read from the start, and everything of the
+//!   device's own there sent again.
+//! - **What waits.** Every entry of the device's own in a shared channel
+//!   that a relay has not answered at its revision or above (§8.4); one
+//!   that a relay refused for room waits, and is pushed again at a later
+//!   pass.
+
+use rusqlite::Connection;
+
+use cordelia_core::protocol::entry_cost;
+use cordelia_crypto::derive;
+use cordelia_crypto::entry::{CheckedEntry, Entry};
+use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::share::Card;
+use cordelia_crypto::shared::anew_name;
+use cordelia_crypto::slots::slot_id;
+use cordelia_storage::entries;
+use cordelia_storage::relay::{Mark, NO_MARK};
+use cordelia_storage::shared::{self as kept, State};
+use cordelia_storage::shared_pass::{self as rows, Answer};
+
+use crate::at_relays::{Most, Pushed, Stands, stands};
+use crate::person::{PersonError, in_one};
+use crate::take::{Taken, take};
+
+/// Why the door of a shared channel's streams refuses (decision 2026-10-10
+/// §8.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotUsable {
+    /// The device holds no such shared channel: it is not in the table, or
+    /// it is dropped, moved from, or held by no act in force.
+    NotHeld,
+    /// The channel's card does not name the relay by its key: it does not
+    /// live there.
+    NotThere,
+    /// The device does not stand applied under the latest statement it has
+    /// seen.
+    NotApplied,
+    /// Sync is off.
+    SyncOff,
+}
+
+/// A shared channel that the door may use at a relay: its row, its ID and
+/// its secret.
+#[derive(Clone)]
+pub struct Usable {
+    pub id: i64,
+    pub channel: [u8; 32],
+    secret: [u8; 32],
+}
+
+impl std::fmt::Debug for Usable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The secret is not printed.
+        f.debug_struct("Usable")
+            .field("id", &self.id)
+            .field("channel", &hex::encode(&self.channel[..4]))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Usable {
+    /// The proof that the end of a connection whose node key is `prover`
+    /// holds this channel's key, over the connection's value `session`.
+    pub fn proof(&self, session: &[u8; 32], prover: &[u8; 32]) -> Option<[u8; 64]> {
+        cordelia_crypto::proof::make(&self.secret, session, prover).ok()
+    }
+}
+
+/// Whether the device stands applied with sync on: where a shared
+/// channel's stream may be opened at all (§2.3, rule 2).
+pub fn may_open(conn: &Connection) -> Result<Result<(), NotUsable>, PersonError> {
+    if stands(conn)? != Stands::Applied {
+        return Ok(Err(NotUsable::NotApplied));
+    }
+    if !crate::commands::sync_is_on(conn).map_err(|e| PersonError::Held(e.to_string()))? {
+        return Ok(Err(NotUsable::SyncOff));
+    }
+    Ok(Ok(()))
+}
+
+/// The card of a channel's row.
+fn card_of(row: &kept::Channel) -> Result<Card, PersonError> {
+    Card::from_bytes(&row.card)
+        .map_err(|e| PersonError::Held(format!("the card of a shared channel: {e}")))
+}
+
+/// What the door may use of the shared channel `channel` at the relay whose
+/// node key is `relay` (decision 2026-10-10 §8.4): the channel is in the
+/// table and held, its card names that relay by its key, and the device
+/// stands applied with sync on.
+pub fn usable(
+    conn: &Connection,
+    channel: &[u8; 32],
+    relay: &[u8; 32],
+) -> Result<Result<Usable, NotUsable>, PersonError> {
+    if let Err(not) = may_open(conn)? {
+        return Ok(Err(not));
+    }
+    let Some(row) = kept::channel(conn, channel)? else {
+        return Ok(Err(NotUsable::NotHeld));
+    };
+    // A channel moved from whose offer waits to be at each relay is used
+    // for that push alone (§7; [`to_send`]).
+    if row.state != State::Held && !crate::shared_anew::delivering(conn, &row)? {
+        return Ok(Err(NotUsable::NotHeld));
+    }
+    let card = card_of(&row)?;
+    if !card.relays().keys().contains(relay) {
+        return Ok(Err(NotUsable::NotThere));
+    }
+    Ok(Ok(Usable {
+        id: row.id,
+        channel: row.channel,
+        secret: card.secret()?,
+    }))
+}
+
+/// The shared channels that live at the relay whose node key is `relay`, in
+/// the order of their rows: each held whose card names that relay by its
+/// key. None where the device does not stand applied with sync on.
+pub fn at_relay(conn: &Connection, relay: &[u8; 32]) -> Result<Vec<[u8; 32]>, PersonError> {
+    if may_open(conn)?.is_err() {
+        return Ok(Vec::new());
+    }
+    let mut at = Vec::new();
+    for row in kept::channels(conn)? {
+        if row.state == State::Held && card_of(&row)?.relays().keys().contains(relay) {
+            at.push(row.channel);
+        }
+    }
+    Ok(at)
+}
+
+/// The shared channels moved from whose offer waits to be at the relay
+/// whose node key is `relay` (§7): the pass pushes the offer there, and
+/// asks nothing else of them. None where the device does not stand applied
+/// with sync on.
+pub fn delivering_at(conn: &Connection, relay: &[u8; 32]) -> Result<Vec<[u8; 32]>, PersonError> {
+    if may_open(conn)?.is_err() {
+        return Ok(Vec::new());
+    }
+    let mut at = Vec::new();
+    for row in kept::channels(conn)? {
+        if crate::shared_anew::delivering(conn, &row)?
+            && card_of(&row)?.relays().keys().contains(relay)
+        {
+            at.push(row.channel);
+        }
+    }
+    Ok(at)
+}
+
+/// Every shared channel the device holds, wherever it lives: the channels
+/// that the device still proves, which keep their places among a
+/// connection's proofs (decision 2026-10-17 §4; §8.4).
+pub fn held(conn: &Connection) -> Result<Vec<[u8; 32]>, PersonError> {
+    Ok(kept::channels(conn)?
+        .into_iter()
+        .filter(|row| row.state == State::Held)
+        .map(|row| row.channel)
+        .collect())
+}
+
+/// The reads again from the start that may begin at `now` begin (§6.3, at
+/// most once a day for each channel): each such channel's places go, at
+/// every relay. Returns the channels.
+pub fn begin_reads_again(conn: &Connection, now: i64) -> Result<Vec<[u8; 32]>, PersonError> {
+    in_one(conn, || {
+        let due = crate::shared::read_again_due(conn, now)?;
+        for channel in &due {
+            if let Some(row) = kept::channel(conn, channel)? {
+                crate::shared::read_again_begun(conn, channel, now)?;
+                rows::forget_places(conn, row.id)?;
+            }
+        }
+        Ok(due)
+    })
+}
+
+/// The mark and the place that the device asks the relay `relay` for a page
+/// of the channel of `usable` with: the ones it keeps, or the start.
+pub fn place(
+    conn: &Connection,
+    usable: &Usable,
+    relay: &[u8; 32],
+) -> Result<(Mark, u64), PersonError> {
+    Ok(rows::place(conn, usable.id, relay)?.unwrap_or((NO_MARK, 0)))
+}
+
+/// What became of a page of a shared channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageOf {
+    /// What became of each entry, through the one door.
+    pub each: Vec<Taken>,
+    /// Whether the pull got somewhere by it: the place moved on, the
+    /// holding is another, or the store took an entry it did not hold.
+    pub got_somewhere: bool,
+    /// The page was asked from a place the device keeps no more: it kept
+    /// no place, and is no end of the channel at that relay.
+    pub stale: bool,
+}
+
+/// Take a page that the relay `relay` handed of the channel of `usable`
+/// (decision 2026-10-10 §8.4, §6.3), in one transaction: each entry through
+/// the one door ([`take`]), whose branch for a shared channel judges it;
+/// then the place, past every entry of the page, those refused among them.
+/// An entry of the device's own is one that relay holds, and is not pushed
+/// back there. A page under another mark than the one kept, or one of
+/// nothing under the mark of no holding against a place kept, says the
+/// relay holds nothing the device knows of: the channel starts again there.
+/// `asked` is the place the page was asked from. `None` where the page
+/// holds an entry of another channel: nothing of it is taken.
+pub fn take_page(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    usable: &Usable,
+    relay: &[u8; 32],
+    asked: (Mark, u64),
+    page: (&[CheckedEntry], Mark, u64),
+    now: i64,
+) -> Result<Option<PageOf>, PersonError> {
+    let (entries, mark, next) = page;
+    if entries.iter().any(|entry| entry.channel != usable.channel) {
+        return Ok(None);
+    }
+    let own = identity.public_key();
+    in_one(conn, || {
+        let kept_place = rows::place(conn, usable.id, relay)?;
+        // A page asked from a place the device keeps no more (a read again
+        // began, or the channel was left out and came back, while it was
+        // asked): its entries go through the door, and it keeps no place
+        // and says no end, so that the next page is asked from the place
+        // kept now, and nothing before the old place is passed over.
+        if kept_place.unwrap_or((NO_MARK, 0)) != asked {
+            let mut each = Vec::with_capacity(entries.len());
+            for entry in entries {
+                each.push(take(conn, identity, entry, now)?);
+            }
+            return Ok(PageOf {
+                each,
+                got_somewhere: true,
+                stale: true,
+            });
+        }
+        let another_holding = mark != NO_MARK && kept_place.is_some_and(|(kept, _)| kept != mark);
+        let no_holding = mark == NO_MARK && entries.is_empty() && kept_place.is_some();
+        if another_holding || no_holding {
+            rows::start_again(conn, usable.id, relay)?;
+        }
+        let mut each = Vec::with_capacity(entries.len());
+        let mut stored = false;
+        for entry in entries {
+            let taken = take(conn, identity, entry, now)?;
+            stored |= matches!(
+                taken,
+                Taken::Shared {
+                    stored: entries::Outcome::Stored,
+                    ..
+                }
+            );
+            if entry.author == own {
+                rows::answered(
+                    conn,
+                    usable.id,
+                    relay,
+                    &entry.slot,
+                    entry.rev,
+                    Answer::Holds,
+                )?;
+            }
+            each.push(taken);
+        }
+        if mark != NO_MARK {
+            rows::keep_place(conn, usable.id, relay, &mark, next)?;
+        }
+        let got_somewhere = if mark == NO_MARK {
+            stored
+        } else {
+            mark != asked.0 || next > asked.1
+        };
+        Ok(PageOf {
+            each,
+            got_somewhere,
+            stale: false,
+        })
+    })
+    .map(Some)
+}
+
+/// The relay `relay` answered a proof of the channel of `usable` with no:
+/// it does not hold it. Its place there goes, and every answer it gave a
+/// push: everything of the device's own there is sent again.
+pub fn not_held_at(
+    conn: &Connection,
+    usable: &Usable,
+    relay: &[u8; 32],
+) -> Result<(), PersonError> {
+    rows::start_again(conn, usable.id, relay)?;
+    Ok(())
+}
+
+/// What waits to be pushed to the relay `relay` in the channel of `usable`,
+/// within `most` (decision 2026-10-10 §8.4): each entry of the device's own
+/// there, in the order the store took them, that the relay has not answered
+/// at its revision or above, each measured as a relay counts it
+/// (`entry_cost`). Nothing past the first that does not fit.
+pub fn to_send(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    usable: &Usable,
+    relay: &[u8; 32],
+    most: Most,
+) -> Result<Vec<CheckedEntry>, PersonError> {
+    let own = identity.public_key();
+    let mut batch: Vec<CheckedEntry> = Vec::new();
+    let mut bytes = 0usize;
+    // Where the channel is not clean, paused or moved from, nothing of the
+    // device's own is sent there but the offer it made (decision
+    // 2026-10-24, rules 23, 25 and 26; §7).
+    let Some(row) = kept::channel(conn, &usable.channel)? else {
+        return Ok(batch);
+    };
+    let only_the_offer = match crate::shared_anew::sends_only_its_offer(conn, identity, &row)? {
+        None => return Ok(batch),
+        Some(only) => only,
+    };
+    let anew_slot = slot_id(&derive::slot_key(&usable.secret)?, &anew_name(&own)?);
+    for held in entries::author_entries(conn, &usable.channel, &own)? {
+        let entry = &held.entry;
+        if only_the_offer && entry.slot != anew_slot {
+            continue;
+        }
+        let answered = rows::answer(conn, usable.id, relay, &entry.slot)?;
+        if answered.is_some_and(|(rev, _)| rev >= entry.rev) {
+            continue;
+        }
+        let Ok(entry) = Entry::check(held.entry) else {
+            continue;
+        };
+        // Measured as a relay counts it, which is more than it travels: so
+        // the push is within both what may travel and the byte share.
+        let counted = usize::try_from(entry_cost(entry.content.len())).unwrap_or(usize::MAX);
+        if batch.len() >= most.entries || bytes + counted > most.bytes {
+            break;
+        }
+        bytes += counted;
+        batch.push(entry);
+    }
+    Ok(batch)
+}
+
+/// Whether this device still sends `batch`, which [`to_send`] picked for
+/// the relay `relay` in the shared channel `channel`, as it would now: the
+/// door may use the channel there ([`usable`]); and the device writes
+/// there, or every entry of the batch is its offer, where the channel is
+/// one it made anew whose offer waits (decision 2026-10-24, rules 23, 25
+/// and 26; §7). Checked again once the push's stream is open: a removal
+/// read in between sends nothing more of the batch (the read of #281 for
+/// the shared gate, low 2).
+pub fn still_sends(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    channel: &[u8; 32],
+    relay: &[u8; 32],
+    batch: &[CheckedEntry],
+) -> Result<bool, PersonError> {
+    let Ok(usable) = usable(conn, channel, relay)? else {
+        return Ok(false);
+    };
+    let Some(row) = kept::channel(conn, channel)? else {
+        return Ok(false);
+    };
+    match crate::shared_anew::sends_only_its_offer(conn, identity, &row)? {
+        None => Ok(false),
+        Some(false) => Ok(true),
+        Some(true) => {
+            let own = identity.public_key();
+            let anew_slot = slot_id(&derive::slot_key(&usable.secret)?, &anew_name(&own)?);
+            Ok(batch.iter().all(|entry| entry.slot == anew_slot))
+        }
+    }
+}
+
+/// The relay `relay` answered a push of `batch` in the channel of `usable`
+/// with `answers`, one for each entry, in one transaction. An entry it
+/// holds, holds a later one of, holds another at its revision of, or
+/// refused as not signed is not sent there again; one it refused for room
+/// or for the address's allowance waits. Where it holds another at the
+/// revision of this device's anew record, the record is written again
+/// above it (§2.3, [`anew_again`]), at `now`. Returns how many it refused
+/// for room or allowance.
+pub fn pushed(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    usable: &Usable,
+    relay: &[u8; 32],
+    batch: &[CheckedEntry],
+    answers: &[Pushed],
+    now: i64,
+) -> Result<usize, PersonError> {
+    in_one(conn, || {
+        let mut refused = 0;
+        for (entry, pushed) in batch.iter().zip(answers) {
+            let answer = match pushed {
+                Pushed::Holds => Answer::Holds,
+                Pushed::HoldsLater => {
+                    offer_again(conn, identity, usable, entry, now)?;
+                    Answer::HoldsLater
+                }
+                Pushed::HoldsAnother => {
+                    anew_again(conn, identity, usable, entry, now)?;
+                    Answer::HoldsAnother
+                }
+                Pushed::DoesNotCheck => Answer::DoesNotCheck,
+                Pushed::NoRoom | Pushed::OverAllowance => {
+                    refused += 1;
+                    continue;
+                }
+            };
+            rows::answered(conn, usable.id, relay, &entry.slot, entry.rev, answer)?;
+            // A message of the device's own: sent again, or taken by every
+            // relay of its card (decision 2026-10-10 §6.1).
+            crate::shared_sender::answered(conn, usable.id, entry, answer)?;
+        }
+        // An offer at each relay of the old channel's card: its entries go
+        // now (§7).
+        crate::shared_anew::deliveries(conn, &identity.public_key(), now)?;
+        Ok(refused)
+    })
+}
+
+/// A relay holds another entry of this device's at the revision of
+/// `entry` (§2.3, `Pushed::HoldsAnother`): where `entry` is this device's
+/// anew record, and the one its store holds, it is written again one
+/// revision above, holding the same, through the one door. A device that
+/// dropped a channel and took it again writes its record at revision 1
+/// once more, and a relay that kept the first answers so.
+fn anew_again(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    usable: &Usable,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<(), PersonError> {
+    // The slot is named by this device's key, and a push holds only this
+    // device's entries.
+    let own = identity.public_key();
+    let slot = slot_id(&derive::slot_key(&usable.secret)?, &anew_name(&own)?);
+    if entry.slot != slot {
+        return Ok(());
+    }
+    let Some(held) = entries::author_entry(conn, &usable.channel, &slot, &own)? else {
+        return Ok(());
+    };
+    if held.entry.rev != entry.rev {
+        return Ok(());
+    }
+    let inside = Entry::check(held.entry)?.open(&usable.secret)?;
+    let again = Entry::seal(&usable.secret, identity, entry.rev + 1, &inside)?.check()?;
+    // In a channel this device made anew and moved from, the door takes
+    // nothing: the offer, the one entry it still sends there, is stored as
+    // it was made (`shared_anew::make_anew_of`), so that it reaches the
+    // relay that held another at its revision.
+    let held_here =
+        kept::channel(conn, &usable.channel)?.is_some_and(|row| row.state == State::Held);
+    match held_here {
+        true => {
+            take(conn, identity, &again, now)?;
+        }
+        false => {
+            entries::store(conn, &again, now)?;
+        }
+    }
+    Ok(())
+}
+
+/// A relay holds a later entry of this device's than `entry` in its slot
+/// (`Pushed::HoldsLater`): where `entry` is the offer of a channel this
+/// device made anew, whose delivery waits, it is not at that relay, and it
+/// is written again one revision above, as [`anew_again`] does (§7). A
+/// relay that holds a later one still answers so again, and the offer
+/// climbs until it is above what that relay holds.
+fn offer_again(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    usable: &Usable,
+    entry: &CheckedEntry,
+    now: i64,
+) -> Result<(), PersonError> {
+    let delivering = cordelia_storage::shared_anew::made_of_channel(conn, &usable.channel)?
+        .is_some_and(|made| made.delivering);
+    if !delivering {
+        return Ok(());
+    }
+    anew_again(conn, identity, usable, entry, now)
+}
+
+/// The share pair channel of this device and `key` (decision 2026-10-10
+/// §3.1): its ID and its secret. `None` where it has none: `key` is this
+/// device's own, or has no X25519 form.
+pub fn share_pair(identity: &NodeIdentity, key: &[u8; 32]) -> Option<([u8; 32], [u8; 32])> {
+    let secret = derive::share_pair_secret(identity, key).ok()?;
+    Some((derive::channel_id(&secret).ok()?, secret))
+}
+
+/// Whether `entry` is one that this device wrote in its share pair channel
+/// with `key`, and that its store holds at that revision: the one kind of
+/// entry the door of a share pair channel pushes (§8.4).
+pub fn is_own_share(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    key: &[u8; 32],
+    entry: &CheckedEntry,
+) -> Result<bool, PersonError> {
+    let Some((channel, _)) = share_pair(identity, key) else {
+        return Ok(false);
+    };
+    if entry.channel != channel || entry.author != identity.public_key() {
+        return Ok(false);
+    }
+    let held = entries::author_entry(conn, &channel, &entry.slot, &entry.author)?;
+    Ok(held.is_some_and(|held| held.entry.rev == entry.rev))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lists::Do;
+    use crate::shared::tests::{
+        DAY, FULL, acts, anew, anew_of, bob, fill_to, holds, labels, member, message, row,
+    };
+    use crate::take::NotTaken;
+    use cordelia_storage::meta;
+
+    /// The relay that a test's cards name ([`crate::lists::tests::filing`]).
+    const AT: [u8; 32] = [3; 32];
+    /// A relay that no card names.
+    const ELSEWHERE: [u8; 32] = [4; 32];
+
+    /// The door of a shared channel's streams takes a channel only where it
+    /// is held here, its card names the relay by its key, and the device
+    /// stands applied with sync on (decision 2026-10-10 §8.4); and a pass
+    /// finds a channel at a relay only so.
+    #[test]
+    fn the_door_takes_a_channel_held_here_at_its_relay_with_sync_on() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        assert!(usable(conn, &channel.id, &AT).unwrap().is_ok());
+        assert_eq!(at_relay(conn, &AT).unwrap(), [channel.id]);
+        assert_eq!(
+            usable(conn, &channel.id, &ELSEWHERE).unwrap().unwrap_err(),
+            NotUsable::NotThere
+        );
+        assert!(at_relay(conn, &ELSEWHERE).unwrap().is_empty());
+        assert_eq!(
+            usable(conn, &[9; 32], &AT).unwrap().unwrap_err(),
+            NotUsable::NotHeld
+        );
+        // Sync off: nothing of it.
+        meta::remove(conn, meta::SYNC_CLAUDE_DIR).unwrap();
+        assert_eq!(
+            usable(conn, &channel.id, &AT).unwrap().unwrap_err(),
+            NotUsable::SyncOff
+        );
+        assert!(at_relay(conn, &AT).unwrap().is_empty());
+        meta::set(conn, meta::SYNC_CLAUDE_DIR, "/home/bob/.claude").unwrap();
+        // Dropped: nothing of it.
+        acts(&s, 0, Do::Drop(channel.id), now + 1);
+        assert_eq!(
+            usable(conn, &channel.id, &AT).unwrap().unwrap_err(),
+            NotUsable::NotHeld
+        );
+        assert!(at_relay(conn, &AT).unwrap().is_empty());
+        // A device that follows no phrase opens no stream of one.
+        let none = crate::several::Several::new(1);
+        assert_eq!(may_open(&none[0].conn).unwrap(), Err(NotUsable::NotApplied));
+        assert!(at_relay(&none[0].conn, &AT).unwrap().is_empty());
+    }
+
+    /// A page asked from a place the device keeps no more keeps no place
+    /// (§6.3, §3.4): the device keeps a place at its relay and asks a page
+    /// from it; before the page is taken, a read again forgets its places.
+    /// The page's entry goes through the door, the place is not written
+    /// back, and the page says it is stale, so that it is no end of the
+    /// channel there; the next page, asked from the start, keeps its place.
+    #[test]
+    fn a_page_asked_from_a_place_forgotten_keeps_no_place() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+        rows::keep_place(conn, here.id, &AT, &[5; 8], 9).unwrap();
+        let asked = place(conn, &here, &AT).unwrap();
+        assert_eq!(asked, ([5; 8], 9));
+        rows::forget_places(conn, here.id).unwrap();
+        let dave = message(&member(7), &channel, 1, "dave", now);
+        let page = [dave];
+        let taken = take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            asked,
+            (&page, [5; 8], 12),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(taken.stale);
+        assert!(matches!(taken.each[..], [Taken::Shared { .. }]));
+        assert_eq!(place(conn, &here, &AT).unwrap(), (NO_MARK, 0));
+        let from_start = take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            (NO_MARK, 0),
+            (&[], [5; 8], 12),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!from_start.stale);
+        assert_eq!(place(conn, &here, &AT).unwrap(), ([5; 8], 12));
+    }
+
+    /// A page moves the device's place at a relay past every entry it
+    /// holds, one the door refused for room among them, so that what
+    /// follows is read (§6.3); a page of another holding, or one of nothing
+    /// under the mark of no holding against a place kept, starts the
+    /// channel again there; an entry of the device's own that a relay
+    /// hands is one that relay holds.
+    #[test]
+    fn a_page_moves_the_place_past_every_entry_refused_for_room_too() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        fill_to(&s, 0, &channel, FULL, now);
+        let conn = &s[0].conn;
+        let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+        assert_eq!(place(conn, &here, &AT).unwrap(), (NO_MARK, 0));
+        // A new key, refused for room: the place moves past it all the same.
+        let dave = message(&member(7), &channel, 1, "dave", now);
+        let page = [dave.clone()];
+        let taken = take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            (NO_MARK, 0),
+            (&page, [5; 8], 9),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(taken.each, [Taken::Refused(NotTaken::SharedFull)]);
+        assert!(taken.got_somewhere);
+        assert_eq!(place(conn, &here, &AT).unwrap(), ([5; 8], 9));
+        // The same page again gets nowhere.
+        let again = take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            ([5; 8], 9),
+            (&page, [5; 8], 9),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!again.got_somewhere);
+        // The device's own entry: that relay holds it, and it waits there
+        // no more.
+        let own = anew(&s[0].identity, &channel, 1);
+        crate::take::take(conn, &s[0].identity, &own, now).unwrap();
+        let most = Most {
+            entries: 100,
+            bytes: 1 << 20,
+        };
+        assert_eq!(
+            to_send(conn, &s[0].identity, &here, &AT, most).unwrap(),
+            std::slice::from_ref(&own)
+        );
+        let page = std::slice::from_ref(&own);
+        take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            ([5; 8], 9),
+            (page, [5; 8], 10),
+            now,
+        )
+        .unwrap();
+        assert!(
+            to_send(conn, &s[0].identity, &here, &AT, most)
+                .unwrap()
+                .is_empty()
+        );
+        // Another holding: the place and the answers start again there,
+        // and the page got somewhere, though its place is lower.
+        let anew_holding = take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            ([5; 8], 10),
+            (&[], [6; 8], 0),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(anew_holding.got_somewhere);
+        assert_eq!(place(conn, &here, &AT).unwrap(), ([6; 8], 0));
+        assert_eq!(
+            to_send(conn, &s[0].identity, &here, &AT, most).unwrap(),
+            std::slice::from_ref(&own)
+        );
+        // A page of nothing under the mark of no holding, against a place
+        // kept: the relay holds the channel no more.
+        take_page(
+            conn,
+            &s[0].identity,
+            &here,
+            &AT,
+            ([6; 8], 0),
+            (&[], NO_MARK, 0),
+            now,
+        )
+        .unwrap();
+        assert_eq!(place(conn, &here, &AT).unwrap(), (NO_MARK, 0));
+        // An entry of another channel: nothing of the page is taken.
+        let other = crate::shared::tests::Shared::of(2);
+        let stray = [message(&member(8), &other, 1, "x", now)];
+        assert!(
+            take_page(
+                conn,
+                &s[0].identity,
+                &here,
+                &AT,
+                (NO_MARK, 0),
+                (&stray, [7; 8], 3),
+                now
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(place(conn, &here, &AT).unwrap(), (NO_MARK, 0));
+    }
+
+    /// What waits at a relay is each entry of the device's own that the
+    /// relay has not answered at its revision or above (§8.4): one it holds,
+    /// holds a later one of, holds another of, or refused as not signed is
+    /// not sent there again; one it refused for room, or for the address's
+    /// allowance, waits; a later revision waits again; another relay is its
+    /// own; and a relay that answers a proof with no is sent everything
+    /// again. A push is within its most, as a relay counts each entry.
+    #[test]
+    fn what_waits_is_what_a_relay_has_not_answered_at_its_revision() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let identity = &s[0].identity;
+        let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+        let most = Most {
+            entries: 100,
+            bytes: 1 << 20,
+        };
+        let own = anew(identity, &channel, 1);
+        crate::take::take(conn, identity, &own, now).unwrap();
+        let waits = |relay: &[u8; 32]| to_send(conn, identity, &here, relay, most).unwrap();
+        assert_eq!(waits(&AT), std::slice::from_ref(&own));
+        for refused in [Pushed::NoRoom, Pushed::OverAllowance] {
+            assert_eq!(
+                pushed(
+                    conn,
+                    identity,
+                    &here,
+                    &AT,
+                    std::slice::from_ref(&own),
+                    &[refused],
+                    now
+                )
+                .unwrap(),
+                1
+            );
+            assert_eq!(waits(&AT), std::slice::from_ref(&own));
+        }
+        // Another at its revision writes it again above: a test of its own.
+        for answer in [Pushed::Holds, Pushed::HoldsLater, Pushed::DoesNotCheck] {
+            not_held_at(conn, &here, &AT).unwrap();
+            assert_eq!(waits(&AT), std::slice::from_ref(&own));
+            assert_eq!(
+                pushed(
+                    conn,
+                    identity,
+                    &here,
+                    &AT,
+                    std::slice::from_ref(&own),
+                    &[answer],
+                    now
+                )
+                .unwrap(),
+                0
+            );
+            assert!(waits(&AT).is_empty(), "{answer:?}");
+        }
+        assert_eq!(waits(&ELSEWHERE), std::slice::from_ref(&own));
+        // A later revision of its record waits again.
+        let later = anew(identity, &channel, 2);
+        crate::take::take(conn, identity, &later, now).unwrap();
+        assert_eq!(waits(&AT), std::slice::from_ref(&later));
+        // Within its most, as a relay counts the entry.
+        let cost = usize::try_from(entry_cost(later.content.len())).unwrap();
+        let within = |entries: usize, bytes: usize| {
+            to_send(conn, identity, &here, &AT, Most { entries, bytes }).unwrap()
+        };
+        assert_eq!(within(1, cost), std::slice::from_ref(&later));
+        assert!(within(1, cost - 1).is_empty());
+        assert!(within(0, cost).is_empty());
+        // Another key's entry is never the device's to push.
+        let theirs = anew(&member(3), &channel, 1);
+        crate::take::take(conn, identity, &theirs, now).unwrap();
+        assert_eq!(waits(&AT), std::slice::from_ref(&later));
+        // An answer at a lower revision does not undo one at a higher.
+        let held = std::slice::from_ref(&later);
+        pushed(conn, identity, &here, &AT, held, &[Pushed::Holds], now).unwrap();
+        rows::answered(conn, here.id, &AT, &own.slot, own.rev, Answer::Holds).unwrap();
+        assert!(waits(&AT).is_empty());
+    }
+
+    /// A channel dropped and taken again has its empty anew record written
+    /// at revision 1 once more; a relay that kept the first answers that
+    /// it holds another at that revision, and the record is written again
+    /// above it and waits there (§2.3). Another key's entry, and a message
+    /// of this device's, are not written again.
+    #[test]
+    fn an_anew_record_a_relay_holds_another_of_is_written_again_above() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let identity = &s[0].identity;
+        let most = Most {
+            entries: 100,
+            bytes: 1 << 20,
+        };
+        assert_eq!(
+            crate::sharing::write_empty_anew_records(conn, identity, now).unwrap(),
+            1
+        );
+        acts(&s, 0, Do::Drop(channel.id), now + 1);
+        holds(&s, 0, 1, "review", now + 2);
+        assert_eq!(
+            crate::sharing::write_empty_anew_records(conn, identity, now + 2).unwrap(),
+            1
+        );
+        let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+        let first = to_send(conn, identity, &here, &AT, most).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].rev, 1);
+        let theirs = anew(&member(3), &channel, 1);
+        let mine = message(identity, &channel, 1, "hello", now + 2);
+        crate::take::take(conn, identity, &mine, now + 2).unwrap();
+        let batch = [first[0].clone(), theirs, mine.clone()];
+        let answers = [Pushed::HoldsAnother; 3];
+        pushed(conn, identity, &here, &AT, &batch, &answers, now + 3).unwrap();
+        let again = to_send(conn, identity, &here, &AT, most).unwrap();
+        assert_eq!(again.len(), 1, "{again:?}");
+        assert_eq!((again[0].slot, again[0].rev), (first[0].slot, 2));
+        let opened = again[0].open(&channel.secret).unwrap();
+        assert_eq!(opened.name, anew_name(&identity.public_key()).unwrap());
+        // Answered at the revision it was written over: nothing more.
+        pushed(
+            conn,
+            identity,
+            &here,
+            &AT,
+            &first,
+            &[Pushed::HoldsAnother],
+            now + 4,
+        )
+        .unwrap();
+        assert_eq!(to_send(conn, identity, &here, &AT, most).unwrap(), again);
+    }
+
+    /// A read again from the start begins at most once a day for each
+    /// channel (§6.3): the places of the channel go at every relay, and
+    /// another asked within the day begins when the day is up.
+    #[test]
+    fn a_read_again_forgets_the_places_at_every_relay_once_a_day() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let id = row(&s, 0, &channel).id;
+        rows::keep_place(conn, id, &AT, &[5; 8], 9).unwrap();
+        rows::keep_place(conn, id, &ELSEWHERE, &[6; 8], 4).unwrap();
+        labels(&s, 0, &member(2).public_key(), Some("carol"), now);
+        assert_eq!(begin_reads_again(conn, now).unwrap(), [channel.id]);
+        assert_eq!(rows::place(conn, id, &AT).unwrap(), None);
+        assert_eq!(rows::place(conn, id, &ELSEWHERE).unwrap(), None);
+        rows::keep_place(conn, id, &AT, &[5; 8], 9).unwrap();
+        labels(&s, 0, &member(3).public_key(), Some("dave"), now + 1);
+        assert!(begin_reads_again(conn, now + DAY - 1).unwrap().is_empty());
+        assert_eq!(rows::place(conn, id, &AT).unwrap(), Some(([5; 8], 9)));
+        assert_eq!(begin_reads_again(conn, now + DAY).unwrap(), [channel.id]);
+        assert_eq!(rows::place(conn, id, &AT).unwrap(), None);
+    }
+
+    /// The one entry a share pair channel's door pushes is a share that this
+    /// device wrote there with the key it is for, and that its store holds
+    /// at that revision (§8.4).
+    #[test]
+    fn the_share_pair_door_pushes_only_a_share_this_device_wrote_for_that_key() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let conn = &s[0].conn;
+        let identity = &s[0].identity;
+        let alice = member(1);
+        let (channel, secret) = share_pair(identity, &alice.public_key()).unwrap();
+        assert_eq!(share_pair(&alice, &s.key(0)).unwrap().0, channel);
+        assert!(share_pair(identity, &s.key(0)).is_none());
+        let name = cordelia_crypto::share::share_name(&[1; 32]);
+        let share = crate::several::entry_by(
+            identity,
+            &secret,
+            now as u64,
+            &name,
+            cordelia_crypto::entry::Value::Other(vec![0; 16]),
+            &[],
+        );
+        assert!(!is_own_share(conn, identity, &alice.public_key(), &share).unwrap());
+        entries::store(conn, &share, now).unwrap();
+        assert!(is_own_share(conn, identity, &alice.public_key(), &share).unwrap());
+        // Not for another key, and not another's entry there.
+        assert!(!is_own_share(conn, identity, &member(2).public_key(), &share).unwrap());
+        let theirs = crate::several::entry_by(
+            &alice,
+            &secret,
+            now as u64,
+            &name,
+            cordelia_crypto::entry::Value::Other(vec![0; 16]),
+            &[],
+        );
+        entries::store(conn, &theirs, now).unwrap();
+        assert!(!is_own_share(conn, identity, &alice.public_key(), &theirs).unwrap());
+    }
+
+    /// What the extremes give a shared channel's door, case by case.
+    fn extremes(channel: &crate::shared::tests::Shared) -> Vec<(String, CheckedEntry)> {
+        use crate::several::{entry_by, signed_in};
+        use cordelia_core::protocol::{
+            AGENT_MESSAGE_BODY_MAX_BYTES, AGENT_MESSAGE_NUMBER_MAX, AGENT_MESSAGE_VALUE_BYTES,
+            MAX_REV, REV_BAND_HALF, SHARED_ACT_TIME_MAX, SHARED_ANEW_VALUE_BYTES,
+        };
+        use cordelia_crypto::entry::Value;
+        use cordelia_crypto::message::{clearing_rev, clearing_value, message_name, message_rev};
+        use cordelia_crypto::share::{Card, Relays};
+        use cordelia_crypto::shared::{Anew, Offer};
+
+        let mut cases: Vec<(String, CheckedEntry)> = Vec::new();
+        // Each case by a key of its own, so that no case's ring or slot is
+        // another's.
+        let mut n = 100;
+        let mut next = || {
+            n += 1;
+            member(n)
+        };
+
+        // A message's value, as `says` writes it, then changed by `edit`.
+        let message_with = |author: &NodeIdentity, number: u64, edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut value = crate::shared::tests::says("x", 0).to_value().unwrap();
+            edit(&mut value);
+            assert_eq!(value.len(), AGENT_MESSAGE_VALUE_BYTES);
+            let name = message_name(&author.public_key(), number).unwrap();
+            entry_by(
+                author,
+                &channel.secret,
+                message_rev(number).unwrap(),
+                &name,
+                Value::Other(value),
+                &[],
+            )
+        };
+        // The message's fields: the form at 0, the flags at 1, the time at
+        // 2, the link's length at 58, then the link and the body's count.
+        for sent in [0, SHARED_ACT_TIME_MAX, 1 << 63, u64::MAX] {
+            let author = next();
+            let entry = message_with(&author, 1, &|v| {
+                v[2..10].copy_from_slice(&sent.to_be_bytes())
+            });
+            cases.push((format!("a message sent at {sent}"), entry));
+        }
+        let body = |count: usize, byte: u8| {
+            move |v: &mut Vec<u8>| {
+                v[58] = 0;
+                v[59..61].copy_from_slice(&(count as u16).to_be_bytes());
+                let room = AGENT_MESSAGE_VALUE_BYTES - 61;
+                for (at, place) in v[61..].iter_mut().enumerate() {
+                    *place = if at < count.min(room) { byte } else { 0 };
+                }
+            }
+        };
+        for (what, count, byte) in [
+            ("an empty body", 0, b'x'),
+            ("a body at its bound", AGENT_MESSAGE_BODY_MAX_BYTES, b'x'),
+            (
+                "a body past its bound",
+                AGENT_MESSAGE_BODY_MAX_BYTES + 1,
+                b'x',
+            ),
+            ("a body of u16::MAX", usize::from(u16::MAX), b'x'),
+            ("a body that is not text", 4, 0xff),
+        ] {
+            let author = next();
+            cases.push((what.into(), message_with(&author, 1, &body(count, byte))));
+        }
+        let link = |text: String| {
+            move |v: &mut Vec<u8>| {
+                let bytes = text.as_bytes();
+                v.truncate(58);
+                v.push(bytes.len() as u8);
+                v.extend_from_slice(bytes);
+                v.extend_from_slice(&1u16.to_be_bytes());
+                v.push(b'x');
+                v.resize(AGENT_MESSAGE_VALUE_BYTES, 0);
+            }
+        };
+        let longest = format!("{}/{}#{}", "o".repeat(39), "r".repeat(100), "9".repeat(10));
+        for (what, text) in [
+            ("a link at its bound", longest.clone()),
+            ("a link past its bound", format!("{longest}9")),
+            ("a link of 255 bytes", "o".repeat(255)),
+        ] {
+            let author = next();
+            cases.push((what.into(), message_with(&author, 1, &link(text))));
+        }
+        for (what, at, byte) in [("every flag", 1, 0xff), ("a form of 255", 0, 0xff)] {
+            let author = next();
+            cases.push((what.into(), message_with(&author, 1, &|v| v[at] = byte)));
+        }
+        for (what, byte) in [("a thread and an answer of 0xff", 0xff), ("of 0", 0)] {
+            let author = next();
+            let entry = message_with(&author, 1, &|v| v[26..58].fill(byte));
+            cases.push((what.into(), entry));
+        }
+        let author = next();
+        cases.push((
+            "the highest number".into(),
+            message_with(&author, AGENT_MESSAGE_NUMBER_MAX, &|_| {}),
+        ));
+        let author = next();
+        let name = message_name(&author.public_key(), AGENT_MESSAGE_NUMBER_MAX).unwrap();
+        let clearing = entry_by(
+            &author,
+            &channel.secret,
+            clearing_rev(AGENT_MESSAGE_NUMBER_MAX).unwrap(),
+            &name,
+            Value::Other(clearing_value()),
+            &[],
+        );
+        cases.push(("a clearing of the highest number".into(), clearing));
+
+        // An offer's fields: the time at 1, the relays' count at 41, the
+        // seals' count at 74 (one relay), the fill after.
+        let card = Card::make(Relays::new(&[AT]).unwrap()).unwrap();
+        let offer = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let keys = [member(1).public_key(), member(2).public_key()];
+            let mut value = Anew::Offer(Offer::make(9, &channel.id, &card, &keys).unwrap())
+                .to_value()
+                .unwrap();
+            edit(&mut value);
+            assert_eq!(value.len(), SHARED_ANEW_VALUE_BYTES);
+            value
+        };
+        for made in [
+            0,
+            SHARED_ACT_TIME_MAX,
+            SHARED_ACT_TIME_MAX + 1,
+            1 << 63,
+            u64::MAX,
+        ] {
+            let author = next();
+            let value = offer(&|v| v[1..9].copy_from_slice(&made.to_be_bytes()));
+            cases.push((
+                format!("an offer made at {made}"),
+                anew_of(&author, channel, 2, value),
+            ));
+        }
+        for (what, at, byte) in [
+            ("an offer of no relay", 41, 0),
+            ("an offer of 255 relays", 41, 255),
+            ("an offer of no seal", 74, 0),
+            ("an offer of 65 seals", 74, 65),
+            ("an offer of 255 seals", 74, 255),
+            (
+                "an offer whose fill is not zeros",
+                SHARED_ANEW_VALUE_BYTES - 1,
+                1,
+            ),
+        ] {
+            let author = next();
+            let value = offer(&|v| v[at] = byte);
+            cases.push((what.into(), anew_of(&author, channel, 2, value)));
+        }
+        let author = next();
+        cases.push((
+            "an anew record at the highest revision of band 0".into(),
+            anew(&author, channel, REV_BAND_HALF - 1),
+        ));
+
+        // What an entry carries in clear: its revision, its size, a delete.
+        // A revision past `MAX_REV` and a size that is no power of two from
+        // 256 to 64 KB are no entry: the wire refuses them, and no checked
+        // entry holds one.
+        let slot_key = derive::slot_key(&channel.secret).unwrap();
+        for rev in [REV_BAND_HALF, MAX_REV] {
+            let author = next();
+            let slot = slot_id(&slot_key, &anew_name(&author.public_key()).unwrap());
+            let entry = signed_in(&channel.secret, &author, slot, rev, vec![0; 16_384]);
+            cases.push((format!("an anew record at revision {rev}"), entry));
+        }
+        for size in [256, 65_536] {
+            let author = next();
+            let slot = slot_id(&slot_key, &anew_name(&author.public_key()).unwrap());
+            let entry = signed_in(&channel.secret, &author, slot, 2, vec![0; size]);
+            cases.push((format!("an anew record of {size} bytes"), entry));
+        }
+        let author = next();
+        let name = anew_name(&author.public_key()).unwrap();
+        let deleted = entry_by(&author, &channel.secret, 2, &name, Value::Delete, &[]);
+        assert!(deleted.delete);
+        cases.push(("a delete in an anew slot".into(), deleted));
+        cases
+    }
+
+    /// **No remote field stops the pass** (the read of #281 for the shared
+    /// gate, its pattern): one store error on an entry a relay hands stops
+    /// the whole shared pass at that relay, its pushes too. Each field of a
+    /// shared message, an offer and an entry's clear fields, at 0, at its
+    /// bound, past it and at its type's most, and each length at nothing
+    /// and past its bound, goes through `take_page` with no error; and the
+    /// pass then goes on: a later page is taken, what waits is pushed, and
+    /// the hourly task and the status read the rows they left.
+    /// Of these, an offer made at 2^63 or later failed the store
+    /// (`shared_anew_offers.made >= 0`), and no other.
+    #[test]
+    fn no_remote_field_at_its_extreme_stops_the_shared_pass() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let identity = &s[0].identity;
+        let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+        let mut next = 0;
+        for (what, entry) in extremes(&channel) {
+            let asked = place(conn, &here, &AT).unwrap();
+            next += 1;
+            let page = [entry];
+            let taken = take_page(
+                conn,
+                identity,
+                &here,
+                &AT,
+                asked,
+                (&page, [5; 8], next),
+                now,
+            );
+            let taken = taken.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(taken.is_some(), "{what}");
+            assert_eq!(place(conn, &here, &AT).unwrap(), ([5; 8], next), "{what}");
+        }
+        // Each case reached the reader: the messages that are messages are
+        // indexed, the times past the store's integer among them, and each
+        // offer within the bound is kept.
+        assert_eq!(crate::shared::tests::indexed(&s, 0, &channel), 9);
+        let offers = cordelia_storage::shared_anew::offers_in(conn, &channel.id).unwrap();
+        assert_eq!(offers.len(), 2, "{offers:?}");
+        // The pass goes on: a message after them is taken and read, and
+        // what waits of the device's own is pushed and answered.
+        let last = message(&member(99), &channel, 1, "after", now);
+        let asked = place(conn, &here, &AT).unwrap();
+        let taken = take_page(
+            conn,
+            identity,
+            &here,
+            &AT,
+            asked,
+            (std::slice::from_ref(&last), [5; 8], next + 1),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(
+                taken.each[..],
+                [Taken::Shared {
+                    stored: entries::Outcome::Stored,
+                    ..
+                }]
+            ),
+            "{:?}",
+            taken.each
+        );
+        let own = anew(identity, &channel, 1);
+        crate::take::take(conn, identity, &own, now).unwrap();
+        let most = Most {
+            entries: 100,
+            bytes: 1 << 20,
+        };
+        let batch = to_send(conn, identity, &here, &AT, most).unwrap();
+        assert_eq!(batch, std::slice::from_ref(&own));
+        pushed(conn, identity, &here, &AT, &batch, &[Pushed::Holds], now).unwrap();
+        assert!(
+            to_send(conn, identity, &here, &AT, most)
+                .unwrap()
+                .is_empty()
+        );
+        // What reads the rows they left: the hourly task, a day and 31
+        // days on, and the status's `shared` object.
+        for later in [now + DAY, now + 31 * DAY] {
+            crate::shared::tests::hourly(conn, &identity.public_key(), later).unwrap();
+        }
+        let said = crate::state::SharedSaid::default();
+        let beside = crate::shared_status::Beside {
+            own_relays: &[],
+            connected: &[AT],
+            said: &said,
+        };
+        crate::shared_status::status_of(conn, identity, &beside, now)
+            .unwrap()
+            .unwrap();
+    }
+}

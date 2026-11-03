@@ -22,6 +22,7 @@ mod p2p;
 mod person_cmd;
 mod recover_cmd;
 mod relay_entries;
+mod shared_cmd;
 mod terminal;
 
 /// What the program is, in one line: the head of `cordelia --help`, and
@@ -117,7 +118,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// List subscribed channels
+    /// List the names this device holds, or a relay's channels
     Channels,
     /// Show what this node stores and has seen (counts only)
     Stats {
@@ -130,7 +131,13 @@ enum Commands {
     /// To add this device, give the key to `cordelia add-device` on a
     /// device that has your recovery phrase.
     #[command(alias = "pubkey")]
-    Id,
+    Id {
+        /// Print, on a second line, the six words of the key's
+        /// fingerprint: what the person you share a channel with reads
+        /// back to you, by another way than the one the key came by
+        #[arg(long)]
+        words: bool,
+    },
     /// Make your recovery phrase on this device
     ///
     /// Run it once, on one device, in a terminal. It shows twelve words,
@@ -204,10 +211,85 @@ enum Commands {
     /// over. If nothing arrives within a minute, the command ends and the
     /// node goes on asking for the rest of the hour. `cordelia status`
     /// shows what happened.
+    ///
+    /// With `--channel <name>` it is another command: it takes one shared
+    /// channel that another person's device hands this one with `cordelia
+    /// share`, and files it under that name on every device of yours. It
+    /// never joins devices.
     Accept {
         /// The key of the device that added this one. `add-device` prints
-        /// it there
+        /// it there. With `--channel`, the key of the other person's
+        /// device, as `cordelia share` prints it there
         key: String,
+        /// Take a shared channel from that key, and file it under this name
+        #[arg(long, value_name = "NAME")]
+        channel: Option<String>,
+    },
+    /// Hand a shared channel to another person's device
+    ///
+    /// Run it in a terminal. Give the whole key, as `cordelia id` prints it
+    /// there. Before its yes it shows the six words of that key: have the
+    /// other person read you the words that `cordelia id --words` prints
+    /// there, by another way than the one the key came by.
+    Share {
+        /// The name you file the shared channel under
+        name: String,
+        /// The other device's key
+        key: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Give another person's device a label your devices show it by in
+    /// shared channels, or take it away with --none
+    ///
+    /// Run it in a terminal.
+    Label {
+        /// The device's key
+        key: String,
+        /// The label: 1 to 64 bytes of text
+        #[arg(required_unless_present = "none", conflicts_with = "none")]
+        label: Option<String>,
+        /// No label for that key
+        #[arg(long)]
+        none: bool,
+    },
+    /// Show the agent of this folder the messages of a shared channel, on
+    /// every device of yours
+    ///
+    /// Run it in a terminal, in the folder. It is shown a count of what
+    /// waits there, can read it, and can write there with
+    /// `cordelia msg send --channel <name>`. What was written there before
+    /// is in `cordelia msg log` only.
+    Subscribe {
+        /// The name you file the shared channel under
+        name: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Stop showing an agent a shared channel, on every device of yours
+    ///
+    /// In the folder, or from anywhere with --agent.
+    Unsubscribe {
+        /// The name you file the shared channel under
+        name: String,
+        /// The agent, as `cordelia sync status` names it, in place of this
+        /// folder's
+        #[arg(long)]
+        agent: Option<String>,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Channels shared between people: messages between your agents and
+    /// other people's agents, never memory
+    Shared {
+        #[command(subcommand)]
+        what: SharedCommand,
     },
     /// Remove one of your devices
     ///
@@ -443,7 +525,15 @@ enum MsgCommand {
     Read {
         /// 8 to 32 hex characters of the message's id, as `summary` shows
         /// it
-        id: String,
+        #[arg(
+            required_unless_present = "next_shared",
+            conflicts_with = "next_shared"
+        )]
+        id: Option<String>,
+        /// The oldest unread message of a shared channel this folder's
+        /// agent subscribes to
+        #[arg(long)]
+        next_shared: bool,
         /// Read as the agent of this folder, not of the one you run in:
         /// give the folder you gave `msg summary --folder`
         #[arg(long, value_name = "DIR")]
@@ -451,9 +541,18 @@ enum MsgCommand {
     },
     /// Send a message, as this folder's agent: its text on standard input
     ///
-    /// Give one of --to, --all and --reply. A message is at most 1024
-    /// bytes: put the rest in the issue or pull request that --re names.
+    /// Give one of --to, --all and --reply, or --channel. A message is at
+    /// most 1024 bytes: put the rest in the issue or pull request that --re
+    /// names.
     Send {
+        /// A shared channel this folder's agent subscribes to: the only
+        /// way into one. Other people's agents read it
+        #[arg(long, value_name = "NAME")]
+        channel: Option<String>,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS", requires = "channel")]
+        words: Option<String>,
         /// The name of one of your agents, as `cordelia sync status` lists
         /// it
         #[arg(long)]
@@ -488,8 +587,9 @@ enum MsgCommand {
     /// says so and asks nothing. Anywhere else it shows only those of this
     /// folder's agent, and marks nothing.
     Log {
-        /// Only messages sent since a time (2026-10-03T09:00:00Z), or in
-        /// the last while (30m, 2h, 3d)
+        /// Only your own agents' messages sent since a time
+        /// (2026-10-03T09:00:00Z), or in the last while (30m, 2h, 3d); a
+        /// shared channel's are all shown
         #[arg(long)]
         since: Option<String>,
     },
@@ -521,6 +621,88 @@ enum MsgCommand {
         /// given)
         #[arg(long = "for", value_name = "TIME")]
         for_time: Option<String>,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum SharedCommand {
+    /// Make a shared channel, at one or two of your relays known by their
+    /// keys
+    ///
+    /// Run it in a terminal. With no --relay it lives at your first two
+    /// relays that have a key in your configuration.
+    New {
+        /// The name you file it under
+        name: String,
+        /// A relay of yours, as your configuration names it (host:port).
+        /// Give it once for each, at most twice
+        #[arg(long = "relay", value_name = "RELAY")]
+        relays: Vec<String>,
+    },
+    /// List the shared channels, their keys and their relays
+    List {
+        /// Also list each channel's keys, those refused for room among them
+        #[arg(long)]
+        keys: bool,
+    },
+    /// File a shared channel under another name, on every device of yours
+    Rename {
+        name: String,
+        new_name: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Make a shared channel anew, choosing who stays, key by key
+    ///
+    /// Run it in a terminal. It lists every key this device has held or
+    /// refused in the channel, and asks of each whether it stays. Those
+    /// who stay move with `cordelia shared move` on one of their devices.
+    Anew {
+        name: String,
+        /// A relay of yours for the new channel, as your configuration
+        /// names it (host:port); with none, the old channel's
+        #[arg(long = "relay", value_name = "RELAY")]
+        relays: Vec<String>,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Move to a channel made anew, in the old one's place
+    ///
+    /// Run it in a terminal, on a device the new channel is sealed to.
+    Move {
+        name: String,
+        /// The new channel's four words, where it was made anew twice
+        #[arg(long, value_name = "CHANNEL WORDS")]
+        to: Option<String>,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Go on writing in a channel paused by an offer to move
+    ///
+    /// Run it in a terminal. The keys the offer leaves out read what is
+    /// written there.
+    Stay {
+        name: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
+    },
+    /// Stop holding a shared channel, on every device of yours
+    ///
+    /// Run it in a terminal. Its other members are not told.
+    Drop {
+        name: String,
+        /// The channel's four words, where two shared channels of yours
+        /// have one name
+        #[arg(long, value_name = "FOUR WORDS")]
+        words: Option<String>,
     },
 }
 
@@ -725,10 +907,53 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Peers { json }) => cmd_peers(&cli.config, json),
         Some(Commands::Channels) => cmd_channels(&cli.config),
         Some(Commands::Stats { json }) => cmd_stats(&cli.config, json),
-        Some(Commands::Id) => cmd_pubkey(&cli.config),
+        Some(Commands::Id { words: false }) => cmd_pubkey(&cli.config),
+        Some(Commands::Id { words: true }) => shared_cmd::id_words(&cli.config),
         Some(Commands::Phrase { name }) => person_cmd::phrase(&cli.config, name),
         Some(Commands::AddDevice { key, name }) => person_cmd::add_device(&cli.config, &key, name),
-        Some(Commands::Accept { key }) => person_cmd::accept(&cli.config, &key),
+        // Two commands under one name, on two paths and two routes
+        // (decision 2026-10-10 §3.2).
+        Some(Commands::Accept { key, channel: None }) => person_cmd::accept(&cli.config, &key),
+        Some(Commands::Accept {
+            key,
+            channel: Some(name),
+        }) => shared_cmd::accept(&cli.config, &key, &name),
+        Some(Commands::Share { name, key, words }) => {
+            shared_cmd::share(&cli.config, &name, &key, words.as_deref())
+        }
+        Some(Commands::Label { key, label, none }) => {
+            let label = if none { None } else { label };
+            shared_cmd::label(&cli.config, &key, label.as_deref())
+        }
+        Some(Commands::Subscribe { name, words }) => {
+            shared_cmd::subscribe(&cli.config, &name, words.as_deref())
+        }
+        Some(Commands::Unsubscribe { name, agent, words }) => {
+            shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
+        }
+        Some(Commands::Shared { what }) => match what {
+            SharedCommand::New { name, relays } => shared_cmd::new(&cli.config, &name, &relays),
+            SharedCommand::List { keys } => shared_cmd::show(&cli.config, keys),
+            SharedCommand::Rename {
+                name,
+                new_name,
+                words,
+            } => shared_cmd::rename(&cli.config, &name, &new_name, words.as_deref()),
+            SharedCommand::Drop { name, words } => {
+                shared_cmd::drop(&cli.config, &name, words.as_deref())
+            }
+            SharedCommand::Anew {
+                name,
+                relays,
+                words,
+            } => shared_cmd::anew(&cli.config, &name, &relays, words.as_deref()),
+            SharedCommand::Move { name, to, words } => {
+                shared_cmd::move_to(&cli.config, &name, to.as_deref(), words.as_deref())
+            }
+            SharedCommand::Stay { name, words } => {
+                shared_cmd::stay(&cli.config, &name, words.as_deref())
+            }
+        },
         Some(Commands::RemoveDevice { key }) => person_cmd::remove_device(&cli.config, &key),
         Some(Commands::Renew) => person_cmd::renew(&cli.config),
         Some(Commands::Settle) => person_cmd::settle(&cli.config),
@@ -771,8 +996,18 @@ fn main() -> anyhow::Result<()> {
                 msg_cmd::summary(&cli.config, started, folder, false);
                 Ok(())
             }
-            MsgCommand::Read { id, folder } => msg_cmd::read(&cli.config, &id, folder.as_deref()),
+            MsgCommand::Read {
+                id,
+                next_shared,
+                folder,
+            } => match (id, next_shared) {
+                (_, true) => msg_cmd::read_next_shared(&cli.config, folder.as_deref()),
+                (Some(id), false) => msg_cmd::read(&cli.config, &id, folder.as_deref()),
+                (None, false) => unreachable!("the parser asks for an id or --next-shared"),
+            },
             MsgCommand::Send {
+                channel,
+                words,
                 to,
                 all,
                 reply,
@@ -782,6 +1017,8 @@ fn main() -> anyhow::Result<()> {
             } => msg_cmd::send(
                 &cli.config,
                 &msg_cmd::SendFlags {
+                    channel,
+                    words,
                     to,
                     all,
                     reply,
@@ -1260,6 +1497,26 @@ fn memory_line(summary: &str) -> String {
     format!("  Memory:    {}", indicator::without_memory(summary))
 }
 
+/// The line of the plain `cordelia status` that says the one hold of a
+/// shared channel (decision 2026-10-10 §9): its label says "Shared" once,
+/// and the words come without their first word.
+fn shared_line(says: &str) -> String {
+    format!("  Shared:    {}", indicator::without_shared(says))
+}
+
+/// What the plain status says under `Memory:`, worked out from `facts`
+/// without the hold of a shared channel, and that hold, where it holds
+/// (decision 2026-10-10 §9).
+fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indicator::Holds>) {
+    let shared = indicator::shown(facts)
+        .holds
+        .into_iter()
+        .find(indicator::is_shared);
+    let mut without = facts.clone();
+    without.devices.removed_holds_shared = 0;
+    (indicator::shown(&without), shared)
+}
+
 fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
     let status = gather_status(config_path);
     // The state, the level, and what the line says: the level is worked
@@ -1413,6 +1670,13 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             // here alone, and in nothing the level is worked out from.
             if live["messages"].is_object() {
                 out["messages"] = live["messages"].clone();
+            }
+            // What the node says of the shared channels, as it gave it,
+            // where it gives it (decision 2026-10-10 §9): apart from
+            // `messages`, never mixed in one count. The level reads one
+            // fact of it alone ([`indicator::shared`]).
+            if live["shared"].is_object() {
+                out["shared"] = live["shared"].clone();
             }
         }
         if let Some(sync) = &status.sync {
@@ -1596,9 +1860,22 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 );
             }
             if config.network.role == "personal" {
-                println!("{}", memory_line(&summary));
-                for more in &also {
+                // The hold of a shared channel is said on a line of its
+                // own, `Shared:`, and not under `Memory:` (decision
+                // 2026-10-10 §9; the words of a change, rule 5): what
+                // `Memory:` says is worked out without it.
+                let (memory, shared) = memory_and_shared(&status.facts);
+                println!("{}", memory_line(&memory.summary));
+                for more in memory
+                    .holds
+                    .iter()
+                    .filter(|holds| holds.says != memory.summary)
+                    .map(indicator::Holds::detail)
+                {
                     println!("    also:     {more}");
+                }
+                if let Some(shared) = shared {
+                    println!("{}", shared_line(&shared.says));
                 }
                 for c in &status.facts.conflicts {
                     println!("    conflict: {c}");
@@ -1822,6 +2099,12 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         out.facts.devices = devices_facts(&person, chrono::Utc::now().timestamp());
         out.person = Some(person);
     }
+    // The one fact of the shared channels that sets a level: a removed
+    // device that still holds one (decision 2026-10-10 §9, property 16).
+    if let Some(live) = &out.live {
+        let now = chrono::Utc::now().timestamp();
+        indicator::shared(&mut out.facts.devices, &live["shared"], now);
+    }
     if let Some(sync) = &out.sync {
         let person = out.person.as_ref().unwrap_or(&serde_json::Value::Null);
         out.facts.channel = channel_facts(&sync["report"], person, out.device.as_deref());
@@ -1943,6 +2226,10 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
             .as_array()
             .map_or(0, Vec::len),
         carried_to_go_secs: ago(&person["names"]["carried_to_go_since"]),
+        // From the status's `shared` object, not from the look
+        // ([`indicator::shared`]).
+        removed_holds_shared_secs: None,
+        removed_holds_shared: 0,
     }
 }
 
@@ -2738,6 +3025,13 @@ fn messages_at_start(state: &cordelia_api::state::AppState) {
         Ok(true) => tracing::info!("messages: read the lists held from before this version"),
         Ok(false) => {}
         Err(e) => tracing::warn!(error = %e, "messages: could not read the lists held"),
+    }
+    // And the lists of shared marks held from before step 31 (decision
+    // 2026-10-10 §14), before the first pass.
+    match cordelia_api::reader::read_held_shared_lists(&db, &state.identity, now) {
+        Ok(true) => tracing::info!("messages: read the lists of shared marks held"),
+        Ok(false) => {}
+        Err(e) => tracing::warn!(error = %e, "messages: could not read the lists of shared marks"),
     }
 }
 
@@ -5457,7 +5751,7 @@ fn shell_arg(path: &str) -> String {
 /// A word as a shell argument: as it is where that is safe, quoted
 /// otherwise. Names from other devices are printed inside commands to
 /// copy, so nothing in one may be read by the shell.
-fn shell_word(word: &str) -> String {
+pub(crate) fn shell_word(word: &str) -> String {
     let plain = !word.is_empty()
         && !word.starts_with('-')
         && word
@@ -5748,6 +6042,25 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         ]);
     }
     print_columns(&rows);
+    // Each folder's subscriptions to shared channels (decision 2026-10-10
+    // §5.1), where it subscribes to any.
+    let shared =
+        api_post(config_path, "/api/v1/shared/list", serde_json::json!({})).unwrap_or_default();
+    for f in &folders {
+        let agent = text(&f["project"]);
+        let names: Vec<String> = list(&shared["subscriptions"])
+            .iter()
+            .filter(|row| row["agent"].as_str() == Some(agent.as_str()))
+            .map(|row| sync_label(&text(&row["channel"])))
+            .collect();
+        if !names.is_empty() {
+            println!(
+                "  {}: subscribes to: {}",
+                sync_label(&agent),
+                names.join(", ")
+            );
+        }
+    }
     for f in &folders {
         for s in list(&f["skipped"]) {
             println!(
@@ -7244,6 +7557,8 @@ mod tests {
                 // Of those, the names that a carry holds with no folder.
                 carried_to_go: 2,
                 carried_to_go_secs: Some(20),
+                removed_holds_shared_secs: None,
+                removed_holds_shared: 0,
             }
         );
 
@@ -9128,6 +9443,60 @@ mod tests {
             memory_line("memory: node stopped"),
             "  Memory:    node stopped"
         );
+    }
+
+    /// **The plain status says the hold of a shared channel on a line of its
+    /// own** (decision 2026-10-10 §9, section 19 item 22): `Shared:`, with
+    /// its words after its label, and `Memory:` says what it would say
+    /// without it, its other holds among the "also" lines and that hold not
+    /// among them. The line itself (`--line`) says it as it is.
+    #[test]
+    fn the_plain_status_says_a_removed_device_that_holds_a_shared_channel_apart() {
+        let mut f = indicator::Facts {
+            initialised: true,
+            running: true,
+            role: "personal".into(),
+            stands: "applied".into(),
+            peers_hot: 2,
+            sync_enabled: true,
+            report_age_secs: Some(3),
+            folders: 1,
+            mapped: 1,
+            ..Default::default()
+        };
+        f.devices.removed_holds_shared = 1;
+        f.devices.removed_holds_shared_secs = Some(3_600);
+        let line = indicator::shown(&f).summary;
+        assert_eq!(
+            line,
+            "shared: 1 shared channel not made anew since a removal: make \
+             each anew once with cordelia shared anew <name>"
+        );
+        let (memory, shared) = memory_and_shared(&f);
+        assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
+        assert!(memory.holds.is_empty(), "{:?}", memory.holds);
+        assert_eq!(
+            shared_line(&shared.unwrap().says),
+            "  Shared:    1 shared channel not made anew since a removal: make \
+             each anew once with cordelia shared anew <name>"
+        );
+        // Beside another amber hold: that one is under `Memory:`.
+        f.devices.said_left = 1;
+        let (memory, shared) = memory_and_shared(&f);
+        assert_eq!(
+            memory_line(&memory.summary),
+            "  Memory:    a device has left"
+        );
+        assert!(shared.is_some());
+        assert!(
+            memory
+                .holds
+                .iter()
+                .all(|holds| !indicator::is_shared(holds))
+        );
+        // With none, there is no `Shared:` line.
+        f.devices.removed_holds_shared = 0;
+        assert!(memory_and_shared(&f).1.is_none());
     }
 
     /// `cordelia --help`, and `cordelia` with no command, are headed by

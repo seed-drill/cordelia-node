@@ -72,7 +72,9 @@ use cordelia_core::protocol::{AGENT_MESSAGE_SENDS_MAX, REV_BAND_HALF};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{Entry, Value};
 use cordelia_crypto::identity::NodeIdentity;
-use cordelia_crypto::message::{self, PersonReads, ReadMarks, hold_name, person_name, read_name};
+use cordelia_crypto::message::{
+    self, PersonReads, ReadMarks, hold_name, person_name, read_name, sread_name,
+};
 use cordelia_crypto::slots::slot_id;
 use cordelia_storage::StorageError;
 use cordelia_storage::entries::{self, Outcome};
@@ -287,6 +289,12 @@ pub fn answered(
         if let Some(rev) = another(&bounds.slot) {
             crate::bounds::answered_another(conn, identity, now, fetched, rev)?;
         }
+        // The list of shared marks is matched by its own slot too, and
+        // written again apart (decision 2026-10-10 §6.1).
+        let shared = HeldList::of(conn, &own, PersonList::SharedReads)?;
+        if let Some(rev) = another(&shared.slot) {
+            crate::shared_messages::list_written(conn, identity, now, fetched, Some(rev))?;
+        }
         match another(&held.slot) {
             Some(rev) => list_written(conn, identity, now, fetched, Some(rev)),
             None => Ok(None),
@@ -441,6 +449,9 @@ pub(crate) enum PersonList {
     Reads,
     /// The bounds a person set on it, in `hold/<its key>`.
     Bounds,
+    /// The shared messages its agents read and sent, in `sread/<its key>`
+    /// (decision 2026-10-10 §6.1).
+    SharedReads,
 }
 
 impl PersonList {
@@ -448,6 +459,7 @@ impl PersonList {
         Ok(match self {
             Self::Reads => person_name(own)?,
             Self::Bounds => hold_name(own)?,
+            Self::SharedReads => sread_name(own)?,
         })
     }
 
@@ -457,6 +469,7 @@ impl PersonList {
         match self {
             Self::Reads => meta::MESSAGES_PERSON_AGAIN,
             Self::Bounds => meta::MESSAGES_BOUNDS_AGAIN,
+            Self::SharedReads => meta::MESSAGES_SREAD_AGAIN,
         }
     }
 }
@@ -718,8 +731,9 @@ impl PersonRead {
 // ── What a pass found last (issue #221) ──────────────────────────────
 
 /// What a device's passes found last of what decides whether its list of
-/// a person's reads, and its list of bounds, is due (decision 2026-10-25,
-/// rules 1 and 2), kept in memory between passes. Each pass asks whether
+/// a person's reads, its list of bounds (decision 2026-10-25, rules 1 and
+/// 2), and its list of shared marks (decision 2026-10-10 §6.1), is due,
+/// kept in memory between passes. Each pass asks whether
 /// either list is due, at each relay; asked in full, that opens the list
 /// the store holds and checks the statement, under the lock, each time.
 /// What decides it is read here with a few reads of the store and nothing
@@ -734,6 +748,7 @@ pub struct ListsSeen {
     under: Option<Under>,
     reads: Option<Inputs>,
     bounds: Option<Inputs>,
+    shared_reads: Option<Inputs>,
 }
 
 #[derive(Debug)]
@@ -742,6 +757,7 @@ struct Under {
     channel: [u8; 32],
     reads_slot: [u8; 32],
     bounds_slot: [u8; 32],
+    shared_reads_slot: [u8; 32],
 }
 
 /// What decides whether one of the lists is due, but the time.
@@ -769,6 +785,8 @@ enum Rows {
         rows: Vec<held::BoundRow>,
         additions: Vec<cordelia_storage::person::KeptAddition>,
     },
+    /// The marks of the device's table of shared marks that a list holds.
+    SharedReads(Vec<Mark>),
 }
 
 impl ListsSeen {
@@ -793,6 +811,7 @@ impl ListsSeen {
                 channel: derive::channel_id(&secret)?,
                 reads_slot: slot_id(&slot_key, &person_name(own)?),
                 bounds_slot: slot_id(&slot_key, &hold_name(own)?),
+                shared_reads_slot: slot_id(&slot_key, &sread_name(own)?),
             });
         }
         match &self.under {
@@ -823,6 +842,7 @@ impl ListsSeen {
         let (channel, slot) = match list {
             PersonList::Reads => (under.channel, under.reads_slot),
             PersonList::Bounds => (under.channel, under.bounds_slot),
+            PersonList::SharedReads => (under.channel, under.shared_reads_slot),
         };
         let rev = entries::author_cost(conn, &channel, &slot, own)?.map(|(rev, _)| rev);
         let (rows, until) = match list {
@@ -838,6 +858,13 @@ impl ListsSeen {
                 let additions = cordelia_storage::person::additions(conn)?;
                 (Rows::Bounds { rows, additions }, until)
             }
+            PersonList::SharedReads => (
+                Rows::SharedReads(
+                    cordelia_storage::shared_messages::marks_to_list(conn)
+                        .map_err(PersonError::Storage)?,
+                ),
+                i64::MAX,
+            ),
         };
         Ok(Some(Inputs {
             statement: person.statement,
@@ -853,6 +880,7 @@ impl ListsSeen {
         match list {
             PersonList::Reads => &mut self.reads,
             PersonList::Bounds => &mut self.bounds,
+            PersonList::SharedReads => &mut self.shared_reads,
         }
     }
 
@@ -927,7 +955,7 @@ mod tests {
     use cordelia_crypto::message::{To, read_mark};
     use cordelia_storage::entries::StoredEntry;
 
-    use crate::sender::{At, Request, no_reply, send};
+    use crate::sender::{Address, At, Request, no_reply, send};
     use crate::several::Several;
     use crate::take::{Taken, take};
 
@@ -959,13 +987,15 @@ mod tests {
             no_place: false,
             mapped: true,
             per_folder_per_hour: AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
+            shared_fetched: false,
+            shared_reached: false,
         };
         let request = Request {
             from: from.into(),
-            to: match to {
+            address: Address::Own(match to {
                 "*" => To::All,
                 name => To::Name(name.into()),
-            },
+            }),
             asks: false,
             link: None,
             body: body.into(),
@@ -2144,5 +2174,60 @@ mod tests {
         assert_eq!(asked.get(), 7);
         assert_eq!(pass(&mut seen, true), None);
         assert_eq!(asked.get(), 7);
+    }
+    /// The list of shared marks, `sread/` (decision 2026-10-10 §6.1), is
+    /// asked as the person's list is (issue #221): ten passes after it is
+    /// written ask nothing and change nothing; a new mark in the table and
+    /// a list of the device's own at a higher revision are each asked
+    /// once, and what is written holds every mark of the table.
+    #[test]
+    fn the_list_of_shared_marks_is_asked_again_only_where_what_decides_it_changed() {
+        let s = devices(2);
+        let t = s.now;
+        let conn = &s[0].conn;
+        let asked = std::cell::Cell::new(0);
+        let pass = |seen: &mut ListsSeen| {
+            let write = |fetched: bool| {
+                asked.set(asked.get() + 1);
+                crate::shared_messages::write_list(conn, &s[0].identity, t, fetched)
+            };
+            seen.where_changed(conn, &s.key(0), PersonList::SharedReads, t, |_| true, write)
+                .unwrap()
+        };
+        let listed = || {
+            let held = HeldList::of(conn, &s.key(0), PersonList::SharedReads).unwrap();
+            let (_, value) = held.held.expect("a list is held");
+            ReadMarks::from_value(&value.expect("the list reads"))
+                .unwrap()
+                .marks
+        };
+        let mut seen = ListsSeen::default();
+        crate::shared_messages::mark(conn, &[1; 16], t).unwrap();
+        assert_eq!(pass(&mut seen), Some(1));
+        assert_eq!(pass(&mut seen), None);
+        assert_eq!(asked.get(), 2);
+        let changes = conn.total_changes();
+        for _ in 0..10 {
+            assert_eq!(pass(&mut seen), None);
+        }
+        assert_eq!(asked.get(), 2, "nothing changed: nothing is asked");
+        assert_eq!(conn.total_changes(), changes);
+
+        // A new mark in the table.
+        crate::shared_messages::mark(conn, &[2; 16], t).unwrap();
+        assert_eq!(pass(&mut seen), Some(2));
+        assert_eq!(listed(), vec![[2; 16], [1; 16]]);
+        assert_eq!(pass(&mut seen), None);
+        assert_eq!(asked.get(), 4);
+
+        // A list of its own at a higher revision.
+        assert_eq!(
+            crate::shared_messages::list_written(conn, &s[0].identity, t, true, Some(2)).unwrap(),
+            Some(3)
+        );
+        assert_eq!(pass(&mut seen), None);
+        assert_eq!(asked.get(), 5);
+        assert_eq!(pass(&mut seen), None);
+        assert_eq!(asked.get(), 5);
     }
 }

@@ -503,6 +503,23 @@ pub(crate) fn counting(
     Ok(Counting::of(statement, kept, &known_removed(conn)?))
 }
 
+/// Every key this device knows to be removed: each that `statement` lists,
+/// and every other it keeps as removed, on any branch (decision 2026-10-24
+/// (removal), rules 2 and 6). What a shared channel leaves out and refuses
+/// (rules 23 and 24): not only what the statement applied lists.
+pub(crate) fn removed_known(
+    conn: &Connection,
+    statement: &Statement,
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    let mut removed = statement.removed.clone();
+    for key in known_removed(conn)?.iter() {
+        if !removed.contains(key) {
+            removed.push(*key);
+        }
+    }
+    Ok(removed)
+}
+
 /// Every key this device keeps as removed (decision 2026-10-24 (removal),
 /// rule 2), as the database holds them. The door asks who counts for each
 /// entry, so they are read once for each mark of `person_clear_mark`
@@ -547,6 +564,13 @@ thread_local! {
 /// was just noted with what was not noted of it before (its time or its
 /// lists, which can move a cut time earlier: two removals made apart, the
 /// later seen first), the records are judged again (rule 6).
+///
+/// **A key kept anew makes every shared channel this device holds not yet
+/// clean,** in the same transaction (rule 23): every device of the
+/// person's held every seed the person held while it counted, so from the
+/// moment a device knows of a removal, on any branch and before it applies
+/// it, it sends nothing in a channel not made anew (rule 25). So is a key
+/// that rule 6 removes as a removed key's record judged again.
 pub(crate) fn know_removed(
     conn: &Connection,
     statement: &Statement,
@@ -554,7 +578,17 @@ pub(crate) fn know_removed(
     now: i64,
     noted: bool,
 ) -> Result<(), PersonError> {
-    if held_rows::keep_removed(conn, &statement.removed, now)? > 0 || noted {
+    let known = known_removed(conn)?;
+    let anew: Vec<[u8; 32]> = statement
+        .removed
+        .iter()
+        .filter(|key| !known.contains(key))
+        .copied()
+        .collect();
+    if held_rows::keep_removed(conn, &anew, now)? > 0 {
+        crate::shared_anew::removal_applied(conn, &anew, now)?;
+        judge_records_by_their_cut(conn, own, now)?;
+    } else if noted {
         judge_records_by_their_cut(conn, own, now)?;
     }
     Ok(())
@@ -581,6 +615,7 @@ pub(crate) fn judge_records_by_their_cut(
     let link = held.statement.statement.link()?;
     let generation = (link.number, link.hash);
     let mut changed = false;
+    let mut kept_anew: Vec<[u8; 32]> = Vec::new();
     loop {
         let cuts = crate::cut::Cuts::read(conn)?;
         let mut again = false;
@@ -615,10 +650,16 @@ pub(crate) fn judge_records_by_their_cut(
                 again = true;
             }
             if held_rows::keep_removed_added_by(conn, &record.key, &record.adder, now)? {
+                kept_anew.push(record.key);
                 again = true;
             }
         }
         if !again {
+            // A key removed so held every seed the person held while it
+            // counted (rule 23, as [`know_removed`]).
+            if !kept_anew.is_empty() {
+                crate::shared_anew::removal_applied(conn, &kept_anew, now)?;
+            }
             return Ok(changed);
         }
         changed = true;
@@ -2832,7 +2873,7 @@ fn come_to(
             acts::drop_left_out(conn, &shown.key)?;
         }
     }
-    acts::forget_cleared(conn)?;
+    acts::forget_cleared_but(conn, crate::shared_anew::SHARED_NOTICE)?;
     for name in &names {
         let channel = derive::channel_id(&derive::own_secret(&to.secret, &name.name)?)?;
         held_rows::move_name(conn, &name.name, &channel)?;
@@ -2850,11 +2891,25 @@ fn come_to(
     // removal is not yet applied by every device only where it does. A
     // renewal removes nobody, and a device that comes to its first
     // statement saw nobody removed.
-    let removes_a_key = before.is_some_and(|before| {
-        let had = &before.statement.statement;
-        statement.removed.iter().any(|key| !had.removes(key))
-    });
+    let removed_now: Vec<[u8; 32]> = match &before {
+        Some(before) => {
+            let had = &before.statement.statement;
+            statement
+                .removed
+                .iter()
+                .filter(|key| !had.removes(key))
+                .copied()
+                .collect()
+        }
+        None => Vec::new(),
+    };
+    let removes_a_key = !removed_now.is_empty();
     crate::look::note_removed_a_key(conn, removes_a_key)?;
+    // A removal makes every shared channel this device holds not yet clean
+    // (decision 2026-10-24, rule 23; decision 2026-10-10 §3.5).
+    if removes_a_key {
+        crate::shared_anew::removal_applied(conn, &removed_now, now)?;
+    }
     // The look of a recovery was of the statement that is left: under
     // this one the device carried what it holds, in this transaction.
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
@@ -9122,8 +9177,28 @@ mod tests {
         // On the device whose key it is, its own key is not removed.
         assert!(!judge_records_by_their_cut(&conn, &key(6), made).unwrap());
         assert_eq!(counted(&conn), [true]);
+        // A shared channel held here is not clean once the key that the
+        // removed key added is removed by its cut (rule 23; the review of
+        // #277, low 1): that key held every seed the person held.
+        let filing = crate::lists::tests::filing(7, "review");
+        cordelia_storage::shared::hold(
+            &conn,
+            &filing.channel,
+            &filing.card.to_bytes(),
+            &filing.name,
+            cordelia_storage::shared::Came::Made,
+            made,
+        )
+        .unwrap();
+        let not_clean =
+            |conn: &Connection| crate::shared_anew::is_not_clean(conn, &filing.channel).unwrap();
+        assert!(
+            !not_clean(&conn),
+            "the key kept as removed by hand marks nothing"
+        );
         assert!(judge_records_by_their_cut(&conn, &key(0), made).unwrap());
         assert_eq!(counted(&conn), [false]);
+        assert!(not_clean(&conn), "rule 23, by rule 6");
         assert!(!judge_records_by_their_cut(&conn, &key(0), made).unwrap());
     }
 

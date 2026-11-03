@@ -367,6 +367,10 @@ pub struct Generation {
     /// 2026-10-19 §4, rule 5): what it carried is at the relays that the
     /// word names ([`Generation::judged`]).
     pub carried_word: Option<CarriedWordLook>,
+    /// The list of shared channels of each key of a row, as that key's own
+    /// entry in the personal channel holds it (decision 2026-10-10 §3.5):
+    /// what the recovery takes acts from by the rules of §3.4.
+    pub lists: Vec<([u8; 32], cordelia_crypto::acts::SharedList)>,
 }
 
 /// What a recovery judges of the one device of the statement it recovers
@@ -692,6 +696,8 @@ pub fn read_generation(
             carried_word = device.and_then(|device| device.carried_word.clone());
         }
     }
+    let shown_keys: Vec<[u8; 32]> = rows.iter().map(|row| row.key).collect();
+    let lists = crate::lists::lists_in(handed, &personal, &shown_keys)?;
     Ok(Generation {
         rows,
         not_shown,
@@ -699,6 +705,7 @@ pub fn read_generation(
         names,
         cut_short,
         carried_word,
+        lists,
     })
 }
 
@@ -1099,10 +1106,15 @@ pub struct MakeRequest {
     /// it that its change entry gave the phrase: what the machine keeps
     /// as a device keeps a secret it left (decision 2026-10-04 §3, §9).
     pub left: Vec<LeftSecret>,
-    /// The keys that the statement newly removes, each with the label
-    /// that the person was shown it by.
+    /// The keys that the person said are gone, lost or in someone else's
+    /// hands, each with the label that the person was shown it by.
     #[serde(default)]
     pub gone: Vec<KeyLabel>,
+    /// The devices of the change recovered from that another change the
+    /// recovery read removed, of which the person was asked nothing
+    /// (decision 2026-10-24 (removal), rule 22), each with its label.
+    #[serde(default)]
+    pub removed_apart: Vec<KeyLabel>,
     /// The devices that the person still has, which are in neither list:
     /// each is shown as that until it is added again (§8).
     #[serde(default)]
@@ -1116,6 +1128,19 @@ pub struct MakeRequest {
     /// The word that the phrase gave for the look ([`Allows::Look`]),
     /// under this very change entry.
     pub word: Word,
+    /// The list of shared channels of each device the recovery showed, as
+    /// its own entry in the personal channel recovered from holds it: each
+    /// the key, in hex, and the list's value, in hex (decision 2026-10-10
+    /// §3.5).
+    #[serde(default)]
+    pub shared_lists: Vec<SharedListHanded>,
+}
+
+/// A device's list of shared channels, as a command hands it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SharedListHanded {
+    pub key: String,
+    pub list: String,
 }
 
 /// What a recovery is to look at, as its word allows.
@@ -1156,8 +1181,11 @@ fn to_look(state: &AppState, entry: &CheckedEntry, word: &Word) -> Result<ToLook
 /// key with its label.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Shown {
-    /// The keys that the statement newly removes.
+    /// The keys that the person said are gone.
     pub gone: Vec<([u8; 32], String)>,
+    /// The keys that another change the recovery read removed: the person
+    /// was asked nothing of them.
+    pub removed_apart: Vec<([u8; 32], String)>,
     /// The devices that the person still has, which are in neither list.
     pub still_have: Vec<([u8; 32], String)>,
     /// The keys of the rows that could not be shown.
@@ -1195,6 +1223,7 @@ pub fn follow(
     left: &[(u64, [u8; 32])],
     shown: &Shown,
     word: &Word,
+    shared_lists: &[([u8; 32], cordelia_crypto::acts::SharedList)],
 ) -> Result<(u64, ToLook), PersonError> {
     let to_look = to_look(state, entry, word)?;
     let at = now();
@@ -1218,7 +1247,13 @@ pub fn follow(
             acts::forget_every_typed_key(conn)?;
             let held = person::held(conn)?.ok_or(PersonError::FollowsNoPhrase)?;
             let listed = &held.statement.statement;
-            crate::look::note_removed_labels(conn, listed, &shown.gone)?;
+            let removed: Vec<([u8; 32], String)> = shown
+                .gone
+                .iter()
+                .chain(&shown.removed_apart)
+                .cloned()
+                .collect();
+            crate::look::note_removed_labels(conn, listed, &removed)?;
             let in_no_list = |key: &[u8; 32]| !listed.lists(key) && !listed.removes(key);
             for (key, label) in shown.still_have.iter().filter(|(key, _)| in_no_list(key)) {
                 acts::note_left_out(conn, key, label, applied.number, at)?;
@@ -1242,6 +1277,7 @@ pub fn follow(
             // that has ended it does not write that it has sent what it
             // carried (§8).
             meta::set(conn, meta::PERSON_LOOK_PENDING, "1")?;
+            shared_recovered(conn, identity, shared_lists, shown, at)?;
             Ok(applied.number)
         });
         if applied.is_ok() {
@@ -1250,6 +1286,37 @@ pub fn follow(
         applied
     })?;
     Ok((number, to_look))
+}
+
+/// The person's lists of shared channels on the machine of a recovery
+/// (decision 2026-10-10 §3.5), in the caller's transaction: the acts the
+/// recovery takes by the rules of §3.4 are written as this machine's list,
+/// and it holds the channels they file. **The acts of a device the person
+/// said is gone are taken, by the person's word** (decision 2026-10-24
+/// (removal), rule 6); those of a device that another change removed, of
+/// which the person was asked nothing, are passed over, as are those of a
+/// device still had (rule 22: the look takes nothing that it wrote). Every
+/// key the recovery removes, either way, held each seed: each channel is
+/// owed its making anew without them once read (rule 24).
+pub(crate) fn shared_recovered(
+    conn: &rusqlite::Connection,
+    identity: &NodeIdentity,
+    shared_lists: &[([u8; 32], cordelia_crypto::acts::SharedList)],
+    shown: &Shown,
+    at: i64,
+) -> Result<(), PersonError> {
+    let by_word: Vec<[u8; 32]> = shown.gone.iter().map(|(key, _)| *key).collect();
+    crate::lists::write_recovered(conn, identity, shared_lists, &by_word, at)?;
+    let without: Vec<[u8; 32]> = shown
+        .gone
+        .iter()
+        .chain(&shown.removed_apart)
+        .map(|(key, _)| *key)
+        .collect();
+    if !without.is_empty() {
+        crate::shared_anew::recovered(conn, &without, at)?;
+    }
+    Ok(())
 }
 
 /// The channel of each of `names` that this device holds, in their order:
@@ -1357,9 +1424,23 @@ pub async fn make(
     };
     let shown = Shown {
         gone: labelled(&body.gone)?,
+        removed_apart: labelled(&body.removed_apart)?,
         still_have: labelled(&body.still_have)?,
         not_shown: labelled(&body.not_shown)?,
     };
+    let mut shared_lists = Vec::new();
+    for handed in &body.shared_lists {
+        let key = carry::key_named(&handed.key).ok_or_else(|| bad("a key"))?;
+        let value = hex::decode(&handed.list)
+            .map_err(|_| ApiError::BadRequest("a list is not hex".into()))?;
+        // A list that is no list is passed over, as any device passes it
+        // over (§3.4).
+        if let Ok(list) =
+            cordelia_crypto::acts::SharedList::from_value(&Value::Other(value), names::is_a_name)
+        {
+            shared_lists.push((key, list));
+        }
+    }
     // What the look may take is read before the change is shown: a word
     // that does not hold, or a machine that follows a phrase, is refused
     // before anything is read.
@@ -1371,7 +1452,15 @@ pub async fn make(
         Err(e) => Err(e),
     };
     let made = read.and_then(|read| {
-        let made = follow(&state, &entry, &statement_key, &left, &shown, &body.word)?;
+        let made = follow(
+            &state,
+            &entry,
+            &statement_key,
+            &left,
+            &shown,
+            &body.word,
+            &shared_lists,
+        )?;
         Ok((made, read))
     });
     // What was handed of the secrets is overwritten here: the store
@@ -1391,6 +1480,12 @@ pub async fn make(
         "names": to_look.names.len(),
         "read": 0,
     }));
+    // What the end of the look says of the shared channels, as before the
+    // yes (decision 2026-10-10 §3.5).
+    let shared_said =
+        crate::shared_anew::recovery_lines(&shared_lists, &shown.gone, &shown.still_have)
+            .map_err(commands::refused)?;
+    state.own_channels.set_shared_recovered(shared_said);
     state.own_channels.written();
     state.own_channels.ask_whole();
     state.sync_control.ask_cycle();
@@ -1455,7 +1550,10 @@ pub async fn progress(
     state: web::Data<AppState>,
 ) -> Result<HttpResponse, ApiError> {
     commands::asked(&req, &state)?;
-    Ok(HttpResponse::Ok().json(json!({ "look": state.own_channels.look() })))
+    Ok(HttpResponse::Ok().json(json!({
+        "look": state.own_channels.look(),
+        "shared": state.own_channels.shared_recovered(),
+    })))
 }
 
 /// What the look says of a name that was not read before the change was
@@ -2516,6 +2614,7 @@ mod tests {
         word: Word,
         names: Names,
         cut_short: Option<[u8; 32]>,
+        shared_lists: Vec<([u8; 32], cordelia_crypto::acts::SharedList)>,
     }
 
     fn makes(node: &Node, from: &Candidate, handed: &[CheckedEntry], answers: &[Answer]) -> Made {
@@ -2580,12 +2679,14 @@ mod tests {
             left,
             shown: Shown {
                 gone: labelled(|said| matches!(said, Answer::Lost | Answer::OtherHands)),
+                removed_apart: Vec::new(),
                 still_have: labelled(|said| *said == Answer::Have),
                 not_shown: not_shown.map(|row| (row.key, row.label.clone())).collect(),
             },
             word,
             names,
             cut_short: read.cut_short,
+            shared_lists: read.lists.clone(),
         }
     }
 
@@ -2597,6 +2698,7 @@ mod tests {
             &made.left,
             &made.shown,
             &made.word,
+            &made.shared_lists,
         )
     }
 
@@ -4168,6 +4270,7 @@ mod tests {
             word: made.word.clone(),
             names: made.names.clone(),
             cut_short: made.cut_short,
+            shared_lists: made.shared_lists.clone(),
         }
     }
 

@@ -663,7 +663,20 @@ pub async fn add_look(
     asked(&req, &state)?;
     let device = key_of("device", &body.device)?;
     let label = body.label.as_deref().unwrap_or(NO_LABEL);
-    let would = adding::would_add(&db(&state), &state.identity, &device, label).map_err(refused)?;
+    let (would, shared) = {
+        let conn = db(&state);
+        let would = adding::would_add(&conn, &state.identity, &device, label).map_err(refused)?;
+        // The shared channels the new device is handed, with the keys of
+        // each (decision 2026-10-10 §5.2): adding a device trusts it with
+        // everything of the person's.
+        let shared =
+            crate::sharing::held_with_keys(&conn, &state.identity.public_key()).map_err(refused)?;
+        (would, shared)
+    };
+    let shared: Vec<serde_json::Value> = shared
+        .into_iter()
+        .map(|(name, keys)| json!({ "name": name, "keys": keys }))
+        .collect();
     let words = fingerprint::shown(&device);
     // The key that the node runs under: the command refuses where it is
     // another than the one in the device's key file (§16).
@@ -671,7 +684,7 @@ pub async fn add_look(
     Ok(HttpResponse::Ok().json(match would {
         WouldAdd::HandsAgain { label } => json!({
             "would": "hand_again", "label": label, "words": words,
-            "this_device": this_device,
+            "this_device": this_device, "shared": shared,
         }),
         WouldAdd::Adds {
             counts_already,
@@ -679,7 +692,7 @@ pub async fn add_look(
         } => json!({
             "would": "add", "label": label, "words": words,
             "counts_already": counts_already, "left_out_as": left_out_as,
-            "this_device": this_device,
+            "this_device": this_device, "shared": shared,
         }),
     }))
 }
@@ -1221,6 +1234,20 @@ pub async fn change_prepare(
         .collect();
     let seen = look::look(&conn, &state.identity, &at, now()).map_err(refused)?;
     let (names, names_not_shown) = names_handed(&conn)?;
+    // What a removal names of the shared channels (decision 2026-10-10
+    // §3.5): each the person holds, and each act in force of each device
+    // that counts, with what undoes it; the command names those of the
+    // devices it removes.
+    let own_relays = crate::sharing::own_relays(&state);
+    let (shared_names, shared_unreached, shared_past_bound, shared_acts) =
+        crate::shared_anew::at_a_removal(&conn, &own_relays).map_err(refused)?;
+    let mut acts_handed = Vec::new();
+    for named in shared_acts {
+        acts_handed.push(json!({
+            "maker": written(&named.maker)?,
+            "line": named.line(),
+        }));
+    }
     Ok(HttpResponse::Ok().json(json!({
         "this_device": written(&state.identity.public_key())?,
         "statement": hex::encode(statement),
@@ -1239,6 +1266,10 @@ pub async fn change_prepare(
         "names": names,
         "names_not_shown": names_not_shown,
         "received": received(&state, now()),
+        "shared_channels": shared_names,
+        "shared_unreached": shared_unreached,
+        "shared_past_bound": shared_past_bound,
+        "shared_acts": acts_handed,
         "look": seen,
     })))
 }
@@ -1362,9 +1393,30 @@ pub async fn change_make(
             "what this device held of a file could not be read, and was not carried: it meets its channel as a new file does"
         );
     }
+    // A removal makes each shared channel anew in the same act, after the
+    // transaction that applies it (decision 2026-10-24, rule 24; decision
+    // 2026-10-10 §3.5): every key of the device's table stays but the
+    // removed ones. A renewal or a settlement that removes nobody changes
+    // none.
+    let made_anew = {
+        let conn = db(&state);
+        let removed =
+            cordelia_storage::meta::get(&conn, cordelia_storage::meta::PERSON_REMOVED_A_KEY)
+                .map_err(|e| refused(PersonError::Storage(e)))?
+                .is_some();
+        match removed {
+            true => {
+                let own = crate::sharing::own_relays(&state);
+                crate::shared_anew::anew_at_removal(&conn, &state.identity, &own, now())
+                    .map_err(refused)?
+            }
+            false => Vec::new(),
+        }
+    };
     state.own_channels.written();
     state.own_channels.ask_whole();
     Ok(HttpResponse::Ok().json(json!({
+        "made_anew": made_anew,
         "change": applied.number,
         "carried": applied.carried,
         "no_version": applied.no_version,

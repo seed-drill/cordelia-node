@@ -1129,7 +1129,7 @@ fn hand_over_in(
 
 /// Whether a hand-over that says it was made at `made`, in seconds, was
 /// made less than an hour before or after the key was typed.
-fn made_within_the_hour(made: u64, typed_at: i64) -> bool {
+pub(crate) fn made_within_the_hour(made: u64, typed_at: i64) -> bool {
     let Ok(made) = i64::try_from(made) else {
         return false;
     };
@@ -1425,6 +1425,7 @@ pub(crate) fn leave(conn: &Connection, held: &Held) -> Result<(), PersonError> {
     meta::remove(conn, meta::PERSON_NAMES_BROUGHT_IN)?;
     meta::remove(conn, meta::PERSON_REMOVED_LABELS)?;
     meta::remove(conn, meta::PERSON_NOT_SHOWN)?;
+    meta::remove(conn, meta::PERSON_REMOVAL_KEYS)?;
     meta::remove(conn, meta::PERSON_WORDS_TAKEN)?;
     meta::remove(conn, meta::PERSON_LOOK_PENDING)?;
     meta::remove(conn, meta::PERSON_MOVED_FROM)?;

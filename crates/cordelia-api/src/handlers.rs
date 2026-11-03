@@ -1546,6 +1546,23 @@ pub(crate) async fn status_with(
     // (decision 2026-10-04 §8): counted with what waits of the older
     // kind, which a personal node writes none of.
     let own_waiting = crate::commands::channels_waiting(&state);
+    // What the `shared` object reads beside the database (decision
+    // 2026-10-10 §9): the relays known by their keys, those connected, and
+    // what the shared pass said. Read before the database is held.
+    let own_relays = crate::sharing::own_relays(&state);
+    let connected: Vec<[u8; 32]> = state
+        .relays
+        .read()
+        .map(|relays| {
+            relays
+                .iter()
+                .filter(|relay| relay.state == "connected")
+                .filter_map(|relay| relay.key.as_deref())
+                .filter_map(|key| cordelia_crypto::bech32::decode_public_key(key).ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let said = state.own_channels.shared_said();
     let db = state.db.lock().unwrap();
     let pk = state.identity.public_key();
     let channels = channels_it_has(&db, &pk, older_kind).unwrap_or(0);
@@ -1586,6 +1603,25 @@ pub(crate) async fn status_with(
             None
         }),
     };
+    // What it says of its shared channels (decision 2026-10-10 §9): an
+    // object of its own, apart from `messages`, absent where the device
+    // does not stand applied. Only one fact of it sets a level, and that
+    // in the command.
+    let shared = match older_kind || state.held.why().is_some() {
+        true => None,
+        false => {
+            let beside = crate::shared_status::Beside {
+                own_relays: &own_relays,
+                connected: &connected,
+                said: &said,
+            };
+            crate::shared_status::status_of(&db, &state.identity, &beside, state.sync_control.now())
+                .unwrap_or_else(|e| {
+                    tracing::debug!(error = %e, "the status says nothing of shared channels");
+                    None
+                })
+        }
+    };
     drop(db);
 
     let no_relay_secs = state
@@ -1623,6 +1659,9 @@ pub(crate) async fn status_with(
     });
     if let Some(messages) = messages {
         status["messages"] = messages.answered();
+    }
+    if let Some(shared) = shared {
+        status["shared"] = shared;
     }
     Ok(HttpResponse::Ok().json(status))
 }

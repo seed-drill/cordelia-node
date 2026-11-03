@@ -134,11 +134,38 @@
 >   file cut but one of these texts. It was step 28 while rule 27 of that
 >   record was built; steps 26 and 27 held that rule's columns and tables,
 >   and went with it, unreleased. A database of such a build at step 27 or
->   28 is refused as one from a later version. One at that build's step 26
->   (rule 27's columns and tables, and no `file_cut`) is taken as current:
->   a carry that would cut a file fails at the missing table, so nothing is
->   applied, and every restore is refused. It fails closed, and no such
->   build was released.
+>   28 is refused: those are the shared channels' steps now, and it holds
+>   none of them (`shared_lists` is missing). One at that build's step 26
+>   (rule 27's columns and tables, and no `file_cut`) is taken as at step
+>   26 and given the shared steps: a carry that would cut a file fails at
+>   the missing table, so nothing is applied, and every restore is
+>   refused. It fails closed, and no such build was released.
+>
+> Steps 27 to 32, per the decision record of 2026-10-10 (a shared channel
+> for messages, section 14):
+>
+> - **v27:** the person's lists of shared channels: `shared_lists` (the
+>   list this device last wrote, with its revision) and
+>   `shared_list_taken` (when this device first took each act).
+> - **v28:** the shared channels a device holds: `shared_channels`,
+>   `shared_keys` (the table of keys of each, with its room),
+>   `shared_unopened`, `shared_labelled`, and the index of shared messages
+>   (`shared_index`, `shared_numbers`, `shared_first_held`,
+>   `shared_signers`, `shared_places`).
+> - **v29:** what the shared pass keeps: `shared_relay_places`,
+>   `shared_relay_sent`, and the take-outs begun and not ended
+>   (`shared_take_out_channels`, `shared_take_out_keys`).
+> - **v30:** making, sharing and taking: `shared_typed_keys`,
+>   `shared_shares`, `shared_share_sent`.
+> - **v31:** subscribing and messages: the tables `shared_msg_*`.
+> - **v32:** channels made anew: `shared_anew_offers`, `shared_anew_made`,
+>   `shared_anew_not_clean`.
+>
+> Each is empty at its step, and changes no older row. The shared channels'
+> build numbered them 21 to 26 before the removal build's steps came first;
+> no release made a database of that numbering, and one that a build of it
+> made, at 21 to 26 with `shared_lists`, is refused, and nothing in it is
+> changed. A database at alpha.17's step 20 steps through 21 to 32.
 >
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed

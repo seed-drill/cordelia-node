@@ -2724,7 +2724,11 @@ device lists yet in the new generation are shown for as long. A relay not
 known to hold the latest change is shown for as long (decision 2026-10-19,
 rule 11), from the latest of when the device came to keep the change entry,
 when this version first started on it, and that relay's latest answer about
-the entry. `protocol.rs`
+the entry. A removed device that still holds a shared channel the person
+has not made anew is amber for as long, from when this device applied that
+removal (decision 2026-10-10 §9): the one fact of a shared channel that sets
+a level, and after that it is in `cordelia devices` only, so that a channel
+in a drawer does not keep every status line amber for good. `protocol.rs`
 asserts that it is shorter than a left secret is kept
 (`LEFT_SECRET_KEPT_DAYS`), so that the time the change was applied is still
 known.
@@ -2871,12 +2875,13 @@ No prefix of the channel begins another, which `protocol.rs` tests.
 
 **Rationale:** A device's slots for its messages (record §2.3), the live
 numbers of one signer at a reader (§2.5), and the places a reader gives one
-signer in an hour (§6). With its three lists (of what its agents read, of
-what a person read on it, and of the bounds a person set on it, decision
-2026-10-25), a device has 67 slots of 3,072 bytes as counted: 205,824
-bytes, and at the cap of 64 devices that count 13,172,736 bytes (12.6 MiB),
+signer in an hour (§6). With its four lists (of what its agents read, of
+what a person read on it, of the bounds a person set on it, decision
+2026-10-25, and of the shared messages it read, `sread/`, decision
+2026-10-10), a device has 68 slots of 3,072 bytes as counted: 208,896
+bytes, and at the cap of 64 devices that count 13,369,344 bytes (12.75 MiB),
 under a channel's 16 MiB at a relay, so no honest device's first message is
-refused for room. `protocol.rs` checks `AGENT_MESSAGE_RING + 3`. It is above
+refused for room. `protocol.rs` checks `AGENT_MESSAGE_RING + 4`. It is above
 the device's hourly limit, so an honest device's hour of messages is never
 overwritten within the hour, and a reader that was away is shown a whole
 ring at once.
@@ -3084,6 +3089,285 @@ allows. A device sends nothing once its next number would be above this,
 until the next statement starts its ring again. The record states the bound
 and does not name a constant for it; it is here so that nothing else derives
 it. An honest device sending 60 an hour never comes near it.
+
+### 12.13 A Shared Channel, for Messages Between People
+
+The constants of the [decision record of 2026-10-10](../decisions/2026-10-10-a-shared-channel-for-messages.md),
+which `protocol.rs` has under "A shared channel, for messages between
+people". "Record" below is that record; each value is the one its section
+14 gives.
+
+#### LABEL_SHARED, LABEL_SHARED_RELAYS, LABEL_SHARE_PAIR, LABEL_ANEW_SEAL, LABEL_SHARED_SENT, LABEL_SHARED_ACT
+
+**Rationale:** `cordelia v2 shared` is the label a shared channel's secret
+is derived under from its seed, with the hash of its relays under `cordelia
+v2 relays` (record §2.1); `cordelia v2 share pair` the label of the share
+pair channel, the pair channel's derivation under a label of its own, so a
+share is never read where a hand-over is looked for (§3.1); `cordelia v2
+anew seal` what a new seed is sealed to each key that stays under, with the
+old and the new channel's IDs (§7); `cordelia v2 message sent` the label of
+a mark that an agent of the person's sent a shared message (§6.1); and
+`cordelia v2 act` what a device signs an act in its list under (§3.4). Each
+has a label of its own, so that no two things are ever derived, sealed or
+signed alike: no seed gives the secret of a channel of anyone's own, and no
+person secret a shared channel's. No label begins another (§12.5), which
+`protocol.rs` tests over `LABELS`, which then has 34. `cordelia v2 message
+sent` and `cordelia v2 messages` differ at their twentieth byte, so neither
+begins the other.
+
+#### SHARED_SEED_BYTES = 32
+
+**Rationale:** As every secret of a channel (record §2.1). A seed comes from
+the operating system's random source, and nothing derives one: a seed
+derives nothing but its one channel.
+
+#### SHARED_MAX_RELAYS = 2
+
+**Rationale:** The person's own channels are carried by two relays by
+default, so that losing one stops nothing (record §8.5; decision 2026-09-30
+§4.6). A card names its relays by key alone, in one form: a count of one
+byte and the keys sorted, each once. A card of two relays is 97 bytes.
+
+#### SHARED_MAX_CHANNELS = 16
+
+**Rationale:** The shared channels a person holds (record §3.4, §8.5). It
+sets the worst case of a device's store at 674 MiB (§6.3), the bytes of
+reading again within the shared pass's share (§8.4), and the requests of a
+pass at 208 a minute. Thirty-two waits until the rules of places (a drop
+and a move take no place; past a bound, makers that count first) are built
+and tested, since they decide whether a full list can block the one way to
+take someone out; it would double each of those costs.
+
+#### SHARED_MAX_DROPPED = 64, SHARED_MAX_SUBSCRIPTIONS = 32, SHARED_MAX_LABELS = 64
+
+**Rationale:** The bounds of the parts of a device's list (record §3.4).
+Drops are kept apart from the 16 places, four times as many, so that
+dropping a channel frees its place at once, and a drop is kept until 64
+newer drops push it out, never for its age. Subscriptions are of an agent and a channel. Labels are as many as
+the keys a channel shows (`SHARED_MAX_KEYS`). Each part's count is one
+byte.
+
+#### SHARED_LABEL_MAX_BYTES = 64
+
+**Derivation:** `MAX_DEVICE_LABEL_BYTES`.
+
+**Rationale:** A label a person gives another person's key (record §5.2)
+is the length of a device's label in a statement, and is written as a
+statement writes one, behind a length of two bytes.
+
+#### SHARED_LIST_MAX_VALUE_BYTES = 41,333
+
+**Derivation:** The form, 1; then each part's count
+and items, each item with its act (time 8, count 8, maker 32, signature 64:
+112): 16 filings of 475 (the ID 32, the card 97, a name of 200 behind a
+length of one byte, how it came 33), 64 drops of 144 (an ID), 32
+subscriptions of 346 (the ID, an agent's name of 200 behind a length of one
+byte, and its state) and 64 labels of 210 (a key, and a label of 64 behind
+a length of two): 1 + 7,601 + 9,217 + 11,073 + 13,441.
+
+**Rationale:** A list at every bound, which with its name of 77 bytes is
+within `MAX_ENTRY_NAME_AND_VALUE_BYTES` and seals at 65,536, counted at a
+relay as 66,560 (record §3.4). At 64 devices that count the lists are
+4,259,840 bytes as counted, under a channel's 16 MiB. A person with four
+devices and a few channels writes lists of some 4 KB each.
+
+#### SHARED_ACT_TIME_MAX = 2^40
+
+**Rationale:** The latest time in seconds that an act may say, and the
+highest count an item may say (record §3.4): some 34,000 years from 1970,
+above the last second that a time in RFC 3339 can be
+(9999-12-31T23:59:59Z, 253,402,300,799), which `protocol.rs` checks. A new
+act is dated one above the newest it holds, and never above this; at this
+time alone the item's count orders acts, so the next act on an item still
+goes above the last of a maker that counts. No act is refused for a clock.
+It is also the latest time an anew offer may say it was made (record §7): an
+offer that says later is no offer, so that its time fits a device's store,
+whose integers end at 2^63 - 1.
+
+#### SHARED_MAX_KEYS = 64
+
+**Rationale:** The keys a device shows in one channel, and the most that
+stay when it is made anew (record §2.4, §6.3, §7): as many as a person's
+devices that count (`MAX_COUNTED_DEVICES`), and what fits in a channel's 16
+MiB at a relay, where 64 devices at 214,016 bytes each take 13,697,024,
+with room for 14 more.
+
+#### SHARED_KEYS_KEPT = 1,024
+
+**Rationale:** The rows a device keeps, in a channel's table of keys, of
+keys that store nothing: refused for room, or let go (record §6.3). A key
+that stores an entry always keeps its row: at most 5,461 that the person
+does not know (16 MiB at one message of 3,072 bytes each) and 128 that the
+person does. Past 1,024 the row of the key that last wrote least lately
+goes, and the device says how many it let go. A member that keeps more than
+1,024 keys writing can push an honest key's row out; labelling that key
+still reads the channel again.
+
+#### SHARED_BYTES_PER_MINUTE = 524,288
+
+**Derivation:** A quarter of `PUSH_BYTES_PER_PEER_PER_MINUTE`.
+
+**Rationale:** What a relay may hand the shared pass in a minute (record
+§8.4), counted beside the device's whole count against the 2 MiB, so that
+the device's own channels, whose pass runs first, always have three
+quarters. It has room for one entry of the largest size as counted, 66,560
+bytes, since a relay holds whatever a member pushed there; and 16 channels
+of 16 MiB, each read again from its start once a day, are 256 MiB, within
+the 720 MiB it hands in a day. `protocol.rs` checks both.
+
+#### SHARED_TAKE_OUT_STEP_ENTRIES = 65
+
+**Derivation:** `AGENT_MESSAGE_RING` + 1: one key's 64 slots of messages
+and its anew record.
+
+**Rationale:** A device takes a shared channel's entries out of its store
+when the channel is dropped or moved from, when a key stops being known,
+and when a key is quiet (record §6.3). At the bound that is some 42 MiB of
+one channel, overwritten under `secure_delete`: in one hold of the device's
+lock it would break bar 5 of the scale test (decision 2026-10-22: at most
+one wait over 100 ms for a device in an hour). So a take-out runs in
+steps, each under a hold of its own, the lock let go between them, and a
+step is the entries of one key: 214,016 bytes as a relay counts them at
+most. A step never splits a key, so a key's entries go in the same write
+as the revisions its row keeps, and the door's refusal at or below them
+holds from the moment they are gone. Deleting one key's 65 entries of
+their sizes under `secure_delete` in WAL mode took 1.4 ms at the median
+and 22 ms at worst over 200 keys on a test machine: under a quarter of the
+bar at worst. A step smaller than a key would gain nothing a person sees
+and split what must go together.
+
+#### SHARED_READ_AGAIN_SECS = 86,400
+
+**Rationale:** A device reads a channel again from its start, at each relay,
+when the person labels a key, when a key with bytes refused comes to count,
+and when the hourly task has made room where a key has bytes refused
+(record §6.3); at most once a day for each channel, and one asked for
+within the day begins when the day is up. A member that lets one key go
+quiet each hour then costs one read a day, within the share.
+
+#### SHARED_OFFER_DELIVERED_SECS = 2,592,000
+
+**Derivation:** `AGENT_MESSAGE_KEPT_DAYS` (30) in seconds.
+
+**Rationale:** A device that makes a channel anew, or moves from it, takes
+the old channel's entries out of its store (record §6.3, §7); but the offer
+it wrote there is in that store, and reaches the old channel's relays only
+by its pushes. So the old channel's entries wait in the store until each
+relay of the old card answers that it holds the offer, and the pass pushes
+the offer alone there, nothing else of the device's own. A relay that is
+not one of the device's own, or is gone, never answers: the entries go at
+the end of this time, the time after which a quiet key is let go, by which
+every message the old channel showed has expired. The bound is the store's
+of 42.13 MiB of one channel, held no longer than that (record §6.3).
+
+#### SHARED_REQUESTS_PER_MINUTE = 600
+
+**Rationale:** The shared pass's own counter of requests at each relay
+(record §8.4), never `Inner::may_ask`, so that the shared pass never takes
+a request from the device's own channels. A relay counts every request on
+the five streams of entries against its 3,000 for a connection, shows
+among them; a device's shows are beside its 2,250, at most 2 × (6 + 30) =
+72 a minute. So a device asks at most 2,250 + 72 + 600 = 2,922 a minute;
+678 would fit, and 600 leaves room. A minute's first pages of 16 channels,
+their proofs and the share pair channels of 8 typed keys are 6 × 16 + 16 +
+6 × 2 × 8 = 208, within it. `protocol.rs` checks each.
+
+#### SHARED_PUSH_BYTES_PER_MINUTE = 393,216
+
+**Derivation:** A quarter of `OUTBOX_BYTES_PER_MINUTE`.
+
+**Rationale:** What the shared pass pushes to a relay in a minute (record
+§8.4), counted in the device's own pacing too, so the relay's allowance is
+never passed and the device's own channels always have three quarters of
+what it pushes. An anew record, 17,408 bytes as counted, and a share each
+fit it.
+
+#### SHARED_KEY_WORDS_SHOWN = 6
+
+**Rationale:** How many words of a key's fingerprint show another person's
+device, and are read back by another way when a channel is handed over
+(record §3.2, §5.3), as `CARRY_FROM_WORDS` names a removed key. Six words
+are 66 bits: a search over keys made to match them costs some 2^26 times
+more than one to match the 40 bits of eight characters of a key, which is
+what the settled rule S11 asked for and the record amends. Costly, not
+impossible: so the words are read back, and a key that matters is
+labelled.
+
+#### SHARED_ANEW_CONTENT_BYTES = 16,384, SHARED_ANEW_VALUE_BYTES = 16,274
+
+**Derivation:** The value is the content, less the seal's 28 bytes, less
+the 7 of an entry's form around its name and value, less its name, 75 bytes
+(`anew/` and a key as it is written): 16,384 − 28 − 7 − 75.
+
+**Rationale:** A device's anew record, empty or an offer, is of one size
+class (record §2.3, §7): each device writes it empty, at its full size,
+when it comes to hold the channel, so its room at a relay is taken whole
+from its first day, and an offer is a slot written again that is never
+larger, which a relay at its cap still takes. An offer to 64 keys is 8,043
+bytes of fields: the form, the time, the new ID, the relays (65), a count,
+and 64 seals of a key and the sealed seed (124 each). The class of 8,192
+would not hold it with the seal and the name. A device's room in a shared
+channel is then 64 × 3,072 + 17,408 = 214,016 bytes as counted.
+
+#### SHARE_VALUE_BYTES = 407
+
+**Derivation:** A content of 512 bytes, less the seal, less 7, less its
+name, 70 bytes (`share/` and a channel's ID in hex): 512 − 28 − 7 − 70.
+
+**Rationale:** A share holds its form, the time it was made, the key it is
+for and the card: 138 bytes at two relays (record §3.1), and nothing else.
+One length, so a relay learns nothing from its size.
+
+#### SHARE_PREFIX = `share/`, SHARED_ANEW_PREFIX = `anew/`, SHARED_READ_PREFIX = `sread/`, PERSONAL_SHARED_PREFIX = `shared/`
+
+**Rationale:** The first parts of the names this record adds (record §2.3,
+§3.1, §3.4, §6.1). `share/` and a channel's ID name a share in a share
+pair channel; `anew/` and a key a device's anew record in a shared
+channel, beside the messages record's `msg/`; `sread/` and a key a
+device's list of the shared messages its agents read and sent, in the
+messages channel, 76 bytes with its key, so that a device has 68 slots of
+3,072 bytes there with the `person/` and `hold/` of decision 2026-10-25,
+13,369,344 bytes at 64 devices, which `protocol.rs` checks; and `shared/`
+and a key a device's list in the personal channel. None of `sread/`,
+`read/`, `msg/`, `person/` and `hold/` begins another, and `shared/`
+begins no other prefix of the personal channel, nor does any begin it.
+
+#### What a shared channel reuses
+
+**Rationale:** A shared channel adds no constant where one of an earlier
+record already says what is needed (record §14), and each keeps its own
+reason there:
+
+- **A key typed for a channel** is kept for `PAIR_KEY_TYPED_SECS` (an hour),
+  at most `MAX_TYPED_KEYS` (8) at one time, counted apart from the keys
+  typed to join devices, and forgotten after `TYPED_KEY_KEPT_SECS` (a day),
+  as a key typed at `accept` is (§12.6): a share is taken only within the
+  hour of its typing, as a hand-over is.
+- **The shares waiting** are at most `MAX_TYPED_KEYS`, each kept for
+  `HAND_OVER_KEPT_SECS` (two hours), as a hand-over is: one share waits for
+  a key at a time, so eight is eight people being handed a channel at once.
+- **A quiet key** is let go after `AGENT_MESSAGE_KEPT_DAYS` (30) with no
+  entry of it first held: by then every message it wrote has expired
+  (§12.12), so nothing it wrote is still shown.
+- **The amber of a removed device that holds a shared channel** lasts
+  `REMOVAL_NOT_APPLIED_SHOWN_DAYS` (7, §12.10), counted from when this
+  device applied the removal, as the amber of a removal not yet applied is:
+  a person who has not made the channel anew in a week is told in
+  `cordelia devices` from then, and the line goes back to what memory says.
+- **A channel's hour** is `AGENT_MESSAGES_PER_DEVICE_PER_HOUR` (60) numbers
+  of a device in one channel, its first sends and its sends again
+  together, so that its ring of `AGENT_MESSAGE_RING` (64) never goes round
+  in an hour; a sending again counts there alone.
+- **The unlabelled hour** is `AGENT_MESSAGE_RING` (64) places in an hour
+  for every key the person has not labelled, together, the person's own
+  devices aside, given newest first as for one signer (§12.12): many keys
+  that one member made cost the reader what one key costs.
+- **The hold** in a shared channel is `AGENT_MESSAGE_PAIR_UNREAD_MAX` (10),
+  fixed: no bound a person sets with `cordelia msg allow` reaches a shared
+  channel.
+- **The status's `shared` object** adds no constant: it says what the
+  device holds and what the shared pass said since the node started, and
+  sets no level but by the amber above.
 
 ---
 
@@ -3420,4 +3704,4 @@ and count the rest only.
 *Spec version: 1.7*
 *Created: 2026-03-16*
 *Updated: 2026-10-24*
-*Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9, §12; decisions/2026-10-04-a-persons-devices.md; decisions/2026-10-09-messages-between-your-own-agents.md*
+*Cross-refs: network-protocol.md §4.9, §9, §12; network-behaviour.md §2.2, §5; data-formats.md §9, §12; decisions/2026-10-04-a-persons-devices.md; decisions/2026-10-09-messages-between-your-own-agents.md; decisions/2026-10-10-a-shared-channel-for-messages.md*

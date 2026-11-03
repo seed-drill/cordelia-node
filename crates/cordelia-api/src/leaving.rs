@@ -289,6 +289,22 @@ pub fn forget(
         held_rows::clear_additions(conn)?;
         held_rows::forget_person(conn)?;
         acts::forget_all(conn)?;
+        // What it held of the person's lists of shared channels is the
+        // person's (decision 2026-10-10 §3.4).
+        cordelia_storage::shared_lists::forget_all(conn)?;
+        // And the shared channels it held, their seeds with them (§2.2).
+        for row in cordelia_storage::shared::channels(conn)? {
+            entries::remove_channel(conn, &row.channel)?;
+        }
+        cordelia_storage::shared::forget_all(conn)?;
+        // The shares it wrote, each holding a card, and the keys typed for
+        // a channel, which would take a share into the next person's list
+        // (§3.1, §3.2).
+        for row in cordelia_storage::shared_sharing::shares(conn)? {
+            entries::remove_channel(conn, &row.pair)?;
+        }
+        cordelia_storage::shared_sharing::forget_all(conn)?;
+        cordelia_storage::shared_anew::forget_all(conn)?;
         if let Some(word) = word {
             entries::store(conn, &word, now)?;
         }
@@ -751,11 +767,59 @@ mod tests {
         entries::store(&on.conn, &entry.check().unwrap(), now).unwrap();
         kept_rows::keep_place(&on.conn, &[0x77; 32], &messages_id, &[1; 8], 1).unwrap();
         assert!(!on.stored().is_empty());
+        // Its list of shared channels (decision 2026-10-10 §3.4).
+        let label = cordelia_crypto::acts::Label {
+            key: [6; 32],
+            label: Some("bob".into()),
+        };
+        let done = crate::lists::act(&on.conn, &on.identity, crate::lists::Do::Label(label), now);
+        assert!(matches!(done, Ok(crate::lists::Done::Made(_))), "{done:?}");
+        assert!(
+            cordelia_storage::shared_lists::kept(&on.conn)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !cordelia_storage::shared_lists::taken(&on.conn)
+                .unwrap()
+                .is_empty()
+        );
+        // A shared channel it holds, with an entry of it (§2.2, §2.3).
+        cordelia_storage::meta::set(&on.conn, cordelia_storage::meta::SYNC_CLAUDE_DIR, "/c")
+            .unwrap();
+        let file = crate::lists::Do::File(crate::lists::tests::filing(1, "review"));
+        let done = crate::lists::act(&on.conn, &on.identity, file, now);
+        assert!(matches!(done, Ok(crate::lists::Done::Made(_))), "{done:?}");
+        let shared = crate::shared::tests::Shared::of(1);
+        let alice = crate::shared::tests::member(1);
+        let written = crate::shared::tests::message(&alice, &shared, 1, "hello", now);
+        crate::take::take(&on.conn, &on.identity, &written, now).unwrap();
+        assert_eq!(on.stored_in(&shared.secret).len(), 1);
+        assert!(
+            !cordelia_storage::shared::channels(&on.conn)
+                .unwrap()
+                .is_empty()
+        );
 
         assert!(forget(&on.conn, &on.identity, false, now).unwrap());
         let kept = kept_rows::kept(&on.conn, &[0x77; 32], &messages_id).unwrap();
         assert_eq!(kept.place, None);
         assert!(!on.follows_a_phrase());
+        assert_eq!(
+            cordelia_storage::shared_lists::kept(&on.conn).unwrap(),
+            None
+        );
+        assert!(
+            cordelia_storage::shared_lists::taken(&on.conn)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            cordelia_storage::shared::channels(&on.conn)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(on.stored_in(&shared.secret).is_empty());
         assert!(crate::look::not_shown(&on.conn).unwrap().is_empty());
         assert!(!crate::carry::is_taken(&on.conn, &word, now).unwrap());
         assert!(held_rows::secrets(&on.conn).unwrap().is_empty());

@@ -23,7 +23,15 @@
 //! the messages channel, are in [`message`] (decision 2026-10-09). The
 //! value of a device's word that it has sent what it carried to the relays
 //! it reaches is in [`reached`] (decision 2026-10-19).
+//!
+//! A shared channel, for messages between people (decision 2026-10-10), is
+//! not yet used by the node either: its card and the share that hands it on
+//! ([`share`]), the entries it holds and the seal of a new seed when it is
+//! made anew ([`shared`]), and a device's list of the person's shared
+//! channels in the personal channel, each act signed by its maker
+//! ([`acts`]).
 
+pub mod acts;
 pub mod addition;
 pub mod aes_gcm;
 pub mod bech32;
@@ -41,6 +49,8 @@ pub mod phrase;
 pub mod proof;
 pub mod psk_envelope;
 pub mod reached;
+pub mod share;
+pub mod shared;
 pub mod signing;
 pub mod slots;
 pub mod statement;
@@ -59,7 +69,7 @@ pub use ecies::{EciesEnvelope, ecies_decrypt, ecies_encrypt, hkdf_sha256, hkdf_s
 pub use identity::{NodeIdentity, verify_swarm_child, x25519_from_ed25519_seed};
 
 use ring::rand::{SecureRandom, SystemRandom};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CryptoError {
@@ -104,6 +114,13 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     let result = hasher.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&result);
+    out
+}
+
+/// SHA-512 hash, returned as raw bytes.
+pub fn sha512(data: &[u8]) -> [u8; 64] {
+    let mut out = [0u8; 64];
+    out.copy_from_slice(&Sha512::digest(data));
     out
 }
 

@@ -282,6 +282,31 @@ pub struct OwnChannels {
     /// How far the look of a recovery is, and what it found, where this
     /// node has made one since it started (decision 2026-10-04 §9).
     look: Mutex<Option<serde_json::Value>>,
+    /// What the recovery made on this node says of the shared channels, a
+    /// line each (decision 2026-10-10 §3.5): said again at the end of its
+    /// look.
+    shared_recovered: Mutex<Vec<String>>,
+    /// What the shared pass says for the status's `shared` object
+    /// (decision 2026-10-10 §9), since the node started: none of it sets
+    /// a level.
+    shared_said: Mutex<SharedSaid>,
+}
+
+/// What the shared pass said since the node started, for the status's
+/// `shared` object (decision 2026-10-10 §9). Kept in memory: each is said
+/// again at the next pass that meets it.
+#[derive(Debug, Default, Clone)]
+pub struct SharedSaid {
+    /// For each shared channel, by its ID: how many entries the door did
+    /// not store, as no honest member writes them (§2.3, rule 3).
+    pub not_stored: std::collections::HashMap<[u8; 32], u64>,
+    /// For each shared channel and each relay of its card, by their keys:
+    /// how many entries of this device's own the relay refused for room,
+    /// or for the address's allowance, at its latest push there.
+    pub refused_at: std::collections::HashMap<([u8; 32], [u8; 32]), u64>,
+    /// Each shared channel and relay where the channel was not proved at
+    /// the latest pass: no room for more proofs on the connection (§8.4).
+    pub no_proof_room: std::collections::HashSet<([u8; 32], [u8; 32])>,
 }
 
 /// How a channel's key is proved to a relay, through the door for a carry.
@@ -637,6 +662,63 @@ impl OwnChannels {
         *self.look.lock().unwrap_or_else(|e| e.into_inner()) = Some(said);
     }
 
+    /// Keep what a recovery says of the shared channels, for the end of its
+    /// look.
+    pub fn set_shared_recovered(&self, said: Vec<String>) {
+        *self
+            .shared_recovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = said;
+    }
+
+    /// The door did not store `n` entries of the shared channel `channel`,
+    /// as no honest member writes them (decision 2026-10-10 §2.3, rule 3).
+    pub fn say_not_stored(&self, channel: &[u8; 32], n: u64) {
+        if n == 0 {
+            return;
+        }
+        let mut said = self.shared_said.lock().unwrap_or_else(|e| e.into_inner());
+        *said.not_stored.entry(*channel).or_default() += n;
+    }
+
+    /// The relay `relay` refused `refused` entries of this device's own in
+    /// the shared channel `channel` at its latest push there, for room or
+    /// for the address's allowance (§9: to the `shared` object, and to no
+    /// level). Nought ends what was said.
+    pub fn say_refused_at(&self, channel: &[u8; 32], relay: &[u8; 32], refused: u64) {
+        let mut said = self.shared_said.lock().unwrap_or_else(|e| e.into_inner());
+        match refused {
+            0 => said.refused_at.remove(&(*channel, *relay)),
+            n => said.refused_at.insert((*channel, *relay), n),
+        };
+    }
+
+    /// Whether the shared channel `channel` found no room for its proof on
+    /// the connection to `relay` at the latest pass (§8.4).
+    pub fn say_no_proof_room(&self, channel: &[u8; 32], relay: &[u8; 32], none: bool) {
+        let mut said = self.shared_said.lock().unwrap_or_else(|e| e.into_inner());
+        match none {
+            true => said.no_proof_room.insert((*channel, *relay)),
+            false => said.no_proof_room.remove(&(*channel, *relay)),
+        };
+    }
+
+    /// What the shared pass said since the node started.
+    pub fn shared_said(&self) -> SharedSaid {
+        self.shared_said
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// What was kept of what a recovery says of the shared channels.
+    pub fn shared_recovered(&self) -> Vec<String> {
+        self.shared_recovered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// What was last kept of the look of a recovery ([`Self::set_look`]).
     pub fn look(&self) -> Option<serde_json::Value> {
         self.look.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -769,6 +851,23 @@ impl OwnChannels {
             .relays_set_up()
             .is_some_and(|set_up| of.from.len() >= set_up);
         from_each || now.saturating_duration_since(of.first) >= FIRST_FETCH_WAIT
+    }
+
+    /// Whether the shared channel whose ID is `channel` was fetched since the
+    /// node started, at `now` (decision 2026-10-10 §6.1, `not_fetched`):
+    /// pulled to its end from each of the `reached` relays of its card that
+    /// are, by key, the device's own, or from one, and the wait for the
+    /// others has gone by since. A device writes nothing in a shared channel
+    /// before then. No where it reaches none of them.
+    pub fn shared_fetch_done(&self, channel: &[u8; 32], reached: usize, now: Instant) -> bool {
+        if reached == 0 {
+            return false;
+        }
+        let fetched = self.fetched.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(of) = fetched.get(channel) else {
+            return false;
+        };
+        of.from.len() >= reached || now.saturating_duration_since(of.first) >= FIRST_FETCH_WAIT
     }
 
     /// The node says whether the messages channel has no place among the

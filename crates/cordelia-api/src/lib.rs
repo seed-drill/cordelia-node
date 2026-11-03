@@ -55,6 +55,7 @@ pub mod handlers;
 pub mod history;
 pub mod leaving;
 pub mod let_go;
+pub mod lists;
 pub mod local;
 pub mod look;
 pub mod marks;
@@ -68,6 +69,15 @@ pub mod recover;
 pub mod sender;
 #[cfg(test)]
 mod several;
+pub mod shared;
+pub mod shared_anew;
+pub mod shared_messages;
+pub mod shared_pass;
+pub mod shared_routes;
+pub mod shared_sender;
+pub mod shared_status;
+pub mod sharing;
+pub mod sharing_routes;
 pub mod state;
 pub mod swept;
 pub mod sync;
@@ -159,6 +169,34 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
             .route("/send", web::post().to(messages::send))
             .route("/log", web::post().to(messages::log))
             .route("/allow", web::post().to(messages::allow)),
+    );
+    // Making, sharing and taking a shared channel (decision 2026-10-10
+    // §5.6): a personal node's, each behind the node's token.
+    cfg.service(
+        web::scope("/api/v1/shared")
+            .route("/new", web::post().to(sharing_routes::new))
+            .route("/share", web::post().to(sharing_routes::share))
+            .route("/accept", web::post().to(sharing_routes::accept))
+            .route("/label", web::post().to(sharing_routes::label))
+            .route("/rename", web::post().to(sharing_routes::rename))
+            .route("/drop", web::post().to(sharing_routes::drop))
+            .route("/anew", web::post().to(sharing_routes::anew))
+            .route("/move", web::post().to(sharing_routes::move_to))
+            .route("/stay", web::post().to(sharing_routes::stay))
+            .route("/list", web::post().to(sharing_routes::list))
+            // Subscribing and messages in a shared channel (§4, §5.6).
+            .route(
+                "/subscribe",
+                web::post().to(crate::shared_routes::subscribe),
+            )
+            .route(
+                "/unsubscribe",
+                web::post().to(crate::shared_routes::unsubscribe),
+            )
+            .route("/read", web::post().to(crate::shared_routes::read))
+            .route("/send", web::post().to(crate::shared_routes::send))
+            .route("/summary", web::post().to(crate::shared_routes::summary))
+            .route("/log", web::post().to(crate::shared_routes::log)),
     );
     shared_routes(cfg);
 }

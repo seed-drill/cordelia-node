@@ -1386,6 +1386,87 @@ fn the_harness_refuses_to_add_a_relay_that_is_not_on_this_machine() {
     relay.add_relay("relay.example:9474", None);
 }
 
+/// Nor does it add a relay to a configuration that names its address
+/// twice already, whatever wrote it: which of the two entries it would
+/// replace cannot be told.
+#[test]
+#[should_panic(expected = "names 127.0.0.1:9474 twice")]
+fn the_harness_refuses_to_add_a_relay_that_a_configuration_names_twice() {
+    let n = node("laptop", "personal", Some(9474));
+    let mut config = std::fs::read_to_string(n.config()).unwrap();
+    config.push_str("\n[[network.bootnodes]]\naddr = \"127.0.0.1:9474\"\n");
+    std::fs::write(n.config(), config).unwrap();
+    n.add_relay("127.0.0.1:9474", None);
+}
+
+/// The relays a node is configured with, each with its key where it has
+/// one, as the node's own reader reads its configuration.
+fn configured_relays(n: &Node) -> Vec<(String, Option<String>)> {
+    let config = cordelia_core::config::Config::load(&n.config()).unwrap();
+    let relays = config.network.bootnodes.into_iter();
+    relays.map(|relay| (relay.addr, relay.key)).collect()
+}
+
+/// A relay that is added to a node whose configuration names its address
+/// already takes the place of the entry there, key and all: the address
+/// is never named twice (decision 2026-10-10 §13). One that it does not
+/// name is added after the others.
+#[test]
+fn adding_a_relay_that_a_node_names_replaces_its_entry_in_its_place() {
+    let n = node("laptop", "personal", Some(9474));
+    let at = "127.0.0.1:9474".to_string();
+    let key = || {
+        let identity = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
+        cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap()
+    };
+    let (first, second) = (key(), key());
+    assert_eq!(configured_relays(&n), [(at.clone(), None)]);
+
+    n.add_relay(&at, Some(&first));
+    assert_eq!(configured_relays(&n), [(at.clone(), Some(first.clone()))]);
+
+    n.add_relay(NOWHERE, None);
+    let both = [
+        (at.clone(), Some(first.clone())),
+        (NOWHERE.to_string(), None),
+    ];
+    assert_eq!(configured_relays(&n), both);
+
+    // A key in place of a key, and then none: the old key's line goes
+    // with its entry.
+    n.add_relay(&at, Some(&second));
+    let config = std::fs::read_to_string(n.config()).unwrap();
+    assert!(!config.contains(&first), "{config}");
+    let both = [(at.clone(), Some(second)), (NOWHERE.to_string(), None)];
+    assert_eq!(configured_relays(&n), both);
+    n.add_relay(&at, None);
+    assert_eq!(
+        configured_relays(&n),
+        [(at, None), (NOWHERE.to_string(), None)]
+    );
+    let config = std::fs::read_to_string(n.config()).unwrap();
+    assert_eq!(
+        config.matches("[[network.bootnodes]]").count(),
+        2,
+        "{config}"
+    );
+}
+
+/// A device set up with its relay's key names that relay once, with its
+/// key, and reaches it: the key it was given is the one that answers.
+#[test]
+fn a_device_set_up_with_its_relays_key_names_its_relay_once_and_reaches_it() {
+    let relay = relay_started();
+    let device = device_started_with_its_relays_key("laptop", &relay);
+    let at = format!("127.0.0.1:{}", relay.p2p);
+    assert_eq!(
+        configured_relays(&device),
+        [(at.clone(), Some(key_of(&relay)))]
+    );
+    assert_eq!(device.will_dial(), [at]);
+    assert!(has_hot_peer(&device).is_some());
+}
+
 /// A node is not started if a relay it would dial is not on this machine,
 /// whatever wrote its configuration. Here a test has taken the stand-in
 /// relay out of a personal node's configuration, so that the node would
