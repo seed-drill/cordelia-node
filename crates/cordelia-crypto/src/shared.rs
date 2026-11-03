@@ -46,7 +46,12 @@
 //!
 //! ```text
 //! form       1    5
-//! made       8    seconds since 1970, by the maker's clock
+//! made       8    seconds since 1970, by the maker's clock, at most
+//!                 `SHARED_ACT_TIME_MAX`, as an act's time: an offer that
+//!                 says later is no offer, so that the time fits a
+//!                 device's store (an offer at 2^63 or later failed it,
+//!                 and stopped the shared pass at its relay: the read of
+//!                 #281 for the shared gate, high)
 //! new        32   the new channel's ID
 //! relays     1 + 32 or 64     the new card's relays, as a card holds them
 //! seals      1    a count, 1 to 64; then for each key that stays: the key,
@@ -61,8 +66,8 @@
 
 use cordelia_core::protocol::{
     AGENT_MESSAGE_BODY_MAX_BYTES, AGENT_MESSAGE_ID_BYTES, AGENT_MESSAGE_LINK_MAX_BYTES,
-    AGENT_MESSAGE_VALUE_BYTES, LABEL_ANEW_SEAL, SEALED_SECRET_BYTES, SHARED_ANEW_PREFIX,
-    SHARED_ANEW_VALUE_BYTES, SHARED_MAX_KEYS,
+    AGENT_MESSAGE_VALUE_BYTES, LABEL_ANEW_SEAL, SEALED_SECRET_BYTES, SHARED_ACT_TIME_MAX,
+    SHARED_ANEW_PREFIX, SHARED_ANEW_VALUE_BYTES, SHARED_MAX_KEYS,
 };
 
 use crate::CryptoError;
@@ -238,6 +243,9 @@ pub enum AnewError {
     #[error("what follows an anew record's fields is not all zeros")]
     Fill,
 
+    #[error("an offer says it was made at {0}, past the latest time an offer may say")]
+    MadeTooLate(u64),
+
     #[error("the offer seals nothing to this device's key")]
     NotSealedToThisKey,
 
@@ -372,6 +380,9 @@ impl Anew {
         let mut out = Vec::with_capacity(SHARED_ANEW_VALUE_BYTES);
         out.push(FORM_ANEW);
         if let Self::Offer(offer) = self {
+            if offer.made > SHARED_ACT_TIME_MAX {
+                return Err(AnewError::MadeTooLate(offer.made));
+            }
             check_keys(offer.seals.iter().map(|seal| &seal.key))?;
             out.extend_from_slice(&offer.made.to_be_bytes());
             out.extend_from_slice(&offer.new_channel);
@@ -406,6 +417,9 @@ impl Anew {
             return Ok(Self::Empty);
         }
         let made = reader.u64().ok_or(AnewError::Field)?;
+        if made > SHARED_ACT_TIME_MAX {
+            return Err(AnewError::MadeTooLate(made));
+        }
         let new_channel = reader.array().ok_or(AnewError::Field)?;
         let relays = Relays::read(&mut reader).map_err(AnewError::Relays)?;
         let count = usize::from(reader.array::<1>().ok_or(AnewError::Field)?[0]);
@@ -582,7 +596,7 @@ mod tests {
     /// An offer from the maker to 64 keys: what the largest record holds.
     fn full_offer(card: &Card) -> Offer {
         let keys: Vec<[u8; 32]> = (0..64u8).map(|n| device(100 + n).public_key()).collect();
-        Offer::make(u64::MAX, &OLD, card, &keys).unwrap()
+        Offer::make(SHARED_ACT_TIME_MAX, &OLD, card, &keys).unwrap()
     }
 
     fn sealed(signer: &NodeIdentity, name: String, rev: u64, value: Vec<u8>) -> Entry {
@@ -811,7 +825,7 @@ mod tests {
         let value = Anew::Offer(offer.clone()).to_value().unwrap();
 
         let mut expected = vec![5];
-        expected.extend_from_slice(&u64::MAX.to_be_bytes());
+        expected.extend_from_slice(&SHARED_ACT_TIME_MAX.to_be_bytes());
         expected.extend_from_slice(&new);
         expected.push(2);
         expected.extend_from_slice(&[3; 32]);
@@ -935,8 +949,9 @@ mod tests {
     }
 
     /// A reader refuses an anew record of another kind, length or form,
-    /// with relays that are not a card's, with no seal, more than 64 or a
-    /// key twice, or with a fill that is not zeros.
+    /// with a time past `SHARED_ACT_TIME_MAX`, with relays that are not a
+    /// card's, with no seal, more than 64 or a key twice, or with a fill
+    /// that is not zeros; and no offer past that time is written.
     #[test]
     fn a_reader_refuses_each_anew_record_that_is_not_one() {
         let card = card(&[[3; 32], [4; 32]]);
@@ -964,6 +979,29 @@ mod tests {
             changed[0] = form;
             assert_eq!(read(changed), Err(AnewError::Form(form)));
         }
+        // The time at 1: the bound is read, and past it is no offer (the
+        // read of #281 for the shared gate, high: a time of 2^63 or later
+        // failed a device's store).
+        for (made, holds) in [
+            (0, true),
+            (SHARED_ACT_TIME_MAX, true),
+            (SHARED_ACT_TIME_MAX + 1, false),
+            (1 << 63, false),
+            (u64::MAX, false),
+        ] {
+            let mut changed = value.clone();
+            changed[1..9].copy_from_slice(&made.to_be_bytes());
+            match read(changed) {
+                Ok(Anew::Offer(offer)) if holds => assert_eq!(offer.made, made),
+                Err(AnewError::MadeTooLate(at)) if !holds => assert_eq!(at, made),
+                other => panic!("{made}: {other:?}"),
+            }
+        }
+        let late = Offer::make(u64::MAX, &OLD, &card, &[device(1).public_key()]).unwrap();
+        assert_eq!(
+            Anew::Offer(late).to_value(),
+            Err(AnewError::MadeTooLate(u64::MAX))
+        );
         // The relays' count at 41: three, and none.
         let mut changed = value.clone();
         changed[41] = 3;

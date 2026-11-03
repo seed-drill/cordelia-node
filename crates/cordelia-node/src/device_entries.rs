@@ -4062,7 +4062,7 @@ impl DeviceEntries {
             }
             match self
                 .leave
-                .share_pair_push(&self.state, link, &key, &entry)
+                .share_pair_push(&self.state, link, &key, &channel, &entry)
                 .await
             {
                 Ok(Pushed::NoRoom | Pushed::OverAllowance) => {}

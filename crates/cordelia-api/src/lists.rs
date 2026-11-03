@@ -255,8 +255,8 @@ impl Makers {
     }
 }
 
-/// What each act's check of its signature gave, by its bytes as a list
-/// writes them: an act that many lists carry is checked once.
+/// What each act's check of its signature gave, by its kind and its bytes
+/// as a list writes them: an act that many lists carry is checked once.
 #[derive(Default)]
 struct Checked(RefCell<HashMap<Vec<u8>, bool>>);
 
@@ -265,7 +265,7 @@ impl Checked {
         *self
             .0
             .borrow_mut()
-            .entry(act.written())
+            .entry(act.kind_and_written())
             .or_insert_with(|| act.holds())
     }
 }
@@ -427,11 +427,28 @@ impl AnyAct {
         self.fields().3
     }
 
-    /// What a device keeps its time of taking by: a hash of the act as a
-    /// list writes it, so that no other bytes carrying its signature can
-    /// stand for it (the review of #281, high 1).
+    /// What a device keeps its time of taking by: a hash of the act's kind
+    /// and of the act as a list writes it, so that no other bytes carrying
+    /// its signature can stand for it (the review of #281, high 1), and no
+    /// act of another kind whose bytes are the same (the read of #281 for
+    /// the shared gate: no two kinds' bytes coincide today, which this
+    /// holds whatever a later kind writes).
     pub fn taking(&self) -> [u8; 64] {
-        cordelia_crypto::sha512(&self.written())
+        cordelia_crypto::sha512(&self.kind_and_written())
+    }
+
+    /// The act's kind, as a list's part says it, and then its bytes as a
+    /// list writes them.
+    fn kind_and_written(&self) -> Vec<u8> {
+        let kind = match self {
+            AnyAct::Filing(_) => <Filing as Item>::KIND,
+            AnyAct::Drop(_) => <Dropped as Item>::KIND,
+            AnyAct::Subscription(_) => <Subscription as Item>::KIND,
+            AnyAct::Label(_) => <Label as Item>::KIND,
+        };
+        let mut bytes = vec![kind];
+        bytes.extend(self.written());
+        bytes
     }
 
     /// Whether it may be taken for what it says: its maker's signature
