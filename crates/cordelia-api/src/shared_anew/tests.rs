@@ -2225,7 +2225,7 @@ fn shared_move_checks_again_after_its_yes() {
 /// The status names no device for a channel first held after a removal
 /// (issue #279, its first part): the laptop removes the tablet, holding no
 /// shared channel; an hour on it files one, which is not clean, and the
-/// status's `removed_device_holds` lists it with no device.
+/// status's `removed_device_holds` lists it with no `device` field.
 #[test]
 fn the_status_names_no_device_for_a_channel_first_held_after_a_removal() {
     let mut s = bob(3);
@@ -2247,7 +2247,7 @@ fn the_status_names_no_device_for_a_channel_first_held_after_a_removal() {
     let groups = shared["removed_device_holds"].as_array().unwrap();
     assert_eq!(groups.len(), 1, "{groups:?}");
     assert_eq!(groups[0]["channels"], serde_json::json!(["later"]));
-    assert_eq!(groups[0]["device"], "");
+    assert!(groups[0].get("device").is_none(), "{groups:?}");
 }
 
 const HOUR_SECS: i64 = 3600;

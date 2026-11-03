@@ -133,17 +133,22 @@ pub fn status_of(
         }
         // Each group names the keys that the removal of its time removed,
         // and the statement before it did not. A group of channels first
-        // held after a removal, marked at no removal's time, names no
-        // device: none of them was held by a removed device (issue #279).
+        // held after a removal, marked at no removal's time, has no
+        // `device`: none of them was held by a removed device (issue #279).
+        // One first held in the same second as the removal names the
+        // removal's keys: the mark keeps no more than its time.
         let mut removed_device_holds: Vec<Value> = Vec::new();
         for (since, channels) in by_since {
             let removed = shared_anew::removed_at(conn, since)?.unwrap_or_default();
-            let device: Vec<String> = removed.iter().map(named).collect();
-            removed_device_holds.push(json!({
-                "device": device.join(", "),
+            let mut group = json!({
                 "channels": channels,
                 "since": rfc3339(since),
-            }));
+            });
+            if !removed.is_empty() {
+                let device: Vec<String> = removed.iter().map(named).collect();
+                group["device"] = json!(device.join(", "));
+            }
+            removed_device_holds.push(group);
         }
 
         let mut acts_of_removed_devices = Vec::new();
