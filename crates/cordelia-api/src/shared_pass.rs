@@ -517,7 +517,7 @@ mod tests {
     use super::*;
     use crate::lists::Do;
     use crate::shared::tests::{
-        DAY, FULL, acts, anew, bob, fill_to, holds, labels, member, message, row,
+        DAY, FULL, acts, anew, anew_of, bob, fill_to, holds, labels, member, message, row,
     };
     use crate::take::NotTaken;
     use cordelia_storage::meta;
@@ -939,5 +939,291 @@ mod tests {
         );
         entries::store(conn, &theirs, now).unwrap();
         assert!(!is_own_share(conn, identity, &alice.public_key(), &theirs).unwrap());
+    }
+
+    /// What the extremes give a shared channel's door, case by case.
+    fn extremes(channel: &crate::shared::tests::Shared) -> Vec<(String, CheckedEntry)> {
+        use crate::several::{entry_by, signed_in};
+        use cordelia_core::protocol::{
+            AGENT_MESSAGE_BODY_MAX_BYTES, AGENT_MESSAGE_NUMBER_MAX, AGENT_MESSAGE_VALUE_BYTES,
+            MAX_REV, REV_BAND_HALF, SHARED_ACT_TIME_MAX, SHARED_ANEW_VALUE_BYTES,
+        };
+        use cordelia_crypto::entry::Value;
+        use cordelia_crypto::message::{clearing_rev, clearing_value, message_name, message_rev};
+        use cordelia_crypto::share::{Card, Relays};
+        use cordelia_crypto::shared::{Anew, Offer};
+
+        let mut cases: Vec<(String, CheckedEntry)> = Vec::new();
+        // Each case by a key of its own, so that no case's ring or slot is
+        // another's.
+        let mut n = 100;
+        let mut next = || {
+            n += 1;
+            member(n)
+        };
+
+        // A message's value, as `says` writes it, then changed by `edit`.
+        let message_with = |author: &NodeIdentity, number: u64, edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut value = crate::shared::tests::says("x", 0).to_value().unwrap();
+            edit(&mut value);
+            assert_eq!(value.len(), AGENT_MESSAGE_VALUE_BYTES);
+            let name = message_name(&author.public_key(), number).unwrap();
+            entry_by(
+                author,
+                &channel.secret,
+                message_rev(number).unwrap(),
+                &name,
+                Value::Other(value),
+                &[],
+            )
+        };
+        // The message's fields: the form at 0, the flags at 1, the time at
+        // 2, the link's length at 58, then the link and the body's count.
+        for sent in [0, SHARED_ACT_TIME_MAX, 1 << 63, u64::MAX] {
+            let author = next();
+            let entry = message_with(&author, 1, &|v| {
+                v[2..10].copy_from_slice(&sent.to_be_bytes())
+            });
+            cases.push((format!("a message sent at {sent}"), entry));
+        }
+        let body = |count: usize, byte: u8| {
+            move |v: &mut Vec<u8>| {
+                v[58] = 0;
+                v[59..61].copy_from_slice(&(count as u16).to_be_bytes());
+                let room = AGENT_MESSAGE_VALUE_BYTES - 61;
+                for (at, place) in v[61..].iter_mut().enumerate() {
+                    *place = if at < count.min(room) { byte } else { 0 };
+                }
+            }
+        };
+        for (what, count, byte) in [
+            ("an empty body", 0, b'x'),
+            ("a body at its bound", AGENT_MESSAGE_BODY_MAX_BYTES, b'x'),
+            (
+                "a body past its bound",
+                AGENT_MESSAGE_BODY_MAX_BYTES + 1,
+                b'x',
+            ),
+            ("a body of u16::MAX", usize::from(u16::MAX), b'x'),
+            ("a body that is not text", 4, 0xff),
+        ] {
+            let author = next();
+            cases.push((what.into(), message_with(&author, 1, &body(count, byte))));
+        }
+        let link = |text: String| {
+            move |v: &mut Vec<u8>| {
+                let bytes = text.as_bytes();
+                v.truncate(58);
+                v.push(bytes.len() as u8);
+                v.extend_from_slice(bytes);
+                v.extend_from_slice(&1u16.to_be_bytes());
+                v.push(b'x');
+                v.resize(AGENT_MESSAGE_VALUE_BYTES, 0);
+            }
+        };
+        let longest = format!("{}/{}#{}", "o".repeat(39), "r".repeat(100), "9".repeat(10));
+        for (what, text) in [
+            ("a link at its bound", longest.clone()),
+            ("a link past its bound", format!("{longest}9")),
+            ("a link of 255 bytes", "o".repeat(255)),
+        ] {
+            let author = next();
+            cases.push((what.into(), message_with(&author, 1, &link(text))));
+        }
+        for (what, at, byte) in [("every flag", 1, 0xff), ("a form of 255", 0, 0xff)] {
+            let author = next();
+            cases.push((what.into(), message_with(&author, 1, &|v| v[at] = byte)));
+        }
+        for (what, byte) in [("a thread and an answer of 0xff", 0xff), ("of 0", 0)] {
+            let author = next();
+            let entry = message_with(&author, 1, &|v| v[26..58].fill(byte));
+            cases.push((what.into(), entry));
+        }
+        let author = next();
+        cases.push((
+            "the highest number".into(),
+            message_with(&author, AGENT_MESSAGE_NUMBER_MAX, &|_| {}),
+        ));
+        let author = next();
+        let name = message_name(&author.public_key(), AGENT_MESSAGE_NUMBER_MAX).unwrap();
+        let clearing = entry_by(
+            &author,
+            &channel.secret,
+            clearing_rev(AGENT_MESSAGE_NUMBER_MAX).unwrap(),
+            &name,
+            Value::Other(clearing_value()),
+            &[],
+        );
+        cases.push(("a clearing of the highest number".into(), clearing));
+
+        // An offer's fields: the time at 1, the relays' count at 41, the
+        // seals' count at 74 (one relay), the fill after.
+        let card = Card::make(Relays::new(&[AT]).unwrap()).unwrap();
+        let offer = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let keys = [member(1).public_key(), member(2).public_key()];
+            let mut value = Anew::Offer(Offer::make(9, &channel.id, &card, &keys).unwrap())
+                .to_value()
+                .unwrap();
+            edit(&mut value);
+            assert_eq!(value.len(), SHARED_ANEW_VALUE_BYTES);
+            value
+        };
+        for made in [
+            0,
+            SHARED_ACT_TIME_MAX,
+            SHARED_ACT_TIME_MAX + 1,
+            1 << 63,
+            u64::MAX,
+        ] {
+            let author = next();
+            let value = offer(&|v| v[1..9].copy_from_slice(&made.to_be_bytes()));
+            cases.push((
+                format!("an offer made at {made}"),
+                anew_of(&author, channel, 2, value),
+            ));
+        }
+        for (what, at, byte) in [
+            ("an offer of no relay", 41, 0),
+            ("an offer of 255 relays", 41, 255),
+            ("an offer of no seal", 74, 0),
+            ("an offer of 65 seals", 74, 65),
+            ("an offer of 255 seals", 74, 255),
+            (
+                "an offer whose fill is not zeros",
+                SHARED_ANEW_VALUE_BYTES - 1,
+                1,
+            ),
+        ] {
+            let author = next();
+            let value = offer(&|v| v[at] = byte);
+            cases.push((what.into(), anew_of(&author, channel, 2, value)));
+        }
+        let author = next();
+        cases.push((
+            "an anew record at the highest revision of band 0".into(),
+            anew(&author, channel, REV_BAND_HALF - 1),
+        ));
+
+        // What an entry carries in clear: its revision, its size, a delete.
+        // A revision past `MAX_REV` and a size that is no power of two from
+        // 256 to 64 KB are no entry: the wire refuses them, and no checked
+        // entry holds one.
+        let slot_key = derive::slot_key(&channel.secret).unwrap();
+        for rev in [REV_BAND_HALF, MAX_REV] {
+            let author = next();
+            let slot = slot_id(&slot_key, &anew_name(&author.public_key()).unwrap());
+            let entry = signed_in(&channel.secret, &author, slot, rev, vec![0; 16_384]);
+            cases.push((format!("an anew record at revision {rev}"), entry));
+        }
+        for size in [256, 65_536] {
+            let author = next();
+            let slot = slot_id(&slot_key, &anew_name(&author.public_key()).unwrap());
+            let entry = signed_in(&channel.secret, &author, slot, 2, vec![0; size]);
+            cases.push((format!("an anew record of {size} bytes"), entry));
+        }
+        let author = next();
+        let name = anew_name(&author.public_key()).unwrap();
+        let deleted = entry_by(&author, &channel.secret, 2, &name, Value::Delete, &[]);
+        assert!(deleted.delete);
+        cases.push(("a delete in an anew slot".into(), deleted));
+        cases
+    }
+
+    /// **No remote field stops the pass** (the read of #281 for the shared
+    /// gate, its pattern): one store error on an entry a relay hands stops
+    /// the whole shared pass at that relay, its pushes too. Each field of a
+    /// shared message, an offer and an entry's clear fields, at 0, at its
+    /// bound, past it and at its type's most, and each length at nothing
+    /// and past its bound, goes through `take_page` with no error; and the
+    /// pass then goes on: a later page is taken, what waits is pushed, and
+    /// the hourly task and the status read the rows they left.
+    /// Of these, an offer made at 2^63 or later failed the store
+    /// (`shared_anew_offers.made >= 0`), and no other.
+    #[test]
+    fn no_remote_field_at_its_extreme_stops_the_shared_pass() {
+        let s = bob(1);
+        let now = s.now + 10;
+        let channel = holds(&s, 0, 1, "review", now);
+        let conn = &s[0].conn;
+        let identity = &s[0].identity;
+        let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+        let mut next = 0;
+        for (what, entry) in extremes(&channel) {
+            let asked = place(conn, &here, &AT).unwrap();
+            next += 1;
+            let page = [entry];
+            let taken = take_page(
+                conn,
+                identity,
+                &here,
+                &AT,
+                asked,
+                (&page, [5; 8], next),
+                now,
+            );
+            let taken = taken.unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(taken.is_some(), "{what}");
+            assert_eq!(place(conn, &here, &AT).unwrap(), ([5; 8], next), "{what}");
+        }
+        // Each case reached the reader: the messages that are messages are
+        // indexed, the times past the store's integer among them, and each
+        // offer within the bound is kept.
+        assert_eq!(crate::shared::tests::indexed(&s, 0, &channel), 9);
+        let offers = cordelia_storage::shared_anew::offers_in(conn, &channel.id).unwrap();
+        assert_eq!(offers.len(), 2, "{offers:?}");
+        // The pass goes on: a message after them is taken and read, and
+        // what waits of the device's own is pushed and answered.
+        let last = message(&member(99), &channel, 1, "after", now);
+        let asked = place(conn, &here, &AT).unwrap();
+        let taken = take_page(
+            conn,
+            identity,
+            &here,
+            &AT,
+            asked,
+            (std::slice::from_ref(&last), [5; 8], next + 1),
+            now,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(
+                taken.each[..],
+                [Taken::Shared {
+                    stored: entries::Outcome::Stored,
+                    ..
+                }]
+            ),
+            "{:?}",
+            taken.each
+        );
+        let own = anew(identity, &channel, 1);
+        crate::take::take(conn, identity, &own, now).unwrap();
+        let most = Most {
+            entries: 100,
+            bytes: 1 << 20,
+        };
+        let batch = to_send(conn, identity, &here, &AT, most).unwrap();
+        assert_eq!(batch, std::slice::from_ref(&own));
+        pushed(conn, identity, &here, &AT, &batch, &[Pushed::Holds], now).unwrap();
+        assert!(
+            to_send(conn, identity, &here, &AT, most)
+                .unwrap()
+                .is_empty()
+        );
+        // What reads the rows they left: the hourly task, a day and 31
+        // days on, and the status's `shared` object.
+        for later in [now + DAY, now + 31 * DAY] {
+            crate::shared::tests::hourly(conn, &identity.public_key(), later).unwrap();
+        }
+        let said = crate::state::SharedSaid::default();
+        let beside = crate::shared_status::Beside {
+            own_relays: &[],
+            connected: &[AT],
+            said: &said,
+        };
+        crate::shared_status::status_of(conn, identity, &beside, now)
+            .unwrap()
+            .unwrap();
     }
 }

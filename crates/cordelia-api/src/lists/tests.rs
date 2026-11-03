@@ -4297,3 +4297,55 @@ fn a_recovery_names_a_channel_past_its_bound_and_does_not_make_it_anew() {
         "{lines:?}"
     );
 }
+
+/// **No field of an act at its extreme stops a device** (the read of #281
+/// for the shared gate, its pattern): the desktop's list carries acts whose
+/// time and count are 0, at `SHARED_ACT_TIME_MAX`, past it, at 2^63 and at
+/// u64::MAX, and whose name, agent and label are at their bounds. The
+/// laptop takes the list through the one door (`take`, which a page of the
+/// personal channel goes through), works the lists out and keeps its
+/// table of shared channels with no error; an act past the bound is
+/// passed over, and one at it is in force.
+#[test]
+fn no_field_of_an_act_at_its_extreme_stops_a_device() {
+    use cordelia_core::protocol::{
+        AGENT_MESSAGE_NAME_MAX_BYTES, MAX_DEVICE_LABEL_BYTES, SHARED_ACT_TIME_MAX,
+    };
+    let s = person(2, 2);
+    sync_on(&s);
+    let now = s.now + 10;
+    let desktop = &s[1].identity;
+    let mut acts = Vec::new();
+    let times = [
+        0,
+        SHARED_ACT_TIME_MAX,
+        SHARED_ACT_TIME_MAX + 1,
+        1 << 63,
+        u64::MAX,
+    ];
+    for (n, time) in times.iter().enumerate() {
+        for (m, count) in times.iter().enumerate() {
+            let key = u8::try_from(10 * n + m + 1).unwrap();
+            acts.push(label(key, Some("k")).by(desktop, *time, *count));
+        }
+    }
+    let longest = "n".repeat(AGENT_MESSAGE_NAME_MAX_BYTES);
+    let at_bound = filing(7, &longest).by(desktop, SHARED_ACT_TIME_MAX, 0);
+    acts.push(at_bound.clone());
+    acts.push(subscription(7, &longest, true).by(desktop, 1, 0));
+    let label_at_bound = "l".repeat(MAX_DEVICE_LABEL_BYTES);
+    acts.push(label(99, Some(&label_at_bound)).by(desktop, 1, 0));
+    acts.push(dropped(8).by(desktop, u64::MAX, u64::MAX));
+    write_by_hand(&s, 1, acts, now);
+    fetch_from(&s, &[1], 0, now + 1);
+    crate::shared::keep(&s[0].conn, &s.key(0), now + 2).unwrap();
+    crate::shared::tests::out(&s, 0, now + 2);
+    assert!(filed(&s, 0).contains(&longest), "{:?}", filed(&s, 0));
+    assert_eq!(labelled(&s, 0, 99), Some(Some(label_at_bound)));
+    // At the bound, time and count, it is in force; past it, in either,
+    // it is passed over.
+    assert_eq!(labelled(&s, 0, 12), Some(Some("k".into())));
+    for past in [3, 5, 21, 32, 55] {
+        assert_eq!(labelled(&s, 0, past), None, "{past}");
+    }
+}
