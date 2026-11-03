@@ -2294,3 +2294,70 @@ fn a_paused_device_hides_what_every_offer_that_pauses_it_leaves_out() {
     want.sort();
     assert_eq!(seen, want);
 }
+
+// ── The review of #282 ───────────────────────────────────────────────
+
+/// Device `n` shares "review" with `to` at `now`.
+fn shares_review(s: &Several, n: usize, to: &NodeIdentity, now: i64) {
+    let to = encode_public_key(&to.public_key()).unwrap();
+    let (conn, identity) = (&s[n].conn, &s[n].identity);
+    let plan = sharing::share_plan(conn, identity, &relays(), "review", &to, None, now).unwrap();
+    sharing::make_share(conn, identity, &relays(), &plan.what, now).unwrap();
+}
+
+/// Device `n`'s pass writes over the shares it does not send, and then
+/// sends only deletes: one for each share of `shares`.
+fn writes_over_its_shares(s: &Several, n: usize, shares: usize, now: i64) {
+    let (conn, identity) = (&s[n].conn, &s[n].identity);
+    assert_eq!(
+        sharing::drop_old_shares(conn, identity, now).unwrap(),
+        shares
+    );
+    let pushed = sharing::shares_to_push(conn, identity, &AT).unwrap();
+    assert_eq!(pushed.len(), shares);
+    assert!(pushed.iter().all(|(_, _, entry)| entry.delete));
+}
+
+/// A share waiting when its channel becomes not clean is written over
+/// with a delete, which is sent (the review of #282, low 2): the desktop
+/// shares "review" with Alice, the laptop removes the tablet, and the
+/// desktop's next pass deletes the share at its relays, though its two
+/// hours have not ended, so a removed device's channel is not taken.
+#[test]
+fn a_share_waiting_at_a_removal_is_written_over() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    shares_review(&s, 1, &member(1), now);
+    let (conn, identity) = (&s[1].conn, &s[1].identity);
+    assert_eq!(sharing::drop_old_shares(conn, identity, now).unwrap(), 0);
+    s.change(0, &[0, 1], &[2]);
+    s.pass(0, 1);
+    writes_over_its_shares(&s, 1, 1, s.now + 20);
+}
+
+/// A share waiting when an offer pauses its channel is written over with
+/// a delete, which is sent (the review of #282, low 2): Bob shares
+/// "review" with Dave; Alice makes it anew without Carol, sealed to Bob.
+#[test]
+fn a_share_waiting_at_a_pause_is_written_over() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    shares_review(&s, 0, &member(3), now);
+    let without_carol = &[alice.public_key(), s.key(0)];
+    stores(
+        &s,
+        0,
+        &offer_by(&alice, &channel, 21, without_carol, now, 2),
+        now,
+    );
+    writes_over_its_shares(&s, 0, 1, now);
+}

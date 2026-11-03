@@ -1101,8 +1101,10 @@ pub fn make_share(
 }
 
 /// Each share this device made that is not within two hours of `now`, by
-/// the time it says, is written over with a delete (§3.1, as
-/// `adding::drop_old_hand_overs` keeps a hand-over); and what is kept of a
+/// the time it says, or of a channel it does not write in now (not held,
+/// not yet clean, or paused: a share made before a removal or an offer),
+/// is written over with a delete (§3.1, as `adding::drop_old_hand_overs`
+/// keeps a hand-over; the review of #282, low 2); and what is kept of a
 /// share written over more than a day ago goes. Returns how many were
 /// written over.
 pub fn drop_old_shares(
@@ -1114,7 +1116,10 @@ pub fn drop_old_shares(
         let mut written = 0;
         for row in rows::shares(conn)? {
             let apart = (now - row.made).abs();
-            if !row.gone && apart >= HAND_OVER_KEPT_SECS {
+            if !row.gone
+                && (apart >= HAND_OVER_KEPT_SECS
+                    || !writes_there_now(conn, identity, &row.channel)?)
+            {
                 write_over(conn, identity, &row, now)?;
                 written += 1;
             } else if row.gone && apart >= TYPED_KEY_KEPT_SECS {
