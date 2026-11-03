@@ -910,26 +910,28 @@ pub fn share_plan(
     })
 }
 
-/// Why `share` hands nothing of the channel `channel`, named `name`: it is
-/// not yet clean on this device, or paused by an offer (§5.5; decision
-/// 2026-10-24, rules 23, 25 and 26). A removed key may read it, and a
-/// person who took it would write there without knowing of the removal.
+/// Why `share` hands nothing of the channel `channel`, named `name`: this
+/// device does not write there now ([`writes_there_now`]), so it hands it
+/// to no one (§5.5; decision 2026-10-24, rules 23, 25 and 26). Paused by
+/// an offer is said so; anything else, not yet clean, and with it a
+/// channel this device holds no row of (the read of #281 for the shared
+/// gate, low 1: a missing check is not clean). A removed key may read it,
+/// and a person who took it would write there without knowing of the
+/// removal.
 fn not_written_there(
     conn: &Connection,
     identity: &NodeIdentity,
     channel: &[u8; 32],
     name: &str,
 ) -> Result<Option<Refusal>, PersonError> {
-    if crate::shared_anew::is_not_clean(conn, channel)? {
-        return Ok(Some(Refusal {
-            word: "not_clean",
-            line: crate::shared_anew::not_clean_line(name),
-        }));
-    }
-    let Some(row) = kept::channel(conn, channel).map_err(PersonError::Storage)? else {
+    if writes_there_now(conn, identity, channel)? {
         return Ok(None);
-    };
-    if crate::shared_anew::pause_of(conn, identity, &row)?.is_some() {
+    }
+    let row = kept::channel(conn, channel).map_err(PersonError::Storage)?;
+    if let Some(row) = row
+        && !crate::shared_anew::is_not_clean(conn, channel)?
+        && crate::shared_anew::pause_of(conn, identity, &row)?.is_some()
+    {
         let word = crate::shared_routes::shell_word(name);
         return Ok(Some(Refusal {
             word: "paused",
@@ -941,7 +943,10 @@ fn not_written_there(
             ),
         }));
     }
-    Ok(None)
+    Ok(Some(Refusal {
+        word: "not_clean",
+        line: crate::shared_anew::not_clean_line(name),
+    }))
 }
 
 /// The revision of an entry this device writes in `slot` of the share pair
@@ -1418,8 +1423,10 @@ pub fn shares_to_push(
 }
 
 /// Whether this device writes in the shared channel `channel` now
-/// ([`crate::shared_anew::writes_there`]); not where it holds it no more.
-fn writes_there_now(
+/// ([`crate::shared_anew::writes_there`]): held, clean and not paused. Not
+/// where it holds no row of it: a missing row is not clean. The one check
+/// of a share's plan, its write and its push (§5.5, §8.4).
+pub fn writes_there_now(
     conn: &Connection,
     identity: &NodeIdentity,
     channel: &[u8; 32],
@@ -1428,6 +1435,37 @@ fn writes_there_now(
         Some(row) => crate::shared_anew::writes_there(conn, identity, &row),
         None => Ok(false),
     }
+}
+
+/// Whether `entry`, which the shared pass is to push to a relay, is still
+/// one to push (§3.1, §8.4): the device stands applied with sync on; it is
+/// the share, or the delete over it, that this device wrote in its share
+/// pair channel with `key` for the channel `channel`, and that its store
+/// holds at that revision; and, but for a delete, this device writes in
+/// that channel now ([`writes_there_now`]). Checked under the lock before
+/// the push, and again once its stream is open: a share picked before a
+/// removal is not pushed after it (the read of #281 for the shared gate,
+/// medium).
+pub fn may_push_share(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    key: &[u8; 32],
+    channel: &[u8; 32],
+    entry: &CheckedEntry,
+) -> Result<bool, PersonError> {
+    if crate::shared_pass::may_open(conn)?.is_err() {
+        return Ok(false);
+    }
+    let Some((_, secret)) = share_pair(identity, key) else {
+        return Ok(false);
+    };
+    if entry.slot != slot_id(&derive::slot_key(&secret)?, &share_name(channel)) {
+        return Ok(false);
+    }
+    if !crate::shared_pass::is_own_share(conn, identity, key, entry)? {
+        return Ok(false);
+    }
+    Ok(entry.delete || writes_there_now(conn, identity, channel)?)
 }
 
 /// The relay whose key is `relay` answered a push of the share of `key` and

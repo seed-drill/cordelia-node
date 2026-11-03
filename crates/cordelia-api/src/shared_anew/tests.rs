@@ -2403,3 +2403,86 @@ fn an_offer_made_past_the_bound_is_no_offer_and_stops_nothing() {
     let after = message(&carol, &channel, 1, "after", now);
     assert!(stores(&s, 0, &after, now).is_some());
 }
+
+/// **A share picked before a removal is not pushed after it** (the read of
+/// #281 for the shared gate, medium): the desktop's pass picks its share of
+/// "review" for Alice to push; before the push, another relay's turn
+/// applies the laptop's removal of the tablet. The check the push makes
+/// under the lock, and again once its stream is open, now refuses the
+/// share; the delete written over it is still pushed.
+#[test]
+fn a_share_picked_before_a_removal_is_not_pushed_after_it() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    let alice = member(1).public_key();
+    shares_review(&s, 1, &member(1), now);
+    let picked = sharing::shares_to_push(&s[1].conn, &s[1].identity, &AT).unwrap();
+    let [(key, channel, share)] = &picked[..] else {
+        panic!("{picked:?}");
+    };
+    assert_eq!(*key, alice);
+    assert!(!share.delete);
+    let may = |s: &Several, entry: &CheckedEntry| {
+        sharing::may_push_share(&s[1].conn, &s[1].identity, key, channel, entry).unwrap()
+    };
+    assert!(may(&s, share));
+    // Not for another channel than the one it hands.
+    let elsewhere = [9; 32];
+    assert!(!sharing::may_push_share(&s[1].conn, &s[1].identity, key, &elsewhere, share).unwrap());
+
+    s.change(0, &[0, 1], &[2]);
+    s.pass(0, 1);
+    assert!(is_not_clean(&s[1].conn, channel).unwrap());
+    assert!(!may(&s, share));
+    // The delete over it, at the next pass, is pushed.
+    writes_over_its_shares(&s, 1, 1, s.now + 20);
+    let pushed = sharing::shares_to_push(&s[1].conn, &s[1].identity, &AT).unwrap();
+    let [(_, _, delete)] = &pushed[..] else {
+        panic!("{pushed:?}");
+    };
+    assert!(may(&s, delete));
+}
+
+/// **A shared push picked before a removal is not sent after it** (the
+/// read of #281 for the shared gate, low 2): the desktop's pass picks what
+/// waits of its own in "review"; before the push's stream is open, another
+/// relay's turn applies the laptop's removal of the tablet. The check made
+/// once the stream is open (`still_sends`) now refuses the batch.
+#[test]
+fn a_shared_push_picked_before_a_removal_is_not_sent_after_it() {
+    use crate::shared_pass::{still_sends, to_send, usable};
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    let most = crate::at_relays::Most {
+        entries: 100,
+        bytes: 1 << 20,
+    };
+    let (conn, identity) = (&s[1].conn, &s[1].identity);
+    let here = usable(conn, &channel.id, &AT).unwrap().unwrap();
+    crate::take::take(conn, identity, &anew(identity, &channel, 1), now).unwrap();
+    let batch = to_send(conn, identity, &here, &AT, most).unwrap();
+    assert!(!batch.is_empty());
+    assert!(still_sends(conn, identity, &channel.id, &AT, &batch).unwrap());
+    s.change(0, &[0, 1], &[2]);
+    s.pass(0, 1);
+    let (conn, identity) = (&s[1].conn, &s[1].identity);
+    assert!(is_not_clean(conn, &channel.id).unwrap());
+    assert!(!still_sends(conn, identity, &channel.id, &AT, &batch).unwrap());
+    assert!(
+        to_send(conn, identity, &here, &AT, most)
+            .unwrap()
+            .is_empty()
+    );
+}

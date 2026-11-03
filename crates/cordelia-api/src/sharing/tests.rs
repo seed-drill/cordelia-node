@@ -1037,3 +1037,20 @@ fn share_refuses_a_new_key_where_the_channel_shows_64() {
     let among = shown.iter().find(|key| **key != s.key(0)).unwrap();
     assert_eq!(word(among), "ok");
 }
+
+/// **A channel with no held row is not clean** (the read of #281 for the
+/// shared gate, low 1): `share`'s plan, its write and its push read one
+/// check, [`writes_there_now`], which is false where this device holds no
+/// row of the channel; and `share` refuses it `not_clean`, where before a
+/// missing row was taken as clean.
+#[test]
+fn share_hands_out_no_channel_with_no_held_row() {
+    let s = bob(1);
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let missing = [9; 32];
+    assert!(!writes_there_now(conn, identity, &missing).unwrap());
+    let refusal = not_written_there(conn, identity, &missing, "review")
+        .unwrap()
+        .expect("refused");
+    assert_eq!(refusal.word, "not_clean");
+}

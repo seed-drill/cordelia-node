@@ -11752,7 +11752,10 @@ async fn what_the_door_does_not_store_of_a_shared_channel_is_said_for_the_status
 
 /// **The door of a share pair channel** (decision 2026-10-10 §2.3, §8.4):
 /// Alice's laptop pushes a share it wrote in its share pair channel with
-/// Bob's desktop, at a relay of their own, and pushes nothing else there;
+/// Bob's desktop, of a channel it holds, at a relay of their own, and
+/// pushes nothing else there, nor a share it wrote again once a removal
+/// left the channel not clean (the read of #281 for the shared gate,
+/// medium);
 /// Bob's desktop, given Alice's key, derives the channel itself, proves it,
 /// and hands each entry that Alice's key signed there to the judge, and
 /// nothing else. A key that reads nothing now asks the relay nothing, and
@@ -11773,10 +11776,15 @@ async fn the_share_pair_door_pushes_a_share_and_hands_the_typed_keys_entries_to_
     bob.connects("relay", &relay).await;
     let relay_key = key_of(&relay);
 
-    // Alice's share, in the share pair channel of her key and Bob's.
+    // Alice's share of a channel she holds, in the share pair channel of
+    // her key and Bob's.
     let (pair, secret) = shared_pass::share_pair(&alice.state.identity, &bob.key()).unwrap();
-    let card = Card::make(Relays::new(&[relay_key]).unwrap()).unwrap();
-    let id = card.channel_id().unwrap();
+    let (id, _) = alice.files_shared("review", &[relay_key]);
+    let held = cordelia_storage::shared::channel(&alice.db(), &id)
+        .unwrap()
+        .unwrap();
+    let card = Card::from_bytes(&held.card).unwrap();
+    assert_eq!(card.relays(), &Relays::new(&[relay_key]).unwrap());
     let share = Share {
         made: alice.now() as u64,
         for_key: bob.key(),
@@ -11796,16 +11804,23 @@ async fn the_share_pair_door_pushes_a_share_and_hands_the_typed_keys_entries_to_
     let link = alice.link("relay");
     let leave = alice.engine.leave();
     let pushed = leave
-        .share_pair_push(&alice.state, &link, &bob.key(), &entry)
+        .share_pair_push(&alice.state, &link, &bob.key(), &id, &entry)
         .await
         .unwrap();
     assert_eq!(pushed, cordelia_api::at_relays::Pushed::Holds);
     assert!(holds_at(&relay, &pair, &entry.id()));
-    // Not for another key, and nothing it did not write.
+    // Not for another key, nor named for another channel, and nothing it
+    // did not write.
     let other = NodeIdentity::generate().unwrap().public_key();
     assert!(
         leave
-            .share_pair_push(&alice.state, &link, &other, &entry)
+            .share_pair_push(&alice.state, &link, &other, &id, &entry)
+            .await
+            .is_err()
+    );
+    assert!(
+        leave
+            .share_pair_push(&alice.state, &link, &bob.key(), &[9; 32], &entry)
             .await
             .is_err()
     );
@@ -11889,6 +11904,54 @@ async fn the_share_pair_door_pushes_a_share_and_hands_the_typed_keys_entries_to_
     assert_eq!(bob.device_counts("relay").asked, asked);
     // Counted by stream in the device's counters, and never held back.
     assert_eq!(bob.device_counts("relay").held_back, 0);
+    // A share picked before a removal, pushed after it (the read of #281
+    // for the shared gate, medium): Alice writes the share again, and
+    // before it is pushed a removal leaves the channel not clean. Nothing
+    // is pushed, and the relay holds only the first.
+    let again = sealed(
+        &me,
+        &secret,
+        alice.now() as u64 + 1,
+        &share_name(&id),
+        Value::Other(share.to_value()),
+    )
+    .check()
+    .unwrap();
+    entries::store(&alice.db(), &again, alice.now()).unwrap();
+    // Kept as `make_share` keeps it, so that no pass takes its channel for
+    // a pair channel of a hand-over.
+    cordelia_storage::shared_sharing::note_share(
+        &alice.db(),
+        &cordelia_storage::shared_sharing::ShareRow {
+            key: bob.key(),
+            channel: id,
+            pair,
+            relays: Relays::new(&[relay_key]).unwrap().to_bytes(),
+            rev: again.rev,
+            made: alice.now(),
+            gone: false,
+        },
+    )
+    .unwrap();
+    cordelia_storage::shared_anew::not_clean(&alice.db(), &id, alice.now(), false).unwrap();
+    let leave = alice.engine.leave();
+    let link = alice.link("relay");
+    let refused = leave
+        .share_pair_push(&alice.state, &link, &bob.key(), &id, &again)
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(
+                cordelia_node::device_entries::leave::SharedRefused::NotUsable(
+                    shared_pass::NotUsable::NotHeld
+                )
+            )
+        ),
+        "{refused:?}"
+    );
+    assert!(!holds_at(&relay, &pair, &again.id()));
+    assert!(holds_at(&relay, &pair, &entry.id()));
 }
 
 /// **A shared request that a relay refuses for now is counted for the relay

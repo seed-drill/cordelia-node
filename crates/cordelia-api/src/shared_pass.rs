@@ -371,6 +371,38 @@ pub fn to_send(
     Ok(batch)
 }
 
+/// Whether this device still sends `batch`, which [`to_send`] picked for
+/// the relay `relay` in the shared channel `channel`, as it would now: the
+/// door may use the channel there ([`usable`]); and the device writes
+/// there, or every entry of the batch is its offer, where the channel is
+/// one it made anew whose offer waits (decision 2026-10-24, rules 23, 25
+/// and 26; §7). Checked again once the push's stream is open: a removal
+/// read in between sends nothing more of the batch (the read of #281 for
+/// the shared gate, low 2).
+pub fn still_sends(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    channel: &[u8; 32],
+    relay: &[u8; 32],
+    batch: &[CheckedEntry],
+) -> Result<bool, PersonError> {
+    let Ok(usable) = usable(conn, channel, relay)? else {
+        return Ok(false);
+    };
+    let Some(row) = kept::channel(conn, channel)? else {
+        return Ok(false);
+    };
+    match crate::shared_anew::sends_only_its_offer(conn, identity, &row)? {
+        None => Ok(false),
+        Some(false) => Ok(true),
+        Some(true) => {
+            let own = identity.public_key();
+            let anew_slot = slot_id(&derive::slot_key(&usable.secret)?, &anew_name(&own)?);
+            Ok(batch.iter().all(|entry| entry.slot == anew_slot))
+        }
+    }
+}
+
 /// The relay `relay` answered a push of `batch` in the channel of `usable`
 /// with `answers`, one for each entry, in one transaction. An entry it
 /// holds, holds a later one of, holds another at its revision of, or
