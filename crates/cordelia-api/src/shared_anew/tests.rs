@@ -2251,3 +2251,46 @@ fn the_status_names_no_device_for_a_channel_first_held_after_a_removal() {
 }
 
 const HOUR_SECS: i64 = 3600;
+
+/// A paused device hides the keys every offer that pauses it leaves out,
+/// not the first offer's alone (the review of #282, medium 2): Alice
+/// removes her tablet and makes "review" anew without it; later Carol
+/// removes hers and makes it anew without hers. Bob stays on neither:
+/// what either tablet sends is shown on Bob's device no more.
+#[test]
+fn a_paused_device_hides_what_every_offer_that_pauses_it_leaves_out() {
+    use crate::shared::tests::message;
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    let (alice_tablet, carol_tablet) = (member(3), member(4));
+    let all = [&alice, &carol, &alice_tablet, &carol_tablet];
+    written_by(&s, 0, &channel, &all, now);
+    for (n, key) in all.iter().enumerate() {
+        stores(&s, 0, &message(key, &channel, 1, "before", now), now);
+        assert_eq!(shown_signers(&s, 0, &channel, now).len(), n + 1);
+    }
+    let without = |maker: &NodeIdentity, left_out: &NodeIdentity, seed: u8, at: i64| {
+        let keys: Vec<[u8; 32]> = all
+            .iter()
+            .map(|key| key.public_key())
+            .filter(|key| *key != left_out.public_key())
+            .chain([s.key(0)])
+            .collect();
+        offer_by(maker, &channel, seed, &keys, at, 2)
+    };
+    stores(&s, 0, &without(&alice, &alice_tablet, 21, now), now);
+    stores(&s, 0, &without(&carol, &carol_tablet, 22, now + 1), now + 1);
+    stores(
+        &s,
+        0,
+        &message(&carol_tablet, &channel, 2, "after", now + 2),
+        now + 2,
+    );
+    let mut seen = shown_signers(&s, 0, &channel, now + 2);
+    seen.sort();
+    let mut want = vec![alice.public_key(), carol.public_key()];
+    want.sort();
+    assert_eq!(seen, want);
+}

@@ -348,7 +348,8 @@ pub fn pause_of(
 
 /// The keys whose messages this device shows nothing of in the channel of
 /// `row`, though it shows the keys (the review of #281, medium 1): while
-/// an offer pauses it there, the keys that offer leaves out; in a channel
+/// offers pause it there, the keys any of them leaves out (two removals
+/// by two people leave out two devices: the review of #282, medium 2); in a channel
 /// it moved from, each key that wrote there that the offer it moved to
 /// does not seal to, but the person's own devices. What such a key sent
 /// before the offer is hidden too: the store does not say which of its
@@ -360,9 +361,20 @@ pub fn hidden_by_an_offer(
     row: &Channel,
 ) -> Result<Vec<[u8; 32]>, PersonError> {
     match row.state {
-        State::Held => Ok(pause_of(conn, identity, row)?
-            .map(|pause| pause.left_out)
-            .unwrap_or_default()),
+        State::Held => {
+            let own = identity.public_key();
+            let mut hidden: Vec<[u8; 32]> = Vec::new();
+            for judged in judged(conn, identity, row, None)? {
+                if judged.offer.maker != own && judged.pauses() {
+                    for key in judged.left_out {
+                        if !hidden.contains(&key) {
+                            hidden.push(key);
+                        }
+                    }
+                }
+            }
+            Ok(hidden)
+        }
         State::Moved => {
             let own = identity.public_key();
             let counting = crate::person::who_counts(conn)?;
