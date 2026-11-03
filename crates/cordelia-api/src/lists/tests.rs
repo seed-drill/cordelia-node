@@ -4349,3 +4349,25 @@ fn no_field_of_an_act_at_its_extreme_stops_a_device() {
         assert_eq!(labelled(&s, 0, past), None, "{past}");
     }
 }
+
+/// An act's time of taking, and its check, are kept by its kind and its
+/// bytes (the read of #281 for the shared gate, hardening): two acts of two
+/// kinds are never one there, whatever bytes a later kind writes.
+#[test]
+fn an_act_is_taken_and_checked_by_its_kind_and_its_bytes() {
+    let laptop = device(1);
+    for (act, kind) in [
+        (
+            filing(1, "review").by(&laptop, 1, 0),
+            <Filing as Item>::KIND,
+        ),
+        (dropped(1).by(&laptop, 1, 0), <Dropped as Item>::KIND),
+        (sub(1, true, &laptop, 1), <Subscription as Item>::KIND),
+        (label(4, Some("k")).by(&laptop, 1, 0), <Label as Item>::KIND),
+    ] {
+        let mut keyed = vec![kind];
+        keyed.extend(act.written());
+        assert_eq!(act.taking(), cordelia_crypto::sha512(&keyed), "{act:?}");
+        assert_eq!(act.kind_and_written(), keyed);
+    }
+}
