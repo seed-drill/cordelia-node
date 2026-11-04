@@ -723,8 +723,7 @@ If you do not mean to add a machine, turn sync off on it.
 - About messages between your agents, whether sync is on or off, last, so
   that it hides nothing above:
   - Two of your agents are held, waiting for you to read their messages
-    (`agents wait for you: messages between 2 agents need reading; run
-    cordelia msg log`). Read them with `cordelia msg log` at a terminal.
+    (`agents wait for you to read their messages; run cordelia msg log`). Read them with `cordelia msg log` at a terminal.
     Plain `cordelia status` says it on a line of its own, `Messages:`.
 
 **`cordelia status --json`** is for panels, scripts and agents. It gives:
