@@ -2331,6 +2331,7 @@ fn the_status_carries_the_messages_object_in_json() {
             "unread_by_an_agent": 5,
             "unread_by_a_person": 3,
             "bounds": [],
+            "held_pairs": 0,
             "waiting": 0,
             "refused_for_room": 0,
             "filled_by": null,
@@ -2352,6 +2353,7 @@ fn the_status_carries_the_messages_object_in_json() {
             "unread_by_an_agent": 4,
             "unread_by_a_person": 0,
             "bounds": [],
+            "held_pairs": 0,
             "waiting": 0,
             "refused_for_room": 0,
             "filled_by": null,
@@ -2948,6 +2950,21 @@ fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
     refused_with(&send(laptop, "work", &["--to", "notes"], "11th\n"), held);
     let other = send(laptop, "plans", &["--to", "notes"], "another pair\n");
     assert!(other.status.success(), "{}", err(&other));
+    // The status says the one pair held, as an amber hold, and the status
+    // line shows it (decision 2026-10-25, rule 4).
+    let says = "agents wait for you: messages between 2 agents need reading; run cordelia msg log";
+    let status = status_of(laptop);
+    assert_eq!(status["messages"]["held_pairs"], 1, "{status}");
+    assert_eq!(status["level"], "amber", "{status}");
+    let holds = status["holds"].as_array().unwrap();
+    let hold = holds.iter().find(|h| h["what"] == "messages_held");
+    assert_eq!(
+        hold,
+        Some(&json!({ "level": "amber", "what": "messages_held", "says": says })),
+        "{status}"
+    );
+    let line = laptop.cli(&["status", "--line"]);
+    assert!(line.contains(says), "{line}");
 
     // Into a pipe: it marks nothing.
     let printed = logged(laptop, "work");
@@ -2970,6 +2987,16 @@ fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
              hear of it.\r\n"
         ),
         "{shown:?}"
+    );
+    let status = status_of(laptop);
+    assert_eq!(status["messages"]["held_pairs"], 0, "{status}");
+    assert!(
+        !status["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["what"] == "messages_held"),
+        "{status}"
     );
     let freed = send(laptop, "work", &["--to", "notes"], "freed\n");
     assert!(

@@ -1172,6 +1172,73 @@ mod tests {
         }
     }
 
+    /// The status's `held_pairs` (decision 2026-10-25, rule 4) is the
+    /// send's own test: 0, then 1 once one pair's messages unread by a
+    /// person reach its bound, in either direction, whatever another pair
+    /// below its bound holds; none for a pair raised above its count or set
+    /// to any; 1 again back at 10; and 0 once the person has read them.
+    #[test]
+    fn the_status_counts_the_pairs_a_send_holds() {
+        let s = devices(2);
+        let t = s.now + MINUTE;
+        let held_now = |at: i64| crate::sender::held_pairs(&s[0].conn, &s.key(0), at).unwrap();
+        let status_now = |at: i64| {
+            let channels = crate::state::OwnChannels::default();
+            crate::messages::status_of(&s[0].conn, &s[0].identity, &channels, at)
+                .unwrap()
+                .unwrap()
+        };
+        let held_send = |at: i64| {
+            matches!(
+                sends(&s, 0, "notes", "work", at),
+                Err(NotSent::Refused(Refused::PairHeld { .. }))
+            )
+        };
+        assert_eq!(held_now(t), 0);
+        assert_eq!(status_now(t).held_pairs, 0);
+        for k in 0..9 {
+            sends(&s, 0, "notes", "work", t + k).unwrap();
+        }
+        sends(&s, 0, "plans", "work", t + 9).unwrap();
+        assert_eq!(held_now(t + 10), 0);
+        // The tenth, the other way.
+        sends(&s, 0, "work", "notes", t + 10).unwrap();
+        assert_eq!(held_now(t + 11), 1);
+        assert!(held_send(t + 11));
+        let counts = status_now(t + 12);
+        assert_eq!(counts.held_pairs, 1);
+        assert_eq!(counts.answered()["held_pairs"], 1);
+        // Raised above the count, the pair is not held, and a send goes.
+        allows(&s, 0, Some(20), 3600, t + 13);
+        assert_eq!(held_now(t + 14), 0);
+        assert!(!held_send(t + 14));
+        // Any never holds.
+        allows(&s, 0, None, 3600, t + 15);
+        assert_eq!(held_now(t + 16), 0);
+        assert_eq!(status_now(t + 16).held_pairs, 0);
+        // Back at the usual hold, held again.
+        allows(&s, 0, Some(10), 3600, t + 17);
+        assert_eq!(held_now(t + 18), 1);
+        assert!(held_send(t + 18));
+        // The person reads them (the person's mark): none is held.
+        let ids: Vec<Vec<u8>> = s[0]
+            .conn
+            .prepare("SELECT id FROM message_index")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 12);
+        for id in ids {
+            let id: held::Id = id.try_into().unwrap();
+            held::mark_read_by_a_person(&s[0].conn, &id).unwrap();
+        }
+        assert_eq!(held_now(t + 20), 0);
+        assert_eq!(status_now(t + 20).held_pairs, 0);
+        assert!(!held_send(t + 20));
+    }
+
     /// A bound stays listed for seven days and ten minutes after its `at`,
     /// by its own clock, and then leaves the list, which is written again
     /// (decision 2026-10-25, rule 3.5).
