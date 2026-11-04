@@ -14,7 +14,7 @@ a device that is lost and brings your memory back to a new machine.
 
 ## Status
 
-**Pre-release (October 2026).** v1 is built and tested. The tests include
+**Pre-release (November 2026).** v1 is built and tested. The tests include
 end-to-end runs with real processes over QUIC through a relay. Two relays
 are running. The current pre-release is `v0.2.0-alpha.18`, for macOS and
 Linux. To install it, run:
