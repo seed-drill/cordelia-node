@@ -1080,6 +1080,11 @@ pub struct Counts {
     /// Each bound in force that is not the usual hold (decision
     /// 2026-10-25, rule 4).
     pub bounds: Vec<BoundSaid>,
+    /// The pairs of the person's agents held now: each pair whose messages
+    /// unread by a person reach its bound in force, by the test a send
+    /// makes (`sender::held_pairs`; decision 2026-10-25, rule 3). It sets
+    /// the status's amber hold `messages_held`.
+    pub held_pairs: u64,
     /// This device's messages that wait to be sent.
     pub waiting: u64,
     /// Of those, the ones a relay refused for room.
@@ -1100,9 +1105,9 @@ pub struct Counts {
 /// places, as a show does (§6). `None` where the device does not stand
 /// applied: the object is absent then.
 ///
-/// **It is said nowhere but here.** Nothing of it feeds the level, the
-/// holds or the line, which a command works out from facts that pass
-/// over the messages channel.
+/// **It is said nowhere but here,** but for one field: `held_pairs` sets
+/// the amber hold `messages_held` (decision 2026-10-25, rule 4). Nothing
+/// else of it feeds the level, the holds or the line.
 ///
 /// What is shown is what a show would show: a message from a signer that
 /// no longer counts is shown by `log` alone (§9.1), and is not counted as
@@ -1154,10 +1159,12 @@ pub fn status_of(
             own_channels.no_room_for_messages(channel)
         })?;
         let bounds = bounds_said(conn, &own, &counting, now)?;
+        let held_pairs = sender::held_pairs(conn, &own, now)?;
         Ok(Some(Counts {
             unread_by_an_agent,
             unread_by_a_person,
             bounds,
+            held_pairs,
             waiting: match kept(held::generation_of(conn, &channel))? {
                 Some(generation) => kept(held::kept_count(conn, generation, now))?,
                 None => 0,
@@ -1183,6 +1190,7 @@ impl Counts {
             "unread_by_an_agent": self.unread_by_an_agent,
             "unread_by_a_person": self.unread_by_a_person,
             "bounds": bounds,
+            "held_pairs": self.held_pairs,
             "waiting": self.waiting,
             "refused_for_room": self.refused_for_room,
             "filled_by": filled_by,
@@ -4754,6 +4762,7 @@ mod tests {
             "unread_by_an_agent",
             "unread_by_a_person",
             "bounds",
+            "held_pairs",
             "waiting",
             "refused_for_room",
             "filled_by",
@@ -4763,7 +4772,7 @@ mod tests {
         ] {
             assert!(answered.get(key).is_some(), "{key}");
         }
-        assert_eq!(answered.as_object().unwrap().len(), 9);
+        assert_eq!(answered.as_object().unwrap().len(), 10);
         // A message refused whose 30 days are up waits no more, and is
         // refused of those that wait no more, until the hourly task.
         conn.execute(
