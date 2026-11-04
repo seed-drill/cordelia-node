@@ -2331,6 +2331,7 @@ fn the_status_carries_the_messages_object_in_json() {
             "unread_by_an_agent": 5,
             "unread_by_a_person": 3,
             "bounds": [],
+            "held_pairs": 0,
             "waiting": 0,
             "refused_for_room": 0,
             "filled_by": null,
@@ -2352,6 +2353,7 @@ fn the_status_carries_the_messages_object_in_json() {
             "unread_by_an_agent": 4,
             "unread_by_a_person": 0,
             "bounds": [],
+            "held_pairs": 0,
             "waiting": 0,
             "refused_for_room": 0,
             "filled_by": null,
@@ -2948,6 +2950,28 @@ fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
     refused_with(&send(laptop, "work", &["--to", "notes"], "11th\n"), held);
     let other = send(laptop, "plans", &["--to", "notes"], "another pair\n");
     assert!(other.status.success(), "{}", err(&other));
+    // The status says the one pair held, as an amber hold, last of the
+    // holds, below what is said of the person's devices (decision
+    // 2026-10-25, rule 4).
+    let says = "agents wait for you to read their messages; run cordelia msg log";
+    let status = status_of(laptop);
+    assert_eq!(status["messages"]["held_pairs"], 1, "{status}");
+    assert_eq!(status["level"], "amber", "{status}");
+    assert_eq!(
+        status["holds"].as_array().unwrap().last(),
+        Some(&json!({ "level": "amber", "what": "messages_held", "says": says })),
+        "{status}"
+    );
+    // The plain status says it on a line of its own.
+    let plain = laptop.cli(&["status"]);
+    assert!(
+        plain.contains(&format!("\n  Messages:  {says}\n")),
+        "{plain}"
+    );
+    assert!(
+        !plain.contains(&format!("also:     To know: {says}")),
+        "{plain}"
+    );
 
     // Into a pipe: it marks nothing.
     let printed = logged(laptop, "work");
@@ -2970,6 +2994,16 @@ fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
              hear of it.\r\n"
         ),
         "{shown:?}"
+    );
+    let status = status_of(laptop);
+    assert_eq!(status["messages"]["held_pairs"], 0, "{status}");
+    assert!(
+        !status["holds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["what"] == "messages_held"),
+        "{status}"
     );
     let freed = send(laptop, "work", &["--to", "notes"], "freed\n");
     assert!(
@@ -3797,7 +3831,7 @@ fn a_bound_set_on_the_desktop_holds_on_both() {
     let status = two.laptop.cli(&["status"]);
     let line = status
         .lines()
-        .find(|line| line.starts_with("  Messages:  "))
+        .find(|line| line.starts_with("  Messages:  between "))
         .unwrap_or_else(|| panic!("{status}"));
     assert!(
         line.starts_with("  Messages:  between notes and work, sending stops at 20 until "),
@@ -3836,7 +3870,15 @@ fn a_bound_set_on_the_desktop_holds_on_both() {
         assert!(!said.status.success(), "{}", out(&said));
         (err(&said) == format!("{}\n", held_at("work", "notes", 20, 10))).then_some(())
     });
-    assert!(!two.laptop.cli(&["status"]).contains("  Messages:  "));
+    // No bound is said now; the pair, held at 10, is.
+    let status = two.laptop.cli(&["status"]);
+    assert!(!status.contains("  Messages:  between "), "{status}");
+    assert!(
+        status.contains(
+            "\n  Messages:  agents wait for you to read their messages; run cordelia msg log\n"
+        ),
+        "{status}"
+    );
 }
 
 /// `allow` into a pipe sets nothing (decision 2026-10-25, rule 2): with

@@ -635,26 +635,70 @@ pub fn held_pair(
     now: i64,
 ) -> Result<Option<HeldPair>, PersonError> {
     let counting = crate::person::who_counts(conn)?;
-    let pairs = kept(held::pairs_with(conn, from, now, &counting.keys()))?;
     let rows = kept(held::bounds(conn))?;
-    let held_at = |other: &held::Other, count: u64| -> Option<u64> {
-        let pair = held::Pair::of(from, other.as_deref());
-        crate::bounds::in_force_of(&rows, own, &counting, &pair, now)
-            .stops_at()
-            .filter(|bound| count >= *bound)
-    };
-    let mut held = pairs.into_iter().filter_map(|(other, count)| {
-        let bound = held_at(&other, count)?;
-        Some(HeldPair {
-            other,
-            waiting: count,
-            bound,
+    let counts = kept(held::pair_counts(conn, now, &counting.keys()))?;
+    // The held pairs with `from` on one side, by the other name, and all
+    // last, as `pairs_with` orders them.
+    let mut held: Vec<HeldPair> = held_of(&counts, &rows, own, &counting, now)
+        .filter_map(|(pair, waiting, bound)| {
+            let other = match (&pair.a, &pair.b) {
+                (a, None) if a == from => None,
+                (_, None) => return None,
+                (a, Some(b)) if a == from => Some(b.clone()),
+                (a, Some(b)) if b == from => Some(a.clone()),
+                _ => return None,
+            };
+            Some(HeldPair {
+                other,
+                waiting,
+                bound,
+            })
         })
-    });
+        .collect();
+    held.sort_by(|x, y| (x.other.is_none(), &x.other).cmp(&(y.other.is_none(), &y.other)));
+    let mut held = held.into_iter();
     Ok(match to {
         To::Name(name) => held.find(|pair| pair.other.as_deref() == Some(name.as_str())),
         To::All => held.next(),
     })
+}
+
+/// The pairs of `counts` held at `now`, each with its count and the bound
+/// in force at which it stops: **the one test of the hold,** which a send
+/// ([`held_pair`]) and the status ([`held_pairs`]) both ask, over the
+/// counts of one read of the index ([`held::pair_counts`]). A pair is held
+/// where its count reaches its bound in force (decision 2026-10-25, rule
+/// 3); `any` never holds. `rows` are the bounds held, `own` this device's
+/// key, and `counting` who counts.
+fn held_of<'a>(
+    counts: &'a std::collections::BTreeMap<held::Pair, u64>,
+    rows: &'a [held::BoundRow],
+    own: &'a [u8; 32],
+    counting: &'a crate::person::Counting,
+    now: i64,
+) -> impl Iterator<Item = (&'a held::Pair, u64, u64)> + 'a {
+    counts.iter().filter_map(move |(pair, count)| {
+        let bound = crate::bounds::in_force_of(rows, own, counting, pair, now)
+            .stops_at()
+            .filter(|bound| count >= bound)?;
+        Some((pair, *count, bound))
+    })
+}
+
+/// How many pairs of the person's agents are held at `now` on this device
+/// (decision 2026-10-25, rules 3 and 4), by the test a send makes
+/// ([`held_of`]), over one read of the index. `counting` and `rows` are
+/// who counts and the bounds held, as the status has them already. What
+/// `cordelia status` says as `held_pairs`, and the amber hold it sets.
+pub fn held_pairs(
+    conn: &Connection,
+    own: &[u8; 32],
+    counting: &crate::person::Counting,
+    rows: &[held::BoundRow],
+    now: i64,
+) -> Result<u64, PersonError> {
+    let counts = kept(held::pair_counts(conn, now, &counting.keys()))?;
+    Ok(held_of(&counts, rows, own, counting, now).count() as u64)
 }
 
 /// Sixteen random bytes, so that two messages with the same words are two
