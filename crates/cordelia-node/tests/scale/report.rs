@@ -1475,6 +1475,35 @@ fn passed_over(read: &Read, p: &Pair) -> bool {
     !sent_again
 }
 
+/// When a relay that device `node` is set up with (the relays its kept
+/// settings name) is first up at or after `t`: `t` where one is up then;
+/// where every one is down, the start again of the relay whose outage `t`
+/// falls in (the run's record of it), or `None` where it never started
+/// again. A device whose settings name no relay of the run is taken as
+/// reaching one at `t`.
+fn relay_up_from(read: &Read, node: usize, t: f64) -> Option<f64> {
+    let fleet = &read.run.fleet;
+    let outage = &read.run.outage;
+    let relays = &fleet.made[node].settings.relays;
+    let mut first: Option<Option<f64>> = None;
+    for (r, &relay) in fleet.relays.iter().enumerate() {
+        let key = &fleet.made[relay].key;
+        if !relays.iter().any(|(_, k)| k == key) {
+            continue;
+        }
+        // The outage is the second relay's (step 7); the first never stops.
+        let down = r == 1
+            && outage.stopped.is_some_and(|a| t >= a)
+            && outage.started.is_none_or(|b| t < b);
+        let up = if down { outage.started } else { Some(t) };
+        first = Some(match (first.flatten(), up) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        });
+    }
+    first.unwrap_or(Some(t))
+}
+
 fn bar_3(read: &Read, edits: &Edits) -> Line {
     let missing: Vec<&Pair> = edits
         .of_person(read, false)
@@ -1489,7 +1518,10 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
     // from no later than its return). Bar 2 judges an edit only where its
     // device ran from when it is timed to its arrival, or the 120 s after;
     // each it skips for its device's off is one of these, so none is left
-    // to "found by the end" alone.
+    // to "found by the end" alone. A device that ran again while every
+    // relay it is set up with was down (a split device in its one relay's
+    // outage) is timed from that relay's start again: it could reach
+    // nothing before.
     let owed_at = |p: &Pair, off: f64, on: f64| {
         (p.edit.at >= off && p.edit.at <= on)
             || (p.edit.at >= read.start
@@ -1500,6 +1532,7 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
     let mut worst: f64 = 0.0;
     let mut slow = 0;
     let mut times_off = 0;
+    let mut from_relay = 0;
     for i in read.devices() {
         let Some((k, _)) = read.person_of(i) else {
             continue;
@@ -1510,6 +1543,12 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
         for (off, on) in read.lives.downs(i, read.start, read.end) {
             let Some(on) = on else { continue };
             times_off += 1;
+            let Some(from) = relay_up_from(read, i, on) else {
+                continue;
+            };
+            if from > on {
+                from_relay += 1;
+            }
             for p in edits
                 .pairs
                 .iter()
@@ -1517,8 +1556,8 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
             {
                 match p.arrived {
                     Some(a) => {
-                        worst = worst.max(a.at - on);
-                        if a.at - on > 60.0 {
+                        worst = worst.max(a.at - from);
+                        if a.at - from > 60.0 {
                             slow += 1;
                         }
                     }
@@ -1543,7 +1582,7 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
         format!(
             "{} edits of the window on other devices; {} not found by the end{}; {} not found \
              and passed over, their writer told to stop within a cycle of writing them or off \
-             when they were written, and not run long enough again; after {} times off, the \
+             when they were written, and not run long enough again; after {} times off{}, the \
              slowest catch-up {:.1} s, {} edits not held within 60 s",
             edits
                 .of_person(read, false)
@@ -1556,13 +1595,21 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
             },
             passed.len(),
             times_off,
+            match from_relay {
+                0 => String::new(),
+                n => format!(
+                    " ({n} of them back while every relay the device uses was down, timed from \
+                     that relay's return)"
+                ),
+            },
             worst,
             slow
         ),
         "every edit's own line on every other device by the end, but one whose writer was told \
          to stop within a cycle (5 s) of writing it, or was off when it was written, and did not \
          run 60 s again 120 s or more before the end; a device that was off holds its person's \
-         edits within 60 s of running again",
+         edits within 60 s of running again, or, where it runs again while every relay it uses \
+         is down, within 60 s of that relay's return",
         lost.is_empty() && slow == 0,
     )
 }
