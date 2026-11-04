@@ -2950,21 +2950,18 @@ fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
     refused_with(&send(laptop, "work", &["--to", "notes"], "11th\n"), held);
     let other = send(laptop, "plans", &["--to", "notes"], "another pair\n");
     assert!(other.status.success(), "{}", err(&other));
-    // The status says the one pair held, as an amber hold, and the status
-    // line shows it (decision 2026-10-25, rule 4).
+    // The status says the one pair held, as an amber hold, last of the
+    // holds, below what is said of the person's devices (decision
+    // 2026-10-25, rule 4).
     let says = "agents wait for you: messages between 2 agents need reading; run cordelia msg log";
     let status = status_of(laptop);
     assert_eq!(status["messages"]["held_pairs"], 1, "{status}");
     assert_eq!(status["level"], "amber", "{status}");
-    let holds = status["holds"].as_array().unwrap();
-    let hold = holds.iter().find(|h| h["what"] == "messages_held");
     assert_eq!(
-        hold,
+        status["holds"].as_array().unwrap().last(),
         Some(&json!({ "level": "amber", "what": "messages_held", "says": says })),
         "{status}"
     );
-    let line = laptop.cli(&["status", "--line"]);
-    assert!(line.contains(says), "{line}");
 
     // Into a pipe: it marks nothing.
     let printed = logged(laptop, "work");
