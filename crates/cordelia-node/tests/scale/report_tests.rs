@@ -2826,3 +2826,117 @@ fn bar_15_times_an_edit_written_while_its_writer_was_off_from_its_return() {
         bar.figure
     );
 }
+
+// ── Bar 3 after stage 100, seed 3: a split device back in its relay's outage ──
+
+/// Bar 3 of a run whose second relay stops at 400 s and starts at 520 s,
+/// where the split person's device `reader` (device 0 set up with the
+/// first relay alone, device 1 with the second alone, by their settings)
+/// is off from 300 s and runs again at 450 s, inside the outage, and the
+/// other device writes an edit at 350 s that reaches it at `arrived`. The
+/// window is 0 to 2500 s.
+fn bar_3_of_a_split_reader(reader: usize, arrived: f64) -> Line {
+    let (_dir, run) = made_up();
+    all_running(&run, 0.0);
+    window(&run, 0.0, 2500.0);
+    *run.outage.lock().unwrap() = Outage {
+        stopped: Some(400.0),
+        started: Some(520.0),
+        back: Vec::new(),
+    };
+    let person = run
+        .plan
+        .population
+        .people
+        .iter()
+        .position(|p| p.split && !p.office)
+        .unwrap();
+    for device in 0..2 {
+        let relay = run.fleet.relays[device];
+        let key = run.fleet.made[relay].key.clone();
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 21_000));
+        run.fleet.made[run.fleet.device(person, device)]
+            .settings
+            .lock()
+            .unwrap()
+            .relays = vec![(addr, key)];
+    }
+    let node = run.fleet.device(person, reader);
+    becomes(&run, node, 300.0, Is::Stopped);
+    becomes(&run, node, 450.0, Is::Running);
+    {
+        let mut o = run.observer.lock().unwrap();
+        o.wrote(
+            Written {
+                number: 20,
+                person,
+                writer: 1 - reader,
+                name: 0,
+                file: "f001.md".into(),
+                size: 600,
+                at: 350.0,
+                burst: false,
+                new: false,
+                replaced: None,
+            },
+            vec![(reader, run.out.clone())],
+        );
+        o.arrivals.insert(
+            (20, reader),
+            Arrival {
+                at: arrived,
+                in_copy: false,
+            },
+        );
+    }
+    let read = read_of(&run);
+    let edits = edits_of(&read);
+    bar_3(&read, &edits)
+}
+
+/// A split device that runs again while its one relay is down (as person
+/// 8's second device at stage 100, seed 3: back at 3,924.5 s in relay 2's
+/// outage, its person's edits held 19.2 s after the relay's start) is
+/// timed from that relay's start: held 19 s after it, it passes; 70 s
+/// after, it fails. The other device, set up with the first relay, which
+/// ran all through, is timed from its running again as before: the same
+/// arrival 19 s after the second relay's start is 89 s after its return,
+/// and fails.
+#[test]
+fn bar_3_times_a_device_back_in_its_only_relays_outage_from_its_start() {
+    for (case, reader, arrived, verdict, said) in [
+        (
+            "relay 2 alone, held 19 s after its start",
+            1,
+            539.0,
+            Verdict::Pass,
+            "after 1 times off (1 of them back while every relay the device uses was down, \
+             timed from that relay's return), the slowest catch-up 19.0 s, 0 edits not held",
+        ),
+        (
+            "relay 2 alone, held 70 s after its start",
+            1,
+            590.0,
+            Verdict::Fail,
+            "the slowest catch-up 70.0 s, 1 edits not held within 60 s",
+        ),
+        (
+            "relay 1 alone, up all through",
+            0,
+            539.0,
+            Verdict::Fail,
+            "after 1 times off, the slowest catch-up 89.0 s, 1 edits not held within 60 s",
+        ),
+        (
+            "relay 1 alone, held 50 s after its return",
+            0,
+            500.0,
+            Verdict::Pass,
+            "after 1 times off, the slowest catch-up 50.0 s, 0 edits not held",
+        ),
+    ] {
+        let bar = bar_3_of_a_split_reader(reader, arrived);
+        assert_eq!(bar.verdict, verdict, "{case}: {}", bar.figure);
+        assert!(bar.figure.contains(said), "{case}: {}", bar.figure);
+    }
+}
