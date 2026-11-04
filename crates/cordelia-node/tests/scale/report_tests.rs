@@ -2829,19 +2829,25 @@ fn bar_15_times_an_edit_written_while_its_writer_was_off_from_its_return() {
 
 // ── Bar 3 after stage 100, seed 3: a split device back in its relay's outage ──
 
-/// Bar 3 of a run whose second relay stops at 400 s and starts at 520 s,
-/// where the split person's device `reader` (device 0 set up with the
-/// first relay alone, device 1 with the second alone, by their settings)
-/// is off from 300 s and runs again at 450 s, inside the outage, and the
+/// Bar 3 of a run whose second relay stops at 400 s and starts again at
+/// `started` (never, where `None`), where the split person's device
+/// `reader`, set up by its settings with the relays `relays` (0 the first,
+/// 1 the second), is off from 300 s and runs again at `back`, and the
 /// other device writes an edit at 350 s that reaches it at `arrived`. The
 /// window is 0 to 2500 s.
-fn bar_3_of_a_split_reader(reader: usize, arrived: f64) -> Line {
+fn bar_3_of_a_split_reader(
+    reader: usize,
+    relays: &[usize],
+    back: f64,
+    started: Option<f64>,
+    arrived: f64,
+) -> Line {
     let (_dir, run) = made_up();
     all_running(&run, 0.0);
     window(&run, 0.0, 2500.0);
     *run.outage.lock().unwrap() = Outage {
         stopped: Some(400.0),
-        started: Some(520.0),
+        started,
         back: Vec::new(),
     };
     let person = run
@@ -2851,19 +2857,15 @@ fn bar_3_of_a_split_reader(reader: usize, arrived: f64) -> Line {
         .iter()
         .position(|p| p.split && !p.office)
         .unwrap();
-    for device in 0..2 {
-        let relay = run.fleet.relays[device];
-        let key = run.fleet.made[relay].key.clone();
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 21_000));
-        run.fleet.made[run.fleet.device(person, device)]
-            .settings
-            .lock()
-            .unwrap()
-            .relays = vec![(addr, key)];
-    }
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 21_000));
+    let keys: Vec<_> = relays
+        .iter()
+        .map(|r| (addr, run.fleet.made[run.fleet.relays[*r]].key.clone()))
+        .collect();
     let node = run.fleet.device(person, reader);
+    run.fleet.made[node].settings.lock().unwrap().relays = keys;
     becomes(&run, node, 300.0, Is::Stopped);
-    becomes(&run, node, 450.0, Is::Running);
+    becomes(&run, node, back, Is::Running);
     {
         let mut o = run.observer.lock().unwrap();
         o.wrote(
@@ -2898,16 +2900,19 @@ fn bar_3_of_a_split_reader(reader: usize, arrived: f64) -> Line {
 /// 8's second device at stage 100, seed 3: back at 3,924.5 s in relay 2's
 /// outage, its person's edits held 19.2 s after the relay's start) is
 /// timed from that relay's start: held 19 s after it, it passes; 70 s
-/// after, it fails. The other device, set up with the first relay, which
-/// ran all through, is timed from its running again as before: the same
-/// arrival 19 s after the second relay's start is 89 s after its return,
-/// and fails.
+/// after, it fails. Every other device is timed from its running again: one
+/// set up with the first relay, which ran all through, or with both, one of
+/// them up; one whose only relay never started again; and one back before
+/// the stop, which was slow during it.
 #[test]
 fn bar_3_times_a_device_back_in_its_only_relays_outage_from_its_start() {
-    for (case, reader, arrived, verdict, said) in [
+    for (case, reader, relays, back, started, arrived, verdict, said) in [
         (
             "relay 2 alone, held 19 s after its start",
             1,
+            &[1][..],
+            450.0,
+            Some(520.0),
             539.0,
             Verdict::Pass,
             "after 1 times off (1 of them back while every relay the device uses was down, \
@@ -2916,6 +2921,9 @@ fn bar_3_times_a_device_back_in_its_only_relays_outage_from_its_start() {
         (
             "relay 2 alone, held 70 s after its start",
             1,
+            &[1][..],
+            450.0,
+            Some(520.0),
             590.0,
             Verdict::Fail,
             "the slowest catch-up 70.0 s, 1 edits not held within 60 s",
@@ -2923,6 +2931,9 @@ fn bar_3_times_a_device_back_in_its_only_relays_outage_from_its_start() {
         (
             "relay 1 alone, up all through",
             0,
+            &[0][..],
+            450.0,
+            Some(520.0),
             539.0,
             Verdict::Fail,
             "after 1 times off, the slowest catch-up 89.0 s, 1 edits not held within 60 s",
@@ -2930,12 +2941,45 @@ fn bar_3_times_a_device_back_in_its_only_relays_outage_from_its_start() {
         (
             "relay 1 alone, held 50 s after its return",
             0,
+            &[0][..],
+            450.0,
+            Some(520.0),
             500.0,
             Verdict::Pass,
             "after 1 times off, the slowest catch-up 50.0 s, 0 edits not held",
         ),
+        (
+            "both relays, relay 2 down, held 89 s after its return",
+            1,
+            &[0, 1][..],
+            450.0,
+            Some(520.0),
+            539.0,
+            Verdict::Fail,
+            "after 1 times off, the slowest catch-up 89.0 s, 1 edits not held within 60 s",
+        ),
+        (
+            "relay 2 alone, never started again",
+            1,
+            &[1][..],
+            450.0,
+            None,
+            539.0,
+            Verdict::Fail,
+            "after 1 times off, the slowest catch-up 89.0 s, 1 edits not held within 60 s",
+        ),
+        (
+            "relay 2 alone, back before its stop, slow during it",
+            1,
+            &[1][..],
+            390.0,
+            Some(520.0),
+            539.0,
+            Verdict::Fail,
+            "after 1 times off, the slowest catch-up 149.0 s, 1 edits not held within 60 s",
+        ),
     ] {
-        let bar = bar_3_of_a_split_reader(reader, arrived);
+        let bar = bar_3_of_a_split_reader(reader, relays, back, started, arrived);
         assert_eq!(bar.verdict, verdict, "{case}: {}", bar.figure);
         assert!(bar.figure.contains(said), "{case}: {}", bar.figure);
     }
