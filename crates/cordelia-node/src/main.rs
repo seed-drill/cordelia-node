@@ -1504,9 +1504,17 @@ fn shared_line(says: &str) -> String {
     format!("  Shared:    {}", indicator::without_shared(says))
 }
 
+/// The line of the plain `cordelia status` that says the hold of agents
+/// that wait for their person (decision 2026-10-25, rule 4): its label
+/// says "Messages", and the words are the line's own.
+fn messages_line(says: &str) -> String {
+    format!("  Messages:  {says}")
+}
+
 /// What the plain status says under `Memory:`, worked out from `facts`
-/// without the hold of a shared channel, and that hold, where it holds
-/// (decision 2026-10-10 §9).
+/// without the hold of a shared channel and without the hold of agents
+/// held for their person, and that hold of a shared channel, where it
+/// holds (decision 2026-10-10 §9). The other is [`messages_held`]'s.
 fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indicator::Holds>) {
     let shared = indicator::shown(facts)
         .holds
@@ -1514,7 +1522,18 @@ fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indi
         .find(indicator::is_shared);
     let mut without = facts.clone();
     without.devices.removed_holds_shared = 0;
+    without.held_pairs = 0;
     (indicator::shown(&without), shared)
+}
+
+/// The hold of agents held for their person, where it holds: said on a
+/// line of its own, `Messages:`, and not under `Memory:` (decision
+/// 2026-10-25, rule 4).
+fn messages_held(facts: &indicator::Facts) -> Option<indicator::Holds> {
+    indicator::shown(facts)
+        .holds
+        .into_iter()
+        .find(indicator::is_messages_held)
 }
 
 fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
@@ -1907,8 +1926,13 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                         println!("    {line}");
                     }
                 }
-                // Each bound a person set for a pair that is in force, and
-                // is not the usual hold (decision 2026-10-25, rule 4).
+                // What is said of messages, together: agents held for
+                // their person, then each bound a person set for a pair
+                // that is in force, and is not the usual hold (decision
+                // 2026-10-25, rule 4).
+                if let Some(held) = messages_held(&status.facts) {
+                    println!("{}", messages_line(&held.says));
+                }
                 let now = chrono::Utc::now().timestamp();
                 for line in msg_cmd::status_bound_lines(&live["messages"], now) {
                     println!("{line}");
@@ -9497,6 +9521,63 @@ mod tests {
         // With none, there is no `Shared:` line.
         f.devices.removed_holds_shared = 0;
         assert!(memory_and_shared(&f).1.is_none());
+    }
+
+    /// The hold of agents held for their person is said on a line of its
+    /// own in the plain status, `Messages:`, and not under `Memory:`,
+    /// alone and beside another amber hold (decision 2026-10-25, rule 4).
+    /// The level and the status line still take it as any amber.
+    #[test]
+    fn the_plain_status_says_agents_held_on_a_line_of_their_own() {
+        let mut f = indicator::Facts {
+            initialised: true,
+            running: true,
+            role: "personal".into(),
+            stands: "applied".into(),
+            peers_hot: 2,
+            sync_enabled: true,
+            report_age_secs: Some(3),
+            folders: 1,
+            mapped: 1,
+            held_pairs: 1,
+            ..Default::default()
+        };
+        let says = "agents wait for you: messages between 2 agents need reading; run cordelia \
+                    msg log";
+        let shown = indicator::shown(&f);
+        assert_eq!(shown.level, Some(indicator::Level::Amber));
+        assert_eq!(shown.summary, says);
+        let (memory, shared) = memory_and_shared(&f);
+        assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
+        assert!(memory.holds.is_empty(), "{:?}", memory.holds);
+        assert!(shared.is_none());
+        assert_eq!(
+            messages_line(&messages_held(&f).unwrap().says),
+            format!("  Messages:  {says}")
+        );
+        // Beside another amber hold: that one is under `Memory:`, and
+        // the hold of agents is not.
+        f.devices.said_left = 1;
+        f.held_pairs = 2;
+        let (memory, _) = memory_and_shared(&f);
+        assert_eq!(
+            memory_line(&memory.summary),
+            "  Memory:    a device has left"
+        );
+        assert!(
+            memory
+                .holds
+                .iter()
+                .all(|holds| !indicator::is_messages_held(holds))
+        );
+        assert_eq!(
+            messages_line(&messages_held(&f).unwrap().says),
+            "  Messages:  agents wait for you: messages between 2 pairs need reading; run \
+             cordelia msg log"
+        );
+        // With none, there is no line.
+        f.held_pairs = 0;
+        assert!(messages_held(&f).is_none());
     }
 
     /// `cordelia --help`, and `cordelia` with no command, are headed by

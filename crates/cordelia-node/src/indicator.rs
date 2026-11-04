@@ -739,6 +739,11 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
 /// rule 4).
 pub const MESSAGES_HOLD: &str = "messages_held";
 
+/// Whether `holds` is the hold of agents that wait for their person.
+pub fn is_messages_held(holds: &Holds) -> bool {
+    holds.what == MESSAGES_HOLD
+}
+
 /// What the line says where `n` pairs of the person's agents are held:
 /// "you" are the one who ends it, by reading.
 pub fn messages_held_says(n: u64) -> String {
