@@ -1521,7 +1521,8 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
     // to "found by the end" alone. A device that ran again while every
     // relay it is set up with was down (a split device in its one relay's
     // outage) is timed from that relay's start again: it could reach
-    // nothing before.
+    // nothing before. Where the relay never started again, it is timed
+    // from its running again, as any other.
     let owed_at = |p: &Pair, off: f64, on: f64| {
         (p.edit.at >= off && p.edit.at <= on)
             || (p.edit.at >= read.start
@@ -1543,9 +1544,8 @@ fn bar_3(read: &Read, edits: &Edits) -> Line {
         for (off, on) in read.lives.downs(i, read.start, read.end) {
             let Some(on) = on else { continue };
             times_off += 1;
-            let Some(from) = relay_up_from(read, i, on) else {
-                continue;
-            };
+            // Where that relay never started again, from its return.
+            let from = relay_up_from(read, i, on).unwrap_or(on);
             if from > on {
                 from_relay += 1;
             }
