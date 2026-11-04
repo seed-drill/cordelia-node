@@ -1060,7 +1060,7 @@ fn keys_sql(counting: &[[u8; 32]]) -> String {
 /// The SQL of whether a row of `message_index` as `i` counts towards the
 /// hold at `?1` (decision 2026-10-09 §6; decision 2026-10-25, rule 1.3):
 /// it has a place, has not expired, is live, and no person has read it on
-/// any device among `counting`. [`pairs_with`] and [`names_in_pairs`] both
+/// any device among `counting`. [`pairs_with`] and [`pair_counts`] both
 /// ask it, so that they count the same messages.
 fn counted_sql(counting: &[[u8; 32]]) -> String {
     format!(
@@ -1074,26 +1074,28 @@ fn counted_sql(counting: &[[u8; 32]]) -> String {
     )
 }
 
-/// Every name on one side of a pair that has a message counted towards the
-/// hold at `now` ([`counted_sql`]), in order: each sender, and each
-/// recipient of a message to one name. What the status asks
-/// [`pairs_with`] of, to find every pair that is held.
-pub fn names_in_pairs(
+/// For every pair of agents, how many of its messages count towards the
+/// hold at `now` ([`counted_sql`]), in one read of the index: a message to
+/// one name is of the pair of its sender and its recipient, in either
+/// direction; a message to every name is of the pair of its sender and
+/// all, and of no other, as [`pairs_with`] counts them. In order of pair.
+pub fn pair_counts(
     conn: &Connection,
     now: i64,
     counting: &[[u8; 32]],
-) -> Result<Vec<String>, StorageError> {
-    Ok(conn
-        .prepare(&format!(
-            "SELECT i.from_name FROM message_index i WHERE {counted}
-             UNION
-             SELECT i.to_name FROM message_index i
-             WHERE i.to_name IS NOT NULL AND {counted}
-             ORDER BY 1",
-            counted = counted_sql(counting),
-        ))?
-        .query_map(params![now], |row| row.get(0))?
-        .collect::<Result<_, _>>()?)
+) -> Result<std::collections::BTreeMap<Pair, u64>, StorageError> {
+    let mut counts = std::collections::BTreeMap::new();
+    let mut statement = conn.prepare(&format!(
+        "SELECT i.from_name, i.to_name FROM message_index i WHERE {counted}",
+        counted = counted_sql(counting),
+    ))?;
+    let mut rows = statement.query(params![now])?;
+    while let Some(row) = rows.next()? {
+        let from: String = row.get(0)?;
+        let to: Option<String> = row.get(1)?;
+        *counts.entry(Pair::of(&from, to.as_deref())).or_default() += 1;
+    }
+    Ok(counts)
 }
 
 /// For each pair with the agent of `name` on one side, how many of its

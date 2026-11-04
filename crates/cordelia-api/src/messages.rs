@@ -1158,8 +1158,11 @@ pub fn status_of(
         let room = room_of(conn, &own, now, |channel| {
             own_channels.no_room_for_messages(channel)
         })?;
-        let bounds = bounds_said(conn, &own, &counting, now)?;
-        let held_pairs = sender::held_pairs(conn, &own, now)?;
+        // The bounds read once, for what is said of them and for the
+        // pairs held.
+        let rows = kept(held::bounds(conn))?;
+        let bounds = bounds_said(conn, &own, &counting, &rows, now)?;
+        let held_pairs = sender::held_pairs(conn, &own, &counting, &rows, now)?;
         Ok(Some(Counts {
             unread_by_an_agent,
             unread_by_a_person,
@@ -1265,10 +1268,11 @@ fn bounds_said(
     conn: &Connection,
     own: &[u8; 32],
     counting: &crate::person::Counting,
+    rows: &[held::BoundRow],
     now: i64,
 ) -> Result<Vec<BoundSaid>, PersonError> {
     let mut said = Vec::new();
-    for (pair, in_force) in crate::bounds::set_now(conn, own, counting, now)? {
+    for (pair, in_force) in crate::bounds::set_now_of(rows, own, counting, now) {
         if let crate::bounds::InForce::Set { bound, until, on } = in_force {
             said.push(BoundSaid {
                 pair,
