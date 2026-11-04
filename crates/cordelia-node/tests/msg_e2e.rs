@@ -2953,7 +2953,7 @@ fn a_pair_stops_at_ten_until_a_person_reads_at_a_terminal_and_types_yes() {
     // The status says the one pair held, as an amber hold, last of the
     // holds, below what is said of the person's devices (decision
     // 2026-10-25, rule 4).
-    let says = "agents wait for you: messages between 2 agents need reading; run cordelia msg log";
+    let says = "agents wait for you to read their messages; run cordelia msg log";
     let status = status_of(laptop);
     assert_eq!(status["messages"]["held_pairs"], 1, "{status}");
     assert_eq!(status["level"], "amber", "{status}");
@@ -3875,8 +3875,7 @@ fn a_bound_set_on_the_desktop_holds_on_both() {
     assert!(!status.contains("  Messages:  between "), "{status}");
     assert!(
         status.contains(
-            "\n  Messages:  agents wait for you: messages between 2 agents need reading; run \
-             cordelia msg log\n"
+            "\n  Messages:  agents wait for you to read their messages; run cordelia msg log\n"
         ),
         "{status}"
     );

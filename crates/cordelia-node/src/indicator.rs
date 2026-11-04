@@ -729,7 +729,7 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
         out.push(Holds {
             level: Level::Amber,
             what: MESSAGES_HOLD,
-            says: messages_held_says(f.held_pairs),
+            says: MESSAGES_HELD_SAYS.into(),
         });
     }
     out
@@ -744,15 +744,12 @@ pub fn is_messages_held(holds: &Holds) -> bool {
     holds.what == MESSAGES_HOLD
 }
 
-/// What the line says where `n` pairs of the person's agents are held:
-/// "you" are the one who ends it, by reading.
-pub fn messages_held_says(n: u64) -> String {
-    let between = match n {
-        1 => "2 agents".to_string(),
-        n => format!("{n} pairs"),
-    };
-    format!("agents wait for you: messages between {between} need reading; run cordelia msg log")
-}
+/// What the line says where pairs of the person's agents are held: "you"
+/// are the one who ends it, by reading. It names no count, which the
+/// status's `held_pairs` carries: a pair may be of an agent and every
+/// agent.
+pub const MESSAGES_HELD_SAYS: &str =
+    "agents wait for you to read their messages; run cordelia msg log";
 
 /// The amber of folders after a person's devices (9 to 11 of [`holds`]),
 /// pushed onto `out`.
@@ -3280,12 +3277,11 @@ mod tests {
 
     // ── Agents held for their person (decision 2026-10-25, rule 4) ───
 
-    const ONE_PAIR_HELD: &str =
-        "agents wait for you: messages between 2 agents need reading; run cordelia msg log";
+    const ONE_PAIR_HELD: &str = "agents wait for you to read their messages; run cordelia msg log";
 
     /// Pairs of agents held for their person are amber, named
-    /// `messages_held`, in words with "you" as the subject: one pair is
-    /// "2 agents", more are counted as pairs. Taken from `held_pairs` of
+    /// `messages_held`, in words with "you" as the subject, the same for
+    /// one pair and for more: the count is the JSON's. Taken from `held_pairs` of
     /// the node's `messages`, and from nothing else of it; with sync on or
     /// off and with or without a folder mapped. The status line shows it
     /// as it shows any amber.
@@ -3297,10 +3293,8 @@ mod tests {
         assert_eq!(whats(&one), [MESSAGES_HOLD]);
         assert_eq!(one.summary, ONE_PAIR_HELD);
         let two = with(&|f| f.held_pairs = 2);
-        assert_eq!(
-            two.summary,
-            "agents wait for you: messages between 2 pairs need reading; run cordelia msg log"
-        );
+        assert_eq!(two.summary, ONE_PAIR_HELD);
+        assert_eq!(MESSAGES_HELD_SAYS, ONE_PAIR_HELD);
         assert_eq!(with(&|f| f.held_pairs = 0).level, None);
         for edit in [(&|f: &mut Facts| f.sync_enabled = false) as Edit, &|f| {
             f.mapped = 0

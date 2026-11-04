@@ -9542,8 +9542,7 @@ mod tests {
             held_pairs: 1,
             ..Default::default()
         };
-        let says = "agents wait for you: messages between 2 agents need reading; run cordelia \
-                    msg log";
+        let says = "agents wait for you to read their messages; run cordelia msg log";
         let shown = indicator::shown(&f);
         assert_eq!(shown.level, Some(indicator::Level::Amber));
         assert_eq!(shown.summary, says);
@@ -9572,8 +9571,7 @@ mod tests {
         );
         assert_eq!(
             messages_line(&messages_held(&f).unwrap().says),
-            "  Messages:  agents wait for you: messages between 2 pairs need reading; run \
-             cordelia msg log"
+            "  Messages:  agents wait for you to read their messages; run cordelia msg log"
         );
         // With none, there is no line.
         f.held_pairs = 0;
