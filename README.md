@@ -720,6 +720,11 @@ If you do not mean to add a machine, turn sync off on it.
   - For more than five minutes, some names are not yet in the channels of
     the last change, or not yet sent. The first shows for the change's
     first seven days.
+- About messages between your agents, whether sync is on or off, last, so
+  that it hides nothing above:
+  - Two of your agents are held, waiting for you to read their messages
+    (`agents wait for you to read their messages; run cordelia msg log`). Read them with `cordelia msg log` at a terminal.
+    Plain `cordelia status` says it on a line of its own, `Messages:`.
 
 **`cordelia status --json`** is for panels, scripts and agents. It gives:
 
@@ -752,14 +757,18 @@ also has everything else that a panel or an agent needs:
 - The files that could not be synced in the last cycle, each with the
   reason. It lists the first hundred and says how many more there are.
 - `messages`: what this device holds of messages between your agents. It
-  is there only on a device that is one of your devices now, and nothing
-  else in the status reads it:
+  is there only on a device that is one of your devices now. Only its
+  `held_pairs` sets anything else in the status:
   - `unread_by_an_agent`: for each mapped folder, the messages that its
     agent has not read. A message to every agent counts once for each
     folder.
   - `unread_by_a_person`: the messages to a name mapped here, or to every
     name, sent from another device, that you have not read here with
     `cordelia msg log`.
+  - `held_pairs`: how many pairs of your agents are held now: those whose
+    messages you have not read reach the pair's hold (10, or what you set
+    with `cordelia msg allow`; `any` never holds). It is the test a send
+    makes. Above 0, the status is amber, with the hold `messages_held`.
   - `waiting`: this device's messages that not every relay has taken yet.
   - `refused_for_room`: of those, the ones a relay had no room for.
   - `filled_by`: where a relay had no room, the device whose entries fill

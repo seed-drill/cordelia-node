@@ -1586,9 +1586,10 @@ pub(crate) async fn status_with(
         .unwrap_or_default();
 
     // What a personal node that stands applied says of messages between
-    // its person's agents (decision 2026-10-09 §8): an object of its own,
-    // which nothing that the level is worked out from reads. A node that
-    // is held up reads nothing of its database.
+    // its person's agents (decision 2026-10-09 §8): an object of its own.
+    // Of it, the command's level reads only `held_pairs`, the pairs held
+    // for their person, an amber hold (decision 2026-10-25, rule 4). A
+    // node that is held up reads nothing of its database.
     let messages = match older_kind || state.held.why().is_some() {
         true => None,
         false => crate::messages::status_of(
@@ -1599,7 +1600,7 @@ pub(crate) async fn status_with(
         )
         .unwrap_or_else(|e| {
             // So that a field which comes and goes can be explained.
-            tracing::debug!(error = %e, "the status says nothing of messages");
+            tracing::warn!(error = %e, "the status says nothing of messages");
             None
         }),
     };

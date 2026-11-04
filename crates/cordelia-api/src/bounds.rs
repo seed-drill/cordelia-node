@@ -151,27 +151,27 @@ pub fn in_force(
 }
 
 /// Each pair whose bound in force at `now` is not the usual hold (decision
-/// 2026-10-25, rule 4), in order of pair: what `cordelia status` says.
-pub fn set_now(
-    conn: &Connection,
+/// 2026-10-25, rule 4), in order of pair, of the bounds `rows` held: what
+/// `cordelia status` says.
+pub fn set_now_of(
+    rows: &[BoundRow],
     own: &[u8; 32],
     counting: &Counting,
     now: i64,
-) -> Result<Vec<(Pair, InForce)>, PersonError> {
-    let rows = kept(held::bounds(conn))?;
-    let mut pairs: Vec<Pair> = speaking(&rows, own, counting)
+) -> Vec<(Pair, InForce)> {
+    let mut pairs: Vec<Pair> = speaking(rows, own, counting)
         .map(|row| row.pair.clone())
         .collect();
     pairs.sort();
     pairs.dedup();
-    Ok(pairs
+    pairs
         .into_iter()
         .map(|pair| {
-            let in_force = in_force_of(&rows, own, counting, &pair, now);
+            let in_force = in_force_of(rows, own, counting, &pair, now);
             (pair, in_force)
         })
         .filter(|(_, in_force)| *in_force != InForce::Usual)
-        .collect())
+        .collect()
 }
 
 /// The device's own bounds that it lists at `now`, the latest `set` first,
@@ -763,6 +763,12 @@ mod tests {
 
     /// Device `n` sends from `from` to `to` at `now`.
     fn sends(s: &Several, n: usize, from: &str, to: &str, now: i64) -> Result<(), NotSent> {
+        sends_to(s, n, from, To::Name(to.into()), now)
+    }
+
+    /// Device `n` sends from `from` to `to`, a name or every agent, at
+    /// `now`.
+    fn sends_to(s: &Several, n: usize, from: &str, to: To, now: i64) -> Result<(), NotSent> {
         let at = At {
             now,
             fetched: true,
@@ -774,7 +780,7 @@ mod tests {
         };
         let request = Request {
             from: from.into(),
-            address: Address::Own(To::Name(to.into())),
+            address: Address::Own(to),
             asks: false,
             link: None,
             body: format!("from {from} at {now}"),
@@ -1170,6 +1176,208 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// The status's `held_pairs` (decision 2026-10-25, rule 4) is the
+    /// send's own test: 0, then 1 once one pair's messages unread by a
+    /// person reach its bound, in either direction, whatever another pair
+    /// below its bound holds; none for a pair raised above its count or set
+    /// to any; 1 again back at 10; and 0 once the person has read them.
+    /// Then an agent sends ten to every agent: its pair with every agent
+    /// is held, 1, and its next send to every agent is refused.
+    #[test]
+    fn the_status_counts_the_pairs_a_send_holds() {
+        let s = devices(2);
+        let t = s.now + MINUTE;
+        let held_now = |at: i64| held_pairs_on(&s, 0, at);
+        let status_now = |at: i64| {
+            let channels = crate::state::OwnChannels::default();
+            crate::messages::status_of(&s[0].conn, &s[0].identity, &channels, at)
+                .unwrap()
+                .unwrap()
+        };
+        let held_send = |at: i64| {
+            matches!(
+                sends(&s, 0, "notes", "work", at),
+                Err(NotSent::Refused(Refused::PairHeld { .. }))
+            )
+        };
+        assert_eq!(held_now(t), 0);
+        assert_eq!(status_now(t).held_pairs, 0);
+        for k in 0..9 {
+            sends(&s, 0, "notes", "work", t + k).unwrap();
+        }
+        sends(&s, 0, "plans", "work", t + 9).unwrap();
+        assert_eq!(held_now(t + 10), 0);
+        // The tenth, the other way.
+        sends(&s, 0, "work", "notes", t + 10).unwrap();
+        assert_eq!(held_now(t + 11), 1);
+        assert!(held_send(t + 11));
+        let counts = status_now(t + 12);
+        assert_eq!(counts.held_pairs, 1);
+        assert_eq!(counts.answered()["held_pairs"], 1);
+        // Raised above the count, the pair is not held, and a send goes.
+        allows(&s, 0, Some(20), 3600, t + 13);
+        assert_eq!(held_now(t + 14), 0);
+        assert!(!held_send(t + 14));
+        // Any never holds.
+        allows(&s, 0, None, 3600, t + 15);
+        assert_eq!(held_now(t + 16), 0);
+        assert_eq!(status_now(t + 16).held_pairs, 0);
+        // Back at the usual hold, held again.
+        allows(&s, 0, Some(10), 3600, t + 17);
+        assert_eq!(held_now(t + 18), 1);
+        assert!(held_send(t + 18));
+        // The person reads them (the person's mark): none is held.
+        let ids: Vec<Vec<u8>> = s[0]
+            .conn
+            .prepare("SELECT id FROM message_index")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 12);
+        for id in ids {
+            let id: held::Id = id.try_into().unwrap();
+            held::mark_read_by_a_person(&s[0].conn, &id).unwrap();
+        }
+        assert_eq!(held_now(t + 20), 0);
+        assert_eq!(status_now(t + 20).held_pairs, 0);
+        assert!(!held_send(t + 20));
+
+        // To every agent: plans sends ten, and its pair with every agent
+        // is held.
+        for k in 0..10 {
+            sends_to(&s, 0, "plans", To::All, t + 21 + k).unwrap();
+        }
+        assert_eq!(held_now(t + 31), 1);
+        assert_eq!(status_now(t + 31).held_pairs, 1);
+        assert!(matches!(
+            sends_to(&s, 0, "plans", To::All, t + 31),
+            Err(NotSent::Refused(Refused::PairHeld { every: true, .. }))
+        ));
+    }
+
+    /// `held_pairs` of device `n` at `now`, as the status asks it.
+    fn held_pairs_on(s: &Several, n: usize, now: i64) -> u64 {
+        let counting = who_counts(&s[n].conn).unwrap();
+        let rows = kept(held::bounds(&s[n].conn)).unwrap();
+        crate::sender::held_pairs(&s[n].conn, &s.key(n), &counting, &rows, now).unwrap()
+    }
+
+    /// The pairs held, counted as before the count was made in one read:
+    /// for each name that a counted message is from or to, its pairs by
+    /// `pairs_with`, each held at its bound in force, each pair once.
+    fn held_pairs_by_name(s: &Several, n: usize, now: i64) -> u64 {
+        let conn = &s[n].conn;
+        let counting = who_counts(conn).unwrap();
+        let rows = kept(held::bounds(conn)).unwrap();
+        let names: Vec<String> = conn
+            .prepare(
+                "SELECT from_name FROM message_index UNION SELECT to_name FROM message_index \
+                 WHERE to_name IS NOT NULL",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut held = std::collections::BTreeSet::new();
+        for name in names {
+            for (other, count) in held::pairs_with(conn, &name, now, &counting.keys()).unwrap() {
+                let pair = Pair::of(&name, other.as_deref());
+                let stops = in_force_of(&rows, &s.key(n), &counting, &pair, now).stops_at();
+                if stops.is_some_and(|bound| count >= bound) {
+                    held.insert(pair);
+                }
+            }
+        }
+        held.len() as u64
+    }
+
+    /// The count in one read of the index is the count by each name, on a
+    /// status with several names, pairs and kinds of message: two pairs
+    /// held at 10, one in either direction; one raised to 20 below it; an
+    /// agent's pair with every agent held, beside its pairs with names
+    /// that are not; and after a bound and a person's reads. Each send is
+    /// 200 seconds apart, under a folder's rate.
+    #[test]
+    fn the_count_in_one_read_is_the_count_by_each_name() {
+        let s = devices(2);
+        let t = s.now + MINUTE;
+        allows_pair(
+            &s,
+            0,
+            &Pair::of("notes", Some("plans")),
+            Some(20),
+            8 * 3600,
+            t,
+        );
+        let mut at = t;
+        let mut next = || {
+            at += 200;
+            at
+        };
+        let both = |at: i64, held: u64| {
+            assert_eq!(held_pairs_on(&s, 0, at), held, "at {at}");
+            assert_eq!(held_pairs_by_name(&s, 0, at), held, "at {at}");
+        };
+        both(t, 0);
+        for k in 0..10 {
+            let (from, to) = if k % 2 == 0 {
+                ("notes", "work")
+            } else {
+                ("work", "notes")
+            };
+            sends(&s, 0, from, to, next()).unwrap();
+        }
+        both(next(), 1);
+        for _ in 0..12 {
+            sends(&s, 0, "notes", "plans", next()).unwrap();
+        }
+        for _ in 0..3 {
+            sends(&s, 0, "plans", "work", next()).unwrap();
+        }
+        both(next(), 1);
+        for _ in 0..10 {
+            sends_to(&s, 0, "plans", To::All, next()).unwrap();
+        }
+        both(next(), 2);
+        // Seven more of plans and work: with the three, ten.
+        for _ in 0..7 {
+            sends(&s, 0, "work", "plans", next()).unwrap();
+        }
+        let now = next();
+        both(now, 3);
+        // Lowered to 12, the pair of notes and plans is held too.
+        allows_pair(
+            &s,
+            0,
+            &Pair::of("notes", Some("plans")),
+            Some(12),
+            3600,
+            now,
+        );
+        both(next(), 4);
+        // The person reads what is between notes and work.
+        let ids: Vec<Vec<u8>> = s[0]
+            .conn
+            .prepare(
+                "SELECT id FROM message_index WHERE from_name IN ('notes', 'work') \
+                 AND to_name IN ('notes', 'work')",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(ids.len(), 10);
+        for id in ids {
+            let id: held::Id = id.try_into().unwrap();
+            held::mark_read_by_a_person(&s[0].conn, &id).unwrap();
+        }
+        both(next(), 3);
     }
 
     /// A bound stays listed for seven days and ten minutes after its `at`,
