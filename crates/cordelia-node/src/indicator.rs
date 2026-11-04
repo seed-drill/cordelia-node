@@ -109,6 +109,11 @@ pub struct Facts {
     /// it, with the device that signed each part where the node names it
     /// (decision 2026-10-19 §2). `None` where the report holds none.
     pub channel: Option<Channel>,
+    /// The pairs of the person's agents held now, waiting for the person
+    /// to read their messages, as the node counts them by the test a send
+    /// makes (`held_pairs` of the status's `messages`, decision
+    /// 2026-10-25, rule 4). 0 where none, or the node does not say.
+    pub held_pairs: u64,
 }
 
 /// What the personal channel holds, as a relay counts it, as the last
@@ -523,7 +528,11 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 ///     five minutes: those of them that the seventh does not say;
 /// 11. a relay that holds the latest change and is out of reach, while
 ///     another is reached: the least of them, and one that can last for
-///     good, so it comes last and hides nothing (rule 11).
+///     good, so it comes last and hides nothing (rule 11);
+/// 12. pairs of the person's agents held, waiting for the person to read
+///     their messages (decision 2026-10-25, rule 4): below every hold
+///     about the person's devices and memory, so that it hides none of
+///     them, with sync on or off, wherever the node counts one.
 ///
 /// What is about folders (0 to 3, and 9 to 11) holds only with sync on,
 /// something mapped and a report; the eighth, as 4 to 7, wherever this
@@ -712,9 +721,47 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
             amber("relay_without_latest", said);
         }
     }
-    if !of_folders {
-        return out;
+    if of_folders {
+        folders_after(f, &mut out);
     }
+    // Last: agents held for their person, who alone ends it.
+    if f.held_pairs > 0 {
+        out.push(Holds {
+            level: Level::Amber,
+            what: MESSAGES_HOLD,
+            says: messages_held_says(f.held_pairs),
+        });
+    }
+    out
+}
+
+/// The hold of agents that wait for their person (decision 2026-10-25,
+/// rule 4).
+pub const MESSAGES_HOLD: &str = "messages_held";
+
+/// What the line says where `n` pairs of the person's agents are held:
+/// "you" are the one who ends it, by reading.
+pub fn messages_held_says(n: u64) -> String {
+    let between = match n {
+        1 => "2 agents".to_string(),
+        n => format!("{n} pairs"),
+    };
+    format!("agents wait for you: messages between {between} need reading; run cordelia msg log")
+}
+
+/// The amber of folders after a person's devices (9 to 11 of [`holds`]),
+/// pushed onto `out`.
+fn folders_after(f: &Facts, out: &mut Vec<Holds>) {
+    let mut amber = |what: &'static str, says: String| {
+        out.push(Holds {
+            level: Level::Amber,
+            what,
+            says,
+        })
+    };
+    let long = |secs: &u64| *secs > AMBER_WAIT_SECS;
+    let count = |n: usize, one: &str| format!("{n} {}", plural(n as u64, one));
+    let d = &f.devices;
     if d.no_room_secs.iter().any(|ago| *ago <= NO_ROOM_STANDS_SECS) {
         amber("relay_no_room", "memory: a relay has no room".into());
     }
@@ -756,17 +803,17 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
             format!("memory: {} relays out of reach", several.len()),
         ),
     }
-    out
 }
 
 /// What the facts take from the running node's status (`GET
 /// /api/v1/status`), `live`: that it runs, and what it says of itself and
 /// of what waits to be sent.
 ///
-/// **Nothing of its `messages` object is taken** (decision 2026-10-09 §8,
-/// C13): messages never raise the level, appear among the holds, or
-/// change the line or the bar. `cordelia status --json` carries the
-/// object as the node gave it, and that is all.
+/// **Of its `messages` object only `held_pairs` is taken** (decision
+/// 2026-10-25, rule 4): pairs of agents held for their person set an
+/// amber hold. Nothing else of messages raises the level, appears among
+/// the holds, or changes the line or the bar (decision 2026-10-09 §8,
+/// C13). `cordelia status --json` carries the object as the node gave it.
 pub fn running(f: &mut Facts, live: &serde_json::Value) {
     f.running = true;
     f.uptime_secs = live["uptime_secs"].as_u64();
@@ -783,6 +830,7 @@ pub fn running(f: &mut Facts, live: &serde_json::Value) {
         .flatten()
         .filter(|r| r["refusals"].as_u64() >= Some(REFUSALS_BEFORE_ATTENTION))
         .count() as u64;
+    f.held_pairs = live["messages"]["held_pairs"].as_u64().unwrap_or(0);
 }
 
 /// What the facts take from the status's `shared` object (decision
@@ -3223,6 +3271,105 @@ mod tests {
         let mut f = synced();
         running(&mut f, &serde_json::json!({ "outbox_waiting": 1000 }));
         assert_eq!(f.outbox_waiting, 1000);
+    }
+
+    // ── Agents held for their person (decision 2026-10-25, rule 4) ───
+
+    const ONE_PAIR_HELD: &str =
+        "agents wait for you: messages between 2 agents need reading; run cordelia msg log";
+
+    /// Pairs of agents held for their person are amber, named
+    /// `messages_held`, in words with "you" as the subject: one pair is
+    /// "2 agents", more are counted as pairs. Taken from `held_pairs` of
+    /// the node's `messages`, and from nothing else of it; with sync on or
+    /// off and with or without a folder mapped. The status line shows it
+    /// as it shows any amber.
+    #[test]
+    fn agents_held_for_their_person_are_amber() {
+        assert_eq!(MESSAGES_HOLD, "messages_held");
+        let one = with(&|f| f.held_pairs = 1);
+        assert_eq!(one.level, Some(Level::Amber));
+        assert_eq!(whats(&one), [MESSAGES_HOLD]);
+        assert_eq!(one.summary, ONE_PAIR_HELD);
+        let two = with(&|f| f.held_pairs = 2);
+        assert_eq!(
+            two.summary,
+            "agents wait for you: messages between 2 pairs need reading; run cordelia msg log"
+        );
+        assert_eq!(with(&|f| f.held_pairs = 0).level, None);
+        for edit in [(&|f: &mut Facts| f.sync_enabled = false) as Edit, &|f| {
+            f.mapped = 0
+        }] {
+            let shown = with(&|f| {
+                edit(f);
+                f.held_pairs = 1;
+            });
+            assert_eq!(shown.level, Some(Level::Amber), "{shown:?}");
+            assert_eq!(shown.holds.last().unwrap().what, MESSAGES_HOLD);
+        }
+        // The status line: amber's mark and the words.
+        assert_eq!(
+            line(one.state, one.level, &one.summary, false),
+            format!("◆ {ONE_PAIR_HELD}")
+        );
+        // From the node's status.
+        let mut f = synced();
+        let live = serde_json::json!({ "messages": { "held_pairs": 3, "unread_by_a_person": 40 } });
+        running(&mut f, &live);
+        assert_eq!(f.held_pairs, 3);
+        running(&mut f, &serde_json::json!({}));
+        assert_eq!(f.held_pairs, 0);
+    }
+
+    /// It ranks below every hold about the person's devices and memory,
+    /// red and amber: beside each, the level and the line are what that
+    /// one alone gives, and the hold of agents comes last among the holds,
+    /// so that it hides none of them.
+    #[test]
+    fn agents_held_rank_below_every_hold_of_devices_and_memory() {
+        let past = channel_of(12 * 1024 * 1024, 0, WORD);
+        let mut edits: Vec<Edit> = RED.iter().map(|(edit, _, _)| *edit).collect();
+        edits.extend(AMBER.iter().map(|(edit, _, _)| *edit));
+        let shared: Edit = &|f| {
+            f.devices.removed_holds_shared = 1;
+            f.devices.removed_holds_shared_secs = Some(60);
+        };
+        edits.push(shared);
+        let mut checked = 0;
+        for edit in edits {
+            let alone = with(edit);
+            let both = with(&|f| {
+                edit(f);
+                f.held_pairs = 1;
+            });
+            assert_eq!(both.level, alone.level, "{alone:?}");
+            assert_eq!(both.summary, alone.summary, "{alone:?}");
+            if alone.level.is_some() {
+                let (last, before) = both.holds.split_last().unwrap();
+                assert_eq!(last.what, MESSAGES_HOLD, "{both:?}");
+                assert_eq!(before, &alone.holds[..], "{both:?}");
+                checked += 1;
+            }
+        }
+        assert!(checked >= RED.len() + AMBER.len(), "{checked}");
+        // The personal channel past its line, first among the amber.
+        let both = with(&|f| {
+            f.channel = Some(past.clone());
+            f.held_pairs = 2;
+        });
+        assert_eq!(both.summary, NAMES_FILL);
+        assert_eq!(whats(&both), ["channel_nearly_full", MESSAGES_HOLD]);
+        // A red hold and a memory hold together: red decides, and the
+        // hold of agents is still last, amber.
+        let all = with(&|f| {
+            f.conflicts = vec!["notes.md".into()];
+            f.outbox_refused = 2;
+            f.held_pairs = 1;
+        });
+        assert_eq!(all.level, Some(Level::Red));
+        assert_eq!(all.summary, "memory: 1 conflict");
+        assert_eq!(whats(&all), ["conflicts", "refused", MESSAGES_HOLD]);
+        assert_eq!(all.holds.last().unwrap().level, Level::Amber);
     }
 
     // ── A relay out of reach (decision 2026-10-19, rule 11) ──────────
