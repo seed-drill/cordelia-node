@@ -1398,8 +1398,9 @@ never held, comes in only under **a word that the phrase signed:**
   - **`messages`,** at the top level, as the node gave it, where it gave
     it (decision 2026-10-09 §8). Only its `held_pairs` changes the
     `level`, `summary` and `holds`: above 0 it is the amber hold
-    `messages_held`, last of every hold, which `--line`, `--waybar` and
-    plain `cordelia status` show as any amber. Nothing else of messages
+    `messages_held`, last of every hold, which `--line` and `--waybar`
+    show as any amber, and plain `cordelia status` on a line of its own,
+    `Messages:`, not under `Memory:`. Nothing else of messages
     changes them; plain `cordelia status` also says each bound in force
     (decision 2026-10-25, rule 4).
   - Under `sync`: the settings; `projects`, one for each folder that syncs;
