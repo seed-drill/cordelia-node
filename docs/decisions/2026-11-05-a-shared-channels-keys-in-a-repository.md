@@ -1,7 +1,7 @@
 # Decision: a shared channel's keys in a repository
 
 **Date**: 2026-11-05
-**Status**: Proposed. Not built: after R1. Revised twice after its reviews (section 10). It needs the fix of #291 to `shared anew` first.
+**Status**: Accepted by the person on 5 November ("Go on 290"). Not built: after R1, with a review of the build's plan first. Revised twice after its reviews (section 10). It needs the fix of #291 to `shared anew` first.
 **Cited as**: "decision 2026-11-05 (members), rule 3". The numbers do not change.
 
 Words used throughout:
@@ -131,7 +131,7 @@ It runs at a terminal, for a shared channel the person holds under that name. `-
 
 ## 9. Questions for the person
 
-1. **Is the file's name right?** `.cordelia/members`, one for each repository, as the first design had it.
+1. **The file's name.** `.cordelia/members`, one for each repository, as the first design had it. The person accepted the record as it stands on 5 November, and the name with it.
 
 ## 10. The reviews, and what changed
 
