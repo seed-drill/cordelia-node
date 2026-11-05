@@ -1,7 +1,7 @@
 # Decision: a shared channel's keys in a repository
 
 **Date**: 2026-11-05
-**Status**: Proposed. Not built: after R1. Revised once after its review (section 10).
+**Status**: Proposed. Not built: after R1. Revised twice after its reviews (section 10). It needs the fix of #291 to `shared anew` first.
 **Cited as**: "decision 2026-11-05 (members), rule 3". The numbers do not change.
 
 Words used throughout:
@@ -9,7 +9,7 @@ Words used throughout:
 - **The shared channels record** is [`2026-10-10-a-shared-channel-for-messages.md`](2026-10-10-a-shared-channel-for-messages.md). Its sections are cited "§7 there".
 - **A member** is a device that holds the shared channel. **The person** is the one who runs the command, at a terminal.
 - **The list** is the file of rule 1.
-- **In the channel**, for a key, means: in this device's table of the channel's keys (§6.3 there), whether held or refused for room, or sealed to by an offer into the channel (§7 there).
+- **In the channel**, for a key, means: in this device's table of the channel's keys (§6.3 there), whether held or refused for room, or sealed to by an offer into the channel that has not moved yet (§7 there). Today `shared anew` lists and asks about only the first kind; #291 has it list the second too, and this record rests on that.
 - **Main** is commit 2007aee6 (`v0.2.0-alpha.18`). Examples say laptop and desktop, and `github.com/example/project`.
 
 ---
@@ -37,9 +37,6 @@ Until it is built, the same flow works by hand: a pull request adds the lines, a
 
 ```
 # The devices whose agents share this repository's channel.
-repository github.com/example/project
-branch main
-
 cordelia_pk1...   alice-laptop
 cordelia_pk1...   alice-desktop
 cordelia_pk1...   bob-laptop
@@ -47,9 +44,7 @@ cordelia_pk1...   bob-laptop
 
 - **Its place:** `.cordelia/members`, at the root of the repository.
 - **Its form:** ASCII and line feeds only, at most 16 KiB. A line that starts with `#`, and an empty line, are skipped.
-  - One `repository` line: the host, owner and name, as `host/owner/name`.
-  - One `branch` line: the branch's short name.
-  - Then one line for each device: its key as `cordelia id` prints it, one or more spaces, and a label of 1 to 32 characters of `a-z`, `0-9`, `.`, `_` and `-`.
+  - One line for each device: its key as `cordelia id` prints it, one or more spaces, and a label of 1 to 32 characters of `a-z`, `0-9`, `.`, `_` and `-`.
 - **Keys are unique, and so are labels.**
 - **At most 64 keys,** less the person's own devices that the list does not name, since those always stay (`SHARED_MAX_KEYS`, §7 there).
 - **A file that does not parse does nothing:** the command names the line and stops.
@@ -58,16 +53,15 @@ cordelia_pk1...   bob-laptop
 
 ## 2. The channel's repository
 
-- **The first time the command runs for a channel on a device,** the person types the repository and branch it follows: `host/owner/name branch`. Nothing is suggested.
-- **The device keeps them with the channel.** A later run that finds another repository or branch refuses, and says which one the channel follows.
-- **So the wrong clone, a fork, or the wrong channel name cannot hand a channel to the wrong keys, or leave a team out.**
-- **The binding is this device's own.** Another device of the person's asks again the first time it runs the command.
+- **At each run, the person types the repository and branch** that the channel follows: `host/owner/name branch`. Nothing is suggested, and nothing is kept.
+- **So the wrong clone, a fork, or the wrong channel name cannot hand a channel to the wrong keys, or leave a team out,** unless the person types the wrong repository.
+- **Why it is typed each time, and not kept:** a kept binding needs a new table, and has to follow the channel through each making anew and each move, on every device. Typing it keeps nothing, and a repository that is renamed or moved is just typed anew. The command runs only when the list changes.
 
 ## 3. Reading the list
 
-- **The command fetches the branch,** from the one remote of the clone whose address is the channel's repository. It runs `git` with fixed settings: no prompt, no pager, no replaced objects, no hooks, and a time limit. If it cannot fetch, it stops and says why. So the list is the branch as it is now, not as the clone last saw it.
-- **A remote's address** is read in one of four forms: `https://<host>/<owner>/<name>`, `ssh://git@<host>/<owner>/<name>`, `ssh://<host>/<owner>/<name>` or `git@<host>:<owner>/<name>`, with or without `.git`. It compares `host/owner/name` in lower case. No remote, or more than one, with that address: the command stops and says so.
-- **It reads the file from the commit it fetched,** with `git cat-file blob`. It never reads the working tree, a local branch or `HEAD`. The file's `repository` and `branch` lines must name the channel's. Otherwise it stops.
+- **The command fetches the branch,** from a remote of the clone whose address is the channel's repository, as `git fetch --no-tags --no-recurse-submodules <remote> <branch>`. It runs `git` with no pager, no replaced objects, `core.hooksPath=/dev/null`, `gc.auto=0` and `maintenance.auto=false`, and with git's own prompts off. ssh may still ask for a passphrase or a host key: the command runs at a terminal, so it may. The command stops git after two minutes. If it cannot fetch, it stops and says why. So the list is the branch as it is now, not as the clone last saw it.
+- **A remote's address** is read in one of four forms: `https://<host>/<owner>/<name>`, `ssh://git@<host>/<owner>/<name>`, `ssh://<host>/<owner>/<name>` or `git@<host>:<owner>/<name>`, with or without `.git`. It compares `host/owner/name` in lower case. No remote with that address: the command stops and says so. Two with it: either serves.
+- **It reads the file from the commit it fetched** (`FETCH_HEAD`), with `git cat-file blob`. It never reads the working tree, a local branch, a remote branch or `HEAD`.
 - **It shows that commit:** its hash, its date and its subject, with anything but plain printable text taken out.
 
 ## 4. What the command does
@@ -84,16 +78,17 @@ It runs at a terminal, for a shared channel the person holds under that name. `-
 3. **It leaves alone** the person's own devices, and keys the person's statement lists as removed. Neither is handed the channel nor asked about.
 4. **To leave out:** each key in the channel that the list does not name.
    - Where there is any, it shows them, each with the first words of its key and its six words.
-   - It asks the first yes: `This makes "<name>" anew without these keys.`
-   - After it, it makes the channel anew as `shared anew` does. Every listed key in the channel stays, with the person's own devices. The answers come from the list, not typed key by key, and the keys asked about are checked again at the yes, as `shared anew` checks them.
+   - It shows the repository and the commit, and asks the first yes: `This makes "<name>" anew without these keys.`
+   - After it, it makes the channel anew as `shared anew` does. Every listed key in the channel stays, with the person's own devices, those not moved yet among them (#291). The answers come from the list, not typed key by key, and the keys asked about are checked again at the yes, as `shared anew` checks them.
    - **A making anew comes first,** so that what is handed over next is the new channel. A no makes nothing anew, and the command goes on to step 5: a device left off the list by mistake is not forced out by an addition.
-5. **To hand it to:** each listed key that is not in the channel, and not a key that an offer this device knows of left out (rule 5).
+5. **To hand it to:** each listed key that is not in the channel, and not a key that an offer this device made, or moved by, left out (rule 5). It lists each key it skips for that reason, with `hand it by hand, with cordelia share, if it should be back`.
    - It hands over at most 8 in one run (`MAX_TYPED_KEYS`: a device keeps no more shares waiting). It says how many are left for the next run, and checks this before its yes.
    - It shows them, each with its label from the list, the first words of its key and its six words.
    - It shows the commit, and says: `These keys come from <host/owner/name>, branch <branch>, at <commit>. Whoever can merge to that branch decides who is in.`
+   - Where the person said no at step 4, it says: `The keys the list dropped still read what is written there.`
    - It asks the second yes, then hands the channel to each, as `share` does. Nobody reads six words to anyone: the list is the check.
    - It prints the line each new member runs: `cordelia accept <this device's key> --channel <name>`, within the hour.
-6. **It deletes this device's waiting shares** of the channel to keys the list does not name.
+6. **It deletes this device's waiting shares** of the channel to keys the list does not name. That is a small new function: today a share is only ever written over.
 7. **Where there is nothing to do,** it says so and asks nothing.
 
 **Two members who run it at the same moment** each make an offer, and the channel can split, as two runs of `shared anew` can (§7 there). One run is enough: a team agrees who runs it.
@@ -103,7 +98,7 @@ It runs at a terminal, for a shared channel the person holds under that name. `-
 - **Joining.** The new member runs `cordelia id` on each device they have, and raises a pull request that adds a line for each. Once it is merged, a member runs the command, and gives the new member the `accept` line it printed. The new member runs it within the hour, on the device named. `accept` checks that the share is signed by the key typed (§3.2 there), and the file is where the key came from.
 - **Leaving.** A pull request deletes the lines. Once it is merged, a member runs the command, and the channel is made anew without them. Until a member does, they still read and write.
 - **Removing one of your own devices** from your devices (`cordelia remove-device`) makes each shared channel anew without it (§3.5 there). Delete its line from the list too, in a pull request. While the line stays, members whose devices did not read that offer could hand the channel back to it.
-- **A key that an offer this device knows of left out is not handed the channel from the list.** Bringing it back is by hand, with `share` and the six words.
+- **A key that an offer this device made, or moved by, left out is not handed the channel from the list.** The device works this out from the old channel's table less the keys the offer was sealed to, while it still holds the old channel. Bringing such a key back is by hand, with `share` and the six words.
 - **One device of a person who stays cannot be left out this way.** That person's other devices hold the new channel, and share it with their own devices (§7 there). The device goes when that person removes it from their own devices.
 
 ## 6. What it does not do, and what comes later
@@ -124,13 +119,13 @@ It runs at a terminal, for a shared channel the person holds under that name. `-
 
 ## 8. Tests, when it is built
 
-- The repository typed at the first run is kept; another repository, branch or channel name is refused.
+- The repository and branch are typed at each run: a clone with no remote of that address gives no list, and a fork's remote is not read.
 - The list is read only from the commit fetched: an edit in the working tree, a local branch or a fork's remote is not read. No fetch, no list.
-- An address of another form, no remote or two remotes with the address, a `repository` or `branch` line that does not match: each stops, and says why.
+- An address of another form, or no remote with the address: the command stops, and says why. A fetch that does not end in two minutes is stopped.
 - A file over 16 KiB, over the bound of keys, with a key or label twice, or a line that does not parse: nothing is done, and the line is named.
 - A list that drops one key and adds another: the channel is made anew first, and the new channel is handed to the new key. The new key's `accept` takes the new channel.
 - An addition alone makes nothing anew. The person's own devices, listed or not, are neither left out nor handed it.
-- A key an offer left out is not handed back. A key sealed to by an offer into the channel that has not moved yet is not handed it again.
+- A key that an offer this device made or moved by left out is not handed back, and is listed with `hand it by hand`. A key sealed to by an offer into the channel that has not moved yet is not handed it again.
 - Nine new keys: eight are handed it, and the command says one is left for the next run.
 - A paused or unclean channel is refused. Each yes names what it does, nothing happens without it, and the command refuses without a terminal.
 
@@ -138,9 +133,9 @@ It runs at a terminal, for a shared channel the person holds under that name. `-
 
 1. **Is the file's name right?** `.cordelia/members`, one for each repository, as the first design had it.
 
-## 10. The review, and what changed
+## 10. The reviews, and what changed
 
-One review, of the first draft (commit 9e98fd04), found two high findings, six medium and seven low. Each was checked in the code before it was taken.
+The first review, of the first draft (commit 9e98fd04), found two high findings, six medium and seven low. Each was checked in the code before it was taken.
 
 | # | Finding | What changed |
 |---|---|---|
@@ -159,3 +154,15 @@ One review, of the first draft (commit 9e98fd04), found two high findings, six m
 | L5 | The new member must know which key to type, and act within the hour | The command prints the `accept` line (rule 4, step 5) |
 | L6 | The rule for a clone that is behind missed keys refused for room | The rule is gone (M1), and "in the channel" counts refused keys |
 | L7 | Waiting shares to keys the list dropped stayed | The command deletes them (rule 4, step 6) |
+
+The second review, of commit 2d48676f, found H1 and H2 closed in the code (the new channel is held at once after the making anew, so it can be handed over in the same run). It found one high, one medium and five low:
+
+| # | Finding | What changed |
+|---|---|---|
+| H1 | A key sealed to by an offer and not moved yet is "in the channel", but `shared anew` cannot keep it: it lists only the table. The gap is on main too | Filed as #291, which has `shared anew` list and ask about such keys; this record needs it first (status, and the words at the head) |
+| M1 | A kept binding needs a new table, and must follow the channel through each making anew and move, and be cleared; nothing could change it | The repository and branch are typed at each run, and nothing is kept (rule 2) |
+| L1 | After a no at the first yes, the second did not say the dropped keys still read; the first yes did not show the commit | Both said (rule 4, steps 4 and 5) |
+| L2 | "No prompt" cannot be promised over ssh; git has no time limit; the settings were not named; a single-branch clone may not update the remote branch | The settings named; ssh may ask; git stopped after two minutes; the commit read from `FETCH_HEAD`; two remotes of one address, either serves (rule 3) |
+| L3 | "An offer this device knows of" was too wide, and not built | Offers this device made, or moved by; how it is worked out; skipped keys are listed (rules 4 and 5) |
+| L4 | The file's `repository` and `branch` lines only repeated what is typed | Cut (rule 1) |
+| L5 | Deleting one waiting share is not built | Said to be new (rule 4, step 6) |
