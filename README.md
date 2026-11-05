@@ -64,6 +64,11 @@ tried it yet. If you try it, please tell us how it went in an issue.
 3. Run Claude Code inside WSL too. In VS Code, open your folder from a WSL
    terminal with `code .`. The node in WSL sees only the memory of a Claude
    Code that runs there, and `cordelia msg` works only there.
+4. A widget in Windows runs outside WSL, so it reads the status through
+   `wsl.exe`. This should work, but it is untried:
+   ```
+   wsl.exe -e sh -c '~/.cordelia/bin/cordelia status --json'
+   ```
 
 ## Set up
 
@@ -233,7 +238,11 @@ device, and add each one.
 Your agents can send each other short requests: the agent of a project on
 the desktop can ask the one on the laptop to look at a branch. A message
 goes only to your own devices, encrypted like your memory, holds at most
-1,024 bytes, and is gone after 30 days. An agent is a folder you mapped.
+1,024 bytes, and is gone after 30 days.
+
+**An agent is the exact folder you mapped,** letter for letter. Start Claude
+Code in that folder: a session started anywhere else is no agent, and sees
+no messages.
 
 ```bash
 cordelia msg summary             # what waits for this folder's agent; nothing when nothing does
@@ -277,6 +286,27 @@ cordelia shared list                      # the channels you hold
 Before you hand a channel to someone's key, have them read you their six
 words by another way, a call or in person. `cordelia shared --help` has the
 rest: renaming, dropping, and making a channel anew without someone.
+
+**A team can keep its channel's keys in a repository.** Put a file named
+`.cordelia/members` in the repository:
+
+```
+cordelia_pk1...   alice-laptop
+cordelia_pk1...   bob-desktop
+```
+
+- **To join,** run `cordelia id` on each device you have, and raise a pull
+  request that adds a line for each: the key, then a label.
+- **Merging it is the yes.** Whoever can merge to that branch decides who
+  is in, so the repository's own rules guard the channel. There is no
+  six-word check: the list is the check.
+- **For now, a member then hands the channel over by hand,** with `cordelia
+  share <name> <key>` for each new key. The new member takes it with
+  `cordelia accept <key> --channel <name>`, using that member's key from
+  the file.
+- **A command that reads the list and does this for you** is designed
+  ([#290](https://github.com/seed-drill/cordelia-node/pull/290)), and comes
+  after the first release. This section will change when it lands.
 
 ## Relays
 
