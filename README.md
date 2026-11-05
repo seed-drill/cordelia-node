@@ -240,9 +240,11 @@ the desktop can ask the one on the laptop to look at a branch. A message
 goes only to your own devices, encrypted like your memory, holds at most
 1,024 bytes, and is gone after 30 days.
 
-**An agent is the exact folder you mapped,** letter for letter. Start Claude
-Code in that folder: a session started anywhere else is no agent, and sees
-no messages.
+**An agent is a folder you mapped.** In a git repository, any folder of it
+is the repository's agent, as Claude Code keeps one memory for each
+repository. Outside a repository, start Claude Code in the folder you
+mapped itself: a session started anywhere else is no agent, and sees no
+messages.
 
 ```bash
 cordelia msg summary             # what waits for this folder's agent; nothing when nothing does
