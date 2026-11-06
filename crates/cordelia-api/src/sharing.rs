@@ -593,11 +593,12 @@ pub fn counted(n: u64, noun: &str) -> String {
 pub fn who_wrote(
     conn: &Connection,
     held: &Held,
-    own: &[u8; 32],
+    identity: &NodeIdentity,
     channel: &[u8; 32],
     name: &str,
     agent: Option<&str>,
 ) -> Result<Vec<String>, PersonError> {
+    let own = &identity.public_key();
     let Some(row) = kept::channel(conn, channel)? else {
         return Ok(Vec::new());
     };
@@ -674,7 +675,7 @@ pub fn who_wrote(
     }];
     lines.extend(changes);
     lines.extend(crate::shared_anew::after_who_wrote(
-        conn, held, own, channel, name,
+        conn, held, identity, channel, name,
     )?);
     Ok(lines)
 }
@@ -1097,7 +1098,7 @@ pub fn make_share(
     lines.extend(who_wrote(
         conn,
         &held,
-        &own,
+        identity,
         &channel,
         &to.filing.name,
         None,
@@ -1766,7 +1767,7 @@ pub fn list(
             "relays": relays,
             "also_a_name": names.contains(&filing.name),
             "rows_let_go": row.as_ref().map_or(0, |row| row.let_go),
-            "wrote": who_wrote(conn, &held, &own, &filing.channel, &filing.name, None)?,
+            "wrote": who_wrote(conn, &held, identity, &filing.channel, &filing.name, None)?,
         });
         if with_keys {
             let mut shown = Vec::new();

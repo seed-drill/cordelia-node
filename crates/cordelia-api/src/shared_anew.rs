@@ -13,7 +13,8 @@
 //!   reader: the keys it shows that the offer does not seal to, less its own
 //!   devices, which follow their person.
 //! - **`shared anew`** ([`anew_plan`], [`make_anew`]): every key of the
-//!   device's table of the channel is listed before anything is asked; the
+//!   device's table of the channel, and every key not moved yet
+//!   ([`not_moved_yet`]), is listed before anything is asked; the
 //!   person answers each with `keep` or `out`, or `out for the rest`; the
 //!   maker's own devices stay and a removed key never does. The new seed is
 //!   sealed to each key that stays in the old channel, and the new channel
@@ -527,8 +528,9 @@ pub struct LeftOut {
 /// The keys that stay at a removal or at a recovery, with no question
 /// (decision 2026-10-24, rule 24): the person's own devices where
 /// `own_devices` says so, and then every key of the table of the channel
-/// of `row` but the removed keys and the person's own devices, in the
-/// order of the listing, 64 at most; and what it left out besides.
+/// of `row`, and every key not moved yet, but the removed keys and the
+/// person's own devices, in the order of the listing, 64 at most; and what
+/// it left out besides.
 ///
 /// A channel past its bound that a removal makes anew is sealed to none of
 /// the person's own devices (§3.5): none of them holds the new channel, so
@@ -537,11 +539,11 @@ pub struct LeftOut {
 fn staying_with_no_question(
     conn: &Connection,
     held: &Held,
-    own: &[u8; 32],
+    identity: &NodeIdentity,
     row: &Channel,
     own_devices: bool,
 ) -> Result<(Vec<[u8; 32]>, LeftOut), PersonError> {
-    let listed = listing_of(conn, held, own, row)?;
+    let listed = listing_of(conn, held, identity, row)?;
     let mut stay = match own_devices {
         true => listed.own_devices.clone(),
         false => Vec::new(),
@@ -648,8 +650,7 @@ pub fn anew_at_removal(
             let Some(held) = held(conn)? else {
                 return Err(PersonError::FollowsNoPhrase);
             };
-            let (stay, left) =
-                staying_with_no_question(conn, &held, &identity.public_key(), &row, false)?;
+            let (stay, left) = staying_with_no_question(conn, &held, identity, &row, false)?;
             past.push((row, stay, left));
         } else {
             held_rows.push(row);
@@ -742,8 +743,7 @@ fn anew_one_at_removal(
     let Some(held) = held(conn)? else {
         return Err(PersonError::FollowsNoPhrase);
     };
-    let own = identity.public_key();
-    let (stay, left) = staying_with_no_question(conn, &held, &own, row, true)?;
+    let (stay, left) = staying_with_no_question(conn, &held, identity, row, true)?;
     let card = card_of(row)?;
     let filing = Filing {
         channel: row.channel,
@@ -1028,6 +1028,8 @@ pub struct Listing {
     pub own_devices: Vec<[u8; 32]>,
     /// The keys asked about, in the order listed.
     pub asked: Vec<[u8; 32]>,
+    /// The keys listed as left out because the person removed them.
+    pub removed: usize,
     /// How many rows the table let go, left out and counted.
     pub let_go: u64,
 }
@@ -1047,15 +1049,18 @@ pub const A_PERSONS_DEVICES: &str = "A device of a person who stays is left out 
 /// The listing of the channel of `row` (§7): the keys it shows, in the
 /// order of §2.4, then the keys beyond the 64, then the keys refused for
 /// room, each with when this device first held or first refused it, when
-/// it last wrote there, and whether its entries are stored or refused; the
-/// maker's own devices as staying; a key the statement removed as left
-/// out; and the rows the table let go, counted.
+/// it last wrote there, and whether its entries are stored or refused; then
+/// the keys not moved yet ([`not_moved_yet`]), but in a channel past a
+/// bound; the maker's own devices as staying; a key the statement removed
+/// as left out, in either part, counted; and the rows the table let go,
+/// counted.
 fn listing_of(
     conn: &Connection,
     held: &Held,
-    own: &[u8; 32],
+    identity: &NodeIdentity,
     row: &Channel,
 ) -> Result<Listing, PersonError> {
+    let own = &identity.public_key();
     let statement = &held.statement.statement;
     let counting = crate::person::who_counts(conn)?;
     // Every key this device knows to be removed is left out, on any branch
@@ -1116,6 +1121,7 @@ fn listing_of(
             listing
                 .lines
                 .push(format!("  {form}: left out, a device you removed"));
+            listing.removed += 1;
             continue;
         }
         let first = match (key.first_held, key.first_refused) {
@@ -1142,24 +1148,30 @@ fn listing_of(
     // not written here yet (§7, "not moved yet"): no table row holds them,
     // so without this a making anew before they moved left them out
     // unasked (#291). Each is asked about like any other key.
-    let mut not_moved = Vec::new();
-    for key in not_moved_yet(conn, own, &row.channel)? {
-        if listing.own_devices.contains(&key) || listing.asked.contains(&key) {
-            continue;
-        }
-        let form = sender_form(conn, held, own, &key)?;
-        match removed.contains(&key) {
-            true => listing
-                .lines
-                .push(format!("  {form}: left out, a device you removed")),
-            false => not_moved.push((key, form)),
-        }
-    }
+    // A channel past its bound lists its table alone (§7).
+    let not_moved = match row.state {
+        State::NotInForce => Vec::new(),
+        _ => not_moved_yet(conn, identity, &row.channel)?,
+    };
+    let not_moved: Vec<[u8; 32]> = not_moved
+        .into_iter()
+        .filter(|key| {
+            !listing.own_devices.contains(key) && !table.iter().any(|row| row.key == *key)
+        })
+        .collect();
     if !not_moved.is_empty() {
         listing.lines.push(format!(
             "Sealed to when \"{shown_name}\" was made anew, and not moved here yet:"
         ));
-        for (key, form) in not_moved {
+        for key in not_moved {
+            let form = sender_form(conn, held, own, &key)?;
+            if removed.contains(&key) {
+                listing
+                    .lines
+                    .push(format!("  {form}: left out, a device you removed"));
+                listing.removed += 1;
+                continue;
+            }
             listing.lines.push(format!("  {form}"));
             listing.asked.push(key);
         }
@@ -1269,7 +1281,7 @@ pub fn anew_plan(
             ),
         );
     }
-    let listing = listing_of(conn, &held, &own, &row)?;
+    let listing = listing_of(conn, &held, identity, &row)?;
     let Some((keep, asked)) = keep else {
         return Ok((listing, None));
     };
@@ -1320,15 +1332,7 @@ pub fn anew_plan(
         sharing::counted(stay.len() as u64, "key"),
         // The rows the table let go are an upper bound (`past_a_bound_line`).
         if listing.let_go > 0 { "up to " } else { "" },
-        sharing::counted(
-            (left_out
-                + crate::person::removed_known(conn, &held.statement.statement)?
-                    .iter()
-                    .filter(|key| st(kept::key(conn, row.id, key)).ok().flatten().is_some())
-                    .count()) as u64
-                + listing.let_go,
-            "key"
-        )
+        sharing::counted((left_out + listing.removed) as u64 + listing.let_go, "key")
     );
     Ok((
         listing,
@@ -1385,7 +1389,7 @@ pub fn make_anew(
     lines.extend(sharing::who_wrote(
         conn,
         &held,
-        &identity.public_key(),
+        identity,
         &new,
         &of.filing.name,
         None,
@@ -1574,7 +1578,7 @@ pub fn move_plan(
         }
     }
     let mut follow = Vec::new();
-    for key in listing_of(conn, &held, &own, &row)?.own_devices {
+    for key in listing_of(conn, &held, identity, &row)?.own_devices {
         if key != own {
             follow.push(sender_form(conn, &held, &own, &key)?);
         }
@@ -1711,7 +1715,7 @@ pub fn make_move(
     lines.extend(sharing::who_wrote(
         conn,
         &held,
-        &identity.public_key(),
+        identity,
         &to.to.channel,
         &to.to.name,
         None,
@@ -1721,11 +1725,16 @@ pub fn make_move(
 
 /// The keys that the offer which made the channel `channel` sealed to and
 /// that have not written there yet, but this device: "not moved yet" (§7).
+/// Only an offer this device can stand by is counted: its own, or one
+/// whose seal for this device opens to this channel's card. Anyone who held
+/// the old channel can write an offer there that names this channel, with
+/// seals that open for no one, and its keys are not taken (#291's review).
 pub fn not_moved_yet(
     conn: &Connection,
-    own: &[u8; 32],
+    identity: &NodeIdentity,
     channel: &[u8; 32],
 ) -> Result<Vec<[u8; 32]>, PersonError> {
+    let own = identity.public_key();
     let Some(row) = st(kept::channel(conn, channel))? else {
         return Ok(Vec::new());
     };
@@ -1740,13 +1749,21 @@ pub fn not_moved_yet(
         .filter(|key| key.first_held.is_some())
         .map(|key| key.key)
         .collect();
+    let old = st(kept::channel(conn, &from))?;
     let mut keys = Vec::new();
     for offer in st(rows::offers_into(conn, channel))? {
         if offer.channel != from {
             continue;
         }
+        let stands = offer.maker == own
+            || old
+                .as_ref()
+                .is_some_and(|old| opened(identity, old, &offer).is_some());
+        if !stands {
+            continue;
+        }
         for key in offer.sealed_to {
-            if key != *own && !wrote.contains(&key) && !keys.contains(&key) {
+            if key != own && !wrote.contains(&key) && !keys.contains(&key) {
                 keys.push(key);
             }
         }
@@ -1764,10 +1781,11 @@ pub fn not_moved_yet(
 pub(crate) fn after_who_wrote(
     conn: &Connection,
     held: &Held,
-    own: &[u8; 32],
+    identity: &NodeIdentity,
     channel: &[u8; 32],
     name: &str,
 ) -> Result<Vec<String>, PersonError> {
+    let own = &identity.public_key();
     let mut lines = Vec::new();
     let Some(row) = st(kept::channel(conn, channel))? else {
         return Ok(lines);
@@ -1808,7 +1826,7 @@ pub(crate) fn after_who_wrote(
             ));
         }
     }
-    for key in not_moved_yet(conn, own, channel)? {
+    for key in not_moved_yet(conn, identity, channel)? {
         lines.push(format!(
             "  not moved yet: {}",
             sender_form(conn, held, own, &key)?
@@ -1860,7 +1878,7 @@ pub fn log_lines(
             "  anew records of keys this device does not show: {unread_records}"
         ));
     }
-    for key in not_moved_yet(conn, &own, &row.channel)? {
+    for key in not_moved_yet(conn, identity, &row.channel)? {
         lines.push(format!(
             "  not moved yet: {}",
             sender_form(conn, &held, &own, &key)?

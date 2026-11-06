@@ -288,15 +288,7 @@ fn only_subscribe_subscribes() {
     );
     // The lines of who wrote there say it so too.
     let held = crate::person::held(conn).unwrap().unwrap();
-    let wrote = sharing::who_wrote(
-        conn,
-        &held,
-        &identity.public_key(),
-        &channel.id,
-        "review",
-        None,
-    )
-    .unwrap();
+    let wrote = sharing::who_wrote(conn, &held, identity, &channel.id, "review", None).unwrap();
     assert!(
         wrote[0].contains(": 1 key, 1 of them labelled by you."),
         "{wrote:?}"
