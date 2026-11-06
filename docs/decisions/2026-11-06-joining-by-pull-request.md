@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Proposed, for review. Revised four times after its reviews (section 13). For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
+**Status**: Proposed, for the person's decision. Revised five times after its reviews (section 13). For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -21,7 +21,7 @@ The person's rule: **a merged pull request is the whole join.** No `share`, no `
 
 **The list names the channel and its members:**
 ```
-channel 9f2c...e41a cordelia_pk1... cordelia_pk1...
+channel 9f2c...e41a cordelia_pk1... cordelia_pk1... without 0
 cordelia_pk1...   alice-laptop
 cordelia_pk1...   bob-laptop
 ```
@@ -45,8 +45,8 @@ cordelia_pk1...   bob-laptop
 
 - **Its place:** `.cordelia/members`, at the root of the repository, on its default branch.
 - **Its form:** ASCII and line feeds only, at most 16 KiB. `#` lines and empty lines are skipped.
-- **One `channel` line:** `channel`, the channel's ID in hex, then the key of each of its relays, one or two (a card's relays, §8 there). Then, where the channel was made anew, `without` and each key the making anew left out (rule 5). These keys do not count among the list's 64. A list without a `channel` line names members and no channel: followers wait, and say so.
-- **A list that names a key as a member, and after `without`, while that key is not in the channel, names no channel for now.** Followers hand over nothing and take nothing, and show rule 4.7's line, until that key's line is deleted. So a key left out cannot stay listed. Bringing it back is a pull request that adds its line and takes it off `without`.
+- **One `channel` line:** `channel`, the channel's ID in hex, then the key of each of its relays, one or two (a card's relays, §8 there). It always ends with `without`, the number of keys that follow, and those keys: the keys a making anew left out (rule 5), or `without 0` for a new channel. A line whose number does not match its keys does not parse, so a line cut short does nothing. These keys do not count among the list's 64. A list without a `channel` line names members and no channel: followers wait, and say so.
+- **A list that names a key as a member, and after `without`, while that key is not in the channel, names no channel for now.** Followers hand over nothing and take nothing, and show rule 4.7's line, until that key's line is deleted, or until the key writes in the channel, as a device of a person who stays does when it is next on. So a key left out cannot stay listed. Bringing it back is a pull request that adds its line and takes it off `without`.
 - **Then one line for each device:** its key as `cordelia id` prints it, then a label of 1 to 32 characters of `a-z`, `0-9`, `.`, `_` and `-`.
 - **Keys are unique, and so are labels.**
 - **At most 64 keys.** A channel that would hold more says so where it is handed over (`channel_full`).
@@ -85,7 +85,7 @@ bob@laptop$ cordelia subscribe
 
    ```
    Add these lines to .cordelia/members in a pull request:
-   channel 9f2c...e41a cordelia_pk1...
+   channel 9f2c...e41a cordelia_pk1... without 0
    cordelia_pk1...   <label>
    ```
 
@@ -119,7 +119,8 @@ bob@laptop$ cordelia subscribe
 
 At each read, each device that follows the repository does the following, with no one asked.
 
-1. **It acts only for the channel the list names, and only where it holds that channel and writes there:** not paused, clean, and not moved from (§7 there). **It hands over nothing in a channel in which it has read an offer**, whether it moved, is paused or stayed: that channel was made anew. Otherwise it hands over nothing and takes nothing, and says why (rule 6).
+1. **It acts only for the channel the list names, and only where it holds that channel and writes there:** not paused, clean, and not moved from (§7 there). Where any of these fails, it hands over nothing and takes nothing, and says why (rule 6).
+   - **It hands over nothing in a channel in which it has read an offer that pauses this person:** one that seals to them and leaves out a key, whether the person then moved, stayed or is still paused (§7 there). That channel was made anew. An offer "without you", or one that is a fault, does not count.
 2. **Hands over.** Listed keys not in the channel, not named after `without`, not the person's own devices, and not keys the person removed, are handed the channel, as `share` does. The node's shares are counted apart from the person's own, so a person's `share` by hand keeps its places. They go **four at a time, in turns:**
    - each share lives for two reads, then is deleted;
    - each read hands over to the next four such keys, in the list's order, starting after the last one handed;
@@ -134,21 +135,21 @@ At each read, each device that follows the repository does the following, with n
    - It files the channel on every device of the person's, as `accept --channel` does.
 5. **Says a key joined.** A key that first writes in the channel while the list names it shows amber: `<label> joined <name> from the list at <commit>`. It stays until a person clears it on that device with `cordelia shared seen <name>`.
 6. **Says a key was dropped.** A key in the channel that an earlier read named and the latest does not shows amber: `<label> is no longer on the list of <name>: make it anew with cordelia shared anew <name>`.
-7. **Says a listed key was left out.** A key the list names, that its `channel` line names after `without`, and that is not in the channel, shows on every follower: `<label> is on the list of <name> but was left out of it: delete its line in a pull request`. Until it goes, the list names no channel (rule 1). A key that is in the channel, as a device of a person who stays is (§7 there), is not shown.
+7. **Says a listed key was left out.** A key the list names, that its `channel` line names after `without`, and that is not in the channel, shows on every follower: `<label> is on the list of <name> but was left out of it: delete its line in a pull request, or wait for that device to write in the channel`. Until it goes, the list names no channel (rule 1). A key that is in the channel, as a device of a person who stays is (§7 there), is not shown.
 
 ## 5. Making a repository channel anew
 
-**`cordelia shared anew <name>`, on any channel, prints the new channel line,** naming after `without` each key it left out that the list names, where this device follows the repository. A device that does not follow names every key it left out, at most 64: only the listed ones matter, and the others may be cut. Every making anew prints it, so no device can make a channel anew without a line that says who was left out:
+**`cordelia shared anew <name>`, on any channel, prints the new channel line,** naming after `without` each key it left out that the list names, where this device follows the repository. A device that follows also keeps the current line's `without` keys that the list still names, so a later making anew never frees a key left out before. A device that does not follow names every key it left out, and the person may cut those that are not listed. It cannot know the current line's `without` keys: where one is still listed, the person carries it over, and the device that made the earlier making anew shows amber until it is there (below). Every making anew prints it, so no device can make a channel anew without a line that says who was left out:
 ```
 If this channel follows a repository's list, put this line in place of its channel line, in a pull request:
-channel <new ID> <relay keys> without <key> <key>
+channel <new ID> <relay keys> without 2 <key> <key>
 ```
 
 **Until that pull request is merged, the list names the old channel, and nobody hands anything over:** a device hands over nothing in a channel in which it has read an offer (rule 4.1), whether it moved, is paused or stayed.
 
 **Once it is merged, the line itself says who was left out,** to every follower: one that was off, and one that joined later, included. No device has to have read the offer. While a key it names is still listed and not in the channel, the list names no channel (rule 1), so nobody is handed anything until that key's line goes. Then the key is not listed, and is never handed the channel. That holds where a member made it anew before the pull request that drops the key, and where a removal made it anew without a stolen device that is still listed.
 
-**The device that made it anew shows the line until the list names the new channel.** Where the merged line's `without` misses a key it left out that is still listed, it shows amber: `<label> was left out of <name>, and its channel line does not say so: add it after without, or delete its line`.
+**The device that made it anew shows the line until the list names the new channel.** From then on, while a key it left out is still listed, it shows amber whenever the list's `channel` line does not name that key after `without`, at this making anew or any later one: `<label> was left out of <name>, and its channel line does not say so: add it after without, or delete its line`.
 
 **Keys that cannot be named:** a key whose row the table let go, and anyone who wrote in a channel past a bound (§6.3 and §7 there). Where such a key is listed, it is handed the new channel. That errs toward the list, which decides.
 
@@ -169,7 +170,9 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 | No room for one more channel, or its name taken | `You hold 16 shared channels, the most there can be`, or `You file another channel as <name>: rename it with cordelia shared rename.` |
 | A member handing over | `Handing <name> to <label>: waiting for that device to take it.` |
 | A member who cannot | `<name> is paused`, `not clean`, `not reached at its relays`, or `full`: `nothing is handed over until then.` |
-| A member who moved | `The list names the channel you moved from: put the new channel line in .cordelia/members.` |
+| A member who moved | `The list names the channel you moved from. The device that made it anew shows its new channel line: put that line in .cordelia/members.` |
+| An offer read in the named channel | `<name> was made anew by <label>: nothing is handed over until the list names the new channel.` |
+| The gate of rule 1 | `<label> is on the list of <name> but was left out of it: nothing is handed over until its line goes, or it writes in the channel.` |
 | The list, from the clone | rule 3's line, with how old it is |
 | Nobody of yours follows | `No device of yours reads the list of <name>: run cordelia subscribe in a clone of <identity>.` |
 | The channel line changed | amber, as a join is: `The list of <identity> names a new channel for <name> at <commit>.` Cleared by `cordelia shared seen <name>`. |
@@ -209,6 +212,7 @@ The notices of rules 4.5 to 4.7 show only on devices that follow the repository.
 - **A program that runs as a member** can change the clone or the node's own repository, and so the list. It can already run `share` with a yes (the README's security section). Each join's notice names the commit, for the person to check.
 - **A list in a public repository** shows the channel's ID, its relays, its keys and their labels. None of it lets anyone read the channel: that needs a member to hand it over.
 - **A member can still hand the channel to a key that is not listed,** by hand: a channel stays flat. `log` shows that key, with no label of the person's.
+- **A known limit:** a device that does not follow the repository, making its channel anew, cannot carry the current line's `without` keys. Where one of those keys is still listed and the person does not carry it over, it is let back in once the new line is merged. The device that left it out shows amber until the line names it again (rule 5).
 - **The reader shows listed keys as it shows any other key** (§2.4 there). They are not labelled for the person, and share the hour and the room of keys the person does not know (§6.3 there), until the person labels them.
 
 ## 11. Constants
@@ -264,11 +268,12 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
 
 ## 13. The reviews, and what they changed
 
-Four reviews, each checked in the code before its findings were taken. Each round's findings and what changed are on pull request #297. What changed most:
+Five reviews, each checked in the code before its findings were taken. Each round's findings and what changed are on pull request #297. What changed most:
 - **The list names the channel** (`channel <ID> <relays>`). A share holds only a card, so nothing else said which channel was the repository's (first review).
 - **Nothing of the person's reaches git.** Their settings, helpers, `insteadOf` rules and environment could each make something ask (first and second reviews).
 - **A private repository is read from the clone,** never fetched. Every way of giving the node credentials can ask (first review).
 - **A left-out key is named in the `channel` line (`without`),** and a list that still lists it names no channel. An earlier rule needed every device to have read the offer itself, which a device that was off, or one that joined later, had not (second to fourth reviews).
+- **Every `channel` line ends with `without` and a count,** so a line cut short does not parse, and a following device's making anew carries the current `without` keys over (fifth review).
 - **Hand-overs go in turns, and takes come only within the hour of the latest read.** Eight places held by devices that were off, and a stale share, had each blocked or misled a join (first and second reviews).
 
 ## 14. Questions for the person
