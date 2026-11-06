@@ -319,7 +319,7 @@ fn channel_of(
                 "fault": fault,
             }));
         }
-        not_moved_yet = shared_anew::not_moved_yet(conn, identity, &filing.channel)?.len();
+        not_moved_yet = shared_anew::not_moved_yet(conn, &own, &filing.channel)?.len();
     }
 
     let relays: Vec<Value> = filing

@@ -780,7 +780,14 @@ pub fn send_of(
         .unwrap_or(0);
     // What this device saw of who wrote there, since this folder last
     // wrote there.
-    let wrote = sharing::who_wrote(conn, &held, identity, &channel, &filing.name, Some(&agent))?;
+    let wrote = sharing::who_wrote(
+        conn,
+        &held,
+        &identity.public_key(),
+        &channel,
+        &filing.name,
+        Some(&agent),
+    )?;
     let sends_at = At {
         now: at.now,
         fetched: true,

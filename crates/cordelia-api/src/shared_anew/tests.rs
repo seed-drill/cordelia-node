@@ -851,7 +851,7 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
     let s = bob(1);
     let now = s.now + 10;
     let channel = holds(&s, 0, 7, "review", now);
-    let (alice, carol) = (member(1), member(2));
+    let (alice, carol, dave) = (member(1), member(2), member(3));
     written_by(&s, 0, &channel, &[&alice, &carol], now);
     let conn = &s[0].conn;
     let identity = &s[0].identity;
@@ -875,7 +875,7 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
             &alice,
             &channel,
             21,
-            &[alice.public_key(), s.key(0)],
+            &[alice.public_key(), s.key(0), dave.public_key()],
             now,
             2,
         ),
@@ -889,7 +889,7 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
     assert!(!writes_there(conn, identity, &row(&s, 0, &channel)).unwrap());
     // The lines of §5.4 say it was made anew and Bob has not moved.
     let held = crate::person::held(conn).unwrap().unwrap();
-    let said = sharing::who_wrote(conn, &held, identity, &channel.id, "review", None).unwrap();
+    let said = sharing::who_wrote(conn, &held, &s.key(0), &channel.id, "review", None).unwrap();
     assert!(
         said.iter()
             .any(|line| line.starts_with("This channel was made anew by")
@@ -909,50 +909,57 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
             .is_none()
     );
     assert!(writes_there(conn, identity, &row(&s, 0, &channel)).unwrap());
-    // Bob moves: the new channel lists Alice as not moved yet until she
-    // writes there.
+    // Bob moves. Alice's offer counts among the keys not moved yet only
+    // once she, its maker, has written in the new channel: until then the
+    // new channel lists nobody as not moved yet (#291's reviews).
     let plan = move_plan(conn, identity, &relays(), "review", None, None, now).unwrap();
     let said = make_move(conn, identity, &plan.what, now).unwrap();
     assert!(
         said[0].starts_with("Moved \"review\" to channel "),
         "{said:?}"
     );
-    let alice_form = sender_form(conn, &held, &s.key(0), &alice.public_key()).unwrap();
     assert!(
-        said.contains(&format!("  not moved yet: {alice_form}")),
+        !said.iter().any(|line| line.contains("not moved yet")),
         "{said:?}"
     );
     let new_channel = plan.what.to.channel;
-    assert_eq!(
-        not_moved_yet(conn, identity, &new_channel).unwrap(),
-        vec![alice.public_key()]
+    assert!(
+        not_moved_yet(conn, &s.key(0), &new_channel)
+            .unwrap()
+            .is_empty()
     );
     let new = Shared {
         secret: plan.what.to.card.secret().unwrap(),
         id: new_channel,
     };
+    // Alice writes there: Dave, sealed to and not yet there, is not moved
+    // yet, until he writes there too.
     stores(&s, 0, &anew(&alice, &new, 1), now);
+    assert_eq!(
+        not_moved_yet(conn, &s.key(0), &new_channel).unwrap(),
+        vec![dave.public_key()]
+    );
+    stores(&s, 0, &anew(&dave, &new, 1), now);
     assert!(
-        not_moved_yet(conn, identity, &new_channel)
+        not_moved_yet(conn, &s.key(0), &new_channel)
             .unwrap()
             .is_empty()
     );
 }
 
-/// A key that the offer which made a channel sealed to, and that has not
-/// moved yet, is listed and asked about by `shared anew` like any other key
-/// (#291). No row of the new channel's table holds it, and before this a
-/// making anew left it out unasked. Kept, the new offer is sealed to it.
+/// Alice makes "review" anew without Carol, sealed to herself, Bob and
+/// Dave, writes in the new channel, and Bob moves. Dave has not written
+/// there yet: no table row holds him, and `shared anew` lists and asks
+/// about him like any other key (#291). Kept, he is sealed to. A removal,
+/// which keeps the table alone (rule 24), does not keep him.
 #[test]
 fn shared_anew_asks_about_a_key_not_moved_yet() {
     let s = bob(1);
     let now = s.now + 10;
     let channel = holds(&s, 0, 7, "review", now);
-    let (alice, carol) = (member(1), member(2));
+    let (alice, carol, dave) = (member(1), member(2), member(3));
     written_by(&s, 0, &channel, &[&alice, &carol], now);
     let (conn, identity) = (&s[0].conn, &s[0].identity);
-    // Alice makes it anew without Carol, sealed to herself and Bob, and
-    // Bob moves before Alice writes there.
     stores(
         &s,
         0,
@@ -960,7 +967,7 @@ fn shared_anew_asks_about_a_key_not_moved_yet() {
             &alice,
             &channel,
             21,
-            &[alice.public_key(), s.key(0)],
+            &[alice.public_key(), s.key(0), dave.public_key()],
             now,
             2,
         ),
@@ -968,17 +975,22 @@ fn shared_anew_asks_about_a_key_not_moved_yet() {
     );
     let plan = move_plan(conn, identity, &relays(), "review", None, None, now).unwrap();
     make_move(conn, identity, &plan.what, now).unwrap();
+    let new = Shared {
+        secret: plan.what.to.card.secret().unwrap(),
+        id: plan.what.to.channel,
+    };
+    stores(&s, 0, &anew(&alice, &new, 1), now);
     assert_eq!(
-        not_moved_yet(conn, identity, &plan.what.to.channel).unwrap(),
-        vec![alice.public_key()]
+        not_moved_yet(conn, &s.key(0), &new.id).unwrap(),
+        vec![dave.public_key()]
     );
-    // Bob makes the new channel anew: Alice is listed and asked about.
-    let alice_key = encode_public_key(&alice.public_key()).unwrap();
-    assert_eq!(
-        asked_of(conn, identity, "review", now),
-        vec![alice_key.clone()]
+    let (alice_key, dave_key) = (
+        encode_public_key(&alice.public_key()).unwrap(),
+        encode_public_key(&dave.public_key()).unwrap(),
     );
-    let keep = [alice_key];
+    let asked = asked_of(conn, identity, "review", now);
+    assert_eq!(asked, vec![alice_key.clone(), dave_key.clone()]);
+    let keep = [alice_key, dave_key];
     let (listing, plan) = anew_plan(
         conn,
         identity,
@@ -986,7 +998,7 @@ fn shared_anew_asks_about_a_key_not_moved_yet() {
         "review",
         None,
         &[],
-        Some((&keep, &keep)),
+        Some((&keep, &asked)),
         now,
     )
     .unwrap();
@@ -998,32 +1010,38 @@ fn shared_anew_asks_about_a_key_not_moved_yet() {
         "{:?}",
         listing.lines
     );
-    // Kept, she is sealed to, and nobody is left out.
+    assert_eq!(listing.not_moved, vec![dave.public_key()]);
     let what = plan.unwrap().what;
-    assert!(what.stay.contains(&alice.public_key()), "{:?}", what.stay);
+    assert!(what.stay.contains(&dave.public_key()), "{:?}", what.stay);
     assert_eq!(what.left_out, 0);
+    // A removal keeps the table's keys alone.
+    let held = crate::person::held(conn).unwrap().unwrap();
+    let (stay, _) =
+        staying_with_no_question(conn, &held, &s.key(0), &row(&s, 0, &new), true).unwrap();
+    assert!(stay.contains(&alice.public_key()), "{stay:?}");
+    assert!(!stay.contains(&dave.public_key()), "{stay:?}");
 }
 
-/// An offer that only names a channel counts for nothing among its keys
-/// not moved yet (#291's review). Mallory, left out of the channel, still
-/// holds the old one, and writes there an offer that names Alice's new
-/// channel, sealed to herself and Eve with seals that open for no one.
-/// Bob moves by Alice's offer: only Alice is not moved yet, and Bob's
-/// `shared anew` lists neither Mallory nor Eve. Without the check, both
-/// would be listed, and a removal would seal to them unasked.
+/// An offer whose maker has not written in the channel it names counts for
+/// nothing among its keys not moved yet (#291's reviews). Mallory, left
+/// out, still holds the old channel, and writes there an offer that names
+/// Alice's new channel, sealed to herself and Eve. Its seals are never
+/// looked at, so one copied from another offer would change nothing:
+/// Mallory has not written in the new channel and cannot, and only Dave,
+/// from Alice's offer, is not moved yet.
 #[test]
-fn an_offer_that_only_names_a_channel_counts_for_nothing() {
+fn an_offer_whose_maker_is_not_in_the_channel_counts_for_nothing() {
     let s = bob(1);
     let now = s.now + 10;
     let channel = holds(&s, 0, 7, "review", now);
-    let (alice, mallory, eve) = (member(1), member(2), member(3));
+    let (alice, mallory, eve, dave) = (member(1), member(2), member(3), member(4));
     written_by(&s, 0, &channel, &[&alice, &mallory], now);
     let (conn, identity) = (&s[0].conn, &s[0].identity);
     let genuine = Offer::make(
         now as u64,
         &channel.id,
         &new_card(21),
-        &[alice.public_key(), s.key(0)],
+        &[alice.public_key(), s.key(0), dave.public_key()],
     )
     .unwrap();
     let forged = Offer {
@@ -1065,20 +1083,28 @@ fn an_offer_that_only_names_a_channel_counts_for_nothing() {
     );
     let plan = move_plan(conn, identity, &relays(), "review", None, None, now).unwrap();
     make_move(conn, identity, &plan.what, now).unwrap();
+    let new = Shared {
+        secret: plan.what.to.card.secret().unwrap(),
+        id: plan.what.to.channel,
+    };
+    stores(&s, 0, &anew(&alice, &new, 1), now);
     assert_eq!(
-        not_moved_yet(conn, identity, &plan.what.to.channel).unwrap(),
-        vec![alice.public_key()]
+        not_moved_yet(conn, &s.key(0), &new.id).unwrap(),
+        vec![dave.public_key()]
     );
     assert_eq!(
         asked_of(conn, identity, "review", now),
-        vec![encode_public_key(&alice.public_key()).unwrap()]
+        vec![
+            encode_public_key(&alice.public_key()).unwrap(),
+            encode_public_key(&dave.public_key()).unwrap()
+        ]
     );
 }
 
 /// A removed device of the person's that an offer sealed to and that has
 /// not moved yet is listed as left out, is not asked about, and is counted
 /// among those left out (#291's review). Bob's laptop moves by Alice's
-/// offer, which seals to his tablet too; the tablet has not written in the
+/// offer, which seals to his tablet too. The tablet has not written in the
 /// new channel when the laptop removes it.
 #[test]
 fn a_removed_device_not_moved_yet_is_left_out_and_counted() {
@@ -1105,8 +1131,13 @@ fn a_removed_device_not_moved_yet_is_left_out_and_counted() {
         let (conn, identity) = (&s[0].conn, &s[0].identity);
         let plan = move_plan(conn, identity, &relays(), "review", None, None, now).unwrap();
         make_move(conn, identity, &plan.what, now).unwrap();
+        let new = Shared {
+            secret: plan.what.to.card.secret().unwrap(),
+            id: plan.what.to.channel,
+        };
+        stores(&s, 0, &anew(&alice, &new, 1), now);
         assert!(
-            not_moved_yet(conn, identity, &plan.what.to.channel)
+            not_moved_yet(conn, &s.key(0), &new.id)
                 .unwrap()
                 .contains(&tablet)
         );
@@ -1273,7 +1304,7 @@ fn a_move_never_takes_a_device_into_a_channel_that_a_removed_key_reads() {
     assert_eq!(refusal_word(refused), "no_offer");
     // And a command that writes there does not tell Bob to move to it.
     let held = crate::person::held(&s[0].conn).unwrap().unwrap();
-    let said = after_who_wrote(&s[0].conn, &held, &s[0].identity, &new.id, "review").unwrap();
+    let said = after_who_wrote(&s[0].conn, &held, &s.key(0), &new.id, "review").unwrap();
     assert!(
         !said.iter().any(|line| line.contains("was made anew by")),
         "{said:?}"
@@ -1783,7 +1814,7 @@ fn a_removal_known_before_it_is_applied_makes_each_shared_channel_not_clean() {
     // those asked of.
     let listed = |conn: &Connection| {
         let held = crate::person::held(conn).unwrap().unwrap();
-        let listing = listing_of(conn, &held, &s[0].identity, &row(&s, 0, &channel)).unwrap();
+        let listing = listing_of(conn, &held, &own, &row(&s, 0, &channel)).unwrap();
         [listing.own_devices, listing.asked].concat()
     };
     assert!(!is_not_clean(conn, &channel.id).unwrap());
