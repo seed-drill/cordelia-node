@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Proposed, for review. Revised once after its first review (section 13). For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
+**Status**: Proposed, for review. Revised twice after its reviews (section 13). For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -48,7 +48,7 @@ cordelia_pk1...   bob-laptop
 - **One `channel` line:** `channel`, the channel's ID in hex, then the key of each of its relays, one or two (a card's relays, §8 there). A list without one names members and no channel: followers wait, and say so.
 - **Then one line for each device:** its key as `cordelia id` prints it, then a label of 1 to 32 characters of `a-z`, `0-9`, `.`, `_` and `-`.
 - **Keys are unique, and so are labels.**
-- **At most 64 keys,** less the person's own devices that the list does not name.
+- **At most 64 keys.** A channel that would hold more says so where it is handed over (`channel_full`).
 - **A file that does not parse does nothing:** the last list read stands, and the status names the line.
 - **List every device you have.** Every device of yours holds your shared channels and writes in each (§3.4 there).
 
@@ -79,8 +79,8 @@ bob@laptop$ cordelia subscribe
    - **The person holds the channel the list names:** it follows the repository and subscribes this folder's agent.
    - **They do not, and the list names this device:** it follows the repository and waits to be handed the channel (rule 4). The yes says: `This follows <identity>. A member's device hands you its channel once it reads the list. cordelia status shows how it goes.`
    - **The list does not name this device:** `Your key is not on the list of <identity> at <commit>. Add it with a pull request, then run this again.` Nothing is done.
-   - **The person dropped that channel:** the yes also says `You dropped this channel. This takes it back.`, and the drop that is kept for it goes (§3.4 there).
-4. **`cordelia subscribe --new`** makes the channel for the team, once, at the person's relays, as `shared new` does. It is filed under the repository's `owner/name` (or `--as <name>`). It prints the line to add, and the person's own keys and labels:
+   - **The person dropped that channel:** the yes also says `You dropped this channel. This takes it back.` The take that follows files it with a time after the drop, and that undoes the drop (§3.4 there). A channel the person moved from is never taken back.
+4. **`cordelia subscribe --new`** makes the channel for the team, once, at the person's relays, as `shared new` does. It is filed under the repository's `owner/name`. It prints the line to add, and the person's own keys and labels:
 
    ```
    Add these lines to .cordelia/members in a pull request:
@@ -89,39 +89,45 @@ bob@laptop$ cordelia subscribe
    ```
 
    It is refused where the list names a channel already.
-5. **What the device keeps** is a row of its own: the identity and the clone's path. It is keyed by the identity, not by a channel's name. The list says which channel the repository's is, so a rename, a making anew or a move changes nothing in the row. `shared drop` of the channel the list names stops the follow. A device that leaves its person deletes every row.
+5. **What the device keeps** is a row of its own: the identity, the clone's path, the last commit read, and the keys that read named. It is keyed by the identity, not by a channel's name. Running `subscribe` again, with a yes that names the commit, starts the row afresh, for a history that was rewritten. The list says which channel the repository's is, so a rename, a making anew or a move changes nothing in the row. `shared drop` of the channel the list names stops the follow. A device that leaves its person deletes every row.
 6. **One device of the person's that follows is enough.** Every follower, of every person, does the work of rule 4 for the team. Each device of yours that should read the list for you runs `subscribe` in a clone once.
 
 ## 3. Reading the list
 
 **The node reads the clone's own copy of the default branch, and fetches a public repository itself.**
 
-- **From the clone, read only.** It reads `refs/remotes/<remote>/<branch>`, the default branch as the person's own git last fetched it. `<branch>` is the one that `refs/remotes/<remote>/HEAD` names, and the remote must still have an address that names the identity. It reads the file with `git cat-file blob`, and never touches the working tree, a local branch, the clone's refs or its files.
-- **Fetching, for a repository anyone can read.** Every ten minutes (`MEMBERS_READ_INTERVAL_SECS`), and at the node's start, the node fetches `HEAD` of `https://<host>/<owner>/<name>` into a repository of its own, `~/.cordelia/repos/<host>/<owner>/<name>.git`. It uses `--depth 1 --filter=blob:none`, then reads the one file.
-- **No setting of the person's reaches it, so nothing can ask:**
-  - git runs with `GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_ALLOW_PROTOCOL=https`;
-  - there is no credential helper, so no keychain, keyring, Git Credential Manager or browser is ever asked;
-  - with no `insteadOf`, a fetch is never made SSH;
+- **From the clone, read only.** It reads `refs/remotes/<remote>/<branch>`, the default branch as the person's own git last fetched it. `<branch>` is the one that `refs/remotes/<remote>/HEAD` names, and the remote must still have an address that names the identity. Where that ref is missing, as after a default branch is renamed, the status says to run `git remote set-head <remote> --auto`. It reads the file with `git cat-file blob`, and never touches the working tree, a local branch, the clone's refs or its files.
+- **Fetching, for a repository anyone can read.** Every ten minutes (`MEMBERS_READ_INTERVAL_SECS`), and at the node's start, the node fetches `HEAD` of `https://<host>/<owner>/<name>` into a repository of its own, `~/.cordelia/repos/<host>/<owner>/<name>.git`. It uses `--depth 1 --filter=blob:none`, then reads the one file. The node's repository names the remote, which the filter needs.
+- **Nothing of the person's reaches git, so nothing can ask.** Every git command the node runs, reads of the clone included, runs in a cleared environment:
+  - only `PATH` is kept;
+  - `HOME` and `XDG_CONFIG_HOME` are an empty folder of the node's, so no global setting is read, on any version of git;
+  - `GIT_CONFIG_NOSYSTEM=1`, and `-c credential.helper=`, which empties the list a clone's own configuration may set;
+  - `GIT_ALLOW_PROTOCOL=https`, so nothing goes over SSH and no agent is asked;
+  - `GIT_NO_LAZY_FETCH=1`, so a read of a partial clone never fetches;
+  - `GIT_TERMINAL_PROMPT=0` and an empty `GIT_ASKPASS`, with `SSH_ASKPASS` gone with the rest;
   - `http.followRedirects=false`;
-  - `GIT_TERMINAL_PROMPT=0`, and no askpass;
   - hooks, `gc` and maintenance are off;
+  - `-c safe.directory=<clone>` for a read of the clone;
   - git is stopped after sixty seconds (`MEMBERS_FETCH_MAX_SECS`), by TERM, and the node clears its own repository's locks.
 - **A private repository is not fetched by the node.** It needs credentials, and every way to give them can ask. Its list comes from the clone, as the person's own `git fetch` or `git pull` brings it. The status says how old it is: `list of <identity> read from your clone, fetched 2 hours ago`.
 - **A redirect** (a repository renamed or moved) ends the fetch. The status says `<identity> has moved: run cordelia subscribe in a clone of it again`.
-- **A read never goes back.** A list counts only where its commit is the last commit read, or comes after it: `git merge-base --is-ancestor`, run in the node's repository or in the clone. A clone left behind, or a history rewritten, gives no new list, and the status says so.
+- **The host's answer stands.** What the node fetches is the branch as the host has it now (rule 10).
+- **A read of the clone never goes back.** It counts only where the clone's commit is the last commit read (from either source), or comes after it: `git merge-base --is-ancestor`, run in the clone. A clone left behind gives no new list, and the status says so. The last commit read is kept in the row, so a restart does not forget it.
 
 ## 4. What a node does with the list
 
 At each read, each device that follows the repository does the following, with no one asked.
 
-1. **It acts only for the channel the list names, and only where it holds that channel and writes there:** not paused, clean, and not moved from (§7 there). Otherwise it hands over nothing and takes nothing, and says why (rule 5).
-2. **Hands over.** Listed keys not in the channel, not the person's own devices, and not keys the person removed, are handed the channel, as `share` does. They go **eight at a time, in turns** (`MAX_TYPED_KEYS`):
-   - each read first deletes the shares this device left at the last read;
-   - it then hands over to the next eight such keys, in the list's order, starting after the last one handed;
-   - so a device that is off for days holds no place.
+1. **It acts only for the channel the list names, and only where it holds that channel and writes there:** not paused, clean, and not moved from (§7 there). Otherwise it hands over nothing and takes nothing, and says why (rule 6).
+   - **It hands over nothing while the list names a key that the offer which made the named channel left out,** as this device read that offer: the old channel's keys that the offer does not seal to. It shows amber: `<label> was left out when <name> was made anew: delete its line in a pull request`. Every member read that offer when it moved, so nobody can be handed the channel until the line goes. That holds where a removal, or a device that does not follow, made the channel anew.
+2. **Hands over.** Listed keys not in the channel, not the person's own devices, and not keys the person removed, are handed the channel, as `share` does. They go **four at a time, in turns:**
+   - each share lives for two reads, then is deleted;
+   - each read hands over to the next four such keys, in the list's order, starting after the last one handed;
+   - so at most eight wait at once (`MAX_TYPED_KEYS`), and a device that is off for days holds no place;
+   - a key that a share of the person's own waits for, made by hand, is skipped: a share of one channel deletes another's for the same key (`make_share`).
 3. **Deletes the shares to keys the list no longer names,** whether the node made them or a person did.
 4. **Takes.** A follower whose person does not hold the named channel looks for a share from each listed key, at each read.
-   - It types each listed key again for that read, under a count of its own, so the person's own `accept --channel` keeps its eight places.
+   - It types each listed key again for that read, under a count of its own, so the person's own `accept --channel` keeps its eight places. It asks the relays once for each listed key at each read, not at every pass: 64 keys are 128 requests every ten minutes, well within what a relay allows (§8.4 there).
    - It takes only the named channel, from a listed key, once the list names this device.
    - It takes only a share made within the hour of the latest read (`PAIR_KEY_TYPED_SECS`), so a share left at a relay long ago is not taken.
    - It files the channel on every device of the person's, as `accept --channel` does.
@@ -154,6 +160,8 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 | A follower not on the list | `Your key is not on the list of <identity> at <commit>.` |
 | A follower, the list naming no channel | `The list of <identity> names no channel yet.` |
 | On the list, not yet handed it | `Waiting for a member's device to hand you <name>. Your list was read <when>.` |
+| Holding another channel of this repository, one the named channel was made anew from | `Run cordelia shared move <name>: the list names the channel it was made anew as.` |
+| The list naming a channel that no device of the person's holds or can move to | amber: `The list of <identity> at <commit> names channel <words>, which no device of yours holds or can move to.` |
 | The channel's relays not among the person's own | `<name> is at <relay>, which is not one of your relays: add it to your configuration.` |
 | No room for one more channel, or its name taken | `You hold 16 shared channels, the most there can be`, or `You file another channel as <name>: run cordelia subscribe --as <other>.` |
 | A member handing over | `Handing <name> to <label>: waiting for that device to take it.` |
@@ -161,6 +169,7 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 | A member who moved | `The list names the channel you moved from: put the new channel line in .cordelia/members.` |
 | The list, from the clone | rule 3's line, with how old it is |
 | Nobody of yours follows | `No device of yours reads the list of <name>: run cordelia subscribe in a clone of <identity>.` |
+| The channel line changed | amber, as a join is: `The list of <identity> names a new channel for <name> at <commit>.` Cleared by `cordelia shared seen <name>`. |
 
 ## 7. What `cordelia status` shows
 
@@ -222,12 +231,12 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
 - **A private repository.** No fetch is made: the list comes from the clone, and the status says how old it is.
 
 **Never asked, and never back**
-- **Nothing asks.** The person's git configuration is set to ask in each way: a credential helper that would ask, an `insteadOf` to SSH, askpass, and a redirect. Each fetch either goes over HTTPS without asking or fails, and no prompt opens.
+- **Nothing asks.** The person's git configuration and environment are set to ask in each way: a credential helper, globally and in the clone's own configuration, that would ask; an `insteadOf` to SSH; `SSH_ASKPASS`; a redirect; and a partial clone whose read would fetch. Each git command either goes over HTTPS without asking or fails, and no prompt opens.
 - **Identity.**
   - A remote changed to a fork is not read.
   - With two remotes, `--remote` is needed.
   - A list in the working tree or on a local branch is not read.
-- **A read never goes back.** A clone behind the last commit read gives no new list.
+- **A read of the clone never goes back.** A clone behind the last commit read gives no new list, across a restart too.
 
 **Who gets the channel**
 - **Only the named channel.**
@@ -238,7 +247,7 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
   - A key dropped by a merge shows amber on every follower.
   - `shared anew` refuses while its line stays, then leaves it out and prints the new line.
   - Before that line is merged, nobody hands the new channel to anyone.
-  - After a removal, a removed device that is still listed is never handed the new channel.
+  - After a removal, a removed device that is still listed is never handed the new channel, even where the new channel line is merged and the device's line is not.
 - **Turns.**
   - Nine new keys, with eight of them off: the ninth is handed the channel at the next read.
   - The taker's typings leave the person's eight places free.
@@ -267,6 +276,24 @@ The first review, of commit 9bfd6647, found three high findings, eight medium an
 | L2 | A fork clone and SSH host aliases | `--remote`; an alias is refused, with why (rule 2.1) |
 | L3 | Listed keys are strangers to the reader | Said (rule 10) |
 | L4 | Notices show only on followers | Said (rule 7) |
+
+The second review, of commit 5e3f01d1, found the first review's H1, M2, M4, M6 to M8 and L2 to L4 closed. It found three high findings, three medium and five low:
+
+| # | Finding | What changed |
+|---|---|---|
+| H1 | A removal, or a device that does not follow, makes a channel anew with no refusal; a PR that adds the new line and forgets a removed device's line would have its key handed the new channel | A member's node hands over nothing while the list names a key the offer that made the named channel left out, and says so (rule 4.1) |
+| H2 | The person's environment still reached git: `SSH_ASKPASS`, git older than 2.32 ignoring `GIT_CONFIG_GLOBAL`, a clone's own configuration, a lazy fetch in a partial clone | Every git command, reads of the clone included, runs in a cleared environment, with an empty home of the node's, `credential.helper` emptied, HTTPS alone and no lazy fetch (rule 3) |
+| H3 | With `--depth 1`, "never goes back" could not be checked in the node's own repository | The host's answer stands; only a read of the clone must not go back (rule 3) |
+| M1 | "The last commit read" had no home: a restart forgot it | The row keeps it, and the keys it named; `subscribe` again starts afresh (rule 2.5) |
+| M2 | The taker's reads at every pass went past a relay's allowance; a share living one read could be missed | The taker asks once for each listed key at each read; a share lives two reads; four are handed over at a time (rule 4) |
+| M3 | Two waits said something false: a channel nobody holds, and a member that has not moved | Each has its own line; a change of the channel line shows amber, as a join does (rule 6) |
+| L1 | Nothing deletes a drop; a channel moved from cannot be taken back | Said (rule 2.3) |
+| L2 | A share of one channel deletes another's for the same key | A key a person's own share waits for is skipped (rule 4.2) |
+| L3 | `--filter` needs a named remote | The node's repository names it (rule 3) |
+| L4 | `refs/remotes/<remote>/HEAD` can be missing | The status says how to set it (rule 3) |
+| L5 | "64 less unlisted devices" could parse differently on two followers | A flat 64 (rule 1) |
+
+Cut as not needed: `--as`.
 
 ## 14. Questions for the person
 
