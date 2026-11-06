@@ -145,6 +145,214 @@ pub fn git_output_by(
     child.wait_with_output().ok().map(Ok)
 }
 
+/// What [`git_run_by`] keeps of what git writes, and how it stops git.
+#[derive(Debug, Clone, Copy)]
+pub struct GitBounds {
+    /// The most bytes of git's output that are kept. Git that writes more
+    /// is stopped, and gives [`GitRan::TooMuch`].
+    pub stdout_max: usize,
+    /// The most bytes of what git says on stderr that are kept: the last
+    /// ones, where it says more, as an error is said last.
+    pub stderr_max: usize,
+    /// How long git is given to end after TERM, once it is to be stopped,
+    /// before its group is killed.
+    pub term_grace: std::time::Duration,
+}
+
+/// What came of git, run by [`git_run_by`].
+#[derive(Debug)]
+pub enum GitRan {
+    /// It ended by its deadline: how, what it wrote, and the last of what
+    /// it said on stderr.
+    Ended {
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// It wrote more than [`GitBounds::stdout_max`], and was stopped.
+    TooMuch,
+    /// It had not ended by its deadline, and was stopped.
+    Late,
+    /// It could not be run.
+    NotRun(std::io::Error),
+}
+
+/// Run `git` as [`git_output_by`] does, in a process group of its own and
+/// given until `deadline`, with what `bounds` say: its output read as it
+/// comes and kept up to a bound, the last of its stderr kept, and git
+/// stopped by TERM first and KILL after (decision 2026-11-06 (joining),
+/// rule 3). TERM lets git remove the locks it holds. Whatever its group
+/// started is killed with it.
+///
+/// Its group is signalled only while git is not yet reaped, so that the
+/// group's ID cannot be another's: whether git has ended is asked without
+/// reaping it.
+pub fn git_run_by(git: &mut Command, deadline: std::time::Instant, bounds: GitBounds) -> GitRan {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(git, 0);
+    let mut child = match git
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return GitRan::NotRun(e),
+    };
+    let (Some(out), Some(err)) = (child.stdout.take(), child.stderr.take()) else {
+        stop(&mut child, bounds.term_grace);
+        return GitRan::NotRun(std::io::Error::other("git's output was not given"));
+    };
+    let stdout_max = bounds.stdout_max;
+    let mut stdout = Some(std::thread::spawn(move || read_at_most(out, stdout_max)));
+    let stderr_max = bounds.stderr_max;
+    let mut stderr = Some(std::thread::spawn(move || read_the_last(err, stderr_max)));
+    let mut output = None;
+    let mut nap = Duration::from_millis(1);
+    loop {
+        // As in `git_output_by`: an answer seen after the deadline is not
+        // taken, however soon after it git ended.
+        if Instant::now() >= deadline {
+            stop(&mut child, bounds.term_grace);
+            return GitRan::Late;
+        }
+        if let Some(reading) = stdout.take_if(|reading| reading.is_finished()) {
+            match reading.join() {
+                Ok((kept, false)) => output = Some(kept),
+                _ => {
+                    stop(&mut child, bounds.term_grace);
+                    return GitRan::TooMuch;
+                }
+            }
+        }
+        // Git has ended, and both of its pipes are closed: what holds them
+        // open past git's end is of its group, and is stopped with it at
+        // the deadline.
+        let said = stderr.as_ref().is_some_and(|reading| reading.is_finished());
+        if output.is_some() && said && has_ended(&mut child) {
+            let said = stderr.take().and_then(|reading| reading.join().ok());
+            return match child.wait() {
+                Ok(status) => GitRan::Ended {
+                    status,
+                    stdout: output.unwrap_or_default(),
+                    stderr: said.unwrap_or_default(),
+                },
+                Err(e) => GitRan::NotRun(e),
+            };
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(Duration::from_millis(10));
+    }
+}
+
+/// Stop git: TERM to its group, up to `grace` for git to end, then KILL
+/// to its group and to git, and git reaped. A reader of its output that
+/// something outside its group still holds open is left to end by itself.
+fn stop(child: &mut std::process::Child, grace: std::time::Duration) {
+    #[cfg(unix)]
+    {
+        use std::time::{Duration, Instant};
+        signal_group(child, libc::SIGTERM);
+        let until = Instant::now() + grace;
+        while !has_ended(child) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        signal_group(child, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = grace;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Send `signal` to the process group that git leads. Only while git is
+/// not yet reaped: its group's ID is then its own.
+#[cfg(unix)]
+fn signal_group(child: &std::process::Child, signal: libc::c_int) {
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: kill(2) is given no pointer.
+        unsafe { libc::kill(-group, signal) };
+    }
+}
+
+/// Whether git has ended, asked without reaping it, so that its process
+/// group's ID stays its own until [`stop`] or the caller reaps it.
+#[cfg(unix)]
+fn has_ended(child: &mut std::process::Child) -> bool {
+    // `id_t` is a `u32` where the node runs, and may be narrower elsewhere.
+    #[allow(irrefutable_let_patterns)]
+    let Ok(pid) = libc::id_t::try_from(child.id()) else {
+        return true;
+    };
+    // SAFETY: an all-zero siginfo_t is a valid value of it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: waitid(2) writes only to `info`, which outlives the call.
+    let asked = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if asked != 0 {
+        // Interrupted: asked again on the next look. Any other error says
+        // that there is no such child left to wait for.
+        return std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted;
+    }
+    // SAFETY: waitid filled `info`; with WNOHANG, its pid is 0 where git
+    // has not ended.
+    unsafe { info.si_pid() != 0 }
+}
+
+/// Whether git has ended. Elsewhere than on Unix, it is reaped as it is
+/// asked, and no group is signalled.
+#[cfg(not(unix))]
+fn has_ended(child: &mut std::process::Child) -> bool {
+    !matches!(child.try_wait(), Ok(None))
+}
+
+/// Read `from` to its end, keeping at most `max` bytes: true beside them
+/// where more came, and nothing more is read.
+fn read_at_most(mut from: impl std::io::Read, max: usize) -> (Vec<u8>, bool) {
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => return (kept, false),
+            Ok(n) if kept.len() + n > max => return (kept, true),
+            Ok(n) => kept.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return (kept, false),
+        }
+    }
+}
+
+/// Read `from` to its end, keeping its last `max` bytes.
+fn read_the_last(mut from: impl std::io::Read, max: usize) -> Vec<u8> {
+    let mut kept = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                kept.extend_from_slice(&buf[..n]);
+                if kept.len() > 2 * max.max(1) {
+                    kept.drain(..kept.len() - max);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    if kept.len() > max {
+        kept.drain(..kept.len() - max);
+    }
+    kept
+}
+
 /// The directory whose folder holds the memory for sessions started in
 /// `cwd`, where git can be run. Claude Code keeps one memory per git
 /// repository, shared by its subdirectories and worktrees, in the folder
@@ -1906,6 +2114,165 @@ mod tests {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
         assert!(!left, "the wrapper's child {pid} is still running");
+    }
+
+    /// A script that stands in for git, run by `git_run_by` through
+    /// `sh`: a file that is written and then run as a program may be held
+    /// open for writing by a fork in another of the tests' threads, which
+    /// fails its run.
+    #[cfg(unix)]
+    fn script(dir: &Path, body: &str) -> Command {
+        let path = dir.join("git.sh");
+        std::fs::write(&path, format!("{body}\n")).unwrap();
+        let mut sh = Command::new("/bin/sh");
+        sh.arg(path);
+        sh
+    }
+
+    /// Whether the process `pid` is running: listed, and not a zombie.
+    #[cfg(unix)]
+    fn is_running(pid: &str) -> bool {
+        let ps = Command::new("ps")
+            .args(["-o", "stat=", "-p", pid])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&ps.stdout).trim().to_string();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    fn bounds(stdout_max: usize, stderr_max: usize, term_grace_ms: u64) -> GitBounds {
+        GitBounds {
+            stdout_max,
+            stderr_max,
+            term_grace: std::time::Duration::from_millis(term_grace_ms),
+        }
+    }
+
+    /// Git that ends in time gives its status, its output whole, and the
+    /// last of what it said on stderr, where an error is said
+    /// (decision 2026-11-06 (joining), rule 3).
+    #[cfg(unix)]
+    #[test]
+    fn test_git_run_by_keeps_the_output_and_the_last_of_stderr() {
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut git = script(
+            tmp.path(),
+            "head -c 20000 /dev/zero | tr '\\0' x >&2\necho 'fatal: the last' >&2\n\
+             printf 'one\\ntwo\\n'\nexit 3",
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let GitRan::Ended {
+            status,
+            stdout,
+            stderr,
+        } = git_run_by(&mut git, deadline, bounds(100, 64, 100))
+        else {
+            panic!("git ended in time");
+        };
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(stdout, b"one\ntwo\n");
+        assert_eq!(stderr.len(), 64);
+        assert!(stderr.ends_with(b"fatal: the last\n"));
+        // Output of just its bound is whole; a byte more is too much.
+        let mut git = script(tmp.path(), "printf 12345");
+        let ran = git_run_by(&mut git, deadline, bounds(5, 64, 100));
+        assert!(matches!(ran, GitRan::Ended { ref stdout, .. } if stdout == b"12345"));
+        let mut git = script(tmp.path(), "printf 123456");
+        assert!(matches!(
+            git_run_by(&mut git, deadline, bounds(5, 64, 100)),
+            GitRan::TooMuch
+        ));
+        let mut missing = Command::new(tmp.path().join("no-such-git"));
+        assert!(matches!(
+            git_run_by(&mut missing, deadline, bounds(5, 64, 100)),
+            GitRan::NotRun(_)
+        ));
+    }
+
+    /// Git that writes more than its bound is stopped at once, not at its
+    /// deadline, and nothing of it is left running.
+    #[cfg(unix)]
+    #[test]
+    fn test_git_run_by_stops_git_that_writes_too_much() {
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        let mut git = script(tmp.path(), "echo $$ > \"$PID_FILE\"\nexec yes");
+        git.env("PID_FILE", &pid_file);
+        let began = Instant::now();
+        let ran = git_run_by(
+            &mut git,
+            began + Duration::from_secs(30),
+            bounds(4096, 64, 100),
+        );
+        assert!(matches!(ran, GitRan::TooMuch));
+        assert!(began.elapsed() < Duration::from_secs(10));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(!is_running(pid.trim()));
+    }
+
+    /// At its deadline, git is sent TERM first, and given its grace to
+    /// end: a git that removes its locks on TERM has done so.
+    #[cfg(unix)]
+    #[test]
+    fn test_git_run_by_sends_term_before_kill() {
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let mark = tmp.path().join("termed");
+        let mut git = script(
+            tmp.path(),
+            "trap 'echo term > \"$MARK\"; exit 0' TERM\nwhile :; do sleep 0.05; done",
+        );
+        git.env("MARK", &mark);
+        let ran = git_run_by(
+            &mut git,
+            Instant::now() + Duration::from_millis(500),
+            bounds(64, 64, 5000),
+        );
+        assert!(matches!(ran, GitRan::Late));
+        assert_eq!(std::fs::read_to_string(&mark).unwrap(), "term\n");
+    }
+
+    /// Git that does not end on TERM is killed once its grace is over,
+    /// with what it started, and none of it is left running; an answer
+    /// seen after the deadline is not taken.
+    #[cfg(unix)]
+    #[test]
+    fn test_git_run_by_kills_git_that_ignores_term() {
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("pid");
+        // TERM ignored, and a child that holds git's output open after git
+        // itself has ended.
+        let mut git = script(
+            tmp.path(),
+            "trap '' TERM\nsh -c 'trap \"\" TERM; echo $$ > \"$PID_FILE\"; exec sleep 30' &\n\
+             echo started",
+        );
+        git.env("PID_FILE", &pid_file);
+        let began = Instant::now();
+        let ran = git_run_by(
+            &mut git,
+            began + Duration::from_secs(1),
+            bounds(64, 64, 300),
+        );
+        assert!(matches!(ran, GitRan::Late));
+        assert!(began.elapsed() < Duration::from_secs(10));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let gone_by = Instant::now() + Duration::from_secs(5);
+        while is_running(pid.trim()) && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!is_running(pid.trim()), "{pid} is still running");
+        for _ in 0..200 {
+            let mut quick = Command::new("/bin/sh");
+            quick.args(["-c", "echo quick"]);
+            assert!(matches!(
+                git_run_by(&mut quick, Instant::now(), bounds(64, 64, 100)),
+                GitRan::Late
+            ));
+        }
     }
 
     /// The notice as a status carries it: one record for each time it
