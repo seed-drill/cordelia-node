@@ -26,18 +26,18 @@ fn a_follow_is_kept_read_and_turned() {
         (kept.remote.as_str(), kept.clone.as_str(), kept.followed_at),
         ("origin", "/work/project", 7)
     );
-    assert_eq!((kept.last, kept.list, kept.turn), (None, None, 0));
+    assert_eq!((kept.last, kept.list, kept.last_handed), (None, None, None));
     let read = LastRead {
         commit: commit('a'),
         at: 9,
         from_clone: true,
     };
     assert!(read_done(&conn, ID, &read, b"channel line").unwrap());
-    set_turn(&conn, ID, 5).unwrap();
+    set_last_handed(&conn, ID, &[5; 32]).unwrap();
     let kept = follow_of(&conn, ID).unwrap().unwrap();
     assert_eq!(kept.last, Some(read));
     assert_eq!(kept.list.as_deref(), Some(&b"channel line"[..]));
-    assert_eq!(kept.turn, 5);
+    assert_eq!(kept.last_handed, Some([5; 32]));
     assert_eq!(follows(&conn).unwrap(), vec![kept]);
     // A list read for a repository not followed changes nothing.
     let other = LastRead {
@@ -61,7 +61,7 @@ fn following_again_starts_afresh_and_unfollowing_keeps_nothing() {
             from_clone: false,
         };
         read_done(conn, ID, &read, b"list").unwrap();
-        set_turn(conn, ID, 2).unwrap();
+        set_last_handed(conn, ID, &[2; 32]).unwrap();
         type_key(conn, ID, &key, 9).unwrap();
         notice(
             conn,
@@ -78,7 +78,7 @@ fn following_again_starts_afresh_and_unfollowing_keeps_nothing() {
     follow(&conn, ID, "upstream", "/work/fork", 11).unwrap();
     let kept = follow_of(&conn, ID).unwrap().unwrap();
     assert_eq!((kept.remote.as_str(), kept.followed_at), ("upstream", 11));
-    assert_eq!((kept.last, kept.list, kept.turn), (None, None, 0));
+    assert_eq!((kept.last, kept.list, kept.last_handed), (None, None, None));
     assert!(typed(&conn, ID).unwrap().is_empty());
     assert!(notices(&conn, ID).unwrap().is_empty());
     filled(&conn);
@@ -124,24 +124,63 @@ fn the_nodes_typings_are_its_own_and_typed_again_start_again() {
 }
 
 #[test]
-fn a_notice_is_kept_once_until_seen() {
+fn a_notice_is_kept_once_until_seen_and_a_dropped_key_until_it_leaves() {
     let conn = db();
     let joined = Notice {
-        of: NoticeOf::Joined([5; 32]),
+        of: NoticeOf::Joined {
+            key: [5; 32],
+            label: "alice-laptop".into(),
+        },
         commit: commit('a'),
         at: 9,
     };
-    let changed = Notice {
+    let changed = |c: char, at: i64| Notice {
         of: NoticeOf::LineChanged,
-        commit: commit('b'),
-        at: 10,
+        commit: commit(c),
+        at,
+    };
+    let dropped = Notice {
+        of: NoticeOf::Dropped {
+            key: [6; 32],
+            label: "bob".into(),
+        },
+        commit: commit('c'),
+        at: 11,
     };
     assert!(notice(&conn, ID, &joined).unwrap());
     assert!(!notice(&conn, ID, &joined).unwrap(), "kept once");
-    assert!(notice(&conn, ID, &changed).unwrap());
-    assert_eq!(notices(&conn, ID).unwrap(), vec![joined, changed]);
+    assert!(notice(&conn, ID, &changed('b', 10)).unwrap());
+    assert!(notice(&conn, ID, &dropped).unwrap());
+    // A second change of the line takes the place of the first, not yet seen.
+    assert!(notice(&conn, ID, &changed('d', 12)).unwrap());
+    assert!(!notice(&conn, ID, &changed('d', 12)).unwrap());
+    assert_eq!(
+        notices(&conn, ID).unwrap(),
+        vec![joined, dropped.clone(), changed('d', 12)]
+    );
+    // `seen` clears the join and the line; the dropped key stays until it
+    // leaves the channel.
     assert_eq!(seen(&conn, ID).unwrap(), 2);
+    assert_eq!(notices(&conn, ID).unwrap(), vec![dropped]);
+    clear_dropped(&conn, ID, &[6; 32]).unwrap();
     assert!(notices(&conn, ID).unwrap().is_empty());
+}
+
+/// A follow and an unfollow are one write inside a caller's transaction,
+/// as a drop of the channel is (rule 2.5), and undo with it.
+#[test]
+fn following_runs_inside_a_callers_transaction() {
+    let conn = db();
+    conn.execute_batch("BEGIN").unwrap();
+    follow(&conn, ID, "origin", "/work/project", 7).unwrap();
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(follow_of(&conn, ID).unwrap(), None, "undone with it");
+    follow(&conn, ID, "origin", "/work/project", 7).unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    unfollow(&conn, ID).unwrap();
+    unfollow_all(&conn).unwrap();
+    conn.execute_batch("COMMIT").unwrap();
+    assert!(follows(&conn).unwrap().is_empty());
 }
 
 #[test]

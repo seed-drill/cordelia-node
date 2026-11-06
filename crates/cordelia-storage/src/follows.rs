@@ -4,14 +4,20 @@
 //! - **The follows** (`shared_follows`): each repository this device
 //!   follows, by its identity (`host/owner/name`), with the clone's remote
 //!   and path, the last commit read with when and from where, the bytes of
-//!   the last list read, and the node's turn among the keys it hands over
-//!   to (rule 4.2). Following again starts the row afresh (rule 2.5).
+//!   the last list read, and the last key the node handed the channel to,
+//!   after which its next turn starts (rule 4.2). Following again starts
+//!   the row afresh (rule 2.5).
 //! - **The node's typings** (`shared_follow_typed`): the listed keys the node
 //!   looks for shares from (rule 4.4), apart from the person's own typings
 //!   (`shared_typed_keys`), with what became of each.
 //! - **The notices** (`shared_follow_notices`): a key that joined from the
-//!   list, and a changed channel line, each with its commit, until a person
-//!   clears them with `cordelia shared seen` (rules 4.5 and 6).
+//!   list and a changed channel line, until a person clears them with
+//!   `cordelia shared seen` (rules 4.5 and 6); and a key the list dropped,
+//!   until it leaves the channel (rule 4.6). Each with its commit, and a
+//!   key's with its label, which its line may no longer give.
+//!
+//! Each write here runs in a savepoint of its own, so that it is one
+//! write whether or not the caller holds a transaction.
 //! - **The node's shares** (`shared_shares.by_node`), and **what a making
 //!   anew left out and the line it printed** (`shared_anew_made.left_out`
 //!   and `line`, rule 5).
@@ -25,6 +31,25 @@ use cordelia_core::CordeliaError;
 
 fn storage(e: rusqlite::Error) -> CordeliaError {
     CordeliaError::Storage(e.to_string())
+}
+
+/// `write` in a savepoint: done whole, or not at all, inside the caller's
+/// transaction or alone.
+fn in_savepoint<T>(
+    conn: &Connection,
+    write: impl FnOnce() -> Result<T, CordeliaError>,
+) -> Result<T, CordeliaError> {
+    conn.execute_batch("SAVEPOINT follows").map_err(storage)?;
+    match write() {
+        Ok(done) => {
+            conn.execute_batch("RELEASE follows").map_err(storage)?;
+            Ok(done)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO follows; RELEASE follows");
+            Err(e)
+        }
+    }
 }
 
 // ── The follows ──────────────────────────────────────────────────────
@@ -43,8 +68,9 @@ pub struct Follow {
     pub last: Option<LastRead>,
     /// The bytes of the last list read.
     pub list: Option<Vec<u8>>,
-    /// Where the node's next hand-over starts, among the keys it hands to.
-    pub turn: u64,
+    /// The last key the node handed the channel to: its next turn starts
+    /// after it, in the list's order.
+    pub last_handed: Option<[u8; 32]>,
 }
 
 /// When the last list was read, its commit, and whether it came from the
@@ -57,13 +83,13 @@ pub struct LastRead {
 }
 
 const FOLLOW_COLUMNS: &str =
-    "identity, remote, clone, followed_at, last_commit, last_read_at, read_from, list, turn";
+    "identity, remote, clone, followed_at, last_commit, last_read_at, read_from, list, last_handed";
 
 fn follow_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Follow> {
     let commit: Option<String> = row.get(4)?;
     let at: Option<i64> = row.get(5)?;
     let from: Option<i64> = row.get(6)?;
-    let turn: i64 = row.get(8)?;
+    let last_handed: Option<Vec<u8>> = row.get(8)?;
     Ok(Follow {
         identity: row.get(0)?,
         remote: row.get(1)?,
@@ -78,7 +104,7 @@ fn follow_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Follow> {
             _ => None,
         },
         list: row.get(7)?,
-        turn: turn as u64,
+        last_handed: last_handed.and_then(|key| key.try_into().ok()),
     })
 }
 
@@ -93,15 +119,16 @@ pub fn follow(
     clone: &str,
     at: i64,
 ) -> Result<(), CordeliaError> {
-    let tx = conn.unchecked_transaction().map_err(storage)?;
-    forget(&tx, identity)?;
-    tx.execute(
-        "INSERT INTO shared_follows (identity, remote, clone, followed_at)
-             VALUES (?1, ?2, ?3, ?4)",
-        params![identity, remote, clone, at],
-    )
-    .map_err(storage)?;
-    tx.commit().map_err(storage)
+    in_savepoint(conn, || {
+        forget(conn, identity)?;
+        conn.execute(
+            "INSERT INTO shared_follows (identity, remote, clone, followed_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+            params![identity, remote, clone, at],
+        )
+        .map_err(storage)?;
+        Ok(())
+    })
 }
 
 /// Everything kept of `identity`, in the caller's write.
@@ -123,18 +150,18 @@ fn forget(conn: &Connection, identity: &str) -> Result<(), CordeliaError> {
 /// This device stops following `identity` (a `shared drop` of its channel,
 /// rule 2.5): nothing of it is kept.
 pub fn unfollow(conn: &Connection, identity: &str) -> Result<(), CordeliaError> {
-    let tx = conn.unchecked_transaction().map_err(storage)?;
-    forget(&tx, identity)?;
-    tx.commit().map_err(storage)
+    in_savepoint(conn, || forget(conn, identity))
 }
 
 /// This device follows nothing: it left its person (rule 2.5).
 pub fn unfollow_all(conn: &Connection) -> Result<(), CordeliaError> {
-    conn.execute_batch(
-        "DELETE FROM shared_follows; DELETE FROM shared_follow_typed;
-         DELETE FROM shared_follow_notices;",
-    )
-    .map_err(storage)
+    in_savepoint(conn, || {
+        conn.execute_batch(
+            "DELETE FROM shared_follows; DELETE FROM shared_follow_typed;
+             DELETE FROM shared_follow_notices;",
+        )
+        .map_err(storage)
+    })
 }
 
 /// Every repository this device follows, by identity.
@@ -179,11 +206,16 @@ pub fn read_done(
     Ok(changed == 1)
 }
 
-/// Where the node's next hand-over for `identity` starts.
-pub fn set_turn(conn: &Connection, identity: &str, turn: u64) -> Result<(), CordeliaError> {
+/// The last key the node handed the channel of `identity` to: its next
+/// turn starts after it.
+pub fn set_last_handed(
+    conn: &Connection,
+    identity: &str,
+    key: &[u8; 32],
+) -> Result<(), CordeliaError> {
     conn.execute(
-        "UPDATE shared_follows SET turn = ?2 WHERE identity = ?1",
-        params![identity, turn as i64],
+        "UPDATE shared_follows SET last_handed = ?2 WHERE identity = ?1",
+        params![identity, &key[..]],
     )
     .map_err(storage)?;
     Ok(())
@@ -270,10 +302,15 @@ pub fn untype(conn: &Connection, identity: &str, key: &[u8; 32]) -> Result<(), C
 /// What a notice is of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoticeOf {
-    /// A key that joined the channel from the list (rule 4.5).
-    Joined([u8; 32]),
-    /// The list's channel line changed (rule 6).
+    /// A key that joined the channel from the list, with its label there
+    /// (rule 4.5). Kept until a person clears it.
+    Joined { key: [u8; 32], label: String },
+    /// The list's channel line changed (rule 6). Kept until a person clears
+    /// it; a later change takes the place of an earlier one not yet cleared.
     LineChanged,
+    /// A key that an earlier read listed and the latest does not, with its
+    /// label then (rule 4.6). Kept until it leaves the channel.
+    Dropped { key: [u8; 32], label: String },
 }
 
 /// A notice, with the commit it was read at and when.
@@ -284,40 +321,55 @@ pub struct Notice {
     pub at: i64,
 }
 
-/// A notice for `identity`. One already kept of the same thing stays as
-/// it is. Returns whether it is new.
+/// A notice for `identity`. A key's notice already kept stays as it is;
+/// a changed line takes the place of one not yet cleared, with its commit.
+/// Returns whether anything was written.
 pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool, CordeliaError> {
-    let (kind, key): (i64, Vec<u8>) = match &notice.of {
-        NoticeOf::Joined(key) => (1, key.to_vec()),
-        NoticeOf::LineChanged => (2, Vec::new()),
+    let (kind, key, label): (i64, Vec<u8>, Option<&str>) = match &notice.of {
+        NoticeOf::Joined { key, label } => (1, key.to_vec(), Some(label)),
+        NoticeOf::LineChanged => (2, Vec::new(), None),
+        NoticeOf::Dropped { key, label } => (3, key.to_vec(), Some(label)),
     };
-    let added = conn
+    let on_conflict = match kind {
+        2 => {
+            "DO UPDATE SET at_commit = excluded.at_commit, at = excluded.at
+                  WHERE at_commit != excluded.at_commit"
+        }
+        _ => "DO NOTHING",
+    };
+    let written = conn
         .execute(
-            "INSERT OR IGNORE INTO shared_follow_notices (identity, kind, key, at_commit, at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![identity, kind, key, notice.commit, notice.at],
+            &format!(
+                "INSERT INTO shared_follow_notices (identity, kind, key, label, at_commit, at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT (identity, kind, key) {on_conflict}"
+            ),
+            params![identity, kind, key, label, notice.commit, notice.at],
         )
         .map_err(storage)?;
-    Ok(added == 1)
+    Ok(written == 1)
 }
 
 /// The notices of `identity`, oldest first.
 pub fn notices(conn: &Connection, identity: &str) -> Result<Vec<Notice>, CordeliaError> {
     conn.prepare(
-        "SELECT kind, key, at_commit, at FROM shared_follow_notices
+        "SELECT kind, key, label, at_commit, at FROM shared_follow_notices
              WHERE identity = ?1 ORDER BY at, kind, key",
     )
     .map_err(storage)?
     .query_map([identity], |row| {
         let kind: i64 = row.get(0)?;
         let key: Vec<u8> = row.get(1)?;
+        let key: [u8; 32] = key.try_into().unwrap_or([0; 32]);
+        let label: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
         Ok(Notice {
             of: match kind {
-                1 => NoticeOf::Joined(key.try_into().unwrap_or([0; 32])),
+                1 => NoticeOf::Joined { key, label },
+                3 => NoticeOf::Dropped { key, label },
                 _ => NoticeOf::LineChanged,
             },
-            commit: row.get(2)?,
-            at: row.get(3)?,
+            commit: row.get(3)?,
+            at: row.get(4)?,
         })
     })
     .map_err(storage)?
@@ -325,14 +377,30 @@ pub fn notices(conn: &Connection, identity: &str) -> Result<Vec<Notice>, Cordeli
     .map_err(storage)
 }
 
-/// A person cleared the notices of `identity` (`cordelia shared seen`).
-/// Returns how many went.
+/// A person cleared the notices of `identity` (`cordelia shared seen`): the
+/// joins and a changed line. A dropped key's stays until it leaves the
+/// channel. Returns how many went.
 pub fn seen(conn: &Connection, identity: &str) -> Result<usize, CordeliaError> {
     conn.execute(
-        "DELETE FROM shared_follow_notices WHERE identity = ?1",
+        "DELETE FROM shared_follow_notices WHERE identity = ?1 AND kind IN (1, 2)",
         [identity],
     )
     .map_err(storage)
+}
+
+/// The key `key`, dropped from the list of `identity`, has left the channel:
+/// its notice goes.
+pub fn clear_dropped(
+    conn: &Connection,
+    identity: &str,
+    key: &[u8; 32],
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "DELETE FROM shared_follow_notices WHERE identity = ?1 AND kind = 3 AND key = ?2",
+        params![identity, &key[..]],
+    )
+    .map_err(storage)?;
+    Ok(())
 }
 
 // ── The node's shares, and what a making anew printed ────────────────
@@ -378,7 +446,8 @@ pub fn shares_by_node(conn: &Connection) -> Result<Vec<NodeShare>, CordeliaError
 
 /// What the making anew of `channel` here left out, and the channel line
 /// it printed (rule 5). Nothing is done where this device did not make it
-/// anew.
+/// anew. Write it after `shared_anew::made`, in the same write: `made`
+/// writes its row afresh.
 pub fn made_line(
     conn: &Connection,
     channel: &[u8; 32],

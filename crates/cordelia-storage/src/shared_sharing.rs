@@ -152,9 +152,12 @@ pub struct ShareRow {
     pub made: i64,
     /// Whether a delete was written over it.
     pub gone: bool,
+    /// Whether the node made it, not a person (decision 2026-11-06
+    /// (joining), rule 4.2).
+    pub by_node: bool,
 }
 
-const SHARE_COLUMNS: &str = "key, channel, pair, relays, rev, made, gone";
+const SHARE_COLUMNS: &str = "key, channel, pair, relays, rev, made, gone, by_node";
 
 fn share_from_row(row: &rusqlite::Row) -> rusqlite::Result<ShareRow> {
     Ok(ShareRow {
@@ -165,6 +168,7 @@ fn share_from_row(row: &rusqlite::Row) -> rusqlite::Result<ShareRow> {
         rev: u64::try_from(row.get::<_, i64>(4)?).unwrap_or(0),
         made: row.get(5)?,
         gone: row.get(6)?,
+        by_node: row.get(7)?,
     })
 }
 
@@ -177,7 +181,9 @@ pub fn note_share(conn: &Connection, share: &ShareRow) -> Result<(), CordeliaErr
     )
     .map_err(storage)?;
     conn.execute(
-        &format!("INSERT INTO shared_shares ({SHARE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"),
+        &format!(
+            "INSERT INTO shared_shares ({SHARE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ),
         params![
             &share.key[..],
             &share.channel[..],
@@ -185,7 +191,8 @@ pub fn note_share(conn: &Connection, share: &ShareRow) -> Result<(), CordeliaErr
             &share.relays,
             i64::try_from(share.rev).unwrap_or(i64::MAX),
             share.made,
-            share.gone
+            share.gone,
+            share.by_node
         ],
     )
     .map_err(storage)?;
@@ -347,6 +354,7 @@ mod tests {
             rev: 100,
             made: 100,
             gone: false,
+            by_node: false,
         };
         note_share(&conn, &share).unwrap();
         share_answered(&conn, &[1; 32], &[2; 32], &[7; 32], 100).unwrap();
