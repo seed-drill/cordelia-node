@@ -38,6 +38,16 @@ libc = "0.2"
 tempfile = { workspace = true }
 # The statements a test counts, to bound the work of a request.
 rusqlite = { workspace = true, features = ["trace"] }
+# A server of git over HTTPS on loopback, for the tests of a repository's
+# list read with git (tests/common). The network crate already brings
+# both: this adds no crate to the build.
+rustls = { workspace = true }
+rcgen = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
+# A terminal of a test's own, at which nothing that git runs may ask. The
+# node's crate already brings it: this adds no crate to the build.
+rustix = { version = "1", features = ["pty"] }
 
 [lints.rust]
 # CI's coverage job builds with `--cfg coverage` (ci.yml), which leaves out
