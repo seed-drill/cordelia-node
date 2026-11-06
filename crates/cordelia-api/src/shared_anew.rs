@@ -1138,6 +1138,32 @@ fn listing_of(
             .push(format!("  {form}: {first}{last}, {entries}"));
         listing.asked.push(key.key);
     }
+    // The keys the offer that made this channel sealed to and that have
+    // not written here yet (§7, "not moved yet"): no table row holds them,
+    // so without this a making anew before they moved left them out
+    // unasked (#291). Each is asked about like any other key.
+    let mut not_moved = Vec::new();
+    for key in not_moved_yet(conn, own, &row.channel)? {
+        if listing.own_devices.contains(&key) || listing.asked.contains(&key) {
+            continue;
+        }
+        let form = sender_form(conn, held, own, &key)?;
+        match removed.contains(&key) {
+            true => listing
+                .lines
+                .push(format!("  {form}: left out, a device you removed")),
+            false => not_moved.push((key, form)),
+        }
+    }
+    if !not_moved.is_empty() {
+        listing.lines.push(format!(
+            "Sealed to when \"{shown_name}\" was made anew, and not moved here yet:"
+        ));
+        for (key, form) in not_moved {
+            listing.lines.push(format!("  {form}"));
+            listing.asked.push(key);
+        }
+    }
     listing.let_go = row.let_go;
     if row.state == State::NotInForce {
         listing.lines.push(past_a_bound_line(&row.name, row.let_go));

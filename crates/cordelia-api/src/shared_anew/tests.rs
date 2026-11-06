@@ -939,6 +939,71 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
     );
 }
 
+/// A key that the offer which made a channel sealed to, and that has not
+/// moved yet, is listed and asked about by `shared anew` like any other key
+/// (#291). No row of the new channel's table holds it, and before this a
+/// making anew left it out unasked. Kept, the new offer is sealed to it.
+#[test]
+fn shared_anew_asks_about_a_key_not_moved_yet() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    // Alice makes it anew without Carol, sealed to herself and Bob, and
+    // Bob moves before Alice writes there.
+    stores(
+        &s,
+        0,
+        &offer_by(
+            &alice,
+            &channel,
+            21,
+            &[alice.public_key(), s.key(0)],
+            now,
+            2,
+        ),
+        now,
+    );
+    let plan = move_plan(conn, identity, &relays(), "review", None, None, now).unwrap();
+    make_move(conn, identity, &plan.what, now).unwrap();
+    assert_eq!(
+        not_moved_yet(conn, &s.key(0), &plan.what.to.channel).unwrap(),
+        vec![alice.public_key()]
+    );
+    // Bob makes the new channel anew: Alice is listed and asked about.
+    let alice_key = encode_public_key(&alice.public_key()).unwrap();
+    assert_eq!(
+        asked_of(conn, identity, "review", now),
+        vec![alice_key.clone()]
+    );
+    let keep = [alice_key];
+    let (listing, plan) = anew_plan(
+        conn,
+        identity,
+        &relays(),
+        "review",
+        None,
+        &[],
+        Some((&keep, &keep)),
+        now,
+    )
+    .unwrap();
+    assert!(
+        listing
+            .lines
+            .iter()
+            .any(|line| line == "Sealed to when \"review\" was made anew, and not moved here yet:"),
+        "{:?}",
+        listing.lines
+    );
+    // Kept, she is sealed to, and nobody is left out.
+    let what = plan.unwrap().what;
+    assert!(what.stay.contains(&alice.public_key()), "{:?}", what.stay);
+    assert_eq!(what.left_out, 0);
+}
+
 // ── The fix round of slice 8 ─────────────────────────────────────────
 
 /// The channel that device `n` files as `name` now, as a `Shared`.
