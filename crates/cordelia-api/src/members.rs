@@ -74,7 +74,7 @@ impl std::fmt::Display for NotAList {
 const TOO_LARGE: &str = "is larger than 16 KiB";
 const NOT_PLAIN: &str = "has a character that is not plain ASCII text";
 const TAB: &str = "has a tab: part words with spaces";
-const CARRIAGE: &str = "ends with a carriage return: save the file with line feeds only";
+const CARRIAGE: &str = "has a carriage return: save the file with line feeds only";
 const COMMENT_AFTER: &str = "has a comment after its words: a comment takes a line of its own";
 const SECOND_CHANNEL: &str = "is a second channel line";
 const NOT_A_CHANNEL: &str = "does not give a channel's ID: 64 lower-case hex characters";
@@ -216,7 +216,7 @@ fn key_of(word: &str) -> Option<[u8; 32]> {
 /// flipped is another key to Ed25519, but the same key to X25519, from
 /// which a share's pair is derived. So a twin counts as the key itself,
 /// for a key twice and for the gate.
-fn same_key(a: &[u8; 32], b: &[u8; 32]) -> bool {
+pub fn same_key(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a[..31] == b[..31] && (a[31] & 0x7f) == (b[31] & 0x7f)
 }
 
@@ -249,6 +249,11 @@ pub fn is_a_label(label: &str) -> bool {
 }
 
 impl ChannelLine {
+    /// Whether the line names `key` after `without`, or its twin.
+    pub fn leaves_out(&self, key: &[u8; 32]) -> bool {
+        self.without.iter().any(|left| same_key(left, key))
+    }
+
     /// The line, as a making anew prints it and [`read`] reads it. A key
     /// after `without` given twice, or with its twin, is printed once. A
     /// value that [`read`] would not take back (no relay or more than two,

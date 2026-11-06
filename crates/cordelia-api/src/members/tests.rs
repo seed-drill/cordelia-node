@@ -334,3 +334,28 @@ fn a_tab_a_carriage_return_and_a_comment_after_words_are_named() {
     );
     assert_eq!(why(&format!("{} # note", channel(&[]))).why, COMMENT_AFTER);
 }
+
+/// Two keys that differ only in the low bits of their last byte are two
+/// keys: only the top bit is masked.
+#[test]
+fn keys_that_differ_below_the_top_bit_are_two() {
+    let near = (1..=255u8)
+        .map(|bit| {
+            let mut near = key(11).1;
+            near[31] ^= bit & 0x7f;
+            near
+        })
+        .find(|near| *near != key(11).1 && is_usable_public_key(near))
+        .expect("a usable key one bit away");
+    assert!(!same_key(&key(11).1, &near));
+    assert!(same_key(&key(11).1, &twin(11).1));
+    let both = format!(
+        "{} alice\n{} bob\n",
+        key(11).0,
+        encode_public_key(&near).unwrap()
+    );
+    assert!(read(both.as_bytes()).is_ok());
+    let line = read(channel(&[11]).as_bytes()).unwrap().channel.unwrap();
+    assert!(line.leaves_out(&key(11).1) && line.leaves_out(&twin(11).1));
+    assert!(!line.leaves_out(&near));
+}
