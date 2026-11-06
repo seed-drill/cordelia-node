@@ -20,7 +20,7 @@ use cordelia_api::git_list::{
     ClonedList, Git, GitVersion, Identity, ListAt, ListFailed, NotAnIdentity, RemoteRefused,
 };
 use cordelia_core::protocol::{
-    MEMBERS_FETCH_MAX_SECS, MEMBERS_FETCH_TERM_SECS, MEMBERS_FILE_MAX_BYTES,
+    MEMBERS_FETCH_MAX_SECS, MEMBERS_FILE_MAX_BYTES, MEMBERS_GIT_TERM_SECS, MEMBERS_REPO_MAX_BYTES,
 };
 
 const LIST: &[u8] = b"# the list\ncordelia_pk1example alice-laptop\n";
@@ -101,20 +101,34 @@ impl Bench {
         clone
     }
 
-    /// The person's own `git fetch` into a clone, from the served
-    /// repository on the disk.
+    /// The person's own `git fetch origin` into a clone.
     fn fetch_into(&self, clone: &Path) {
-        git(
-            &self.home(),
-            clone,
-            &[
-                "fetch",
-                "--quiet",
-                "--force",
-                self.bare.to_str().unwrap(),
-                "+refs/heads/*:refs/remotes/origin/*",
-            ],
+        self.fetch_into_with(clone, false);
+    }
+
+    /// The person's own `git fetch origin` into a clone, with `--prune`
+    /// where `prune`: from the served repository on the disk in place of
+    /// the public address, which `FETCH_HEAD` then names, as a fetch from
+    /// it would.
+    fn fetch_into_with(&self, clone: &Path, prune: bool) {
+        let home = self.home();
+        let public = git(&home, clone, &["config", "remote.origin.url"]);
+        let instead = format!("url.{}.insteadOf={public}", self.bare.display());
+        let mut args = vec!["-c", &instead, "fetch", "--quiet"];
+        if prune {
+            args.push("--prune");
+        }
+        args.push("origin");
+        git(&home, clone, &args);
+        // Git writes the address it fetched from without `.git`.
+        let on_disk = self.bare.to_str().unwrap().strip_suffix(".git").unwrap();
+        let fetch_head = clone.join(".git/FETCH_HEAD");
+        let said = std::fs::read_to_string(&fetch_head).unwrap();
+        let said = said.replace(
+            &format!(" of {on_disk}\n"),
+            " of https://example.org/example/project\n",
         );
+        std::fs::write(&fetch_head, said).unwrap();
     }
 }
 
@@ -127,6 +141,10 @@ impl Bench {
 #[test]
 fn a_fetch_reads_the_list_into_the_nodes_own_repository() {
     let bench = Bench::new(Answers::Git);
+    // A file elsewhere in the repository, larger than the list may be.
+    let work = bench.tmp.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    std::fs::write(work.join("big.bin"), vec![b'x'; 100_000]).unwrap();
     let first = bench.commit(Some(LIST));
     git(&bench.home(), &bench.bare, &["tag", "v1", "main"]);
     let node = bench.node("node");
@@ -150,6 +168,21 @@ fn a_fetch_reads_the_list_into_the_nodes_own_repository() {
     assert_eq!(ask(&["rev-parse", "refs/cordelia/list"]), first);
     assert_eq!(ask(&["config", "remote.origin.url"]), bench.url());
     assert_eq!(ask(&["for-each-ref", "refs/tags"]), "");
+    // A partial clone of its own, whose fetch leaves out every file larger
+    // than the list may be: the large file is not there, and the list is.
+    assert_eq!(ask(&["config", "remote.origin.promisor"]), "true");
+    assert_eq!(ask(&["config", "extensions.partialClone"]), "origin");
+    let big = git(&bench.home(), &bench.bare, &["rev-parse", "main:big.bin"]);
+    let list = git(
+        &bench.home(),
+        &bench.bare,
+        &["rev-parse", "main:.cordelia/members"],
+    );
+    assert!(
+        !holds(&bench.home(), &repo, &big),
+        "the large file was fetched"
+    );
+    assert!(holds(&bench.home(), &repo, &list));
     // The node asked in git's protocol 2, which the server was given.
     assert!(
         bench
@@ -202,6 +235,13 @@ fn the_list_is_a_plain_file_of_at_most_16_kib() {
     larger.push(b'\n');
     bench.commit(Some(&larger));
     assert_eq!(fetched(), Err(ListFailed::TooLarge));
+    // The fetch left it out.
+    let blob = git(
+        &bench.home(),
+        &bench.bare,
+        &["rev-parse", "main:.cordelia/members"],
+    );
+    assert!(!holds(&bench.home(), &node.repo_of(&identity()), &blob));
     // A folder in its place.
     let work = bench.tmp.path().join("work");
     std::fs::remove_file(work.join(".cordelia/members")).unwrap();
@@ -214,6 +254,57 @@ fn the_list_is_a_plain_file_of_at_most_16_kib() {
     std::os::unix::fs::symlink("../README", work.join(".cordelia/members")).unwrap();
     commit_work(&bench.home(), &work, &bench.bare);
     assert_eq!(fetched(), Err(ListFailed::NotAFile));
+}
+
+/// Whether the repository `repo` holds the object `object`, asked so that
+/// nothing is fetched for the asking.
+fn holds(home: &Path, repo: &Path, object: &str) -> bool {
+    test_git(home, repo, &["cat-file", "-e", object])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+/// The node's own repository is made afresh before a fetch where it holds
+/// more than its bound, `MEMBERS_REPO_MAX_BYTES`, and the list is fetched
+/// again; within its bound it is kept (rule 3).
+#[test]
+fn the_nodes_repository_is_made_afresh_past_its_bound() {
+    assert_eq!(MEMBERS_REPO_MAX_BYTES, 64 * 1024 * 1024);
+    let bench = Bench::new(Answers::Git);
+    bench.commit(Some(LIST));
+    let node = bench.node("node");
+    node.fetch_list(&identity(), &bench.url()).unwrap();
+    let repo = node.repo_of(&identity());
+    std::fs::write(repo.join("planted"), "a file of the node's repository").unwrap();
+    let second = bench.commit(Some(b"# the list, changed\n"));
+    assert_eq!(
+        node.fetch_list(&identity(), &bench.url()).unwrap().commit,
+        second
+    );
+    assert!(
+        repo.join("planted").exists(),
+        "made afresh within its bound"
+    );
+    // A bound it is past.
+    let small = Git::given(&bench.tmp.path().join("node"), "git", bench.inherited())
+        .unwrap()
+        .with_repo_max_bytes(1);
+    let third = bench.commit(Some(LIST));
+    assert_eq!(
+        small.fetch_list(&identity(), &bench.url()).unwrap(),
+        ListAt {
+            commit: third.clone(),
+            file: Some(LIST.to_vec()),
+        }
+    );
+    assert!(!repo.join("planted").exists(), "not made afresh");
+    assert_eq!(
+        git(&bench.home(), &repo, &["rev-parse", "refs/cordelia/list"]),
+        third
+    );
 }
 
 /// A redirect, as for a repository renamed or moved, is not followed:
@@ -270,7 +361,7 @@ fn a_fetch_that_does_not_end_is_stopped_and_its_locks_cleared() {
     assert_eq!(fetched, Err(ListFailed::Late { secs: 3 }));
     assert!(took >= Duration::from_secs(3), "{took:?}");
     assert!(
-        took < Duration::from_secs(3 + MEMBERS_FETCH_TERM_SECS + 10),
+        took < Duration::from_secs(3 + MEMBERS_GIT_TERM_SECS + 10),
         "{took:?}"
     );
     assert!(!repo.join("shallow.lock").exists());
@@ -495,6 +586,217 @@ fn a_read_of_a_clone_never_goes_back() {
     assert!(after(&third, "--all").is_err());
 }
 
+/// A replace ref or a graft in a clone is not heeded (rule 3): a replace
+/// ref that makes the remote branch's commit read as a local commit with
+/// another list leaves the list read the remote's; and a graft, in
+/// `info/grafts` or made with `git replace --graft`, that makes a commit of
+/// a history written again seem to come after the last commit read does
+/// not make it count.
+#[test]
+fn a_replace_ref_or_a_graft_in_the_clone_is_not_heeded() {
+    let bench = Bench::new(Answers::Git);
+    let first = bench.commit(Some(LIST));
+    let clone = bench.clone_of("clone");
+    let home = bench.home();
+    let node = bench.node("node");
+    // A local commit with another list, put in place of the remote's.
+    std::fs::write(clone.join(".cordelia/members"), b"# replaced\n").unwrap();
+    git(&home, &clone, &["commit", "--quiet", "-am", "local"]);
+    let local = git(&home, &clone, &["rev-parse", "HEAD"]);
+    git(&home, &clone, &["replace", &first, &local]);
+    let shown = format!("{first}:.cordelia/members");
+    assert_eq!(git(&home, &clone, &["show", &shown]), "# replaced");
+    let read = node.read_clone(&clone, "origin", &identity()).unwrap();
+    assert_eq!(
+        read.at,
+        ListAt {
+            commit: first.clone(),
+            file: Some(LIST.to_vec()),
+        }
+    );
+    // History written again at the host: a commit with no parent.
+    let work = bench.tmp.path().join("work");
+    git(&home, &work, &["checkout", "--quiet", "--orphan", "again"]);
+    std::fs::write(work.join("README"), "written again\n").unwrap();
+    git(&home, &work, &["add", "-A"]);
+    git(&home, &work, &["commit", "--quiet", "-m", "again"]);
+    let bare = bench.bare.to_str().unwrap();
+    git(
+        &home,
+        &work,
+        &["push", "--quiet", "--force", bare, "again:main"],
+    );
+    let rewritten = git(&home, &work, &["rev-parse", "HEAD"]);
+    bench.fetch_into(&clone);
+    let read = node.read_clone(&clone, "origin", &identity()).unwrap();
+    assert_eq!(read.at.commit, rewritten);
+    assert_eq!(node.comes_after(&clone, &first, &rewritten), Ok(false));
+    // The person's git sees each graft; the node's does not.
+    let ancestor = || {
+        test_git(
+            &home,
+            &clone,
+            &["merge-base", "--is-ancestor", &first, &rewritten],
+        )
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+    };
+    std::fs::create_dir_all(clone.join(".git/info")).unwrap();
+    std::fs::write(
+        clone.join(".git/info/grafts"),
+        format!("{rewritten} {first}\n"),
+    )
+    .unwrap();
+    assert!(ancestor(), "the graft file is not heeded by this git");
+    assert_eq!(node.comes_after(&clone, &first, &rewritten), Ok(false));
+    std::fs::remove_file(clone.join(".git/info/grafts")).unwrap();
+    git(&home, &clone, &["replace", "--graft", &rewritten, &first]);
+    assert!(ancestor());
+    assert_eq!(node.comes_after(&clone, &first, &rewritten), Ok(false));
+}
+
+/// A host that renames its default branch (rule 3): after the person's
+/// plain `git fetch`, `refs/remotes/origin/HEAD` still names the old
+/// branch at its old commit, and `FETCH_HEAD` is new, but names only the
+/// new branch: the list is read at the old commit, and not known to be
+/// fresh. After `git fetch --prune` the old branch is gone, and the person
+/// is told what to run.
+#[test]
+fn a_default_branch_renamed_at_the_host_is_not_known_to_be_fresh() {
+    let bench = Bench::new(Answers::Git);
+    let first = bench.commit(Some(LIST));
+    let home = bench.home();
+    let at_host = |args: &[&str]| git(&home, &bench.bare, args);
+    at_host(&["branch", "-m", "main", "master"]);
+    at_host(&["symbolic-ref", "HEAD", "refs/heads/master"]);
+    let clone = bench.clone_of("clone");
+    let node = bench.node("node");
+    bench.fetch_into(&clone);
+    let read = node.read_clone(&clone, "origin", &identity()).unwrap();
+    assert_eq!(read.at.commit, first);
+    assert_eq!(read.branch, "master");
+    assert!(read.fetched.is_some());
+    // A FETCH_HEAD of another repository says nothing of this one.
+    let fetch_head = clone.join(".git/FETCH_HEAD");
+    let said = std::fs::read_to_string(&fetch_head).unwrap();
+    std::fs::write(
+        &fetch_head,
+        said.replace("/example/project", "/alice/project"),
+    )
+    .unwrap();
+    let read = node.read_clone(&clone, "origin", &identity()).unwrap();
+    assert_eq!(read.fetched, None);
+    // The host renames master to main, and a commit follows.
+    at_host(&["branch", "-m", "master", "main"]);
+    at_host(&["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let second = bench.commit(Some(b"# the list, changed\n"));
+    bench.fetch_into(&clone);
+    let read = node.read_clone(&clone, "origin", &identity()).unwrap();
+    assert_eq!(read.at.commit, first);
+    assert_eq!(read.branch, "master");
+    assert_eq!(read.fetched, None);
+    // With --prune, the old branch goes.
+    bench.fetch_into_with(&clone, true);
+    let failed = node.read_clone(&clone, "origin", &identity()).unwrap_err();
+    assert_eq!(
+        failed,
+        ListFailed::NoBranch {
+            remote: "origin".to_string(),
+            branch: "master".to_string()
+        }
+    );
+    assert_eq!(
+        failed.says(),
+        "your clone has no copy of origin/master: run git fetch origin, \
+         then git remote set-head origin --auto"
+    );
+    // What set-head writes, as the host answers it: read, and fresh.
+    git(
+        &home,
+        &clone,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    let read = node.read_clone(&clone, "origin", &identity()).unwrap();
+    assert_eq!(read.at.commit, second);
+    assert_eq!(read.branch, "main");
+    assert!(read.fetched.is_some());
+}
+
+/// A clone's remote branch is looked up by its whole name, and nothing
+/// else that git could take the name for (rule 3): a tag or a local branch
+/// of the same name, or a symbolic ref in its place, is not read.
+#[test]
+fn a_clones_remote_branch_is_looked_up_by_its_whole_name() {
+    let bench = Bench::new(Answers::Git);
+    let first = bench.commit(Some(LIST));
+    let clone = bench.clone_of("clone");
+    let home = bench.home();
+    let node = bench.node("node");
+    std::fs::write(clone.join(".cordelia/members"), b"# a local branch\n").unwrap();
+    git(&home, &clone, &["commit", "--quiet", "-am", "local"]);
+    // The default branch named as a branch that the clone has no copy of,
+    // where a local branch of that name is there, and a tag whose name is
+    // the remote branch's whole name, which `rev-parse` would take for it.
+    git(&home, &clone, &["branch", "trunk"]);
+    git(&home, &clone, &["tag", "refs/remotes/origin/trunk"]);
+    git(
+        &home,
+        &clone,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+        ],
+    );
+    assert_eq!(
+        node.read_clone(&clone, "origin", &identity()),
+        Err(ListFailed::NoBranch {
+            remote: "origin".to_string(),
+            branch: "trunk".to_string()
+        })
+    );
+    // A symbolic ref in the branch's place, to the local branch: git
+    // follows it from `refs/remotes/origin/HEAD`, out of the remote's refs,
+    // so no default branch of the remote is known.
+    git(
+        &home,
+        &clone,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/trunk",
+            "refs/heads/trunk",
+        ],
+    );
+    assert_eq!(
+        node.read_clone(&clone, "origin", &identity()),
+        Err(ListFailed::NoRemoteHead {
+            remote: "origin".to_string()
+        })
+    );
+    git(
+        &home,
+        &clone,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    );
+    assert_eq!(
+        node.read_clone(&clone, "origin", &identity())
+            .unwrap()
+            .at
+            .commit,
+        first
+    );
+}
+
 /// A partial clone is read without a fetch, by a git that heeds
 /// `GIT_NO_LAZY_FETCH`: where it lacks the list, it says so, and nothing
 /// is fetched; once it holds it, it is read. A git older than 2.44 does
@@ -603,6 +905,11 @@ fn a_partial_clone_is_read_without_a_fetch_and_refused_to_an_older_git() {
         }
     );
     assert!(refused.says().contains("older than 2.44"));
+    // Never back reads the clone's objects too, and is refused alike.
+    assert_eq!(
+        old.comes_after(&partial, &first, &"0".repeat(40)),
+        Err(refused.clone())
+    );
     let whole = bench.clone_of("whole");
     assert_eq!(
         old.read_clone(&whole, "origin", &identity())
@@ -720,7 +1027,7 @@ impl Person {
     }
 
     /// A clone whose remote is SSH, with settings of its own that would
-    /// ask, or run a program of the person's.
+    /// ask.
     fn clone_of(&self, bench: &Bench) -> PathBuf {
         let clone = bench.clone_of("ssh-clone");
         let (bin, marks) = (self.root.join("bin"), self.root.join("marks"));
@@ -734,7 +1041,6 @@ impl Person {
         set("credential.helper", &mark("helper-clone", "exit 0"));
         set("core.askPass", &mark("askpass-clone", "echo secret"));
         set("core.sshCommand", &mark("ssh-clone", "exit 255"));
-        set("core.fsmonitor", &mark("fsmonitor-clone", "exit 1"));
         set(
             &format!("url.{}.insteadOf", bench.server.url("example", "x")),
             "ssh://git@example.org/",
@@ -803,7 +1109,9 @@ const EXPECTED: [&str; 6] = [
 /// the environment the node inherits, is a program that writes a mark,
 /// and none is written; the host is sent no password and nothing of the
 /// person's settings; nothing goes over SSH or from a file; and the clone
-/// is left as it was.
+/// is left as it was. Here the environment is handed to `Git::given`:
+/// that a node takes only what it should of the environment its own
+/// process inherits is shown by `nothing_asks_at_a_terminal` alone.
 #[test]
 fn nothing_of_the_persons_reaches_git_and_nothing_asks() {
     let bench = Bench::new(Answers::Password);
