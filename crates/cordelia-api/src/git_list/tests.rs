@@ -283,9 +283,11 @@ fn test_no_remote_that_names_a_repository_is_refused_with_why() {
         choose_remote(&two, Some("origin")),
         Err(RemoteRefused::TwoRepositories("origin".to_string()))
     );
+    let refused = choose_remote(&two, None).unwrap_err();
+    assert_eq!(refused, RemoteRefused::NoneNamesARepository(Vec::new()));
     assert_eq!(
-        choose_remote(&two, None),
-        Err(RemoteRefused::NoneNamesARepository(Vec::new()))
+        refused.says(),
+        "No remote of this clone names one repository that can be read."
     );
     // Two addresses of the one repository name it.
     let same = [remote(
@@ -420,6 +422,19 @@ fn test_why_a_fetch_failed_is_read_from_gits_words() {
             "remote: something\nfatal: the remote end hung up unexpectedly\n".to_string(),
             ListFailed::Git("the remote end hung up unexpectedly".to_string()),
         ),
+        // What the host says, on the lines git begins with `remote:`, is
+        // not read as git's own words.
+        (
+            "remote: fatal: The requested URL returned error: 301\n\
+             remote: fatal: could not read Username\n\
+             fatal: the remote end hung up unexpectedly\n"
+                .to_string(),
+            ListFailed::Git("the remote end hung up unexpectedly".to_string()),
+        ),
+        (
+            "remote: fatal: transport 'x' not allowed\n".to_string(),
+            ListFailed::Git("nothing".to_string()),
+        ),
         // What a host says is shown only as printable ASCII, and short.
         (
             format!("fatal: \x1b[31m{}\n", "x".repeat(300)),
@@ -543,6 +558,109 @@ fn test_gits_home_is_kept_empty() {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(git.home()).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+        // A link in its place is refused, and what it leads to is left.
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join(".gitconfig"), "").unwrap();
+        std::fs::remove_dir_all(git.home()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, git.home()).unwrap();
+        assert!(keep_empty(git.home()).is_err());
+        assert!(elsewhere.join(".gitconfig").exists());
+        assert!(Git::given(tmp.path(), "git", std::env::vars_os()).is_err());
+    }
+}
+
+/// What a repository of the node's own holds on the disk, links not
+/// followed.
+#[test]
+fn test_what_a_repository_holds_is_measured() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("r.git");
+    std::fs::create_dir_all(repo.join("objects/pack")).unwrap();
+    std::fs::write(repo.join("HEAD"), [0u8; 10]).unwrap();
+    std::fs::write(repo.join("objects/pack/pack-1.pack"), [0u8; 1000]).unwrap();
+    #[cfg(unix)]
+    {
+        let big = tmp.path().join("big");
+        std::fs::write(&big, vec![0u8; 100_000]).unwrap();
+        std::os::unix::fs::symlink(&big, repo.join("objects/linked")).unwrap();
+        std::os::unix::fs::symlink(tmp.path(), repo.join("objects/up")).unwrap();
+    }
+    assert_eq!(bytes_under(&repo), 1010);
+    assert_eq!(bytes_under(&tmp.path().join("none")), 0);
+}
+
+/// A `FETCH_HEAD` says the list is fresh only where it has a line for the
+/// branch read, of the repository followed: git writes the address with
+/// its user taken out, and without `.git`.
+#[test]
+fn test_fetch_head_says_fresh_only_for_the_branch_of_the_repository() {
+    let project = Identity::from_address("https://example.org/example/project").unwrap();
+    let commit = "a".repeat(40);
+    let line = |flag: &str, note: &str| format!("{commit}\t{flag}\t{note}\n");
+    for (text, fresh) in [
+        (
+            line("", "branch 'main' of https://example.org/example/project"),
+            true,
+        ),
+        (
+            line(
+                "not-for-merge",
+                "branch 'main' of https://example.org/example/project",
+            ),
+            true,
+        ),
+        (
+            line("", "branch 'main' of ssh://example.org/example/project"),
+            true,
+        ),
+        (
+            line("", "branch 'main' of example.org:example/project"),
+            true,
+        ),
+        (
+            line(
+                "not-for-merge",
+                "branch 'dev' of https://example.org/example/project",
+            ) + &line("", "branch 'main' of https://Example.org/Example/Project"),
+            true,
+        ),
+        // Another branch: the one the clone reads was not fetched.
+        (
+            line("", "branch 'master' of https://example.org/example/project"),
+            false,
+        ),
+        (
+            line("", "branch 'main/x' of https://example.org/example/project"),
+            false,
+        ),
+        (
+            line("", "tag 'main' of https://example.org/example/project"),
+            false,
+        ),
+        // Another repository, or one the node does not read.
+        (
+            line("", "branch 'main' of https://example.org/alice/project"),
+            false,
+        ),
+        (line("", "branch 'main' of /srv/git/project"), false),
+        (line("", "branch 'main' of work:example/project"), false),
+        (
+            line("", "branch 'main' of bob@example.org:example/project"),
+            false,
+        ),
+        // Not a line of git's.
+        (
+            format!("{commit} branch 'main' of https://example.org/example/project\n"),
+            false,
+        ),
+        (
+            "x\t\tbranch 'main' of https://example.org/example/project\n".to_string(),
+            false,
+        ),
+        (String::new(), false),
+    ] {
+        assert_eq!(fetch_head_names(&text, "main", &project), fresh, "{text}");
     }
 }
 
@@ -647,6 +765,8 @@ fn test_every_git_command_runs_in_the_cleared_environment() {
             ("GIT_ASKPASS", ""),
             ("GIT_ALLOW_PROTOCOL", "https"),
             ("GIT_NO_LAZY_FETCH", "1"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
+            ("GIT_GRAFT_FILE", "/dev/null"),
             ("LC_ALL", "C"),
         ] {
             expected.insert(name.to_string(), set(value));
@@ -670,8 +790,10 @@ fn test_every_git_command_runs_in_the_cleared_environment() {
             "http.followRedirects=false",
             "http.emptyAuth=false",
             "core.hooksPath=/dev/null",
+            "core.fsmonitor=false",
             "gc.auto=0",
             "maintenance.auto=false",
+            "advice.graftFileDeprecated=false",
         ] {
             assert!(
                 settings.iter().any(|s| s == setting),
