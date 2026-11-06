@@ -204,7 +204,7 @@ The notices of rules 4.5 to 4.7 show only on devices that follow the repository.
 - **The host** decides what the branch is. A public repository is reached over TLS. A private one is reached by the person's own git.
 - **A program that runs as a member** can change the clone or the node's own repository, and so the list. It can already run `share` with a yes (the README's security section). Each join's notice names the commit, for the person to check.
 - **A list in a public repository** shows the channel's ID, its relays, its keys and their labels. None of it lets anyone read the channel: that needs a member to hand it over.
-- **A member can still hand the channel to a key that is not listed,** by hand: a channel stays flat. `log` shows that key, with no label of the person's.7 shows that key on every follower.
+- **A member can still hand the channel to a key that is not listed,** by hand: a channel stays flat. `log` shows that key, with no label of the person's.
 - **The reader shows listed keys as it shows any other key** (§2.4 there). They are not labelled for the person, and share the hour and the room of keys the person does not know (§6.3 there), until the person labels them.
 
 ## 11. Constants
