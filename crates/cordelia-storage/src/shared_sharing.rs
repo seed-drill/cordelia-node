@@ -357,6 +357,16 @@ mod tests {
             by_node: false,
         };
         note_share(&conn, &share).unwrap();
+        // The node's mark is kept when a share is noted again.
+        let by_node = ShareRow {
+            by_node: true,
+            ..share.clone()
+        };
+        note_share(&conn, &by_node).unwrap();
+        assert!(shares(&conn).unwrap()[0].by_node);
+        note_share(&conn, &by_node).unwrap();
+        assert!(shares(&conn).unwrap()[0].by_node, "kept when noted again");
+        note_share(&conn, &share).unwrap();
         share_answered(&conn, &[1; 32], &[2; 32], &[7; 32], 100).unwrap();
         share_answered(&conn, &[1; 32], &[2; 32], &[7; 32], 99).unwrap();
         assert_eq!(

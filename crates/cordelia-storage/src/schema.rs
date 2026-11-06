@@ -7544,6 +7544,15 @@ mod tests {
             }
             out
         };
+        let sql = |conn: &Connection, table: &str| -> String {
+            conn.query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        let old_sql: Vec<String> = altered.iter().map(|table| sql(&conn, table)).collect();
         let before = (but(&conn), rows(&conn));
         assert!(tables(&conn).is_empty());
         let failing = format!("{MIGRATION_V33} SELECT no_such_function();");
@@ -7559,6 +7568,23 @@ mod tests {
         assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(tables(&conn), NEW_IN_V33);
         assert_eq!((but(&conn), rows(&conn)), before);
+        // The step only adds: each altered table's new text, with the
+        // columns the step adds taken out, is its old text, so no old column
+        // or check went. SQLite writes an added column after the last one,
+        // before the table's own constraints.
+        let added: Vec<&str> = MIGRATION_V33
+            .split("ADD COLUMN ")
+            .skip(1)
+            .map(|rest| rest.split(';').next().unwrap())
+            .collect();
+        assert_eq!(added.len(), 3);
+        for (table, old) in altered.iter().zip(&old_sql) {
+            let mut new = sql(&conn, table);
+            for column in &added {
+                new = new.replace(&format!(", {column}"), "");
+            }
+            assert_eq!(&new, old, "{table}");
+        }
         let defaults: (i64, Option<Vec<u8>>, Option<String>) = conn
             .query_row(
                 "SELECT s.by_node, m.left_out, m.line FROM shared_shares s, shared_anew_made m",

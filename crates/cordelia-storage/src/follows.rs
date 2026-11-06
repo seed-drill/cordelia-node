@@ -15,15 +15,16 @@
 //!   `cordelia shared seen` (rules 4.5 and 6); and a key the list dropped,
 //!   until it leaves the channel (rule 4.6). Each with its commit, and a
 //!   key's with its label, which its line may no longer give.
-//!
-//! Each write here runs in a savepoint of its own, so that it is one
-//! write whether or not the caller holds a transaction.
+
 //! - **The node's shares** (`shared_shares.by_node`), and **what a making
 //!   anew left out and the line it printed** (`shared_anew_made.left_out`
 //!   and `line`, rule 5).
 //!
 //! Nothing here reads a list or decides anything: that is done where these
 //! are read. Every time here is the node's.
+//!
+//! Each write here runs in a savepoint of its own, so that it is one
+//! write whether or not the caller holds a transaction.
 
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -41,10 +42,13 @@ fn in_savepoint<T>(
 ) -> Result<T, CordeliaError> {
     conn.execute_batch("SAVEPOINT follows").map_err(storage)?;
     match write() {
-        Ok(done) => {
-            conn.execute_batch("RELEASE follows").map_err(storage)?;
-            Ok(done)
-        }
+        Ok(done) => match conn.execute_batch("RELEASE follows") {
+            Ok(()) => Ok(done),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO follows; RELEASE follows");
+                Err(storage(e))
+            }
+        },
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK TO follows; RELEASE follows");
             Err(e)
@@ -388,8 +392,9 @@ pub fn seen(conn: &Connection, identity: &str) -> Result<usize, CordeliaError> {
     .map_err(storage)
 }
 
-/// The key `key`, dropped from the list of `identity`, has left the channel:
-/// its notice goes.
+/// The key `key`, dropped from the list of `identity`, has left the channel,
+/// or the list names it again: its notice goes. A key dropped again later
+/// is then noticed afresh, with its new commit.
 pub fn clear_dropped(
     conn: &Connection,
     identity: &str,
