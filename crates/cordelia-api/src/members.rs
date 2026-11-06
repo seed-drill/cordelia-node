@@ -73,6 +73,9 @@ impl std::fmt::Display for NotAList {
 
 const TOO_LARGE: &str = "is larger than 16 KiB";
 const NOT_PLAIN: &str = "has a character that is not plain ASCII text";
+const TAB: &str = "has a tab: part words with spaces";
+const CARRIAGE: &str = "ends with a carriage return: save the file with line feeds only";
+const COMMENT_AFTER: &str = "has a comment after its words: a comment takes a line of its own";
 const SECOND_CHANNEL: &str = "is a second channel line";
 const NOT_A_CHANNEL: &str = "does not give a channel's ID: 64 lower-case hex characters";
 const RELAYS: &str = "does not give one or two relays' keys before without";
@@ -86,6 +89,11 @@ const LABEL: &str = "gives a label that is not 1 to 32 of a-z, 0-9, . _ and -";
 const LABEL_TWICE: &str = "gives a label a second time";
 const TOO_MANY: &str = "names more than 64 devices";
 
+// The words above spell these numbers out.
+const _: () = assert!(
+    MEMBERS_FILE_MAX_BYTES == 16_384 && SHARED_MAX_KEYS == 64 && MEMBERS_LABEL_MAX_CHARS == 32
+);
+
 /// The file `file`, read as a list (rule 1).
 pub fn read(file: &[u8]) -> Result<Members, NotAList> {
     let not = |line: usize, why| NotAList { line, why };
@@ -98,8 +106,15 @@ pub fn read(file: &[u8]) -> Result<Members, NotAList> {
     };
     for (index, line) in file.split(|byte| *byte == b'\n').enumerate() {
         let number = index + 1;
-        if !line.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
-            return Err(not(number, NOT_PLAIN));
+        if let Some(byte) = line.iter().find(|byte| !(0x20..=0x7e).contains(*byte)) {
+            return Err(not(
+                number,
+                match byte {
+                    b'\t' => TAB,
+                    b'\r' => CARRIAGE,
+                    _ => NOT_PLAIN,
+                },
+            ));
         }
         // Only ASCII is left, so the line is UTF-8.
         let line = std::str::from_utf8(line).map_err(|_| not(number, NOT_PLAIN))?;
@@ -109,6 +124,9 @@ pub fn read(file: &[u8]) -> Result<Members, NotAList> {
         };
         if first.starts_with('#') {
             continue;
+        }
+        if words[1..].iter().any(|word| word.starts_with('#')) {
+            return Err(not(number, COMMENT_AFTER));
         }
         if *first == "channel" {
             if members.channel.is_some() {
@@ -124,7 +142,11 @@ pub fn read(file: &[u8]) -> Result<Members, NotAList> {
         if !is_a_label(label) {
             return Err(not(number, LABEL));
         }
-        if members.devices.iter().any(|device| device.key == key) {
+        if members
+            .devices
+            .iter()
+            .any(|device| same_key(&device.key, &key))
+        {
             return Err(not(number, KEY_TWICE));
         }
         if members.devices.iter().any(|device| device.label == label) {
@@ -161,7 +183,7 @@ fn channel_line(words: &[&str]) -> Result<ChannelLine, &'static str> {
     if relays.is_empty() || relays.len() > SHARED_MAX_RELAYS {
         return Err(RELAYS);
     }
-    if relays.len() == 2 && relays[0] == relays[1] {
+    if relays.len() == 2 && same_key(&relays[0], &relays[1]) {
         return Err(KEY_TWICE);
     }
     let (count, keys) = rest[at + 1..].split_first().ok_or(NOT_A_COUNT)?;
@@ -172,7 +194,7 @@ fn channel_line(words: &[&str]) -> Result<ChannelLine, &'static str> {
     let mut without: Vec<[u8; 32]> = Vec::with_capacity(keys.len());
     for word in keys {
         let key = key_of(word).ok_or(NOT_A_KEY)?;
-        if without.contains(&key) {
+        if without.iter().any(|kept| same_key(kept, &key)) {
             return Err(KEY_TWICE);
         }
         without.push(key);
@@ -188,6 +210,14 @@ fn channel_line(words: &[&str]) -> Result<ChannelLine, &'static str> {
 fn key_of(word: &str) -> Option<[u8; 32]> {
     let key = decode_public_key(word).ok()?;
     (encode_public_key(&key).ok()? == word && is_usable_public_key(&key)).then_some(key)
+}
+
+/// Whether two keys are one, or each other's twin: a key with its top bit
+/// flipped is another key to Ed25519, but the same key to X25519, from
+/// which a share's pair is derived. So a twin counts as the key itself,
+/// for a key twice and for the gate.
+fn same_key(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a[..31] == b[..31] && (a[31] & 0x7f) == (b[31] & 0x7f)
 }
 
 /// A channel's ID: 64 lower-case hex characters.
@@ -219,19 +249,30 @@ pub fn is_a_label(label: &str) -> bool {
 }
 
 impl ChannelLine {
-    /// The line, as a making anew prints it and [`read`] reads it.
-    pub fn to_line(&self) -> String {
+    /// The line, as a making anew prints it and [`read`] reads it. A key
+    /// after `without` given twice, or with its twin, is printed once. A
+    /// value that [`read`] would not take back (no relay or more than two,
+    /// a relay twice, a key that is not one) is refused.
+    pub fn to_line(&self) -> Result<String, &'static str> {
+        let mut without: Vec<&[u8; 32]> = Vec::with_capacity(self.without.len());
+        for key in &self.without {
+            if !without.iter().any(|kept| same_key(kept, key)) {
+                without.push(key);
+            }
+        }
         let mut line = format!("channel {}", hex::encode(self.channel));
         for key in &self.relays {
             line.push(' ');
-            line.push_str(&encode_public_key(key).unwrap_or_default());
+            line.push_str(&encode_public_key(key).map_err(|_| NOT_A_KEY)?);
         }
-        line.push_str(&format!(" without {}", self.without.len()));
-        for key in &self.without {
+        line.push_str(&format!(" without {}", without.len()));
+        for key in without {
             line.push(' ');
-            line.push_str(&encode_public_key(key).unwrap_or_default());
+            line.push_str(&encode_public_key(key).map_err(|_| NOT_A_KEY)?);
         }
-        line
+        let words: Vec<&str> = line.split(' ').collect();
+        channel_line(&words[1..])?;
+        Ok(line)
     }
 }
 
@@ -245,7 +286,10 @@ impl Members {
         };
         self.devices
             .iter()
-            .filter(|device| line.without.contains(&device.key) && !in_channel(&device.key))
+            .filter(|device| {
+                line.without.iter().any(|key| same_key(key, &device.key))
+                    && !in_channel(&device.key)
+            })
             .collect()
     }
 

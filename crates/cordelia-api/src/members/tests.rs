@@ -81,8 +81,8 @@ fn a_file_that_is_not_a_list_names_its_line_and_gives_nothing() {
         }
     );
     assert_eq!(why("# fine\nlabel \u{e9}\n").line, 2);
-    assert_eq!(why("# fine\r\n").why, NOT_PLAIN);
-    assert_eq!(why("# a tab\there\n").why, NOT_PLAIN);
+    assert_eq!(why("# fine\r\n").why, CARRIAGE);
+    assert_eq!(why("# a tab\there\n").why, TAB);
     let twice = format!("{}\n{}\n", channel(&[]), channel(&[]));
     assert_eq!(
         why(&twice),
@@ -201,7 +201,10 @@ fn a_channel_line_printed_is_read_as_it_was() {
             relays: vec![key(1).1, key(2).1],
             without: without.iter().map(|n| key(*n).1).collect(),
         };
-        let read_back = read(printed.to_line().as_bytes()).unwrap().channel.unwrap();
+        let read_back = read(printed.to_line().unwrap().as_bytes())
+            .unwrap()
+            .channel
+            .unwrap();
         assert_eq!(read_back, printed);
     }
 }
@@ -213,11 +216,12 @@ fn a_channel_line_printed_is_read_as_it_was() {
 #[test]
 fn a_listed_key_left_out_and_not_in_holds_the_list_back() {
     let file = format!(
-        "{}\n{} alice\n{} stolen\n{} bobs-desktop\n",
+        "{}\n{} alice\n{} stolen\n{} bobs-desktop\n{} newcomer\n",
         channel(&[11, 12, 13]),
         key(10).0,
         key(11).0,
-        key(12).0
+        key(12).0,
+        key(14).0
     );
     let members = read(file.as_bytes()).unwrap();
     let in_channel = |key_in: &[u8; 32]| *key_in == key(10).1 || *key_in == key(12).1;
@@ -237,4 +241,96 @@ fn a_listed_key_left_out_and_not_in_holds_the_list_back() {
         members.names(in_channel).map(|line| line.without.len()),
         Some(3)
     );
+}
+
+/// The key with its top bit flipped: another key to Ed25519, the same to
+/// X25519.
+fn twin(n: u8) -> (String, [u8; 32]) {
+    let mut twin = key(n).1;
+    twin[31] ^= 0x80;
+    (encode_public_key(&twin).unwrap(), twin)
+}
+
+/// A twin counts as its key: once as a device, and in the gate.
+#[test]
+fn a_keys_twin_counts_as_the_key() {
+    assert!(
+        is_usable_public_key(&twin(11).1),
+        "a twin is a key that can be used"
+    );
+    let both = format!("{} alice\n{} bob\n", key(11).0, twin(11).0);
+    assert_eq!(why(&both).why, KEY_TWICE);
+    let in_without = format!(
+        "channel {ID} {} without 2 {} {}",
+        key(1).0,
+        key(11).0,
+        twin(11).0
+    );
+    assert_eq!(why(&in_without).why, KEY_TWICE);
+    let gated = format!("{}\n{} stolen-twin\n", channel(&[11]), twin(11).0);
+    let members = read(gated.as_bytes()).unwrap();
+    assert_eq!(members.gated(|_| false).len(), 1);
+    assert_eq!(members.names(|_| false), None);
+}
+
+#[test]
+fn a_line_that_read_would_refuse_is_not_printed() {
+    let line = |relays: Vec<[u8; 32]>, without: Vec<[u8; 32]>| ChannelLine {
+        channel: [9; 32],
+        relays,
+        without,
+    };
+    assert_eq!(line(vec![], vec![]).to_line(), Err(RELAYS));
+    assert_eq!(
+        line(vec![key(1).1, key(2).1, key(3).1], vec![]).to_line(),
+        Err(RELAYS)
+    );
+    assert_eq!(
+        line(vec![key(1).1, key(1).1], vec![]).to_line(),
+        Err(KEY_TWICE)
+    );
+    // A key after `without` twice, or with its twin, is printed once.
+    let mut doubled = vec![key(9).1, key(10).1, key(9).1];
+    doubled.push(twin(10).1);
+    let printed = line(vec![key(1).1], doubled).to_line().unwrap();
+    let read_back = read(printed.as_bytes()).unwrap().channel.unwrap();
+    assert_eq!(read_back.without, vec![key(9).1, key(10).1]);
+}
+
+/// The checks the first tests did not reach: another spelling of a key, a
+/// key that cannot be used, a count with a sign, the exact bound, and a
+/// list with no channel line.
+#[test]
+fn the_checks_at_the_edges_hold() {
+    use bech32::{Bech32m, Hrp};
+    let other = bech32::encode::<Bech32m>(Hrp::parse("cordelia_pk").unwrap(), &key(10).1).unwrap();
+    assert_eq!(why(&format!("{other} alice")).why, NOT_A_KEY);
+    let mut identity = [0u8; 32];
+    identity[0] = 1;
+    let unusable = encode_public_key(&identity).unwrap();
+    assert_eq!(why(&format!("{unusable} alice")).why, NOT_A_KEY);
+    let signed = format!("channel {ID} {} without +1 {}", key(1).0, key(9).0);
+    assert_eq!(why(&signed).why, NOT_A_COUNT);
+    let device = format!("{} alice\n", key(10).0);
+    let at_bound = format!(
+        "{device}#{}\n",
+        "x".repeat(MEMBERS_FILE_MAX_BYTES - device.len() - 2)
+    );
+    assert_eq!(at_bound.len(), MEMBERS_FILE_MAX_BYTES);
+    assert!(read(at_bound.as_bytes()).is_ok());
+    assert_eq!(why(&format!("{at_bound} ")).why, TOO_LARGE);
+    let no_channel = read(format!("{} alice\n", key(10).0).as_bytes()).unwrap();
+    assert!(no_channel.gated(|_| false).is_empty());
+    assert_eq!(no_channel.names(|_| false), None);
+}
+
+#[test]
+fn a_tab_a_carriage_return_and_a_comment_after_words_are_named() {
+    assert_eq!(why(&format!("{}\talice", key(10).0)).why, TAB);
+    assert_eq!(why(&format!("{} alice\r\n", key(10).0)).why, CARRIAGE);
+    assert_eq!(
+        why(&format!("{} alice # her laptop", key(10).0)).why,
+        COMMENT_AFTER
+    );
+    assert_eq!(why(&format!("{} # note", channel(&[]))).why, COMMENT_AFTER);
 }
