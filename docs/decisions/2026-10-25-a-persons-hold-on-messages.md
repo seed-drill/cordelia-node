@@ -55,7 +55,7 @@ For one: "You have read the other one, `<where>`."
 
 For one: "You have read 1 other message, `<where>`, so it is not shown." So "You have read 10 other messages, 3 on this device and 7 on "laptop", so they are not shown." tells you whose word hides them (rule 5).
 
-In each message it lists, "Not read by a person here." becomes "Not read by a person."
+In each message it lists, "Not read by a person here." becomes "Not read by a person." (Since 6 November 2026 that line is not printed: `log` lists no message that a person has read, and each message's line was made terser on the person's ruling, issue #228; the messages record's 4.1.)
 
 The question at a terminal:
 
