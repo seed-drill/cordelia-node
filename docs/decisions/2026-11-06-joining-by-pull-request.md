@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Proposed, for the person's decision. Revised five times after its reviews (section 13). For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
+**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Revised five times after its reviews (section 13). To be built: a reviewed plan first. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -276,8 +276,8 @@ Five reviews, each checked in the code before its findings were taken. Each roun
 - **Every `channel` line ends with `without` and a count,** so a line cut short does not parse, and a following device's making anew carries the current `without` keys over (fifth review).
 - **Hand-overs go in turns, and takes come only within the hour of the latest read.** Eight places held by devices that were off, and a stale share, had each blocked or misled a join (first and second reviews).
 
-## 14. Questions for the person
+## 14. The person's answers (6 November)
 
-1. **`cordelia shared seen <name>`** clears the notice of a join (rule 4.5) and of a changed channel line (rule 6), on each device: is the word right?
-2. **The default name `owner/name`:** right?
-3. **A private repository's list comes only from the person's own fetches,** because every way of giving the node credentials can ask. A read-only token in the node's configuration would let it fetch a private repository itself. Leave that for later?
+1. **`cordelia shared seen <name>`** clears the notice of a join (rule 4.5) and of a changed channel line (rule 6), on each device: yes.
+2. **The default name is the repository's `owner/name`:** yes.
+3. **A private repository's list comes only from the person's own fetches.** A read-only token in the node's configuration is left for later: yes.
