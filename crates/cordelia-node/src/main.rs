@@ -538,8 +538,9 @@ enum MsgCommand {
         /// give the folder you gave `msg summary --folder`
         #[arg(long, value_name = "DIR")]
         folder: Option<String>,
-        /// Also show the four words of the device that sent it, its
-        /// thread, and how many messages the two agents have here
+        /// For a message from your own agents, also show the four words
+        /// of the device that sent it, its thread, and how many messages
+        /// the two agents have here
         #[arg(short = 'v', long)]
         verbose: bool,
     },
