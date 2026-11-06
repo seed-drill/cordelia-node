@@ -7,7 +7,7 @@ use rusqlite::Connection;
 use crate::StorageError;
 
 /// Current schema version (incremented per migration).
-pub const SCHEMA_VERSION: u32 = 32;
+pub const SCHEMA_VERSION: u32 = 33;
 
 /// The schema version of 0.2.0-alpha.8, the last release before the
 /// entries of a channel from its secret: what the tests of the first start
@@ -1867,6 +1867,76 @@ CREATE TABLE shared_anew_not_clean (
 );
 "#;
 
+/// Migration v33: what a device keeps of the repositories it follows
+/// (decision 2026-11-06 (joining), rules 2 to 6). Each column takes only its
+/// type and its bound.
+///
+/// - `shared_follows`: each repository this device follows, by its identity
+///   (`host/owner/name`): the clone's remote and path, when it was
+///   followed, the last commit read with when and from where (0 the host,
+///   1 the clone), the bytes of the last list read, and the node's turn
+///   among the keys it hands over to.
+/// - `shared_follow_typed`: the node's own typings of listed keys, for each
+///   repository, apart from the person's (`shared_typed_keys`), with what
+///   became of each.
+/// - `shared_follow_notices`: the notices a person clears with `cordelia
+///   shared seen`: a key that joined from the list (1), and a changed
+///   channel line (2), each with its commit.
+/// - `shared_shares.by_node`: whether the node made the share, not a person.
+/// - `shared_anew_made.left_out` and `line`: the keys a making anew left
+///   out, 32 bytes each, and the channel line it printed.
+///
+/// A relay keeps nothing in any of them.
+const MIGRATION_V33: &str = r#"
+CREATE TABLE shared_follows (
+    identity      TEXT PRIMARY KEY CHECK(typeof(identity) = 'text'
+                                         AND length(CAST(identity AS BLOB)) BETWEEN 5 AND 300),
+    remote        TEXT NOT NULL CHECK(typeof(remote) = 'text'
+                                      AND length(CAST(remote AS BLOB)) BETWEEN 1 AND 255),
+    clone         TEXT NOT NULL CHECK(typeof(clone) = 'text'
+                                      AND length(CAST(clone AS BLOB)) BETWEEN 1 AND 4096),
+    followed_at   INTEGER NOT NULL CHECK(typeof(followed_at) = 'integer'),
+    last_commit   TEXT CHECK(last_commit IS NULL
+                             OR (typeof(last_commit) = 'text' AND length(last_commit) IN (40, 64))),
+    last_read_at  INTEGER CHECK(last_read_at IS NULL OR typeof(last_read_at) = 'integer'),
+    read_from     INTEGER CHECK(read_from IS NULL OR read_from IN (0, 1)),
+    list          BLOB CHECK(list IS NULL OR (typeof(list) = 'blob' AND length(list) <= 16384)),
+    turn          INTEGER NOT NULL DEFAULT 0 CHECK(typeof(turn) = 'integer' AND turn >= 0),
+    CHECK((last_commit IS NULL) = (last_read_at IS NULL)),
+    CHECK((last_commit IS NULL) = (read_from IS NULL))
+);
+
+CREATE TABLE shared_follow_typed (
+    identity  TEXT NOT NULL CHECK(typeof(identity) = 'text'),
+    key       BLOB NOT NULL CHECK(typeof(key) = 'blob' AND length(key) = 32),
+    typed_at  INTEGER NOT NULL CHECK(typeof(typed_at) = 'integer'),
+    became    TEXT CHECK(became IS NULL
+                         OR (typeof(became) = 'text' AND length(CAST(became AS BLOB)) <= 64)),
+    detail    TEXT CHECK(detail IS NULL
+                         OR (typeof(detail) = 'text' AND length(CAST(detail AS BLOB)) <= 1024)),
+    PRIMARY KEY (identity, key)
+);
+
+CREATE TABLE shared_follow_notices (
+    identity   TEXT NOT NULL CHECK(typeof(identity) = 'text'),
+    kind       INTEGER NOT NULL CHECK(kind IN (1, 2)),
+    key        BLOB NOT NULL CHECK(typeof(key) = 'blob'
+                                   AND ((kind = 1 AND length(key) = 32)
+                                        OR (kind = 2 AND length(key) = 0))),
+    at_commit  TEXT NOT NULL CHECK(typeof(at_commit) = 'text' AND length(at_commit) IN (40, 64)),
+    at         INTEGER NOT NULL CHECK(typeof(at) = 'integer'),
+    PRIMARY KEY (identity, kind, key)
+);
+
+ALTER TABLE shared_shares ADD COLUMN by_node INTEGER NOT NULL DEFAULT 0 CHECK(by_node IN (0, 1));
+
+ALTER TABLE shared_anew_made ADD COLUMN left_out BLOB CHECK(left_out IS NULL
+    OR (typeof(left_out) = 'blob' AND length(left_out) % 32 = 0 AND length(left_out) <= 32768));
+
+ALTER TABLE shared_anew_made ADD COLUMN line TEXT CHECK(line IS NULL
+    OR (typeof(line) = 'text' AND length(CAST(line AS BLOB)) <= 16384));
+"#;
+
 /// Run `sql` and set the schema version to `version` as one transaction:
 /// both happen, or neither. For a step that cannot be run twice (a column
 /// added), so that a start cut short between the two leaves it to be run
@@ -2180,6 +2250,11 @@ fn migrate_from_v13(conn: &Connection, current: u32) -> Result<u32, StorageError
     if current < 32 {
         tracing::info!("applying migration v32 (channels made anew)");
         migrate_in_one(conn, MIGRATION_V32, 32)?;
+    }
+
+    if current < 33 {
+        tracing::info!("applying migration v33 (the repositories followed)");
+        migrate_in_one(conn, MIGRATION_V33, 33)?;
     }
 
     Ok(conn.pragma_query_value(None, "user_version", |row| row.get(0))?)
@@ -6795,6 +6870,7 @@ mod tests {
                AND name NOT LIKE 'shared_relay_%' AND name NOT LIKE 'shared_take_out_%'
                AND name NOT LIKE 'shared_typed_%' AND name NOT LIKE 'shared_share%'
                AND name NOT LIKE '%shared_msg_%' AND name NOT LIKE '%shared_anew_%'
+               AND name NOT LIKE '%shared_follow%'
              ORDER BY name",
         )
         .unwrap()
@@ -6819,6 +6895,7 @@ mod tests {
                 || NEW_IN_V30.contains(&name)
                 || name.contains("shared_msg_")
                 || name.contains("shared_anew_")
+                || name.contains("shared_follow")
                 || (name.starts_with("sqlite_autoindex_shared_") && !name.contains("shared_list"))
         })
     }
@@ -6854,6 +6931,7 @@ mod tests {
                 || NEW_IN_V30.contains(&name)
                 || name.contains("shared_msg_")
                 || name.contains("shared_anew_")
+                || name.contains("shared_follow")
                 || name.starts_with("sqlite_autoindex_shared_relay_")
                 || name.starts_with("sqlite_autoindex_shared_typed_")
                 || name.starts_with("sqlite_autoindex_shared_share")
@@ -7010,6 +7088,7 @@ mod tests {
                 NEW_IN_V30.contains(&name)
                     || name.contains("shared_msg_")
                     || name.contains("shared_anew_")
+                    || name.contains("shared_follow")
                     || name.starts_with("sqlite_autoindex_shared_typed_")
                     || name.starts_with("sqlite_autoindex_shared_share")
             })
@@ -7070,10 +7149,10 @@ mod tests {
             "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, NULL, NULL, NULL)",
             "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, NULL, zeroblob(32), NULL, NULL)",
             "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, zeroblob(31), NULL, NULL)",
-            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(34), 9, 9, 0)",
-            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), -1, 9, 0)",
-            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9007199254740992, 9, 0)",
-            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9, 9, 2)",
+            "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(34), 9, 9, 0)",
+            "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), -1, 9, 0)",
+            "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9007199254740992, 9, 0)",
+            "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 9, 9, 2)",
             "INSERT INTO shared_share_sent VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9)",
         ];
         for refused in refused {
@@ -7081,7 +7160,7 @@ mod tests {
         }
         for taken in [
             "INSERT INTO shared_typed_keys VALUES (zeroblob(32), 'r', 9, 9, zeroblob(32), 'taken', NULL)",
-            "INSERT INTO shared_shares VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(65), 9, 9, 1)",
+            "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(65), 9, 9, 1)",
             "INSERT INTO shared_share_sent VALUES (zeroblob(32), zeroblob(32), zeroblob(32), 9)",
         ] {
             assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
@@ -7147,7 +7226,12 @@ mod tests {
         .unwrap();
         let but = |conn: &Connection| {
             everything_but(conn, |name| {
-                name.contains("shared_msg_") || name.contains("shared_anew_")
+                name.contains("shared_msg_")
+                    || name.contains("shared_anew_")
+                    || name.contains("shared_follow")
+                    // Step 33 adds a column to it.
+                    || name == "shared_shares"
+                || name.contains("shared_follow")
             })
         };
         let before = but(&conn);
@@ -7300,9 +7384,10 @@ mod tests {
             new_in_v32(&conn).is_empty(),
             "the tables go with the version"
         );
-        init_db(&conn).unwrap();
+        // To this step, and no later one: step 33 adds a column to a table
+        // of step 30, which `but` takes in.
+        migrate_in_one(&conn, MIGRATION_V32, 32).unwrap();
         assert_eq!(version(&conn), 32);
-        assert_eq!(version(&conn), SCHEMA_VERSION);
         assert_eq!(new_in_v32(&conn), NEW_IN_V32);
         assert_eq!(but(&conn), before);
         conn.execute_batch(
@@ -7313,7 +7398,6 @@ mod tests {
         )
         .unwrap();
         migrate_in_one(&conn, MIGRATION_V32, 32).unwrap();
-        init_db(&conn).unwrap();
         assert_eq!(but(&conn), before);
         for table in NEW_IN_V32 {
             let rows: i64 = conn
@@ -7353,6 +7437,144 @@ mod tests {
             "INSERT INTO shared_anew_not_clean VALUES (zeroblob(32), 9, 0, 1)",
         ] {
             assert_eq!(conn.execute(taken, []), Ok(1), "{taken}");
+        }
+    }
+
+    /// What the step to version 33 adds: three tables.
+    const NEW_IN_V33: [&str; 3] = [
+        "shared_follow_notices",
+        "shared_follow_typed",
+        "shared_follows",
+    ];
+
+    /// The step to version 33 (decision 2026-11-06 (joining), rules 2 to 6):
+    /// from a database at step 32 that holds rows of the steps before it,
+    /// it adds the tables of the repositories followed, the node's own
+    /// typings and the notices, empty; a column to `shared_shares` and two
+    /// to `shared_anew_made`, the rows there keeping their values with the
+    /// new columns at their defaults; and changes no other row or
+    /// definition. A failure leaves none of it, and the step asked for
+    /// twice is run once. Each column takes only its type and its bound.
+    #[test]
+    fn step_33_adds_its_tables_and_columns_and_changes_no_older_row() {
+        let version = |conn: &Connection| -> u32 {
+            conn.pragma_query_value(None, "user_version", |row| row.get(0))
+                .unwrap()
+        };
+        let conn = at_v26();
+        for (sql, at) in [
+            (MIGRATION_V27, 27),
+            (MIGRATION_V28, 28),
+            (MIGRATION_V29, 29),
+            (MIGRATION_V30, 30),
+            (MIGRATION_V31, 31),
+            (MIGRATION_V32, 32),
+        ] {
+            migrate_in_one(&conn, sql, at).unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone)
+                 VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 3, 9, 0);
+             INSERT INTO shared_anew_made VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 2, 3, 0);",
+        )
+        .unwrap();
+        let tables = |conn: &Connection| -> Vec<String> {
+            let mut names: Vec<String> = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            names.retain(|name: &String| NEW_IN_V33.contains(&name.as_str()));
+            names
+        };
+        let altered = ["shared_shares", "shared_anew_made"];
+        let but = |conn: &Connection| {
+            everything_but(conn, |name| {
+                name.contains("shared_follow") || altered.contains(&name)
+            })
+        };
+        type Rows = (Vec<(Vec<u8>, i64, i64, i64)>, Vec<(i64, i64, i64)>);
+        let rows = |conn: &Connection| -> Rows {
+            let shares = conn
+                .prepare("SELECT key, rev, made, gone FROM shared_shares")
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let made = conn
+                .prepare("SELECT rev, past_64, let_go FROM shared_anew_made")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            (shares, made)
+        };
+        let before = (but(&conn), rows(&conn));
+        assert!(tables(&conn).is_empty());
+        let failing = format!("{MIGRATION_V33} SELECT no_such_function();");
+        assert!(migrate_in_one(&conn, &failing, 33).is_err());
+        assert_eq!(version(&conn), 32);
+        assert!(tables(&conn).is_empty(), "the tables go with the version");
+        assert!(
+            conn.prepare("SELECT by_node FROM shared_shares").is_err(),
+            "and so does the column"
+        );
+        init_db(&conn).unwrap();
+        assert_eq!(version(&conn), 33);
+        assert_eq!(version(&conn), SCHEMA_VERSION);
+        assert_eq!(tables(&conn), NEW_IN_V33);
+        assert_eq!((but(&conn), rows(&conn)), before);
+        let defaults: (i64, Option<Vec<u8>>, Option<String>) = conn
+            .query_row(
+                "SELECT s.by_node, m.left_out, m.line FROM shared_shares s, shared_anew_made m",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(defaults, (0, None, None));
+        migrate_in_one(&conn, MIGRATION_V33, 33).unwrap();
+        init_db(&conn).unwrap();
+        assert_eq!((but(&conn), rows(&conn)), before);
+        conn.execute_batch("DELETE FROM shared_shares; DELETE FROM shared_anew_made;")
+            .unwrap();
+        let commit = "a".repeat(40);
+        for refused in [
+            "INSERT INTO shared_follows (identity, remote, clone, followed_at) VALUES ('a/b', 'origin', '/r', 9)".to_string(),
+            "INSERT INTO shared_follows (identity, remote, clone, followed_at) VALUES ('example.org/o/n', '', '/r', 9)".to_string(),
+            "INSERT INTO shared_follows (identity, remote, clone, followed_at) VALUES ('example.org/o/n', 'origin', '', 9)".to_string(),
+            "INSERT INTO shared_follows (identity, remote, clone, followed_at) VALUES ('example.org/o/n', 'origin', '/r', 'nine')".to_string(),
+            format!("INSERT INTO shared_follows (identity, remote, clone, followed_at, last_commit, last_read_at, read_from) VALUES ('example.org/o/n', 'origin', '/r', 9, '{}', 9, 0)", "a".repeat(39)),
+            format!("INSERT INTO shared_follows (identity, remote, clone, followed_at, last_commit) VALUES ('example.org/o/n', 'origin', '/r', 9, '{commit}')"),
+            format!("INSERT INTO shared_follows (identity, remote, clone, followed_at, last_commit, last_read_at, read_from) VALUES ('example.org/o/n', 'origin', '/r', 9, '{commit}', 9, 2)"),
+            "INSERT INTO shared_follows (identity, remote, clone, followed_at, list) VALUES ('example.org/o/n', 'origin', '/r', 9, zeroblob(16385))".to_string(),
+            "INSERT INTO shared_follows (identity, remote, clone, followed_at, turn) VALUES ('example.org/o/n', 'origin', '/r', 9, -1)".to_string(),
+            "INSERT INTO shared_follow_typed (identity, key, typed_at) VALUES ('example.org/o/n', zeroblob(31), 9)".to_string(),
+            format!("INSERT INTO shared_follow_typed (identity, key, typed_at, became) VALUES ('example.org/o/n', zeroblob(32), 9, '{}')", "b".repeat(65)),
+            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 3, zeroblob(32), '{commit}', 9)"),
+            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 1, zeroblob(0), '{commit}', 9)"),
+            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 2, zeroblob(32), '{commit}', 9)"),
+            "INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 1, zeroblob(32), 'abc', 9)".to_string(),
+            "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone, by_node) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 1, 9, 0, 2)".to_string(),
+            "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, left_out) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, zeroblob(33))".to_string(),
+            format!("INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, line) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, '{}')", "c".repeat(16385)),
+        ] {
+            assert!(conn.execute(&refused, []).is_err(), "{refused}");
+        }
+        for taken in [
+            format!("INSERT INTO shared_follows VALUES ('example.org/o/n', 'origin', '/r', 9, '{commit}', 9, 1, zeroblob(16384), 3)"),
+            "INSERT INTO shared_follow_typed VALUES ('example.org/o/n', zeroblob(32), 9, 'taken', NULL)".to_string(),
+            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 1, zeroblob(32), '{commit}', 9)"),
+            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 2, zeroblob(0), '{}', 9)", "d".repeat(64)),
+            "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone, by_node) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 1, 9, 0, 1)".to_string(),
+            "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, left_out, line) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, zeroblob(64), 'channel x without 0')".to_string(),
+        ] {
+            assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
         }
     }
 
