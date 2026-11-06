@@ -1735,10 +1735,11 @@ pub fn make_move(
 /// The keys that the offer which made the channel `channel` sealed to and
 /// that have not written there yet, but this device: "not moved yet" (§7).
 /// An offer counts only where this device made it, or its maker has
-/// written in this channel: only a holder of this channel's seed can. A
-/// key left out still holds the old channel, and can write an offer there
-/// that names this one, even with a seal of this device's copied from
-/// another; its keys are not taken (#291's reviews).
+/// written in this channel and is not a key the person removed: only a
+/// holder of this channel's seed can write there. A key left out still
+/// holds the old channel, and can write an offer there that names this
+/// one, even with a seal of this device's copied from another; its keys
+/// are not taken (#291's reviews).
 pub fn not_moved_yet(
     conn: &Connection,
     own: &[u8; 32],
@@ -1758,12 +1759,18 @@ pub fn not_moved_yet(
         .filter(|key| key.first_held.is_some())
         .map(|key| key.key)
         .collect();
+    // A maker the person removed counts for nothing, though it wrote here.
+    let removed = match held(conn)? {
+        Some(held) => crate::person::removed_known(conn, &held.statement.statement)?,
+        None => Vec::new(),
+    };
     let mut keys = Vec::new();
     for offer in st(rows::offers_into(conn, channel))? {
         if offer.channel != from {
             continue;
         }
-        if offer.maker != *own && !wrote.contains(&offer.maker) {
+        if offer.maker != *own && (!wrote.contains(&offer.maker) || removed.contains(&offer.maker))
+        {
             continue;
         }
         for key in offer.sealed_to {
