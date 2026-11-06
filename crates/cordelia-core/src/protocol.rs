@@ -2910,6 +2910,27 @@ pub const SHARED_READ_PREFIX: &str = "sread/";
 /// the device's key follows it, and only its own entry there is its list.
 pub const PERSONAL_SHARED_PREFIX: &str = "shared/";
 
+// ── A repository's list (decision 2026-11-06 (joining)) ─────────────
+
+/// The most bytes of a repository's `.cordelia/members` that a device
+/// reads (decision 2026-11-06 (joining), rule 1): 16 KiB, room for the
+/// channel line with a long `without`, and 64 devices with their labels.
+/// A larger file is not read, and the last list read stands.
+pub const MEMBERS_FILE_MAX_BYTES: usize = 16_384;
+
+/// How long the node's fetch of a repository's list may take (decision
+/// 2026-11-06 (joining), rule 3): git is stopped after this, by TERM and
+/// then KILL, and the node clears its own repository's locks. A fetch of
+/// one commit's changes takes seconds; one that has not ended in a minute
+/// is waiting on something that will not come, and the next read tries
+/// again.
+pub const MEMBERS_FETCH_MAX_SECS: u64 = 60;
+
+/// How long git is given, after TERM, to remove the locks it holds before
+/// it is killed (decision 2026-11-06 (joining), rule 3): git removes them
+/// as it ends, in well under this.
+pub const MEMBERS_FETCH_TERM_SECS: u64 = 2;
+
 // Checked at compile time (decision 2026-10-10 §14). The largest card is
 // the seed and two relays behind their count: with the form, the time and
 // the key it is for, it fits a share; and it fits an anew record, whose
