@@ -31,6 +31,11 @@
 //! [`messages`], behind the sender ([`sender`]), the reader ([`reader`])
 //! and the marks ([`marks`]).
 //!
+//! A repository's list of the devices that share its channel is read with
+//! git through [`git_list`] (decision 2026-11-06 (joining)): which
+//! repository a clone is, a read of the clone's copy of its list, and
+//! never back, each with nothing of the person's reaching git.
+//!
 //! A personal node serves [`configure_device_routes`]: it carries no
 //! channel of the older kind (decision 2026-10-04 §10). A node of any
 //! other role serves [`configure_routes`], with the Channels API of the
@@ -51,6 +56,7 @@ pub mod entries;
 pub mod error;
 pub mod first_start;
 pub mod found;
+pub mod git_list;
 pub mod handlers;
 pub mod history;
 pub mod leaving;

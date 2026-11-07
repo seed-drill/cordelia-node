@@ -3377,6 +3377,8 @@ reason there:
 
 **`MEMBERS_LABEL_MAX_CHARS` = 32.** A label is for people reading the file: short enough to stay on one line beside a key, long enough for `alice-laptop-2026` and the like. The characters are `a-z`, `0-9`, `.`, `_` and `-`, so a label needs no escaping anywhere it is shown.
 
+**`MEMBERS_GIT_TERM_SECS` = 2.** How long git is given after TERM, where a read of a clone has not ended within `STREAM_TIMEOUT_SECS`, before its process group is killed (rule 3). A read of a clone is a few local commands of git, each of which ends in milliseconds; one that has not ended in ten seconds is stuck, on a disk or a lock. Git ends on TERM in milliseconds, removing whatever it was writing for itself; two seconds is room for a loaded machine, and KILL ends the rest. The node's reads of a clone write nothing in it.
+
 ## 13. Memory Across Connections (Change F)
 
 These bound what one connection of an unlisted peer can make a relay hold,

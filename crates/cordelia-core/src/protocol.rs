@@ -2922,6 +2922,12 @@ pub const MEMBERS_FILE_MAX_BYTES: usize = 16_384;
 /// `a-z`, `0-9`, `.`, `_` and `-`.
 pub const MEMBERS_LABEL_MAX_CHARS: usize = 32;
 
+/// How long git is given to end after TERM, where a read of a clone has
+/// not ended within `STREAM_TIMEOUT_SECS`, before its process group is
+/// killed (decision 2026-11-06 (joining), rule 3): git ends on TERM in
+/// well under this.
+pub const MEMBERS_GIT_TERM_SECS: u64 = 2;
+
 // Checked at compile time (decision 2026-10-10 §14). The largest card is
 // the seed and two relays behind their count: with the form, the time and
 // the key it is for, it fits a share; and it fits an anew record, whose
