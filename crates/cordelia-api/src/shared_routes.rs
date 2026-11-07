@@ -347,7 +347,7 @@ pub(crate) fn follow_read(
         state,
         body.look,
         body.said_yes_to.as_deref(),
-        |conn, own, _| crate::following::plan(conn, identity, own, &body.folder, read, body.new),
+        |conn, own, _| crate::following::plan(conn, identity, own, read, body.new),
         |conn, _, following, now| {
             let said = crate::following::make(conn, identity, following, now)?;
             // The node reads the list now, not at its next turn (rule 3).

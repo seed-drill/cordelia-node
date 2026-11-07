@@ -1272,7 +1272,8 @@ pub fn keys_that_read(conn: &Connection, now: i64) -> Result<Vec<TypedForChannel
 }
 
 /// What became of the shares found for a key typed for a channel
-/// ([`take_share`]).
+/// ([`take_share`]), or for a key the node typed (decision 2026-11-06
+/// (joining), rule 4.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Became {
     /// The key reads nothing now: typed again, spent, or its hour gone.
@@ -1285,15 +1286,21 @@ pub enum Became {
     Refused(&'static str),
 }
 
+/// What [`take_one`] came to: [`Became`], with the line of a refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Took {
+    NotNow,
+    Nothing,
+    Taken([u8; 32]),
+    Refused(Refusal),
+}
+
 /// Take, for the key `typed`, the one share among `found`, each an entry
 /// that the judge passed by rules 1 to 8 (`crate::shared::accept_typed`),
-/// at every relay that was read (§3.2). Where they hold more than one
-/// share, of more than one channel, none is taken. Where the one share is
-/// of a channel the person holds, the person holds 16, the device does not
-/// stand applied with sync on, or a relay of its card is not, by key, one of
-/// the device's own, nothing is taken, and the reason is kept. Where all
-/// hold, in one transaction: the channel is filed as taken from the key,
-/// the typing is spent, and the empty anew record is written.
+/// at every relay that was read (§3.2), as [`take_one`] does. The typing
+/// must read now: typed at that time, within its hour, with no share taken
+/// under it. Where nothing is taken for a reason, the reason is kept with
+/// the typing; where it is taken, the typing is spent.
 pub fn take_share(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -1302,7 +1309,6 @@ pub fn take_share(
     own_relays: &[OwnRelay],
     now: i64,
 ) -> Result<Became, PersonError> {
-    let own = identity.public_key();
     in_one(conn, || {
         let reads = rows::typed_key(conn, &typed.key)?.filter(|row| {
             row.typed_at == typed.typed_at
@@ -1312,109 +1318,165 @@ pub fn take_share(
         let Some(row) = reads else {
             return Ok(Became::NotNow);
         };
-        let Some((_, secret)) = share_pair(identity, &typed.key) else {
-            return Ok(Became::NotNow);
+        let taker = Taker {
+            key: row.key,
+            name: &row.name,
+            only: None,
         };
-        let mut shares: Vec<Share> = Vec::new();
-        for entry in found {
-            let Ok(inside) = entry.open(&secret) else {
-                continue;
-            };
-            let Ok(share) = Share::from_value(&inside.value) else {
-                continue;
-            };
-            let id = share.card.channel_id()?;
-            if !shares
-                .iter()
-                .any(|one| one.card.channel_id().ok() == Some(id))
-            {
-                shares.push(share);
-            }
-        }
-        let keep = |word: &'static str, line: String| -> Result<Became, PersonError> {
-            rows::became(conn, &row.key, row.typed_at, word, Some(&line))?;
-            Ok(Became::Refused(word))
-        };
-        let Some(held) = held(conn)? else {
-            return Ok(Became::NotNow);
-        };
-        match shares.len() {
-            0 => return Ok(Became::Nothing),
-            1 => {}
-            n => {
-                let line = format!(
-                    "{} has {n} shares waiting for this device: nothing was taken. Ask them to \
-                     share the one channel again, which takes back the others, and run cordelia \
-                     accept again.",
-                    sender_form(conn, &held, &own, &row.key)?
-                );
-                return keep("more_than_one_share", line);
-            }
-        }
-        let share = shares.remove(0);
-        let channel = share.card.channel_id()?;
-        // Rule 9: a channel the person holds, and the 16.
-        let filings = filed(conn)?;
-        if let Some(filing) = filings.iter().find(|filing| filing.channel == channel) {
-            let line = format!(
-                "Your devices hold this channel already, as \"{}\": nothing was taken.",
-                crate::messages::cleaned(&filing.name)
-            );
-            return keep("already_held", line);
-        }
-        // A channel the person dropped or moved from, while the lists keep
-        // its drop, is not taken back, as `shared move` refuses it (the
-        // review of #281, low 2): a key left out of it could share it again.
-        if crate::shared_anew::held_or_dropped(conn, None)?.contains(&channel) {
-            let line = "Your devices dropped this channel, or moved from it: nothing was taken."
-                .to_string();
-            return keep("already_held", line);
-        }
-        if filings.len() >= SHARED_MAX_CHANNELS {
-            return keep("too_many_channels", TOO_MANY_CHANNELS.into());
-        }
-        // Rule 10.
-        match standing(conn) {
-            Ok(_) => {}
-            Err(Failed::Refused(refusal)) => return keep(refusal.word, refusal.line),
-            Err(Failed::Error(e)) => return Err(e),
-        }
-        // Rule 11: every relay of the card is, by key, one of the device's
-        // own.
-        if !all_own(own_relays, &share.card) {
-            let other = share
-                .card
-                .relays()
-                .keys()
-                .iter()
-                .find(|key| !own_relays.iter().any(|relay| relay.key == **key))
-                .copied()
-                .unwrap_or_default();
-            let line = format!(
-                "{} is not one of your relays, and a shared channel lives only at your own \
-                 relays: nothing was done.",
-                relay_shown(own_relays, &other)
-            );
-            return keep("not_own_relay", line);
-        }
-        // The name may have been taken since it was typed.
-        if let Err(Failed::Refused(refusal)) = name_free(conn, &row.name) {
-            return keep(refusal.word, refusal.line);
-        }
-        let filing = Filing {
-            channel,
-            card: share.card,
-            name: row.name.clone(),
-            came: Came::Taken(row.key),
-        };
-        match lists::act(conn, identity, Do::File(filing), now)? {
-            Done::Made(_) => {}
-            Done::Refused(_) => return keep("too_many_channels", TOO_MANY_CHANNELS.into()),
-        }
-        rows::taken(conn, &row.key, row.typed_at, &channel, now)?;
-        write_empty_anew_records(conn, identity, now)?;
-        Ok(Became::Taken(channel))
+        Ok(
+            match take_one(conn, identity, &taker, found, own_relays, now)? {
+                Took::NotNow => Became::NotNow,
+                Took::Nothing => Became::Nothing,
+                Took::Refused(refusal) => {
+                    rows::became(
+                        conn,
+                        &row.key,
+                        row.typed_at,
+                        refusal.word,
+                        Some(&refusal.line),
+                    )?;
+                    Became::Refused(refusal.word)
+                }
+                Took::Taken(channel) => {
+                    rows::taken(conn, &row.key, row.typed_at, &channel, now)?;
+                    Became::Taken(channel)
+                }
+            },
+        )
     })
+}
+
+/// Who takes a share: the key whose share it is, the name the channel is
+/// filed under, and, for the node's take of a repository's channel, the one
+/// channel it may take (decision 2026-11-06 (joining), rule 4.4).
+#[derive(Debug, Clone)]
+pub(crate) struct Taker<'a> {
+    pub key: [u8; 32],
+    pub name: &'a str,
+    pub only: Option<[u8; 32]>,
+}
+
+/// Take, for `taker`, the one share among `found`, each an entry that the
+/// judge passed by rules 2 to 8 (§3.2), at every relay that was read, in
+/// the caller's transaction. A share of another channel than `taker.only`
+/// names, where it names one, is no share to take. Where they hold more
+/// than one share, of more than one channel, none is taken. Where the one
+/// share is of a channel the person holds, dropped or moved from, the
+/// person holds 16, the device does not stand applied with sync on, a
+/// relay of its card is not, by key, one of the device's own, or the name
+/// is taken, nothing is taken, and why is said. Where all hold: the channel
+/// is filed on every device of the person's as taken from the key, and the
+/// empty anew record is written.
+pub(crate) fn take_one(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    taker: &Taker<'_>,
+    found: &[CheckedEntry],
+    own_relays: &[OwnRelay],
+    now: i64,
+) -> Result<Took, PersonError> {
+    let own = identity.public_key();
+    let Some((_, secret)) = share_pair(identity, &taker.key) else {
+        return Ok(Took::NotNow);
+    };
+    let mut shares: Vec<Share> = Vec::new();
+    for entry in found {
+        let Ok(inside) = entry.open(&secret) else {
+            continue;
+        };
+        let Ok(share) = Share::from_value(&inside.value) else {
+            continue;
+        };
+        let id = share.card.channel_id()?;
+        if taker.only.is_some_and(|only| only != id) {
+            continue;
+        }
+        if !shares
+            .iter()
+            .any(|one| one.card.channel_id().ok() == Some(id))
+        {
+            shares.push(share);
+        }
+    }
+    let keep = |word: &'static str, line: String| Ok(Took::Refused(Refusal { word, line }));
+    let Some(held) = held(conn)? else {
+        return Ok(Took::NotNow);
+    };
+    match shares.len() {
+        0 => return Ok(Took::Nothing),
+        1 => {}
+        n => {
+            let line = format!(
+                "{} has {n} shares waiting for this device: nothing was taken. Ask them to share \
+                 the one channel again, which takes back the others, and run cordelia accept \
+                 again.",
+                sender_form(conn, &held, &own, &taker.key)?
+            );
+            return keep("more_than_one_share", line);
+        }
+    }
+    let share = shares.remove(0);
+    let channel = share.card.channel_id()?;
+    // Rule 9: a channel the person holds, and the 16.
+    let filings = filed(conn)?;
+    if let Some(filing) = filings.iter().find(|filing| filing.channel == channel) {
+        let line = format!(
+            "Your devices hold this channel already, as \"{}\": nothing was taken.",
+            crate::messages::cleaned(&filing.name)
+        );
+        return keep("already_held", line);
+    }
+    // A channel the person dropped or moved from, while the lists keep
+    // its drop, is not taken back, as `shared move` refuses it (the
+    // review of #281, low 2): a key left out of it could share it again.
+    if crate::shared_anew::held_or_dropped(conn, None)?.contains(&channel) {
+        let line =
+            "Your devices dropped this channel, or moved from it: nothing was taken.".to_string();
+        return keep("already_held", line);
+    }
+    if filings.len() >= SHARED_MAX_CHANNELS {
+        return keep("too_many_channels", TOO_MANY_CHANNELS.into());
+    }
+    // Rule 10.
+    match standing(conn) {
+        Ok(_) => {}
+        Err(Failed::Refused(refusal)) => return keep(refusal.word, refusal.line),
+        Err(Failed::Error(e)) => return Err(e),
+    }
+    // Rule 11: every relay of the card is, by key, one of the device's
+    // own.
+    if !all_own(own_relays, &share.card) {
+        let other = share
+            .card
+            .relays()
+            .keys()
+            .iter()
+            .find(|key| !own_relays.iter().any(|relay| relay.key == **key))
+            .copied()
+            .unwrap_or_default();
+        let line = format!(
+            "{} is not one of your relays, and a shared channel lives only at your own relays: \
+             nothing was done.",
+            relay_shown(own_relays, &other)
+        );
+        return keep("not_own_relay", line);
+    }
+    // The name may have been taken since it was typed.
+    if let Err(Failed::Refused(refusal)) = name_free(conn, taker.name) {
+        return keep(refusal.word, refusal.line);
+    }
+    let filing = Filing {
+        channel,
+        card: share.card,
+        name: taker.name.to_string(),
+        came: Came::Taken(taker.key),
+    };
+    match lists::act(conn, identity, Do::File(filing), now)? {
+        Done::Made(_) => {}
+        Done::Refused(_) => return keep("too_many_channels", TOO_MANY_CHANNELS.into()),
+    }
+    write_empty_anew_records(conn, identity, now)?;
+    Ok(Took::Taken(channel))
 }
 
 /// A share, or the delete over it, to push: the key it is for, the
