@@ -204,7 +204,7 @@ fn keys_that_wrote(
         .into_iter()
         .filter(|key| key.first_held.is_some() && key.key != *own)
         .map(|key| key.key)
-        .filter(|key| !counting.counts(key) && !removed.contains(key))
+        .filter(|key| !counting.counts(key) && !crate::person::among_removed(&removed, key))
         .collect();
     let labelled = wrote.iter().filter(|key| labels.contains(key)).count();
     Ok((wrote.len(), labelled))

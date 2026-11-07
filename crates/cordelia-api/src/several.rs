@@ -1049,6 +1049,83 @@ pub(crate) fn entry_by(
         .unwrap()
 }
 
+/// The twin of a device's key: the key with its top bit (bit 7 of byte
+/// 31, the sign of x) flipped, which is the key's point negated. To
+/// Ed25519 it is another key, and whoever holds the device's secret signs
+/// under it with that secret negated; to X25519 it is the same key. A
+/// test makes one as a thief with a stolen device would.
+pub(crate) struct Twin {
+    pub(crate) key: [u8; 32],
+    secret: curve25519_dalek::Scalar,
+    nonce: [u8; 32],
+}
+
+impl Twin {
+    /// The twin of `device`'s key, with what signs under it.
+    pub(crate) fn of(device: &NodeIdentity) -> Self {
+        use sha2::{Digest, Sha512};
+        let hash = Sha512::digest(device.seed());
+        let mut scalar = [0u8; 32];
+        scalar.copy_from_slice(&hash[..32]);
+        scalar[0] &= 0xf8;
+        scalar[31] &= 0x7f;
+        scalar[31] |= 0x40;
+        let secret = -curve25519_dalek::Scalar::from_bytes_mod_order(scalar);
+        let key = curve25519_dalek::EdwardsPoint::mul_base(&secret)
+            .compress()
+            .to_bytes();
+        let mut flipped = device.public_key();
+        flipped[31] ^= 0x80;
+        assert_eq!(key, flipped, "the twin is the key with its top bit flipped");
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&hash[32..]);
+        Self { key, secret, nonce }
+    }
+
+    /// An Ed25519 signature of `message` under the twin (RFC 8032, 5.1.6,
+    /// with the secret negated).
+    pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
+        use curve25519_dalek::{EdwardsPoint, Scalar};
+        use sha2::{Digest, Sha512};
+        let wide = |parts: &[&[u8]]| {
+            let mut hash = Sha512::new();
+            for part in parts {
+                hash.update(part);
+            }
+            let mut wide = [0u8; 64];
+            wide.copy_from_slice(&hash.finalize());
+            Scalar::from_bytes_mod_order_wide(&wide)
+        };
+        let r = wide(&[&self.nonce, message]);
+        let big_r = EdwardsPoint::mul_base(&r).compress().to_bytes();
+        let k = wide(&[&big_r, &self.key, message]);
+        let s = r + k * self.secret;
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&big_r);
+        signature[32..].copy_from_slice(&s.to_bytes());
+        signature
+    }
+
+    /// The entry the twin writes of `value` under `name` at `rev`, with no
+    /// chain, in the channel whose secret is `channel`, as [`entry_by`]
+    /// makes one. It passes the check that a relay and a device make.
+    pub(crate) fn entry(&self, channel: &[u8; 32], rev: u64, name: &str, value: Value) -> Entry {
+        let inside = Inside {
+            name: name.to_string(),
+            value,
+            chain: Some(Vec::new()),
+        };
+        // Sealed by any key: what is sealed reads no author.
+        let mut entry = Entry::seal(channel, &identity_of(0xfff0), rev, &inside).unwrap();
+        entry.author = self.key;
+        let form = entry.signed_bytes();
+        entry.author_signature = self.sign(&[LABEL_ENTRY_AUTHOR, &form[..]].concat());
+        let channel_key = derive::signing_key(channel).unwrap();
+        entry.channel_signature = channel_key.sign(&[LABEL_ENTRY_CHANNEL, &form[..]].concat());
+        entry
+    }
+}
+
 /// An entry of the channel whose secret is `channel`, with these clear
 /// fields, signed by `author` and by the channel: whatever its content
 /// says. It passes the check, which reads no content.

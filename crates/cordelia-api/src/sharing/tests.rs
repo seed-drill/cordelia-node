@@ -816,7 +816,8 @@ async fn the_routes_ask_their_yes_and_refuse_a_field_they_do_not_know() {
 
 /// A key the person's statement lists as removed is handed nothing, taken
 /// from in nothing and labelled nothing (decision 2026-10-10 §5.5,
-/// `removed_key`).
+/// `removed_key`), and nor is its twin, its top bit flipped, which opens
+/// what is sealed to it (decision 2026-10-24, property 4).
 #[test]
 fn a_removed_key_is_handed_nothing_taken_from_or_labelled() {
     let mut s = bob(2);
@@ -837,6 +838,15 @@ fn a_removed_key_is_handed_nothing_taken_from_or_labelled() {
     let accepted = accept_plan(conn, identity, &relays(), &removed, "taken", now);
     assert_eq!(word(accepted.err().unwrap()), "removed_key");
     let labelled = label_plan(conn, identity, &removed, Some("old"), now);
+    assert_eq!(word(labelled.err().unwrap()), "removed_key");
+    let mut twin = s.key(1);
+    twin[31] ^= 0x80;
+    let twin = encode_public_key(&twin).unwrap();
+    let shared = share_plan(conn, identity, &relays(), "review", &twin, None, now);
+    assert_eq!(word(shared.err().unwrap()), "removed_key");
+    let accepted = accept_plan(conn, identity, &relays(), &twin, "taken", now);
+    assert_eq!(word(accepted.err().unwrap()), "removed_key");
+    let labelled = label_plan(conn, identity, &twin, Some("old"), now);
     assert_eq!(word(labelled.err().unwrap()), "removed_key");
 }
 

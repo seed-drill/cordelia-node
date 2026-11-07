@@ -347,7 +347,7 @@ fn another_persons(
     what: &str,
 ) -> Out<()> {
     let statement = &held.statement.statement;
-    if crate::person::removed_known(conn, statement)?.contains(key) {
+    if crate::person::among_removed(&crate::person::removed_known(conn, statement)?, key) {
         return refused(
             "removed_key",
             format!(

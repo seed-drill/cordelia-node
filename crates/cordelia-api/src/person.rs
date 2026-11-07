@@ -520,6 +520,17 @@ pub(crate) fn removed_known(
     Ok(removed)
 }
 
+/// Whether `key` is one of `removed`, or the twin of one
+/// ([`cordelia_crypto::identity::same_key`]): its holder signs under the
+/// twin, and opens what is sealed to it. So wherever a shared channel
+/// leaves out or refuses a removed key, it leaves out and refuses its twin
+/// (decision 2026-10-24 (removal), property 4, rules 23 and 24).
+pub(crate) fn among_removed(removed: &[[u8; 32]], key: &[u8; 32]) -> bool {
+    removed
+        .iter()
+        .any(|one| cordelia_crypto::identity::same_key(one, key))
+}
+
 /// Every key this device keeps as removed (decision 2026-10-24 (removal),
 /// rule 2), as the database holds them. The door asks who counts for each
 /// entry, so they are read once for each mark of `person_clear_mark`

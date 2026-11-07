@@ -264,6 +264,18 @@ pub fn is_usable_public_key(ed_pk: &[u8; 32]) -> bool {
     x25519_pub_from_ed25519_pub(ed_pk).is_some()
 }
 
+/// Whether two keys are one, or each other's twin. A key's twin is the
+/// key with its top bit flipped (bit 7 of byte 31, the sign of x): the
+/// key's point negated. To Ed25519 it is another key, and whoever holds
+/// the key's secret signs under the twin with that secret negated. To
+/// X25519 it is the same key ([`x25519_pub_from_ed25519_pub`] reads y
+/// alone), so what is sealed to the one opens with the other's secret. A
+/// key a device must not reach, or must not take from, is matched with
+/// this, and never byte for byte.
+pub fn same_key(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a[..31] == b[..31] && (a[31] & 0x7f) == (b[31] & 0x7f)
+}
+
 /// Wrap a raw 32-byte Ed25519 seed in PKCS#8 v1 DER for ring.
 ///
 /// ring doesn't accept raw seeds directly -- it requires PKCS#8 DER.
@@ -624,6 +636,27 @@ mod tests {
         assert!(verify_signature(&child.public_key(), msg, &sig));
         // Lead cannot verify child's signature with its own key
         assert!(!verify_signature(&lead.public_key(), msg, &sig));
+    }
+
+    /// A key's twin, its top bit flipped, is a usable key with the key's
+    /// own X25519 key; `same_key` matches the two, and no key that differs
+    /// in any other bit.
+    #[test]
+    fn a_keys_twin_is_the_same_key() {
+        let id = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let key = id.public_key();
+        let mut twin = key;
+        twin[31] ^= 0x80;
+        assert!(is_usable_public_key(&twin));
+        let x25519 = Some(id.x25519_public_key());
+        assert_eq!(x25519_pub_from_ed25519_pub(&key), x25519);
+        assert_eq!(x25519_pub_from_ed25519_pub(&twin), x25519);
+        assert!(same_key(&key, &key) && same_key(&key, &twin) && same_key(&twin, &key));
+        for bit in 0..255 {
+            let mut other = key;
+            other[bit / 8] ^= 1 << (bit % 8);
+            assert!(!same_key(&key, &other) && !same_key(&twin, &other), "{bit}");
+        }
     }
 
     // T8-3 (LOW): generate_psk produces unique 32-byte values

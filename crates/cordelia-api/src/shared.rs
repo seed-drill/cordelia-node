@@ -175,7 +175,7 @@ impl Knows {
         let labels = labels
             .into_iter()
             .map(|act| act.item.key)
-            .filter(|key| !removed.contains(key))
+            .filter(|key| !crate::person::among_removed(&removed, key))
             .collect();
         Ok(Self {
             counting,
@@ -196,7 +196,8 @@ impl Knows {
     /// labels were made; then the person's own devices; then every other
     /// key whose entries the store holds, in the order this device first
     /// held an entry of it there (a key let go has nothing to show). A
-    /// key the person's statement lists as removed is shown nothing.
+    /// key the person's statement lists as removed, or its twin, is shown
+    /// nothing.
     pub(crate) fn shown(&self, conn: &Connection, id: i64) -> Result<Vec<ShownKey>, PersonError> {
         let mut shown: Vec<[u8; 32]> = Vec::with_capacity(SHARED_MAX_KEYS);
         let room = SHARED_MAX_KEYS + self.labels.len() + self.devices.len() + self.removed.len();
@@ -205,7 +206,7 @@ impl Knows {
             if shown.len() == SHARED_MAX_KEYS {
                 break;
             }
-            if !shown.contains(key) && !self.removed.contains(key) {
+            if !shown.contains(key) && !crate::person::among_removed(&self.removed, key) {
                 shown.push(*key);
             }
         }
@@ -1024,7 +1025,9 @@ pub fn shown(
         if row.state == State::Moved {
             let keys: Vec<[u8; 32]> = kept::index_signers(conn, row.id)?
                 .into_iter()
-                .filter(|key| !knows.removed.contains(key) && !hidden.contains(key))
+                .filter(|key| {
+                    !crate::person::among_removed(&knows.removed, key) && !hidden.contains(key)
+                })
                 .collect();
             return Ok(kept::shown(conn, row.id, &keys, now)?);
         }

@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::lists::tests::filing;
-use crate::several::Several;
+use crate::several::{Several, Twin};
 use crate::shared::Read;
 use crate::shared::tests::{
     FULL, Shared, acts, anew, anew_of, bob, fill_to, holds, member, out, row, stores,
@@ -1110,8 +1110,8 @@ fn an_offer_whose_maker_is_not_in_the_channel_counts_for_nothing() {
 /// A removed device of the person's that an offer sealed to and that has
 /// not moved yet is listed as left out, is not asked about, and is counted
 /// among those left out (#291's review). Bob's laptop moves by Alice's
-/// offer, which seals to his tablet too. The tablet has not written in the
-/// new channel when the laptop removes it.
+/// offer, which seals to his tablet too, and to the tablet's twin. The
+/// tablet has not written in the new channel when the laptop removes it.
 #[test]
 fn a_removed_device_not_moved_yet_is_left_out_and_counted() {
     let mut s = bob(3);
@@ -1120,6 +1120,7 @@ fn a_removed_device_not_moved_yet_is_left_out_and_counted() {
     let alice = member(1);
     written_by(&s, 0, &channel, &[&alice], now);
     let tablet = s.key(2);
+    let twin = Twin::of(&crate::several::identity_of(2)).key;
     stores(
         &s,
         0,
@@ -1127,7 +1128,7 @@ fn a_removed_device_not_moved_yet_is_left_out_and_counted() {
             &alice,
             &channel,
             21,
-            &[alice.public_key(), s.key(0), tablet],
+            &[alice.public_key(), s.key(0), tablet, twin],
             now,
             2,
         ),
@@ -1154,6 +1155,10 @@ fn a_removed_device_not_moved_yet_is_left_out_and_counted() {
     let alice_key = encode_public_key(&alice.public_key()).unwrap();
     let asked = asked_of(conn, identity, "review", now);
     assert!(!asked.contains(&tablet_key), "{asked:?}");
+    assert!(
+        !asked.contains(&encode_public_key(&twin).unwrap()),
+        "{asked:?}"
+    );
     let keep = [alice_key];
     let (listing, plan) = anew_plan(
         conn,
@@ -1166,7 +1171,7 @@ fn a_removed_device_not_moved_yet_is_left_out_and_counted() {
         now,
     )
     .unwrap();
-    assert_eq!(listing.removed, 1, "{:?}", listing.lines);
+    assert_eq!(listing.removed, 2, "{:?}", listing.lines);
     assert!(
         listing
             .lines
@@ -3351,4 +3356,193 @@ fn a_line_longer_than_a_list_is_cut_and_says_so() {
     );
     let kept = kept_of(&s, 0, &channel);
     assert_eq!((kept.cut, kept.left_out.len()), (cut as u64, 300));
+}
+
+// ── A removed key's twin, and a key a thief made ─────────────────────
+
+/// Whether a seal of the offer that device `n` wrote in `channel` opens
+/// with the X25519 secret of `holder`, whatever key the seal names: the
+/// new channel's card where one does. A thief who holds that secret tries
+/// each seal so.
+fn a_seal_opens_for(
+    s: &Several,
+    n: usize,
+    channel: &Shared,
+    holder: &NodeIdentity,
+) -> Option<Card> {
+    let own = s.key(n);
+    let slot = slot_id(
+        &derive::slot_key(&channel.secret).unwrap(),
+        &anew_name(&own).unwrap(),
+    );
+    let stored = entries::author_entry(&s[n].conn, &channel.id, &slot, &own)
+        .unwrap()
+        .unwrap();
+    let inside = stored.entry.check().unwrap().open(&channel.secret).unwrap();
+    let Anew::Offer(offer) = Anew::from_value(&inside.value).unwrap() else {
+        panic!("no offer");
+    };
+    offer.seals.iter().find_map(|seal| {
+        let one = Offer {
+            made: offer.made,
+            new_channel: offer.new_channel,
+            relays: offer.relays.clone(),
+            seals: vec![Seal {
+                key: holder.public_key(),
+                sealed: seal.sealed,
+            }],
+        };
+        one.open(holder, &channel.id).ok()
+    })
+}
+
+/// Message `number` of the twin `twin` in `channel`, saying `body`, as a
+/// relay takes it from the wire: the relay's door checks it as every
+/// entry is checked ([`Entry::check`]).
+fn twin_says(twin: &Twin, channel: &Shared, number: u64, body: &str, sent: i64) -> CheckedEntry {
+    let value = crate::shared::tests::says(body, sent).to_value().unwrap();
+    let name = cordelia_crypto::message::message_name(&twin.key, number).unwrap();
+    let rev = cordelia_crypto::message::message_rev(number).unwrap();
+    let entry = twin.entry(&channel.secret, rev, &name, Value::Other(value));
+    cordelia_storage::relay::check(&entry.to_wire()).unwrap()
+}
+
+/// Bob's three devices hold "review", each following the others' lists,
+/// and Alice and the tablet wrote there; then a thief with the tablet
+/// writes there `wrote`, which device 0, the laptop, stores, before it
+/// knows of any removal. Returns the channel and Alice.
+fn a_thief_wrote(s: &mut Several, wrote: &dyn Fn(&Shared, i64) -> CheckedEntry) -> Shared {
+    let now = s.now + 10;
+    let channel = holds(s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(s, n, now);
+    }
+    written_by(s, 0, &channel, &[&member(1)], now);
+    let tablet = crate::several::identity_of(2);
+    stores(s, 0, &anew(&tablet, &channel, 1), now);
+    stores(s, 0, &wrote(&channel, now), now);
+    channel
+}
+
+/// The twin of a removed key is the removed key (decision 2026-10-24,
+/// property 4 and rule 24; decision 2026-10-10 §2.4, §3.5): a thief with
+/// Bob's tablet writes in "review" as the tablet's twin, the tablet's key
+/// with its top bit flipped, signed with the tablet's secret negated. The
+/// check that a relay and a device make takes it, and the door stores and
+/// shows it as any key's; it is labelled. The laptop then removes
+/// the tablet: it shows nothing of the twin, here or in the channel once
+/// moved from, holds its label for nothing, lists it as a device removed
+/// and asks nothing of it, and its making anew at the removal seals
+/// nothing that the tablet's own X25519 secret opens.
+#[test]
+fn a_removal_leaves_out_the_twin_of_the_key_it_removes() {
+    let mut s = bob(3);
+    let tablet = crate::several::identity_of(2);
+    let twin = Twin::of(&tablet);
+    let channel = a_thief_wrote(&mut s, &|channel, now| {
+        twin_says(&twin, channel, 1, "from the tablet's twin", now)
+    });
+    let shown = crate::shared::shown_keys(&s[0].conn, &channel.id).unwrap();
+    assert!(shown.contains(&twin.key), "the door takes it as any key's");
+    // It is labelled, as the stolen tablet could label it before its
+    // removal.
+    crate::shared::tests::labels(&s, 0, &twin.key, Some("alice"), s.now + 10);
+
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let shown = crate::shared::shown_keys(conn, &channel.id).unwrap();
+    assert!(!shown.contains(&twin.key), "shown nothing");
+    assert!(!shown_signers(&s, 0, &channel, now).contains(&twin.key));
+    let held = crate::person::held(conn).unwrap().unwrap();
+    let knows = crate::shared::Knows::of(conn, &held).unwrap();
+    assert!(!knows.knows(&twin.key), "its label counts for nothing");
+    let said = log_lines(conn, identity, &row(&s, 0, &channel), now).unwrap();
+    assert!(!said.iter().any(|line| line.contains("no longer shown")));
+    let (listing, _) =
+        anew_plan(conn, identity, &relays(), "review", None, &[], None, now).unwrap();
+    assert!(!listing.asked.contains(&twin.key), "{:?}", listing.lines);
+    assert_eq!(listing.removed, 2, "{:?}", listing.lines);
+    anew_at_removal(conn, identity, &relays(), now).unwrap();
+    let offer = st(rows::offer_from(conn, &channel.id, &s.key(0)))
+        .unwrap()
+        .unwrap();
+    assert!(offer.sealed_to.contains(&member(1).public_key()));
+    assert!(!offer.sealed_to.contains(&twin.key), "rule 24");
+    assert!(
+        a_seal_opens_for(&s, 0, &channel, &tablet).is_none(),
+        "property 4"
+    );
+    // The channel moved from shows nothing of it either.
+    assert_eq!(row(&s, 0, &channel).state, State::Moved);
+    assert!(!shown_signers(&s, 0, &channel, now).contains(&twin.key));
+}
+
+/// An offer by a removed key's twin, and one that seals to it, are each a
+/// fault, as they are of the removed key (decision 2026-10-10 §7): the
+/// desktop reads the twin's offer, sealed to it, before it knows of the
+/// laptop's removal of the tablet; once it applies the removal, that offer
+/// is `maker_removed`, and Alice's, which seals to the twin, is
+/// `seals_removed`.
+#[test]
+fn an_offer_by_or_to_a_removed_keys_twin_is_a_fault() {
+    let mut s = bob(3);
+    let (channel, alice) = removed_the_tablet(&mut s, 1);
+    let now = s.now + 20;
+    let twin = Twin::of(&crate::several::identity_of(2));
+    let offer = Offer::make(now as u64, &channel.id, &new_card(30), &[s.key(1)]).unwrap();
+    let value = Anew::Offer(offer).to_value().unwrap();
+    let name = anew_name(&twin.key).unwrap();
+    let by_twin = twin.entry(&channel.secret, 1, &name, Value::Other(value));
+    stores(&s, 1, &by_twin.check().unwrap(), now);
+    s.pass(0, 1);
+    stores(
+        &s,
+        1,
+        &offer_by(
+            &alice,
+            &channel,
+            31,
+            &[alice.public_key(), s.key(1), twin.key],
+            now,
+            2,
+        ),
+        now,
+    );
+    let mut is = what_is(&s, 1, &channel, now);
+    is.sort_by_key(|(maker, _)| *maker != twin.key);
+    assert_eq!(
+        is,
+        vec![
+            (twin.key, OfferIs::Fault(Fault::MakerRemoved)),
+            (alice.public_key(), OfferIs::Fault(Fault::SealsRemoved)),
+        ]
+    );
+}
+
+/// A key that a thief made with the stolen device's seed, before the
+/// removal, stays at the removal's making anew (decision 2026-10-24, rule
+/// 24, as built): the thief writes in "review" under a key of its own,
+/// which is in the laptop's table, is no removed key and is not the
+/// person's; the laptop removes the tablet, and its making anew seals the
+/// new seed to that key, so the thief opens it and reads the new channel.
+/// Nothing in the code or either record leaves such a key out: this test
+/// shows the gap, and fails until it is closed (the person decides how).
+#[test]
+#[ignore = "shows a gap: a key a thief made before the removal stays at its making anew"]
+fn a_removal_leaves_out_a_key_the_thief_made() {
+    let mut s = bob(3);
+    let made = NodeIdentity::from_seed([0x7e; 32]).unwrap();
+    let channel = a_thief_wrote(&mut s, &|channel, now| {
+        crate::shared::tests::message(&made, channel, 1, "from a key the thief made", now)
+    });
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    anew_at_removal(&s[0].conn, &s[0].identity, &relays(), now).unwrap();
+    assert!(
+        a_seal_opens_for(&s, 0, &channel, &made).is_none(),
+        "the thief opens the new seed with the key it made"
+    );
 }

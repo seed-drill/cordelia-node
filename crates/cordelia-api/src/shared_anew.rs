@@ -58,7 +58,7 @@ use cordelia_storage::shared_pass::{self as pass_rows, Answer, ChannelOut};
 
 use crate::lists::{self, AnyAct, Do, Maker};
 use crate::members::{ChannelLine, same_key};
-use crate::person::{Counting, Held, PersonError, held, in_one};
+use crate::person::{Counting, Held, PersonError, among_removed, held, in_one};
 use crate::sharing::{
     self, Failed, Out, OwnRelay, Plan, channel_words, date_of, refused, relay_shown, sender_form,
     six_words, standing,
@@ -310,7 +310,7 @@ fn judge(
         .collect();
     let is = if offer.new_channel == row.channel || held_channels.contains(&offer.new_channel) {
         OfferIs::Fault(Fault::Held)
-    } else if removed.contains(&offer.maker) {
+    } else if among_removed(removed, &offer.maker) {
         OfferIs::Fault(Fault::MakerRemoved)
     } else if seals_removed(removed, offer) {
         OfferIs::Fault(Fault::SealsRemoved)
@@ -336,10 +336,13 @@ fn judge(
 }
 
 /// Whether `offer` seals to a key of `removed`, every key this device
-/// knows to be removed (decision 2026-10-24, rules 2, 4 and 23): a fault,
-/// whatever else it is.
+/// knows to be removed, or to the twin of one (decision 2026-10-24, rules
+/// 2, 4 and 23): a fault, whatever else it is.
 fn seals_removed(removed: &[[u8; 32]], offer: &OfferRow) -> bool {
-    offer.sealed_to.iter().any(|key| removed.contains(key))
+    offer
+        .sealed_to
+        .iter()
+        .any(|key| among_removed(removed, key))
 }
 
 /// The card this device's seal in `offer` opens to: `None` where it does
@@ -383,7 +386,7 @@ pub fn judged(
     let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     Ok(offers
         .iter()
-        .filter(|offer| shown.contains(&offer.maker) || removed.contains(&offer.maker))
+        .filter(|offer| shown.contains(&offer.maker) || among_removed(&removed, &offer.maker))
         .map(|offer| {
             judge(
                 identity,
@@ -1404,7 +1407,7 @@ fn listing_of(
             continue;
         }
         let form = sender_form(conn, held, own, &key.key)?;
-        if removed.contains(&key.key) {
+        if among_removed(&removed, &key.key) {
             listing
                 .lines
                 .push(format!("  {form}: left out, a device you removed"));
@@ -1452,7 +1455,7 @@ fn listing_of(
         ));
         for key in not_moved {
             let form = sender_form(conn, held, own, &key)?;
-            if removed.contains(&key) {
+            if among_removed(&removed, &key) {
                 listing
                     .lines
                     .push(format!("  {form}: left out, a device you removed"));
@@ -2051,7 +2054,8 @@ pub fn moved_with(
         if offer.channel != from {
             continue;
         }
-        if offer.maker != *own && (!wrote.contains(&offer.maker) || removed.contains(&offer.maker))
+        if offer.maker != *own
+            && (!wrote.contains(&offer.maker) || among_removed(&removed, &offer.maker))
         {
             continue;
         }
@@ -2123,7 +2127,7 @@ pub(crate) fn after_who_wrote(
                 .any(|key| key == own || counting.counts(key));
             let fault = offer.new_channel == *channel
                 || held_channels.contains(&offer.new_channel)
-                || removed.contains(&offer.maker)
+                || among_removed(&removed, &offer.maker)
                 || seals_removed(&removed, &offer);
             let left_out = shown
                 .iter()
@@ -2203,7 +2207,7 @@ pub fn log_lines(
         ));
     }
     for signer in st(kept::index_signers(conn, row.id))? {
-        if !shown.contains(&signer) && signer != own && !removed.contains(&signer) {
+        if !shown.contains(&signer) && signer != own && !among_removed(&removed, &signer) {
             lines.push(format!(
                 "  {} is no longer shown here: 64 keys come before it",
                 sender_form(conn, &held, &own, &signer)?
