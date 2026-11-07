@@ -441,7 +441,10 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
         listing.lines
     );
     // Bob's own devices stay and are not asked; the tablet is left out.
-    assert_eq!(listing.own_devices, vec![s.key(0), s.key(1)]);
+    assert_eq!(
+        listing.own_devices.keys().copied().collect::<Vec<_>>(),
+        vec![s.key(0), s.key(1)]
+    );
     assert!(!listing.asked.contains(&s.key(1)));
     assert!(
         listing.lines.iter().any(|line| line
@@ -1826,7 +1829,7 @@ fn a_removal_known_before_it_is_applied_makes_each_shared_channel_not_clean() {
     let listed = |conn: &Connection| {
         let held = crate::person::held(conn).unwrap().unwrap();
         let listing = listing_of(conn, &held, &own, &row(&s, 0, &channel)).unwrap();
-        [listing.own_devices, listing.asked].concat()
+        [listing.own_devices.keys().copied().collect(), listing.asked].concat()
     };
     assert!(!is_not_clean(conn, &channel.id).unwrap());
     assert!(listed(conn).contains(&tablet.public_key()));

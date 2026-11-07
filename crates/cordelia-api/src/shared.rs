@@ -58,7 +58,7 @@ use cordelia_core::protocol::{
 use cordelia_crypto::acts::Came as FiledAs;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry, Value};
-use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::identity::{Holders, NodeIdentity};
 use cordelia_crypto::message::{message_id, message_name, message_rev, number_of};
 use cordelia_crypto::share::Card;
 use cordelia_crypto::shared::{self as forms, Anew, NotShared, SharedTaken, anew_name};
@@ -143,7 +143,7 @@ fn slot_of(
 /// Nothing a member writes enters it.
 pub(crate) struct Knows {
     counting: Counting,
-    removed: Vec<[u8; 32]>,
+    removed: Holders,
     /// The person's own devices that count: in the order of the statement
     /// and then of their additions.
     devices: Vec<[u8; 32]>,
@@ -175,7 +175,7 @@ impl Knows {
         let labels = labels
             .into_iter()
             .map(|act| act.item.key)
-            .filter(|key| !crate::person::among_removed(&removed, key))
+            .filter(|key| !removed.holds(key))
             .collect();
         Ok(Self {
             counting,
@@ -206,7 +206,7 @@ impl Knows {
             if shown.len() == SHARED_MAX_KEYS {
                 break;
             }
-            if !shown.contains(key) && !crate::person::among_removed(&self.removed, key) {
+            if !shown.contains(key) && !self.removed.holds(key) {
                 shown.push(*key);
             }
         }
@@ -1025,9 +1025,7 @@ pub fn shown(
         if row.state == State::Moved {
             let keys: Vec<[u8; 32]> = kept::index_signers(conn, row.id)?
                 .into_iter()
-                .filter(|key| {
-                    !crate::person::among_removed(&knows.removed, key) && !hidden.contains(key)
-                })
+                .filter(|key| !knows.removed.holds(key) && !hidden.contains(key))
                 .collect();
             return Ok(kept::shown(conn, row.id, &keys, now)?);
         }

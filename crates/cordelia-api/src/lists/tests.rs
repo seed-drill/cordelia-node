@@ -3755,7 +3755,7 @@ fn shared_anew_past_a_bound_lists_only_the_keys_it_holds() {
     // It lists and asks about the one key it holds.
     assert_eq!(listing.asked, vec![kept.public_key()]);
     assert_eq!(
-        listing.own_devices,
+        listing.own_devices.keys().copied().collect::<Vec<_>>(),
         vec![s.key(laptop), s.key(desktop), s.key(phone)]
     );
     // One line says how many it could not list, and what to do.

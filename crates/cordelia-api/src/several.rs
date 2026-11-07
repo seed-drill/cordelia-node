@@ -1061,6 +1061,13 @@ pub(crate) struct Twin {
 }
 
 impl Twin {
+    /// The twin of `key`: the key with its top bit flipped.
+    pub(crate) fn of_key(key: &[u8; 32]) -> [u8; 32] {
+        let mut twin = *key;
+        twin[31] ^= 0x80;
+        twin
+    }
+
     /// The twin of `device`'s key, with what signs under it.
     pub(crate) fn of(device: &NodeIdentity) -> Self {
         use sha2::{Digest, Sha512};

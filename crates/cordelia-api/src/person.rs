@@ -99,7 +99,7 @@ use cordelia_crypto::change_entry::{self, ChangeEntryError, DeviceSecret, ForPhr
 use cordelia_crypto::derive::{self, DeriveError};
 use cordelia_crypto::entry::{CheckedEntry, Entry, EntryError, Inside, Link, Value};
 use cordelia_crypto::hand_over::HandOverError;
-use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::identity::{Holder, Holders, NodeIdentity};
 use cordelia_crypto::phrase::Phrase;
 use cordelia_crypto::slots::slot_id;
 use cordelia_crypto::statement::{
@@ -229,6 +229,9 @@ pub enum PersonError {
     #[error("the statement lists that key as removed: it is not added again without a new key")]
     KeyRemoved,
 
+    #[error("that key is the twin of a key of one of the person's devices: the two are one device")]
+    TwinOfADevice,
+
     #[error(
         "this device may not add: it was added, since the last change, by a device added since"
     )]
@@ -314,8 +317,9 @@ pub struct Counting {
     listed: Vec<[u8; 32]>,
     /// Every key this device knows to be removed (decision 2026-10-24
     /// (removal), rule 2): those the statement lists, and those any other
-    /// change it has seen lists, on any branch.
-    removed: Vec<[u8; 32]>,
+    /// change it has seen lists, on any branch. Each as a holder, sorted: a
+    /// removed key's twin is removed with it.
+    removed: Vec<Holder>,
     /// The keys added since by a record that counts, in the order the
     /// device saw their records.
     added: Vec<[u8; 32]>,
@@ -336,7 +340,12 @@ impl Counting {
         let keys = |records: &mut dyn Iterator<Item = &KeptAddition>| {
             records.map(|record| record.key).collect::<Vec<_>>()
         };
-        let mut removed: Vec<[u8; 32]> = statement.removed.iter().chain(removed).copied().collect();
+        let mut removed: Vec<Holder> = statement
+            .removed
+            .iter()
+            .chain(removed)
+            .map(Holder::of)
+            .collect();
         removed.sort_unstable();
         removed.dedup();
         Self {
@@ -384,7 +393,12 @@ impl Counting {
     /// Whether `key` counts: the statement lists it as a device, or a
     /// record that counts adds it. A key that the device knows to be
     /// removed, on any branch, never counts (decision 2026-10-24
-    /// (removal), rule 6).
+    /// (removal), rule 6), nor does its twin.
+    ///
+    /// This is who may sign, and is asked of a key byte for byte: a twin is
+    /// another signer, and does not count by its key. Whether a key is the
+    /// person's own, as a shared channel or an addition asks, is
+    /// [`Counting::devices_held`], where a twin is its key.
     pub fn counts(&self, key: &[u8; 32]) -> bool {
         if self.is_removed(key) {
             return false;
@@ -393,9 +407,17 @@ impl Counting {
     }
 
     /// Whether the device knows `key` to be removed, on any branch
-    /// (decision 2026-10-24 (removal), rule 2).
+    /// (decision 2026-10-24 (removal), rule 2), or its twin: one holder
+    /// ([`Holder`]).
     pub fn is_removed(&self, key: &[u8; 32]) -> bool {
-        self.removed.binary_search(key).is_ok()
+        self.removed.binary_search(&Holder::of(key)).is_ok()
+    }
+
+    /// The devices that count, each as a holder ([`Holder`]): what a shared
+    /// channel and an addition ask of a key to know whether it is the
+    /// person's own, its twin included.
+    pub fn devices_held(&self) -> Holders {
+        self.keys().into_iter().collect()
     }
 
     /// Whether `key` may add a device: it is a device of the statement, or
@@ -505,30 +527,20 @@ pub(crate) fn counting(
 
 /// Every key this device knows to be removed: each that `statement` lists,
 /// and every other it keeps as removed, on any branch (decision 2026-10-24
-/// (removal), rules 2 and 6). What a shared channel leaves out and refuses
-/// (rules 23 and 24): not only what the statement applied lists.
+/// (removal), rules 2 and 6), in that order. What a shared channel leaves
+/// out and refuses (rules 23 and 24): not only what the statement applied
+/// lists. Each is a holder ([`Holders`]): its twin is signed under by
+/// whoever holds its secret, and opens what is sealed to it, so it is left
+/// out and refused with it (decision 2026-10-24 (removal), property 4).
 pub(crate) fn removed_known(
     conn: &Connection,
     statement: &Statement,
-) -> Result<Vec<[u8; 32]>, PersonError> {
-    let mut removed = statement.removed.clone();
-    for key in known_removed(conn)?.iter() {
-        if !removed.contains(key) {
-            removed.push(*key);
-        }
-    }
-    Ok(removed)
-}
-
-/// Whether `key` is one of `removed`, or the twin of one
-/// ([`cordelia_crypto::identity::same_key`]): its holder signs under the
-/// twin, and opens what is sealed to it. So wherever a shared channel
-/// leaves out or refuses a removed key, it leaves out and refuses its twin
-/// (decision 2026-10-24 (removal), property 4, rules 23 and 24).
-pub(crate) fn among_removed(removed: &[[u8; 32]], key: &[u8; 32]) -> bool {
-    removed
+) -> Result<Holders, PersonError> {
+    Ok(statement
+        .removed
         .iter()
-        .any(|one| cordelia_crypto::identity::same_key(one, key))
+        .chain(known_removed(conn)?.iter())
+        .collect())
 }
 
 /// Every key this device keeps as removed (decision 2026-10-24 (removal),

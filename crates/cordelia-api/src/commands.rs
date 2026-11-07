@@ -217,6 +217,9 @@ fn says(e: &PersonError) -> String {
                                     `cordelia init --new-key` on that device gives it a new \
                                     one."
             .into(),
+        PersonError::TwinOfADevice => "that key is a twin of the key of one of your devices: \
+                                       the two are one device, so it is not added."
+            .into(),
         PersonError::MayNotAdd => "this device may not add another yet: it was itself added, \
                                    since the last change, by a device added since. Add from \
                                    another device, or make a change first (`cordelia renew`)."

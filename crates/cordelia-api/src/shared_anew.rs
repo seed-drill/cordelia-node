@@ -46,7 +46,7 @@ use cordelia_crypto::acts::{Came, Filing};
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{Entry, Inside, Value};
-use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::identity::{Holder, Holders, NodeIdentity};
 use cordelia_crypto::share::{Card, Relays};
 use cordelia_crypto::shared::{Anew, Offer, Seal, anew_name};
 use cordelia_crypto::slots::slot_id;
@@ -57,8 +57,8 @@ use cordelia_storage::shared_anew::{self as rows, MadeRow, OfferRow};
 use cordelia_storage::shared_pass::{self as pass_rows, Answer, ChannelOut};
 
 use crate::lists::{self, AnyAct, Do, Maker};
-use crate::members::{ChannelLine, same_key};
-use crate::person::{Counting, Held, PersonError, among_removed, held, in_one};
+use crate::members::ChannelLine;
+use crate::person::{Counting, Held, PersonError, held, in_one};
 use crate::sharing::{
     self, Failed, Out, OwnRelay, Plan, channel_words, date_of, refused, relay_shown, sender_form,
     six_words, standing,
@@ -295,7 +295,7 @@ pub(crate) fn dropped_or_moved(
 /// ([`crate::person::removed_known`]).
 fn judge(
     identity: &NodeIdentity,
-    removed: &[[u8; 32]],
+    removed: &Holders,
     counting: &Counting,
     row: &Channel,
     offer: &OfferRow,
@@ -303,18 +303,22 @@ fn judge(
     shown: &[[u8; 32]],
 ) -> Judged {
     let own = identity.public_key();
+    let persons = the_persons(counting, &own);
+    let sealed: Holders = offer.sealed_to.iter().collect();
     let left_out: Vec<[u8; 32]> = shown
         .iter()
-        .filter(|key| !offer.sealed_to.contains(key) && **key != own && !counting.counts(key))
+        .filter(|key| !sealed.holds(key) && !persons.holds(key))
         .copied()
         .collect();
     let is = if offer.new_channel == row.channel || held_channels.contains(&offer.new_channel) {
         OfferIs::Fault(Fault::Held)
-    } else if among_removed(removed, &offer.maker) {
+    } else if removed.holds(&offer.maker) {
         OfferIs::Fault(Fault::MakerRemoved)
     } else if seals_removed(removed, offer) {
         OfferIs::Fault(Fault::SealsRemoved)
     } else if offer.sealed_to.contains(&own) {
+        // The seal this device opens is the one under its own key, as the
+        // reader found it (`own_seal`): byte for byte.
         match opened(identity, row, offer) {
             Some(card) => OfferIs::ForThisDevice(card),
             None => OfferIs::Fault(Fault::DidNotOpen),
@@ -322,7 +326,7 @@ fn judge(
     } else if let Some(other) = offer
         .sealed_to
         .iter()
-        .find(|key| counting.counts(key) && **key != own)
+        .find(|key| persons.holds(key) && Holder::of(key) != Holder::of(&own))
     {
         OfferIs::SealedElsewhere(*other)
     } else {
@@ -338,11 +342,17 @@ fn judge(
 /// Whether `offer` seals to a key of `removed`, every key this device
 /// knows to be removed, or to the twin of one (decision 2026-10-24, rules
 /// 2, 4 and 23): a fault, whatever else it is.
-fn seals_removed(removed: &[[u8; 32]], offer: &OfferRow) -> bool {
-    offer
-        .sealed_to
-        .iter()
-        .any(|key| among_removed(removed, key))
+fn seals_removed(removed: &Holders, offer: &OfferRow) -> bool {
+    offer.sealed_to.iter().any(|key| removed.holds(key))
+}
+
+/// This device and the person's devices that count, each as a holder: the
+/// person's own, as a shared channel asks who an offer seals to or leaves
+/// out, a twin among them.
+fn the_persons(counting: &Counting, own: &[u8; 32]) -> Holders {
+    let mut persons = counting.devices_held();
+    persons.add(own);
+    persons
 }
 
 /// The card this device's seal in `offer` opens to: `None` where it does
@@ -386,7 +396,7 @@ pub fn judged(
     let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     Ok(offers
         .iter()
-        .filter(|offer| shown.contains(&offer.maker) || among_removed(&removed, &offer.maker))
+        .filter(|offer| shown.contains(&offer.maker) || removed.holds(&offer.maker))
         .map(|offer| {
             judge(
                 identity,
@@ -448,16 +458,15 @@ pub fn hidden_by_an_offer(
         }
         State::Moved => {
             let own = identity.public_key();
-            let counting = crate::person::who_counts(conn)?;
+            let persons = the_persons(&crate::person::who_counts(conn)?, &own);
             for offer in st(rows::offers_in(conn, &row.channel))? {
                 let moved_there = st(kept::channel(conn, &offer.new_channel))?
                     .is_some_and(|new| new.came == kept::Came::Moved(row.channel));
                 if moved_there {
+                    let sealed: Holders = offer.sealed_to.iter().collect();
                     return Ok(st(kept::index_signers(conn, row.id))?
                         .into_iter()
-                        .filter(|key| {
-                            !offer.sealed_to.contains(key) && *key != own && !counting.counts(key)
-                        })
+                        .filter(|key| !sealed.holds(key) && !persons.holds(key))
                         .collect());
                 }
             }
@@ -617,8 +626,8 @@ fn staying_with_no_question(
     own_devices: bool,
 ) -> Result<(Vec<[u8; 32]>, LeftOut, NewLine), PersonError> {
     let listed = listing_of(conn, held, own, row)?;
-    let mut stay = match own_devices {
-        true => listed.own_devices.clone(),
+    let mut stay: Vec<[u8; 32]> = match own_devices {
+        true => listed.own_devices.keys().copied().collect(),
         false => Vec::new(),
     };
     let mut past_64 = 0;
@@ -1185,12 +1194,6 @@ fn new_line_of(
     chosen: &[[u8; 32]],
     stay: &[[u8; 32]],
 ) -> Result<NewLine, PersonError> {
-    let among = |keys: &[[u8; 32]], key: &[u8; 32]| keys.iter().any(|one| same_key(one, key));
-    let once = |keys: &mut Vec<[u8; 32]>, key: &[u8; 32]| {
-        if !among(keys, key) {
-            keys.push(*key);
-        }
-    };
     // Back along the moves, to the channel the list names: what this
     // device's makings anew left out on the way is carried over.
     let made = st(follows::made_lines(conn))?;
@@ -1224,26 +1227,30 @@ fn new_line_of(
     }
     let named = |key: &[u8; 32]| list.is_none_or(|list| list.lists(key));
     let removed = crate::person::removed_known(conn, &held.statement.statement)?;
-    let mut line = NewLine::default();
+    let stay: Holders = stay.iter().collect();
+    let mut left_out = Holders::new();
     for key in removing {
-        once(&mut line.left_out, key);
+        left_out.add(key);
     }
-    for key in removed.iter().filter(|key| named(key)) {
-        once(&mut line.left_out, key);
+    for key in removed.keys().filter(|key| named(key)) {
+        left_out.add(key);
     }
-    line.without = line.left_out.clone();
-    for key in carried.iter().filter(|key| named(key) && !among(stay, key)) {
-        once(&mut line.without, key);
+    let mut without = left_out.clone();
+    for key in carried.iter().filter(|key| named(key) && !stay.holds(key)) {
+        without.add(key);
     }
     // Every key a person left out is kept, whether or not the list names
     // it: the status compares it with the list as it comes to be.
-    for key in chosen.iter().filter(|key| !among(stay, key)) {
-        once(&mut line.left_out, key);
+    for key in chosen.iter().filter(|key| !stay.holds(key)) {
+        left_out.add(key);
         if named(key) {
-            once(&mut line.without, key);
+            without.add(key);
         }
     }
-    Ok(line)
+    Ok(NewLine {
+        left_out: left_out.keys().copied().collect(),
+        without: without.keys().copied().collect(),
+    })
 }
 
 /// The new channel line of a making anew of the channel `old` into `card`,
@@ -1312,8 +1319,9 @@ fn line_said(line: Option<String>, cut: u64) -> Vec<String> {
 pub struct Listing {
     /// The lines that list every key, in order.
     pub lines: Vec<String>,
-    /// The person's own devices, which stay and are not asked about.
-    pub own_devices: Vec<[u8; 32]>,
+    /// The person's own devices, which stay and are not asked about, each
+    /// as a holder: a twin of one is that device, and is not asked about.
+    pub own_devices: Holders,
     /// The keys asked about, in the order listed.
     pub asked: Vec<[u8; 32]>,
     /// Of `asked`, the keys not moved yet: asked about at `shared anew`,
@@ -1367,8 +1375,8 @@ fn listing_of(
         .map(|device| device.key)
         .chain(additions.iter().map(|record| record.key))
     {
-        if counting.counts(&key) && !listing.own_devices.contains(&key) {
-            listing.own_devices.push(key);
+        if counting.counts(&key) {
+            listing.own_devices.add(&key);
         }
     }
     let table = st(kept::keys(conn, row.id))?;
@@ -1396,18 +1404,18 @@ fn listing_of(
     listing.lines.push(format!(
         "Every key this device has held or refused in \"{shown_name}\":"
     ));
-    for key in &listing.own_devices {
+    for key in listing.own_devices.keys() {
         listing.lines.push(format!(
             "  {}: stays, as your own device",
             sender_form(conn, held, own, key)?
         ));
     }
     for key in ordered {
-        if listing.own_devices.contains(&key.key) {
+        if listing.own_devices.holds(&key.key) {
             continue;
         }
         let form = sender_form(conn, held, own, &key.key)?;
-        if among_removed(&removed, &key.key) {
+        if removed.holds(&key.key) {
             listing
                 .lines
                 .push(format!("  {form}: left out, a device you removed"));
@@ -1445,9 +1453,7 @@ fn listing_of(
     };
     let not_moved: Vec<[u8; 32]> = not_moved
         .into_iter()
-        .filter(|key| {
-            !listing.own_devices.contains(key) && !table.iter().any(|row| row.key == *key)
-        })
+        .filter(|key| !listing.own_devices.holds(key) && !table.iter().any(|row| row.key == *key))
         .collect();
     if !not_moved.is_empty() {
         listing.lines.push(format!(
@@ -1455,7 +1461,7 @@ fn listing_of(
         ));
         for key in not_moved {
             let form = sender_form(conn, held, own, &key)?;
-            if among_removed(&removed, &key) {
+            if removed.holds(&key) {
                 listing
                     .lines
                     .push(format!("  {form}: left out, a device you removed"));
@@ -1603,10 +1609,9 @@ pub fn anew_plan(
                 ),
             );
         };
-        if !stay.contains(&key) {
-            stay.push(key);
-        }
+        stay.add(&key);
     }
+    let stay: Vec<[u8; 32]> = stay.keys().copied().collect();
     if stay.len() > SHARED_MAX_KEYS {
         return refused("", STAY_PAST_64.into());
     }
@@ -1860,7 +1865,7 @@ pub fn move_plan(
             )),
         );
     }
-    let counting = crate::person::who_counts(conn)?;
+    let persons = the_persons(&crate::person::who_counts(conn)?, &own);
     let by = sender_form(conn, &held, &own, &offer.maker)?;
     let on = date_of(i64::try_from(offer.made).unwrap_or(i64::MAX));
     let at: Vec<String> = card
@@ -1871,14 +1876,14 @@ pub fn move_plan(
         .collect();
     let mut stays = Vec::new();
     for key in &offer.sealed_to {
-        if *key != own && !counting.counts(key) {
+        if !persons.holds(key) {
             stays.push(format!("  {}", sender_form(conn, &held, &own, key)?));
         }
     }
     let mut follow = Vec::new();
-    for key in listing_of(conn, &held, &own, &row)?.own_devices {
-        if key != own {
-            follow.push(sender_form(conn, &held, &own, &key)?);
+    for key in listing_of(conn, &held, &own, &row)?.own_devices.keys() {
+        if *key != own {
+            follow.push(sender_form(conn, &held, &own, key)?);
         }
     }
     let mut left = Vec::new();
@@ -2047,20 +2052,21 @@ pub fn moved_with(
     // A maker the person removed counts for nothing, though it wrote here.
     let removed = match held(conn)? {
         Some(held) => crate::person::removed_known(conn, &held.statement.statement)?,
-        None => Vec::new(),
+        None => Holders::new(),
     };
+    // Each key as the offers wrote it: a key and its twin sealed to are
+    // each asked about (rule 5 of decision 2026-11-06 (joining) keeps them
+    // once), but this device's own is its own.
     let mut keys = Vec::new();
     for offer in st(rows::offers_into(conn, channel))? {
         if offer.channel != from {
             continue;
         }
-        if offer.maker != *own
-            && (!wrote.contains(&offer.maker) || among_removed(&removed, &offer.maker))
-        {
+        if offer.maker != *own && (!wrote.contains(&offer.maker) || removed.holds(&offer.maker)) {
             continue;
         }
         for key in offer.sealed_to {
-            if key != *own && !keys.contains(&key) {
+            if Holder::of(&key) != Holder::of(own) && !keys.contains(&key) {
                 keys.push(key);
             }
         }
@@ -2113,7 +2119,7 @@ pub(crate) fn after_who_wrote(
         return Ok(lines);
     };
     if row.state == State::Held {
-        let counting = crate::person::who_counts(conn)?;
+        let persons = the_persons(&crate::person::who_counts(conn)?, own);
         let removed = crate::person::removed_known(conn, &held.statement.statement)?;
         let shown = crate::shared::shown_keys(conn, channel)?;
         let held_channels = held_or_dropped(conn, None)?;
@@ -2121,19 +2127,15 @@ pub(crate) fn after_who_wrote(
             if offer.maker == *own || !shown.contains(&offer.maker) {
                 continue;
             }
-            let for_this_person = offer
-                .sealed_to
-                .iter()
-                .any(|key| key == own || counting.counts(key));
+            let sealed: Holders = offer.sealed_to.iter().collect();
+            let for_this_person = offer.sealed_to.iter().any(|key| persons.holds(key));
             let fault = offer.new_channel == *channel
                 || held_channels.contains(&offer.new_channel)
-                || among_removed(&removed, &offer.maker)
+                || removed.holds(&offer.maker)
                 || seals_removed(&removed, &offer);
             let left_out = shown
                 .iter()
-                .filter(|key| {
-                    !offer.sealed_to.contains(key) && *key != own && !counting.counts(key)
-                })
+                .filter(|key| !sealed.holds(key) && !persons.holds(key))
                 .count();
             if !for_this_person || fault || left_out == 0 {
                 continue;
@@ -2207,7 +2209,10 @@ pub fn log_lines(
         ));
     }
     for signer in st(kept::index_signers(conn, row.id))? {
-        if !shown.contains(&signer) && signer != own && !among_removed(&removed, &signer) {
+        if !shown.contains(&signer)
+            && Holder::of(&signer) != Holder::of(&own)
+            && !removed.holds(&signer)
+        {
             lines.push(format!(
                 "  {} is no longer shown here: 64 keys come before it",
                 sender_form(conn, &held, &own, &signer)?

@@ -87,9 +87,9 @@ use cordelia_storage::sync_state;
 
 use crate::leaving::Among;
 use crate::person::{
-    AdditionSeen, Applied, Change, Held, NotCounted, PersonError, Refused, Shown, added_name,
-    applied_secret, apply_added, apply_judged, drop_hand_overs, followed_entry, held, in_one,
-    its_own_entry, see_addition,
+    AdditionSeen, Applied, Change, Counting, Held, NotCounted, PersonError, Refused, Shown,
+    added_name, applied_secret, apply_added, apply_judged, drop_hand_overs, followed_entry, held,
+    in_one, its_own_entry, see_addition,
 };
 use crate::publish::Standing;
 
@@ -159,13 +159,14 @@ pub fn add_device(
         let statement = &standing.held.statement.statement;
         let pair = derive::pair_secret(identity, new)?;
         // A key removed on any branch this device knows is not added again
-        // (decision 2026-10-24 (removal), rule 6).
+        // (decision 2026-10-24 (removal), rule 6), nor is its twin.
         if standing.counting.is_removed(new) {
             return Err(PersonError::KeyRemoved);
         }
         if !standing.counting.may_add(&own) {
             return Err(PersonError::MayNotAdd);
         }
+        twin_of_a_device(&standing.counting, new)?;
 
         let mut hand_over = HandOver {
             made_at: at(now),
@@ -239,6 +240,7 @@ pub fn would_add(
     if !standing.counting.may_add(&own) {
         return Err(PersonError::MayNotAdd);
     }
+    twin_of_a_device(&standing.counting, new)?;
     if let Some(listed) = statement.devices.iter().find(|device| device.key == *new) {
         return Ok(WouldAdd::HandsAgain {
             label: listed.label.clone(),
@@ -257,6 +259,17 @@ pub fn would_add(
         counts_already,
         left_out_as,
     })
+}
+
+/// A key and its twin are one holder ([`cordelia_crypto::identity::Holder`]):
+/// a twin of a device that counts is that device, and is not added as
+/// another. This device's own key's twin is refused where the pair secret
+/// is derived, as its key is.
+fn twin_of_a_device(counting: &Counting, new: &[u8; 32]) -> Result<(), PersonError> {
+    match counting.devices_held().holds(new) && !counting.counts(new) {
+        true => Err(PersonError::TwinOfADevice),
+        false => Ok(()),
+    }
 }
 
 /// The time `now`, as a record or a revision gives it: seconds, and none
@@ -1824,15 +1837,38 @@ mod tests {
         let mut s = Several::of_one_person(3);
         s.change(0, &[0, 1], &[2]);
         let on = &s[0];
-        // A key that the statement lists as removed.
+        // A key that the statement lists as removed, and its twin, the key
+        // with its top bit flipped: one holder.
+        let twin = |key: [u8; 32]| crate::several::Twin::of_key(&key);
         assert!(matches!(
             add(on, &s.key(2), "back again"),
             Err(PersonError::KeyRemoved)
         ));
-        // Its own key, a key that is no usable public key, and a label
-        // that a statement could not carry.
+        assert!(matches!(
+            add(on, &twin(s.key(2)), "its twin"),
+            Err(PersonError::KeyRemoved)
+        ));
+        assert!(matches!(
+            would_add(&on.conn, &on.identity, &twin(s.key(2)), "its twin"),
+            Err(PersonError::KeyRemoved)
+        ));
+        // The twin of a device that counts is that device.
+        assert!(matches!(
+            add(on, &twin(s.key(1)), "a twin"),
+            Err(PersonError::TwinOfADevice)
+        ));
+        assert!(matches!(
+            would_add(&on.conn, &on.identity, &twin(s.key(1)), "a twin"),
+            Err(PersonError::TwinOfADevice)
+        ));
+        // Its own key, and its twin, a key that is no usable public key,
+        // and a label that a statement could not carry.
         assert!(matches!(
             add(on, &on.key(), "itself"),
+            Err(PersonError::Derive(DeriveError::OwnKey))
+        ));
+        assert!(matches!(
+            add(on, &twin(on.key()), "its own twin"),
             Err(PersonError::Derive(DeriveError::OwnKey))
         ));
         assert!(matches!(

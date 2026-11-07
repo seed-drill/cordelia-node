@@ -38,7 +38,7 @@ use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::fingerprint;
-use cordelia_crypto::identity::{NodeIdentity, is_usable_public_key};
+use cordelia_crypto::identity::{Holder, NodeIdentity, is_usable_public_key};
 use cordelia_crypto::share::{Card, Relays, Share, share_name};
 use cordelia_crypto::shared::{Anew, anew_name};
 use cordelia_crypto::slots::slot_id;
@@ -337,8 +337,9 @@ pub fn sender_form(
 
 /// The key is another person's device: not this device or one of the
 /// person's, and not one this device knows to be removed, on any branch
-/// (§5.5; decision 2026-10-24, rules 2 and 6).
-/// `what` is the command, for its line.
+/// (§5.5; decision 2026-10-24, rules 2 and 6), each asked as a holder: the
+/// twin of any of them is that key ([`Holder`]), and never another
+/// person's. `what` is the command, for its line.
 fn another_persons(
     conn: &Connection,
     held: &Held,
@@ -347,7 +348,7 @@ fn another_persons(
     what: &str,
 ) -> Out<()> {
     let statement = &held.statement.statement;
-    if crate::person::among_removed(&crate::person::removed_known(conn, statement)?, key) {
+    if crate::person::removed_known(conn, statement)?.holds(key) {
         return refused(
             "removed_key",
             format!(
@@ -359,7 +360,7 @@ fn another_persons(
     }
     let counting =
         crate::person::counting(conn, statement, &cordelia_storage::person::additions(conn)?)?;
-    if key == own || counting.counts(key) {
+    if Holder::of(key) == Holder::of(own) || counting.devices_held().holds(key) {
         let form = sender_form(conn, held, own, key)?;
         let line = match what {
             "share" => format!(
