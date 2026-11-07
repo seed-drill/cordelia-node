@@ -1059,6 +1059,7 @@ pub fn make_share(
                 rev,
                 made: now,
                 gone: false,
+                by_node: false,
             },
         )?;
         Ok(None)

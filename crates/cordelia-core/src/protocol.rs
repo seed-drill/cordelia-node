@@ -2918,6 +2918,10 @@ pub const PERSONAL_SHARED_PREFIX: &str = "shared/";
 /// A larger file is not read, and the last list read stands.
 pub const MEMBERS_FILE_MAX_BYTES: usize = 16_384;
 
+/// The longest label a device's line may give (rule 1): 32 characters of
+/// `a-z`, `0-9`, `.`, `_` and `-`.
+pub const MEMBERS_LABEL_MAX_CHARS: usize = 32;
+
 /// How long the node's fetch of a repository's list may take (decision
 /// 2026-11-06 (joining), rule 3): git is stopped after this, by TERM and
 /// then KILL, and the node clears its own repository's locks. A fetch of
