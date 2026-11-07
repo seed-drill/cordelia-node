@@ -233,6 +233,12 @@ pub enum PersonError {
     TwinOfADevice,
 
     #[error(
+        "the change lists a device and removes its twin, which is the same device: nothing was \
+         made. A device whose twin is removed is removed too."
+    )]
+    TwinInBothLists,
+
+    #[error(
         "this device may not add: it was added, since the last change, by a device added since"
     )]
     MayNotAdd,
@@ -407,22 +413,13 @@ impl Counting {
     }
 
     /// Whether the device knows `key` to be removed, on any branch
-    /// (decision 2026-10-24 (removal), rule 2), or its twin, one holder
-    /// ([`Holder`]), where `key` is itself no device: neither the statement
-    /// lists it nor a record counts it. A device's twin is named removed by
-    /// a removed device's record, or a person's answer about it, and never
-    /// by the device: so it never removes the device. The twin of a
-    /// removed key is removed with it, since no record counts it while the
-    /// key counts ([`Counting::judge`]), and `add-device` refuses it.
+    /// (decision 2026-10-24 (removal), rule 2), or its twin: one holder
+    /// ([`Holder`]). A key and its twin are one key to who counts, so no
+    /// twin of a device that counts or is listed is ever kept as removed
+    /// (rule 6, [`judge_records_by_their_cut`]), and no change lists a key
+    /// and removes its twin ([`crate::change`]).
     pub fn is_removed(&self, key: &[u8; 32]) -> bool {
         self.removed.binary_search(&Holder::of(key)).is_ok()
-            && (self.removed.iter().any(|one| one.key() == key) || !self.is_a_device(key))
-    }
-
-    /// Whether the statement lists `key` as a device, or a record that
-    /// counts adds it, removed or not.
-    fn is_a_device(&self, key: &[u8; 32]) -> bool {
-        self.listed.contains(key) || self.added.contains(key)
     }
 
     /// The devices that count, each as a holder ([`Holder`]): what a shared
@@ -472,10 +469,10 @@ impl Counting {
     /// It is one rule, asked when a record is seen and asked again of a
     /// record that was kept as not counted.
     ///
-    /// A record of the twin of a device that counts counts already: the
-    /// twin is that device ([`Holder`]). So no record makes a device of a
-    /// key's twin, and the twin of a removed key is removed with it
-    /// ([`Counting::is_removed`]).
+    /// A key and its twin are judged as one key ([`Holder`]): a record of
+    /// the twin of a device that counts counts already, and one of the twin
+    /// of a removed key counts for nothing. So the first of the two to be
+    /// kept, as a device or as removed, decides for both.
     fn judge(&self, key: &[u8; 32], adder: &[u8; 32]) -> AdditionSeen {
         if self.is_removed(key) {
             AdditionSeen::NotCounted(NotCounted::Removed)
@@ -549,36 +546,15 @@ pub(crate) fn counting(
 /// lists. Each is a holder ([`Holders`]): its twin is signed under by
 /// whoever holds its secret, and opens what is sealed to it, so it is left
 /// out and refused with it (decision 2026-10-24 (removal), property 4).
-///
-/// But not a removed key whose twin is a device, that the statement lists
-/// or a record counts: that is the device's twin, named removed by a
-/// removed device's record or a person's answer, and the device stays
-/// ([`Counting::is_removed`]), so its holder is not taken for removed.
+/// The keys are kept as they were removed, and each is asked as a holder.
 pub(crate) fn removed_known(
     conn: &Connection,
     statement: &Statement,
 ) -> Result<Holders, PersonError> {
-    let devices: Vec<[u8; 32]> = statement
-        .devices
-        .iter()
-        .map(|device| device.key)
-        .chain(
-            held_rows::additions(conn)?
-                .iter()
-                .filter(|record| record.counted)
-                .map(|record| record.key),
-        )
-        .collect();
-    let twin_of_a_device = |key: &[u8; 32]| {
-        devices
-            .iter()
-            .any(|device| device != key && Holder::of(device) == Holder::of(key))
-    };
     Ok(statement
         .removed
         .iter()
         .chain(known_removed(conn)?.iter())
-        .filter(|key| !twin_of_a_device(key))
         .collect())
 }
 
@@ -678,8 +654,25 @@ pub(crate) fn judge_records_by_their_cut(
     let generation = (link.number, link.hash);
     let mut changed = false;
     let mut kept_anew: Vec<[u8; 32]> = Vec::new();
+    // A key and its twin are one key ([`Holder`]): each spare below spares
+    // the twin of the key it names too.
+    let twin = |key: &[u8; 32]| {
+        let mut twin = *key;
+        twin[31] ^= 0x80;
+        twin
+    };
     loop {
         let cuts = crate::cut::Cuts::read(conn)?;
+        // The devices that count, those the statement lists among them: a
+        // twin of one is that device, never a key the removed device holds
+        // by its record, and is never kept as removed. Worked out again on
+        // each pass, as records are counted for nothing.
+        let devices = counting(
+            conn,
+            &held.statement.statement,
+            &held_rows::additions(conn)?,
+        )?
+        .devices_held();
         let mut again = false;
         for record in held_rows::additions(conn)? {
             if !cuts.cuts_key(&record.adder, &generation, record.seen_at) {
@@ -688,14 +681,18 @@ pub(crate) fn judge_records_by_their_cut(
             // A key that a removal of the adder lists as a device is the
             // person's by the phrase: it holds the secret by that change,
             // and not by the record alone.
-            if cuts.listed_toward_a_removal(&record.adder, &record.key) {
+            if cuts.listed_toward_a_removal(&record.adder, &record.key)
+                || cuts.listed_toward_a_removal(&record.adder, &twin(&record.key))
+            {
                 continue;
             }
             // Nor is a key that the person, at the terminal of a recovery
             // made here, said is a device they still have: shown with the
             // phrase, it is theirs by their answer, and is added again by
             // the record of 2026-10-04, section 9, step 6.
-            if held_rows::is_kept_by_answer(conn, &record.key)? {
+            if held_rows::is_kept_by_answer(conn, &record.key)?
+                || held_rows::is_kept_by_answer(conn, &twin(&record.key))?
+            {
                 continue;
             }
             // Nor, on this device, its own key: rule 6 is against keys
@@ -705,6 +702,11 @@ pub(crate) fn judge_records_by_their_cut(
             // 2026-10-04, section 9, step 6), which a removed key could
             // never be.
             if record.key == *own {
+                continue;
+            }
+            // Nor the twin of a device that counts, its own among them: the
+            // device was kept first, and decides for both.
+            if devices.holds(&record.key) && !devices.keys().any(|key| *key == record.key) {
                 continue;
             }
             if record.counted {
@@ -797,6 +799,9 @@ pub(crate) fn is_clear(
     if held_rows::holders_past_bound(conn, link.number, &link.hash)? {
         return Ok(false);
     }
+    // Only `is_removed` is asked of it, which reads the removed keys alone
+    // (a key or its twin among them), so the records it is made without
+    // change nothing of the answer.
     let removed = Counting::of(statement, &[], &known_removed(conn)?);
     let mut holders: Vec<[u8; 32]> = statement.devices.iter().map(|device| device.key).collect();
     holders.extend(held_rows::holders(conn, link.number, &link.hash)?);
@@ -9072,12 +9077,13 @@ mod tests {
 
     /// A record that the device about to be removed signs, of the twin of
     /// an honest device, never removes that device (decision 2026-10-24
-    /// (removal), rule 6; a key and its twin are one holder): the tablet
-    /// adds the desktop's twin, and the laptop takes that record as
-    /// counting already, then removes the tablet within the ten minutes of
-    /// its cut, so rule 6 keeps the twin as removed. The removal is applied
-    /// and clear, the desktop counts and is not taken for removed in a
-    /// shared channel, and the tablet's twin is removed with the tablet.
+    /// (removal), rule 6; a key and its twin are one key): the tablet adds
+    /// the desktop's twin, and the laptop takes that record as counting
+    /// already, then removes the tablet within the ten minutes of its cut.
+    /// Rule 6 does not keep the twin as removed: the desktop was kept
+    /// first, and decides for both. The removal is applied and clear, the
+    /// desktop counts and is not taken for removed in a shared channel, and
+    /// the tablet's twin is removed with the tablet.
     #[test]
     fn a_removed_devices_record_of_a_devices_twin_never_removes_the_device() {
         use crate::several::{Several, Twin};
@@ -9102,37 +9108,45 @@ mod tests {
         s.change(laptop, &[laptop, desktop], &[tablet]);
         let conn = &s[laptop].conn;
         assert!(
-            held_rows::removed_keys(conn).unwrap().contains(&twin),
+            !held_rows::removed_keys(conn).unwrap().contains(&twin),
             "rule 6"
         );
         its_device_stays(conn, &s.key(desktop), &s.key(tablet));
     }
 
-    /// A change that removes the twin of a device it keeps, as a person who
-    /// answers "removed" of a twin that the removed device added does,
-    /// removes the twin and not the device (one holder): the laptop
-    /// removes the tablet and the desktop's twin, and keeps the desktop.
+    /// A change that lists a key and removes its twin is refused: the two
+    /// are one key. The laptop's change may neither keep the desktop and
+    /// remove its twin, nor remove the tablet and list its twin.
     #[test]
-    fn a_change_that_removes_a_devices_twin_keeps_the_device() {
+    fn a_change_that_lists_a_key_and_removes_its_twin_is_refused() {
         use crate::several::{Several, Twin};
-        let mut s = Several::of_one_person(3);
+        let s = Several::of_one_person(3);
         let (laptop, desktop, tablet) = (0, 1, 2);
-        let twin = Twin::of_key(&s.key(desktop));
-        let now = s.tick();
         let on = &s[laptop];
-        let entry = crate::change::make_change_at(
-            &s.phrase,
-            &on.held().statement,
-            &on.latest(),
-            &on.key(),
+        let made = |stay: Vec<Device>, removed: &[[u8; 32]]| {
+            crate::change::make_change_at(
+                &s.phrase,
+                &on.held().statement,
+                &on.latest(),
+                &on.key(),
+                stay,
+                removed,
+                s.now as u64,
+            )
+        };
+        let removes_its_twin = made(
             s.listed(&[laptop, desktop]),
-            &[s.key(tablet), twin],
-            now as u64,
-        )
-        .unwrap();
-        let outcome = shown(&on.conn, &on.identity, &entry, now).unwrap();
-        assert!(matches!(outcome, Shown::Applied(_)), "{outcome:?}");
-        its_device_stays(&on.conn, &s.key(desktop), &s.key(tablet));
+            &[s.key(tablet), Twin::of_key(&s.key(desktop))],
+        );
+        assert!(matches!(
+            removes_its_twin,
+            Err(PersonError::TwinInBothLists)
+        ));
+        let mut stay = s.listed(&[laptop, desktop]);
+        stay.push(Device::new(Twin::of_key(&s.key(tablet)), "its twin").unwrap());
+        let lists_its_twin = made(stay, &[s.key(tablet)]);
+        assert!(matches!(lists_its_twin, Err(PersonError::TwinInBothLists)));
+        assert!(made(s.listed(&[laptop, desktop]), &[s.key(tablet)]).is_ok());
     }
 
     /// After a removal of `removed` that named the twin of `device` as
@@ -9255,6 +9269,132 @@ mod tests {
         .unwrap()
         .check()
         .unwrap()
+    }
+
+    /// The record of `key`'s twin, made by device `adder` under `statement`.
+    fn added_twin(statement: &Statement, adder: u16, of: u16) -> SignedAddition {
+        let twin = crate::several::Twin::of_key(&key(of));
+        Addition::under(
+            statement,
+            Device::new(twin, "a twin").unwrap(),
+            key(adder),
+            NOW as u64,
+        )
+        .unwrap()
+        .sign(&device(adder))
+        .unwrap()
+    }
+
+    /// A device the person said at a recovery they still have, whose twin
+    /// the removed device added after its cut time, is not removed (rule 6;
+    /// a key and its twin are one key): the person's answer spares the
+    /// twin too. Device 6 is in no list here, and can be added.
+    #[test]
+    fn a_kept_devices_twin_that_the_removed_device_added_is_not_removed() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let phrase = phrase();
+        let [_, two, three, _] = statements(&phrase);
+        let conn = device_at(0, 2);
+        let made = NOW + 50_000;
+        let cut = made - REMOVAL_TAKEN_MARGIN_SECS as i64;
+        let twin = crate::several::Twin::of_key(&key(6));
+        assert_eq!(
+            see_addition(&conn, &added_twin(&two, 2, 6), cut).unwrap(),
+            AdditionSeen::Counted
+        );
+        held_rows::keep_by_answer(&conn, &key(6), 3).unwrap();
+        let entry = change_made_at(&phrase, &three, secret(3), made);
+        know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap();
+        let removed = held_rows::removed_keys(&conn).unwrap();
+        assert!(
+            !removed.contains(&twin) && !removed.contains(&key(6)),
+            "{removed:?}"
+        );
+        assert!(!who_counts(&conn).unwrap().is_removed(&key(6)));
+        // Applied, the removal leaves device 6 in no list, to be added again.
+        assert!(matches!(
+            shown(&conn, &device(0), &entry, made + 2).unwrap(),
+            Shown::Applied(_)
+        ));
+        assert!(!who_counts(&conn).unwrap().is_removed(&key(6)));
+        let would = crate::adding::would_add(&conn, &device(0), &key(6), "device 6");
+        assert!(
+            matches!(would, Ok(crate::adding::WouldAdd::Adds { .. })),
+            "{would:?}"
+        );
+    }
+
+    /// A key and its twin are judged as one key, the first of the two to be
+    /// kept deciding for both (rule 6; the property 2 of the record of
+    /// 2026-10-17 does not hold for them, and the cost is stated): device 1
+    /// adds device 6, and the removed device 2 adds 6's twin, after its cut
+    /// time. Where 6's record is kept first, the twin's counts already, the
+    /// removal of 2 keeps nothing of it as removed, and 6 counts. Where the
+    /// twin's is kept first, it counts and 6's counts already; the removal
+    /// removes the twin, and with it 6, which needs a new key.
+    #[test]
+    fn a_key_and_its_twin_are_judged_in_the_order_they_are_kept() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let phrase = phrase();
+        let [_, two, three, _] = statements(&phrase);
+        let made = NOW + 50_000;
+        let cut = made - REMOVAL_TAKEN_MARGIN_SECS as i64;
+        let entry = change_made_at(&phrase, &three, secret(3), made);
+        let honest_first = device_at(0, 2);
+        assert_eq!(
+            see_addition(&honest_first, &added(&two, 1, 6), cut).unwrap(),
+            AdditionSeen::Counted
+        );
+        assert_eq!(
+            see_addition(&honest_first, &added_twin(&two, 2, 6), cut).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::CountsAlready)
+        );
+        know_what_is_shown(&honest_first, &device(0), &entry, made + 1).unwrap();
+        let counting = who_counts(&honest_first).unwrap();
+        assert!(counting.counts(&key(6)) && !counting.is_removed(&key(6)));
+
+        let twin_first = device_at(0, 2);
+        assert_eq!(
+            see_addition(&twin_first, &added_twin(&two, 2, 6), cut).unwrap(),
+            AdditionSeen::Counted
+        );
+        assert_eq!(
+            see_addition(&twin_first, &added(&two, 1, 6), cut).unwrap(),
+            AdditionSeen::NotCounted(NotCounted::CountsAlready)
+        );
+        know_what_is_shown(&twin_first, &device(0), &entry, made + 1).unwrap();
+        let counting = who_counts(&twin_first).unwrap();
+        assert!(!counting.counts(&key(6)) && counting.is_removed(&key(6)));
+    }
+
+    /// A removal that lists a device spares that device's twin, as it spares
+    /// the device (rule 6, a key and its twin one key): the removed device 2
+    /// added 6's twin, and this device took that record before device 1's
+    /// record of 6. The removal of 2 lists 6, as the device that made it
+    /// kept it: the twin is not removed, and once applied 6 counts.
+    #[test]
+    fn a_removal_that_lists_a_device_spares_its_twin() {
+        use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
+        let phrase = phrase();
+        let [_, two, _, _] = statements(&phrase);
+        let conn = device_at(0, 2);
+        let made = NOW + 50_000;
+        let cut = made - REMOVAL_TAKEN_MARGIN_SECS as i64;
+        see_addition(&conn, &added_twin(&two, 2, 6), cut).unwrap();
+        see_addition(&conn, &added(&two, 1, 6), cut).unwrap();
+        let lists_six = two
+            .next(key(0), &secret(13), listed(&[0, 1, 6]), &[key(2)])
+            .unwrap();
+        let entry = change_made_at(&phrase, &lists_six, secret(13), made);
+        know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap();
+        let twin = crate::several::Twin::of_key(&key(6));
+        assert!(!held_rows::removed_keys(&conn).unwrap().contains(&twin));
+        assert!(matches!(
+            shown(&conn, &device(0), &entry, made + 2).unwrap(),
+            Shown::Applied(_)
+        ));
+        assert!(who_counts(&conn).unwrap().counts(&key(6)));
+        assert!(follows_a_clear_change(&conn).unwrap());
     }
 
     /// Rule 6, its records (decision 2026-10-24 (removal), unit test 12): a

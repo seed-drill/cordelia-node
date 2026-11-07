@@ -29,6 +29,7 @@
 use cordelia_crypto::change_entry::{self, ForPhrase};
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::CheckedEntry;
+use cordelia_crypto::identity::Holder;
 use cordelia_crypto::phrase::Phrase;
 use cordelia_crypto::statement::{self, Device, SignedStatement, Statement, StatementError};
 use zeroize::{Zeroize, Zeroizing};
@@ -159,12 +160,28 @@ pub fn prepare_change(
     }
     let secret = Zeroizing::new(statement::new_secret()?);
     let next = applied.statement.next(*maker, &secret, stay, removed)?;
+    one_key_in_one_list(&next)?;
     Ok(Prepared {
         applied: applied.clone(),
         joined: Vec::new(),
         bytes: next.to_bytes()?,
         secret,
     })
+}
+
+/// A key and its twin are one key ([`Holder`]): a change never lists a
+/// device and removes its twin, as it never lists and removes one key.
+fn one_key_in_one_list(statement: &Statement) -> Result<(), PersonError> {
+    let removed = |key: &[u8; 32]| {
+        statement
+            .removed
+            .iter()
+            .any(|one| Holder::of(one) == Holder::of(key))
+    };
+    match statement.devices.iter().any(|device| removed(&device.key)) {
+        true => Err(PersonError::TwinInBothLists),
+        false => Ok(()),
+    }
 }
 
 /// Prepare the statement that joins `applied` with `joined`, the heads
@@ -185,6 +202,7 @@ pub fn prepare_settlement(
         .chain(joined.iter().map(|head| &head.statement))
         .collect();
     let settled = Statement::settle(&heads, *maker, &secret, stay, removed)?;
+    one_key_in_one_list(&settled)?;
     Ok(Prepared {
         applied: applied.clone(),
         joined: joined.to_vec(),
@@ -238,6 +256,7 @@ pub fn prepare_recovery(
             &removes,
         )?,
     };
+    one_key_in_one_list(&made)?;
     Ok(Prepared {
         applied: from.clone(),
         joined: apart.into_iter().cloned().collect(),
