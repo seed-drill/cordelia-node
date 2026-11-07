@@ -38,6 +38,8 @@ libc = "0.2"
 tempfile = { workspace = true }
 # The statements a test counts, to bound the work of a request.
 rusqlite = { workspace = true, features = ["trace"] }
+# Another spelling of a key, which a repository's list refuses (members.rs).
+bech32 = { workspace = true }
 
 [lints.rust]
 # CI's coverage job builds with `--cfg coverage` (ci.yml), which leaves out

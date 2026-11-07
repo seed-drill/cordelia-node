@@ -2910,6 +2910,18 @@ pub const SHARED_READ_PREFIX: &str = "sread/";
 /// the device's key follows it, and only its own entry there is its list.
 pub const PERSONAL_SHARED_PREFIX: &str = "shared/";
 
+// ── A repository's list (decision 2026-11-06 (joining)) ─────────────
+
+/// The most bytes of a repository's `.cordelia/members` that a device
+/// reads (decision 2026-11-06 (joining), rule 1): 16 KiB, room for the
+/// channel line with a long `without`, and 64 devices with their labels.
+/// A larger file is not read, and the last list read stands.
+pub const MEMBERS_FILE_MAX_BYTES: usize = 16_384;
+
+/// The longest label a device's line may give (rule 1): 32 characters of
+/// `a-z`, `0-9`, `.`, `_` and `-`.
+pub const MEMBERS_LABEL_MAX_CHARS: usize = 32;
+
 // Checked at compile time (decision 2026-10-10 §14). The largest card is
 // the seed and two relays behind their count: with the form, the time and
 // the key it is for, it fits a share; and it fits an anew record, whose
