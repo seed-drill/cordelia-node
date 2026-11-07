@@ -867,7 +867,15 @@ impl Git {
     /// The remotes of the clone at `clone`, the top of its work tree, as
     /// its own configuration names them.
     pub fn remotes_of(&self, clone: &Path) -> Result<Vec<Remote>, ListFailed> {
-        let deadline = Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS);
+        self.remotes_of_by(clone, stream_deadline())
+    }
+
+    /// [`Git::remotes_of`], with git given until `deadline`.
+    pub fn remotes_of_by(
+        &self,
+        clone: &Path,
+        deadline: Instant,
+    ) -> Result<Vec<Remote>, ListFailed> {
         let clone = self.clone_at(clone, deadline)?;
         Ok(self.config_of(&clone, deadline)?.remotes)
     }
@@ -879,7 +887,19 @@ impl Git {
         clone: &Path,
         chosen: Option<&str>,
     ) -> Result<(String, Identity), RemoteRefused> {
-        let remotes = self.remotes_of(clone).map_err(RemoteRefused::Git)?;
+        self.identity_of_clone_by(clone, chosen, stream_deadline())
+    }
+
+    /// [`Git::identity_of_clone`], with git given until `deadline`.
+    pub fn identity_of_clone_by(
+        &self,
+        clone: &Path,
+        chosen: Option<&str>,
+        deadline: Instant,
+    ) -> Result<(String, Identity), RemoteRefused> {
+        let remotes = self
+            .remotes_of_by(clone, deadline)
+            .map_err(RemoteRefused::Git)?;
         choose_remote(&remotes, chosen)
     }
 
@@ -894,8 +914,18 @@ impl Git {
         remote: &str,
         identity: &Identity,
     ) -> Result<ClonedList, ListFailed> {
-        let deadline = Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS);
-        let secs = STREAM_TIMEOUT_SECS;
+        self.read_clone_by(clone, remote, identity, stream_deadline())
+    }
+
+    /// [`Git::read_clone`], with git given until `deadline`.
+    pub fn read_clone_by(
+        &self,
+        clone: &Path,
+        remote: &str,
+        identity: &Identity,
+        deadline: Instant,
+    ) -> Result<ClonedList, ListFailed> {
+        let secs = secs_until(deadline);
         let (clone, config) = self.clone_to_read(clone, deadline)?;
         let named = config
             .remotes
@@ -937,18 +967,28 @@ impl Git {
     /// --is-ancestor`, run in the clone. A `last` that the clone does not
     /// hold is one its commit cannot come after: the clone is behind.
     pub fn comes_after(&self, clone: &Path, last: &str, commit: &str) -> Result<bool, ListFailed> {
+        self.comes_after_by(clone, last, commit, stream_deadline())
+    }
+
+    /// [`Git::comes_after`], with git given until `deadline`.
+    pub fn comes_after_by(
+        &self,
+        clone: &Path,
+        last: &str,
+        commit: &str,
+        deadline: Instant,
+    ) -> Result<bool, ListFailed> {
         if !is_a_commit(last) || !is_a_commit(commit) {
             return Err(ListFailed::Git("that is not a commit".to_string()));
         }
         if last == commit {
             return Ok(true);
         }
-        let deadline = Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS);
         let (clone, _) = self.clone_to_read(clone, deadline)?;
         let mut git = self.command(At::Clone(&clone.top));
         git.args(["merge-base", "--is-ancestor", last, commit]);
         let ran = self
-            .run(git, deadline, STREAM_TIMEOUT_SECS, SHORT_OUTPUT_BYTES)
+            .run(git, deadline, secs_until(deadline), SHORT_OUTPUT_BYTES)
             .map_err(Outcome::failed)?;
         match ran.code {
             Some(0) => Ok(true),
@@ -1053,6 +1093,33 @@ impl Git {
             .filter(|branch| is_a_branch(branch))
             .ok_or_else(no_head)?;
         Ok(branch.to_string())
+    }
+
+    /// The top of the work tree that `folder` is in, as a real path: the
+    /// clone that `cordelia subscribe` follows, run in any folder of it
+    /// (decision 2026-11-06 (joining), rule 2), with git given until
+    /// `deadline`, and no longer than [`STREAM_TIMEOUT_SECS`].
+    /// `NotARepository` where it is in no repository, or in one with no
+    /// work tree.
+    pub fn top_of(&self, folder: &Path, deadline: Instant) -> Result<PathBuf, ListFailed> {
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS));
+        let folder = folder
+            .canonicalize()
+            .map_err(|_| ListFailed::NotARepository)?;
+        let mut git = self.command(At::Clone(&folder));
+        git.args(["rev-parse", "--show-toplevel"]);
+        let ran = self
+            .run(git, deadline, secs_until(deadline), SHORT_OUTPUT_BYTES)
+            .map_err(Outcome::failed)?;
+        let said = String::from_utf8_lossy(&ran.stdout);
+        let top = said.strip_suffix('\n').unwrap_or(&said);
+        if !ran.success || top.is_empty() {
+            return Err(ListFailed::NotARepository);
+        }
+        // A path that is not text is not kept: it does not read back.
+        PathBuf::from(top)
+            .canonicalize()
+            .map_err(|_| ListFailed::NotARepository)
     }
 }
 
@@ -1249,6 +1316,18 @@ fn last_line(said: &str) -> &str {
         .or_else(|| said.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("nothing")
         .trim()
+}
+
+/// The deadline that a read of a clone is given where its caller gives
+/// none: [`STREAM_TIMEOUT_SECS`] from now.
+fn stream_deadline() -> Instant {
+    Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS)
+}
+
+/// The seconds from now until `deadline`, rounded up, to say a late git.
+fn secs_until(deadline: Instant) -> u64 {
+    let left = deadline.saturating_duration_since(Instant::now());
+    left.as_secs() + u64::from(left.subsec_nanos() > 0)
 }
 
 /// An object's name as git gives it, a commit's or another's: 40 hex

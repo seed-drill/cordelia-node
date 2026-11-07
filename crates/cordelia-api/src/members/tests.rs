@@ -251,7 +251,8 @@ fn twin(n: u8) -> (String, [u8; 32]) {
     (encode_public_key(&twin).unwrap(), twin)
 }
 
-/// A twin counts as its key: once as a device, and in the gate.
+/// A twin counts as its key: once as a device, in the gate, and where the
+/// list is asked whether it names a key, and by which label.
 #[test]
 fn a_keys_twin_counts_as_the_key() {
     assert!(
@@ -271,6 +272,9 @@ fn a_keys_twin_counts_as_the_key() {
     let members = read(gated.as_bytes()).unwrap();
     assert_eq!(members.gated(|_| false).len(), 1);
     assert_eq!(members.names(|_| false), None);
+    // The list names the key that its twin's line gives.
+    assert!(members.lists(&key(11).1) && members.lists(&twin(11).1));
+    assert_eq!(members.label_of(&key(11).1), Some("stolen-twin"));
 }
 
 #[test]

@@ -6,7 +6,7 @@
 //!   and path, the last commit read with when and from where, the bytes of
 //!   the last list read, and the last key the node handed the channel to,
 //!   after which its next turn starts (rule 4.2). Following again starts
-//!   the row afresh (rule 2.5).
+//!   never-back over, and keeps the rest (rule 2.5).
 //! - **The node's typings** (`shared_follow_typed`): the listed keys the node
 //!   looks for shares from (rule 4.4), apart from the person's own typings
 //!   (`shared_typed_keys`), with what became of each.
@@ -113,9 +113,15 @@ fn follow_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Follow> {
 }
 
 /// This device follows `identity`, through `remote` of the clone at
-/// `clone`, from `at`. Following a repository again starts afresh: its
-/// last read, its list, its turn, the node's typings and the notices go
-/// (rule 2.5).
+/// `clone`, from `at`.
+///
+/// Following a repository again (rule 2.5) takes the remote and the clone
+/// given, and forgets only the last commit read, with when and from
+/// where, so that never-back starts over, for a history that was
+/// rewritten. It keeps the rest: the list last read, which the next read
+/// is compared with (rule 4.6); the notices, which go only as rules 4.5
+/// and 4.6 say; the last key handed and the node's typings; and when it
+/// was first followed, before which no key's join is noticed (rule 4.5).
 pub fn follow(
     conn: &Connection,
     identity: &str,
@@ -124,13 +130,22 @@ pub fn follow(
     at: i64,
 ) -> Result<(), CordeliaError> {
     in_savepoint(conn, || {
-        forget(conn, identity)?;
-        conn.execute(
-            "INSERT INTO shared_follows (identity, remote, clone, followed_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-            params![identity, remote, clone, at],
-        )
-        .map_err(storage)?;
+        let again = conn
+            .execute(
+                "UPDATE shared_follows SET remote = ?2, clone = ?3, last_commit = NULL,
+                     last_read_at = NULL, read_from = NULL
+                 WHERE identity = ?1",
+                params![identity, remote, clone],
+            )
+            .map_err(storage)?;
+        if again == 0 {
+            conn.execute(
+                "INSERT INTO shared_follows (identity, remote, clone, followed_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                params![identity, remote, clone, at],
+            )
+            .map_err(storage)?;
+        }
         Ok(())
     })
 }
@@ -205,6 +220,26 @@ pub fn read_done(
                  list = ?5
              WHERE identity = ?1",
             params![identity, read.commit, read.at, read.from_clone as i64, list],
+        )
+        .map_err(storage)?;
+    Ok(changed == 1)
+}
+
+/// The last commit read of `identity`, when and from where, with the list
+/// kept as it was: a person's yes to follow it again, whose commit is
+/// where never-back starts over (rule 2.5), while the next read is
+/// compared with the list last read (rule 4.6). Nothing is done for a
+/// repository this device does not follow.
+pub fn set_last_read(
+    conn: &Connection,
+    identity: &str,
+    read: &LastRead,
+) -> Result<bool, CordeliaError> {
+    let changed = conn
+        .execute(
+            "UPDATE shared_follows SET last_commit = ?2, last_read_at = ?3, read_from = ?4
+             WHERE identity = ?1",
+            params![identity, read.commit, read.at, read.from_clone as i64],
         )
         .map_err(storage)?;
     Ok(changed == 1)

@@ -307,16 +307,16 @@ impl Members {
         }
     }
 
-    /// Whether the list names `key` as a device.
+    /// Whether the list names `key` as a device, or its twin.
     pub fn lists(&self, key: &[u8; 32]) -> bool {
-        self.devices.iter().any(|device| device.key == *key)
+        self.devices.iter().any(|device| same_key(&device.key, key))
     }
 
-    /// The label the list gives `key`, where it lists it.
+    /// The label the list gives `key`, or its twin, where it lists it.
     pub fn label_of(&self, key: &[u8; 32]) -> Option<&str> {
         self.devices
             .iter()
-            .find(|device| device.key == *key)
+            .find(|device| same_key(&device.key, key))
             .map(|device| device.label.as_str())
     }
 }

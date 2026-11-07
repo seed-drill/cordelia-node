@@ -34,7 +34,8 @@
 //! A repository's list of the devices that share its channel is read with
 //! git through [`git_list`] (decision 2026-11-06 (joining)): which
 //! repository a clone is, a read of the clone's copy of its list, and
-//! never back, each with nothing of the person's reaching git.
+//! never back, each with nothing of the person's reaching git. Following a
+//! repository, `cordelia subscribe` in a clone, is [`following`].
 //!
 //! A personal node serves [`configure_device_routes`]: it carries no
 //! channel of the older kind (decision 2026-10-04 §10). A node of any
@@ -55,6 +56,7 @@ pub use cut::{CutNow, may_have_dropped_links};
 pub mod entries;
 pub mod error;
 pub mod first_start;
+pub mod following;
 pub mod found;
 pub mod git_list;
 pub mod handlers;
@@ -196,6 +198,9 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
                 "/subscribe",
                 web::post().to(crate::shared_routes::subscribe),
             )
+            // Following a repository: `subscribe` in a clone (decision
+            // 2026-11-06 (joining), rule 2).
+            .route("/follow", web::post().to(crate::shared_routes::follow))
             .route(
                 "/unsubscribe",
                 web::post().to(crate::shared_routes::unsubscribe),
