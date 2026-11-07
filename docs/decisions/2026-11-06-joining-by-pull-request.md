@@ -163,7 +163,7 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 |---|---|
 | A follower not on the list | `Your key is not on the list of <identity> at <commit>.` |
 | A follower, the list naming no channel | `The list of <identity> names no channel yet.` |
-| On the list, not yet handed it | `Waiting for a member's device to hand you <name>. Your list was read <when>.` |
+| On the list, not yet handed it | `Waiting for a member's device to hand you <name>. Your list was read <when>. A member's device hands it over once a member's clone has the merged list: a member runs git pull there.` |
 | Holding another channel of this repository, one the named channel was made anew from | `Run cordelia shared move <name>: the list names the channel it was made anew as.` |
 | The list naming a channel that no device of the person's holds or can move to | amber: `The list of <identity> at <commit> names channel <words>, which no device of yours holds or can move to.` |
 | The channel's relays not among the person's own | `<name> is at <relay>, which is not one of your relays: add it to your configuration.` |

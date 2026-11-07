@@ -4268,6 +4268,13 @@ mod tests {
         let shared = passes * channels + channels + passes * 2 * typed;
         assert_eq!(shared, 208);
         assert!(shared <= u64::from(SHARED_REQUESTS_PER_MINUTE));
+        // And the keys the node types at a read of a repository's list
+        // (decision 2026-11-06 (joining), rule 4.4): a proof and a pull of
+        // the share pair channel of each of a list's 64, once after each
+        // read, all in one pass: 128 more, within the 600.
+        let listed = 2 * SHARED_MAX_KEYS as u64;
+        assert_eq!(shared + listed, 336);
+        assert!(shared + listed <= u64::from(SHARED_REQUESTS_PER_MINUTE));
         // The shows of a minute, as a device's side of a relay counts
         // them: one for each whole pass and each pass that sends, and as
         // many again.

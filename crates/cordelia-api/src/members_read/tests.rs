@@ -8,13 +8,16 @@
 use super::*;
 use crate::following::tests::OnDisk;
 use crate::git_list::ListAt;
-use crate::lists::Do;
 use crate::lists::tests::filing;
-use crate::several::Several;
-use crate::shared::tests::{Shared, acts, anew, anew_of, bob, holds, member, stores};
+use crate::several::{Several, entry_by};
+use crate::shared::NotAShare;
+use crate::shared::tests::{HOUR, Shared, acts, anew, anew_of, bob, holds, member, stores};
+use cordelia_crypto::acts::Came;
 use cordelia_crypto::bech32::encode_public_key;
-use cordelia_crypto::entry::CheckedEntry;
+use cordelia_crypto::entry::Value;
+use cordelia_crypto::share::{Share, share_name};
 use cordelia_crypto::shared::{Anew, Offer};
+use cordelia_storage::meta;
 
 const REPOSITORY: &str = "example.org/team/project";
 
@@ -29,15 +32,24 @@ const READ: i64 = 600;
 /// [`filing`]'s card.
 const AT: [u8; 32] = [3; 32];
 
+/// The device's relays known by their keys: that of [`filing`]'s card,
+/// where a channel lives, and that of a channel line ([`line_relay`]),
+/// which a device that takes the channel reads (rule 4.4).
 fn own_relays() -> Vec<OwnRelay> {
-    vec![OwnRelay {
-        name: "relay.example.org:9474".into(),
-        key: AT,
-    }]
+    vec![
+        OwnRelay {
+            name: "relay.example.org:9474".into(),
+            key: AT,
+        },
+        OwnRelay {
+            name: "line.example.org:9474".into(),
+            key: line_relay(),
+        },
+    ]
 }
 
 /// The key a channel line of these tests gives its relay: one that can be
-/// used, as a relay's is. What a line says of its relays is not read here.
+/// used, as a relay's is. Only a device that takes the channel reads it.
 fn line_relay() -> [u8; 32] {
     NodeIdentity::from_seed([0x52; 32]).unwrap().public_key()
 }
@@ -1067,6 +1079,725 @@ fn a_follow_made_again_on_the_same_clone_is_not_written_over_by_a_stale_read() {
     assert_eq!(row.last, Some(rewritten));
     assert_eq!(row.list.as_deref(), Some(list.as_bytes()));
     assert!(node_keys(&s).is_empty());
+}
+
+// ── Taking (rule 4.4) ────────────────────────────────────────────────
+
+/// The name a channel of [`REPOSITORY`] is filed under: its `owner/name`.
+const NAME: &str = "team/project";
+
+/// The agent of [`FOLDER`], the clone of the follow.
+const AGENT: &str = "project";
+
+/// Device 0 maps [`FOLDER`] to [`AGENT`].
+fn maps_the_clone(s: &Several) {
+    let mapped = serde_json::json!([{ "folder": FOLDER, "name": AGENT }]);
+    meta::set(&s[0].conn, meta::SYNC_CLAUDE_MAPPINGS, &mapped.to_string()).unwrap();
+}
+
+/// The list of these tests' takes: the channel line of `channel`, with
+/// `without`, and members `numbers` and every device of Bob's, each
+/// labelled.
+fn bobs_list(
+    s: &Several,
+    channel: &Shared,
+    numbers: impl IntoIterator<Item = u32>,
+    without: &[[u8; 32]],
+) -> String {
+    let mut devices = listed(numbers);
+    for n in 0..s.machines.len() {
+        devices.push((s.key(n), format!("bob-{n}")));
+    }
+    list_with(Some((&channel.id, without)), &devices)
+}
+
+/// Device 0 follows a list that names the channel of the card of `seed`,
+/// Alice and Carol (members 1 and 2) and each device of Bob's, from `now`:
+/// the channel and the list.
+fn joins(s: &Several, seed: u8, now: i64) -> (Shared, String) {
+    let channel = Shared::of(seed);
+    let list = bobs_list(s, &channel, 1..=2, &[]);
+    follows_at(s, &list, &commit('a'), now);
+    (channel, list)
+}
+
+/// A share by `from` of the channel of the card of `seed`, for device 0,
+/// made at `made`, in their share pair channel.
+fn share_of(s: &Several, from: &NodeIdentity, seed: u8, made: i64) -> CheckedEntry {
+    let card = filing(seed, "x").card;
+    let to = s.key(0);
+    let (_, secret) = crate::shared_pass::share_pair(from, &to).unwrap();
+    let share = Share {
+        made: u64::try_from(made).unwrap(),
+        for_key: to,
+        card: card.clone(),
+    };
+    let name = share_name(&card.channel_id().unwrap());
+    entry_by(from, &secret, 1, &name, Value::Other(share.to_value()), &[])
+}
+
+/// The keys the node typed on device 0 for the follow, by key.
+fn typed_keys(s: &Several) -> Vec<[u8; 32]> {
+    follows::typed(&s[0].conn, REPOSITORY)
+        .unwrap()
+        .into_iter()
+        .map(|typed| typed.key)
+        .collect()
+}
+
+/// What became of the node's typing of `key` on device 0, and its line.
+fn became_of(s: &Several, key: &[u8; 32]) -> (Option<String>, Option<String>) {
+    let typed = follows::typed(&s[0].conn, REPOSITORY).unwrap();
+    let typed = typed.into_iter().find(|typed| typed.key == *key).unwrap();
+    (typed.became, typed.detail)
+}
+
+/// The keys device 0 asks its relays for at `now`, by key.
+fn asked_for(s: &Several, now: i64) -> Vec<[u8; 32]> {
+    let keys: Vec<[u8; 32]> = to_ask(&s[0].conn, now)
+        .unwrap()
+        .into_iter()
+        .map(|typing| typing.key)
+        .collect();
+    sorted(&keys)
+}
+
+/// The node's typing of `from`'s key on device 0 that it asks its relays
+/// for at `now`.
+fn typing_of(s: &Several, from: &NodeIdentity, now: i64) -> Typing {
+    let key = from.public_key();
+    to_ask(&s[0].conn, now)
+        .unwrap()
+        .into_iter()
+        .find(|typing| typing.key == key)
+        .unwrap_or_else(|| panic!("no typing of the key to ask for"))
+}
+
+/// What device 0's pass does with `entries`, handed from the share pair
+/// channel of `typing`'s key at `now`: each judged, and those that pass
+/// given to the take.
+fn handed_to(s: &Several, typing: &Typing, entries: &[CheckedEntry], now: i64) -> Became {
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let found: Vec<CheckedEntry> = entries
+        .iter()
+        .filter_map(
+            |entry| match judge(conn, identity, typing, entry, now).unwrap() {
+                Some(Judged::Share(entry)) => Some(*entry),
+                _ => None,
+            },
+        )
+        .collect();
+    take(conn, identity, typing, &found, &own_relays(), now).unwrap()
+}
+
+/// Why device 0 takes nothing for its follow, with this list kept: its
+/// word and line.
+fn not_taking(s: &Several) -> (&'static str, String) {
+    let follow = row(s).unwrap();
+    let why = takes_in(&s[0].conn, &s[0].identity, &own_relays(), &follow)
+        .unwrap()
+        .unwrap_err();
+    (why.word, why.line)
+}
+
+/// Device 0's filings, each channel with its name and where it came from.
+fn filings_of(s: &Several, n: usize) -> Vec<([u8; 32], String, Came)> {
+    sharing::filed(&s[n].conn)
+        .unwrap()
+        .into_iter()
+        .map(|filing| (filing.channel, filing.name, filing.came))
+        .collect()
+}
+
+/// A device on the list that does not hold the channel it names types each
+/// listed key at each read, but its person's own devices', and asks its
+/// relays for each once after the read (rule 4.4). The share of the named
+/// channel from a listed key is taken as `accept --channel` takes one:
+/// filed under the repository's `owner/name` on every device of the
+/// person's, as taken from the key. What became of each typing is kept;
+/// the agent of the clone is subscribed; and once the person holds the
+/// channel, a read types nothing.
+#[test]
+fn the_named_channel_is_taken_from_a_listed_key_on_every_device() {
+    let mut s = bob(2);
+    let now = s.now + 10;
+    maps_the_clone(&s);
+    let (channel, list) = joins(&s, 7, now);
+    let (alice, carol) = (member(1), member(2));
+    let both = sorted(&[alice.public_key(), carol.public_key()]);
+    assert!(typed_keys(&s).is_empty(), "nothing is typed before a read");
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    assert_eq!(typed_keys(&s), both, "not Bob's own devices");
+    let at = read + 10;
+    assert_eq!(asked_for(&s, at), both);
+
+    // Carol has handed nothing: she is asked for once, until the next read.
+    let typing = typing_of(&s, &carol, at);
+    assert_eq!(handed_to(&s, &typing, &[], at), Became::Nothing);
+    assert_eq!(
+        became_of(&s, &carol.public_key()),
+        (Some(ASKED.into()), None)
+    );
+    assert_eq!(asked_for(&s, at), [alice.public_key()]);
+    // Alice handed it, a minute before the read.
+    let typing = typing_of(&s, &alice, at);
+    let share = share_of(&s, &alice, 7, read - 60);
+    assert_eq!(
+        handed_to(&s, &typing, &[share], at),
+        Became::Taken(channel.id)
+    );
+    assert_eq!(
+        filings_of(&s, 0),
+        [(channel.id, NAME.into(), Came::Taken(alice.public_key()))]
+    );
+    assert_eq!(
+        became_of(&s, &alice.public_key()),
+        (Some(TAKEN.into()), None)
+    );
+    assert!(asked_for(&s, at).is_empty());
+    let subscribed = crate::shared_messages::in_force(&s[0].conn).unwrap();
+    assert_eq!(subscribed, [(channel.id, AGENT.to_string())]);
+
+    // Bob's other device holds it too, from device 0's list.
+    s.pass(0, 1);
+    crate::lists::follow(&s[1].conn, &s[1].identity, s.now).unwrap();
+    assert_eq!(
+        filings_of(&s, 1),
+        [(channel.id, NAME.into(), Came::Taken(alice.public_key()))]
+    );
+    // The next read: the person holds it, and nothing is typed.
+    reads(&s, &list, &commit('a'), read + READ);
+    assert!(typed_keys(&s).is_empty());
+    assert_eq!(not_taking(&s).0, "held");
+}
+
+/// A share of another channel from a listed key is not taken, alone or
+/// beside the share of the channel the list names, which is then taken
+/// (rule 4.4): the take is told the one channel it may take.
+#[test]
+fn a_share_of_another_channel_from_a_listed_key_is_not_taken() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (channel, list) = joins(&s, 7, now);
+    let alice = member(1);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    let other = share_of(&s, &alice, 8, read);
+    let typing = typing_of(&s, &alice, read + 1);
+    assert_eq!(
+        handed_to(&s, &typing, std::slice::from_ref(&other), read + 1),
+        Became::Nothing
+    );
+    assert!(filings_of(&s, 0).is_empty());
+
+    let next = read + READ;
+    reads(&s, &list, &commit('a'), next);
+    let typing = typing_of(&s, &alice, next + 1);
+    let named = share_of(&s, &alice, 7, next);
+    assert_eq!(
+        handed_to(&s, &typing, &[other, named], next + 1),
+        Became::Taken(channel.id)
+    );
+    assert_eq!(filings_of(&s, 0).len(), 1);
+}
+
+/// A share from a key the list does not name is not taken: the node types
+/// no key it does not name, and the typing of a key goes at the read whose
+/// list no longer names it (rule 4.4).
+#[test]
+fn a_share_from_an_unlisted_key_is_not_taken() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (channel, list) = joins(&s, 7, now);
+    let (alice, dave) = (member(1), member(9));
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    assert!(!typed_keys(&s).contains(&dave.public_key()));
+    let never = Typing {
+        of: REPOSITORY.into(),
+        key: dave.public_key(),
+        typed_at: read,
+    };
+    let from_dave = share_of(&s, &dave, 7, read);
+    assert_eq!(
+        handed_to(&s, &never, &[from_dave], read + 1),
+        Became::NotNow
+    );
+
+    // Alice's line goes in the next commit: her typing goes with it.
+    let typing = typing_of(&s, &alice, read + 1);
+    let without_alice = bobs_list(&s, &channel, 2..=2, &[]);
+    reads(&s, &without_alice, &commit('b'), read + 2);
+    assert_eq!(typed_keys(&s), [member(2).public_key()]);
+    let from_alice = share_of(&s, &alice, 7, read);
+    assert_eq!(
+        handed_to(&s, &typing, &[from_alice], read + 3),
+        Became::NotNow
+    );
+    assert!(filings_of(&s, 0).is_empty());
+}
+
+/// A share made an hour or more from the latest read is not taken, though
+/// it was made within the hour of an earlier one, and one made within the
+/// hour of the latest read is (rule 4.4). A typing reads for the hour of
+/// its read and no longer.
+#[test]
+fn a_share_older_than_the_hour_of_the_latest_read_is_not_taken() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (channel, list) = joins(&s, 7, now);
+    let alice = member(1);
+    let first = now + READ;
+    reads(&s, &list, &commit('a'), first);
+    let old = share_of(&s, &alice, 7, first);
+    let typing = typing_of(&s, &alice, first);
+    assert_eq!(
+        handed_to(&s, &typing, std::slice::from_ref(&old), first + HOUR),
+        Became::NotNow,
+        "past the hour of its read"
+    );
+    assert!(asked_for(&s, first + HOUR).is_empty());
+
+    let latest = first + HOUR;
+    reads(&s, &list, &commit('a'), latest);
+    let typing = typing_of(&s, &alice, latest + 1);
+    let judged = judge(&s[0].conn, &s[0].identity, &typing, &old, latest + 1).unwrap();
+    assert_eq!(judged, Some(Judged::Not(NotAShare::NotMadeWithinTheHour)));
+    assert_eq!(handed_to(&s, &typing, &[old], latest + 1), Became::Nothing);
+
+    let next = latest + READ;
+    reads(&s, &list, &commit('a'), next);
+    let typing = typing_of(&s, &alice, next + 1);
+    let fresh = share_of(&s, &alice, 7, latest + 30);
+    assert_eq!(
+        handed_to(&s, &typing, &[fresh], next + 1),
+        Became::Taken(channel.id)
+    );
+}
+
+/// Nothing is taken where the list names no channel, rule 1's gate holds,
+/// its channel line names this device after `without`, the list does not
+/// name this device, or a relay of its line is not one of this device's
+/// own: no key is typed, none is asked for, and each says why, in rule 6's
+/// line (rule 4.4). A list that clears them all has each key typed.
+#[test]
+fn nothing_is_taken_where_the_gate_holds_this_device_is_left_out_or_not_listed() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = Shared::of(7);
+    let words = channel_words(&channel.id);
+    let (bob_key, carol) = (s.key(0), member(2).public_key());
+    let none = list_with(None, &listed(1..=2));
+    follows_at(&s, &none, &commit('a'), now);
+    let mut read = now;
+    let mut not_typed = |list: &str, at: char| {
+        read += 1;
+        reads(&s, list, &commit(at), read);
+        assert!(typed_keys(&s).is_empty());
+        assert!(asked_for(&s, read).is_empty());
+        not_taking(&s)
+    };
+    assert_eq!(
+        not_typed(&none, 'a'),
+        (
+            "no_channel",
+            format!("The list of {REPOSITORY} names no channel yet.")
+        )
+    );
+    let gated = bobs_list(&s, &channel, 1..=2, &[carol]);
+    assert_eq!(
+        not_typed(&gated, 'b'),
+        (
+            "left_out",
+            format!(
+                "m2 is on the list of channel {words} but was left out of it: nothing is handed \
+                 over until its line goes, or it writes in the channel."
+            )
+        )
+    );
+    let left_out = bobs_list(&s, &channel, 1..=2, &[bob_key]);
+    assert_eq!(
+        not_typed(&left_out, 'c'),
+        (
+            "left_out_of_it",
+            format!(
+                "The list of {REPOSITORY} at {} names channel {words}, which no device of yours \
+                 holds or can move to.",
+                commit('c')
+            )
+        )
+    );
+    let not_listed = list_with(Some((&channel.id, &[])), &listed(1..=2));
+    assert_eq!(
+        not_typed(&not_listed, 'd'),
+        (
+            "not_listed",
+            format!(
+                "Your key is not on the list of {REPOSITORY} at {}.",
+                commit('d')
+            )
+        )
+    );
+
+    // A relay of the line that this device does not know by its key.
+    let list = bobs_list(&s, &channel, 1..=2, &[]);
+    let card_only = &own_relays()[..1];
+    let unreached = after_read(
+        &s[0].conn,
+        &s[0].identity,
+        card_only,
+        &read_of(&s, &list, &commit('e'), true),
+        read + 1,
+    );
+    assert!(matches!(unreached, Ok(Done::Read { .. })), "{unreached:?}");
+    assert!(typed_keys(&s).is_empty());
+    let why = takes_in(&s[0].conn, &s[0].identity, card_only, &row(&s).unwrap())
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(why.word, "not_own_relay");
+    assert_eq!(
+        why.line,
+        format!(
+            "Channel {words} is at ({}), which is not one of your relays: add it to your \
+             configuration.",
+            cordelia_crypto::fingerprint::shown(&line_relay())
+        )
+    );
+
+    reads(&s, &list, &commit('e'), read + 2);
+    let both = sorted(&[member(1).public_key(), carol]);
+    assert_eq!(typed_keys(&s), both);
+    assert_eq!(asked_for(&s, read + 2), both);
+}
+
+/// Where a key the node typed at a read is asked for, and the person has
+/// since dropped the channel, or moved from it, nothing is taken, and why
+/// is kept with the typing (rules 2.5, 4.4 and 6). The next read types
+/// nothing: a drop stops the follow, and a move says to put the new line
+/// in the list.
+#[test]
+fn nothing_is_taken_of_a_channel_dropped_or_moved_from() {
+    // Dropped.
+    let s = bob(1);
+    let now = s.now + 10;
+    let (channel, list) = joins(&s, 7, now);
+    let alice = member(1);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    let typing = typing_of(&s, &alice, read + 1);
+    acts(&s, 0, Do::File(filing(7, "review")), read + 1);
+    acts(&s, 0, Do::Drop(channel.id), read + 2);
+    let share = share_of(&s, &alice, 7, read);
+    assert_eq!(
+        handed_to(&s, &typing, std::slice::from_ref(&share), read + 3),
+        Became::Refused("dropped")
+    );
+    let words = channel_words(&channel.id);
+    assert_eq!(
+        became_of(&s, &alice.public_key()),
+        (
+            Some("dropped".into()),
+            Some(format!(
+                "You dropped channel {words}, and a dropped channel is not taken again."
+            ))
+        )
+    );
+    assert!(filings_of(&s, 0).is_empty());
+    assert_eq!(reads(&s, &list, &commit('a'), read + READ), Done::Stopped);
+
+    // Moved from: Bob held it, and moved to the channel Alice made it anew
+    // as.
+    let s = bob(1);
+    let now = s.now + 10;
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let channel = holds(&s, 0, 7, "review", now);
+    write_in(&s, &channel, &[&alice], now);
+    stores(
+        &s,
+        0,
+        &offer_by(&alice, &channel, 21, &[alice.public_key(), s.key(0)], now),
+        now,
+    );
+    let plan =
+        crate::shared_anew::move_plan(conn, identity, &own_relays(), "review", None, None, now)
+            .unwrap();
+    crate::shared_anew::make_move(conn, identity, &plan.what, now).unwrap();
+    let list = bobs_list(&s, &channel, 1..=2, &[]);
+    follows_at(&s, &list, &commit('a'), now);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    assert!(typed_keys(&s).is_empty());
+    assert_eq!(
+        not_taking(&s),
+        ("moved", crate::following::MOVED_FROM.into())
+    );
+    // A typing kept from before, asked for now.
+    follows::type_key(conn, REPOSITORY, &alice.public_key(), read).unwrap();
+    let typing = typing_of(&s, &alice, read + 1);
+    assert_eq!(
+        handed_to(&s, &typing, &[share_of(&s, &alice, 7, read)], read + 1),
+        Became::Refused("moved")
+    );
+    assert!(row(&s).is_some(), "a move does not stop the follow");
+}
+
+/// Nothing is taken where the person holds a channel the named one was
+/// made anew from, by an offer that counts: they move to it (rules 4.4 and
+/// 6). An offer "without you" does not count.
+#[test]
+fn nothing_is_taken_where_a_channel_it_was_made_anew_from_is_held() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let old = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    write_in(&s, &old, &[&alice, &carol], now);
+    let new = Shared::of(21);
+    let list = bobs_list(&s, &new, 1..=2, &[]);
+    follows_at(&s, &list, &commit('a'), now);
+    // Without you: Carol's, sealed to Alice and Carol, and not to Bob.
+    let without_you = offer_by(
+        &carol,
+        &old,
+        21,
+        &[alice.public_key(), carol.public_key()],
+        now,
+    );
+    stores(&s, 0, &without_you, now);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    assert_eq!(
+        typed_keys(&s).len(),
+        2,
+        "an offer without you does not count"
+    );
+    let typing = typing_of(&s, &alice, read + 1);
+
+    stores(
+        &s,
+        0,
+        &offer_by(&alice, &old, 21, &[alice.public_key(), s.key(0)], now),
+        now,
+    );
+    let share = share_of(&s, &alice, 21, read);
+    assert_eq!(
+        handed_to(&s, &typing, &[share], read + 1),
+        Became::Refused("made_anew")
+    );
+    let move_line =
+        "Run cordelia shared move review: the list names the channel it was made anew as.";
+    assert_eq!(
+        became_of(&s, &alice.public_key()),
+        (Some("made_anew".into()), Some(move_line.into()))
+    );
+    reads(&s, &list, &commit('a'), read + READ);
+    assert!(typed_keys(&s).is_empty());
+    assert_eq!(not_taking(&s), ("made_anew", move_line.into()));
+    assert_eq!(filings_of(&s, 0).len(), 1);
+    assert!(
+        crate::shared_anew::dropped_or_moved(conn, &new.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Nothing is taken where the latest read counted for nothing (rules 2.5,
+/// 3 and 4.4): a key typed at an earlier read and asked for now is refused,
+/// and why is kept with it; and no read that counts for nothing types a
+/// key, as a list that names another follow's channel does not.
+#[test]
+fn nothing_is_taken_where_the_read_counted_for_nothing() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (channel, list) = joins(&s, 7, now);
+    let alice = member(1);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    let typing = typing_of(&s, &alice, read + 1);
+    let behind = done(&s, &read_of(&s, &list, &commit('b'), false), read + 1);
+    assert!(matches!(behind, Done::NotRead(_)), "{behind:?}");
+    assert_eq!(
+        handed_to(&s, &typing, &[share_of(&s, &alice, 7, read)], read + 2),
+        Became::Refused("not_read")
+    );
+    let (became, why) = became_of(&s, &alice.public_key());
+    assert_eq!(became.as_deref(), Some("not_read"));
+    assert!(why.unwrap().starts_with("your clone is at commit"));
+    assert!(filings_of(&s, 0).is_empty());
+
+    // Another follow names the channel first: this list counts for
+    // nothing, and types nothing.
+    let s = bob(1);
+    let now = s.now + 10;
+    let other = bobs_list(&s, &channel, 1..=1, &[]);
+    follows_as(&s, OTHER, &other, &commit('a'), now);
+    follows_at(&s, &list_with(None, &listed(1..=1)), &commit('a'), now);
+    let list = bobs_list(&s, &channel, 1..=2, &[]);
+    let read = reads(&s, &list, &commit('b'), now + READ);
+    assert!(matches!(&read, Done::NotRead(not) if not.word == "followed_elsewhere"));
+    assert!(typed_keys(&s).is_empty());
+    assert_eq!(not_taking(&s).0, "not_read");
+}
+
+/// The node's typings leave the person's own `accept --channel` its eight
+/// places (rule 4.4): with nine listed keys typed by the node, the person
+/// types eight of their own, and a ninth is refused as before; and the
+/// node's are not among those the person's read.
+#[test]
+fn the_persons_own_typings_keep_their_eight_places() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let channel = Shared::of(7);
+    let list = bobs_list(&s, &channel, 1..=9, &[]);
+    follows_at(&s, &list, &commit('a'), now);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    assert_eq!(asked_for(&s, read).len(), 9);
+    let accept = |n: u32| {
+        let typed = encode_public_key(&member(n).public_key()).unwrap();
+        sharing::accept_plan(
+            conn,
+            identity,
+            &own_relays(),
+            &typed,
+            &format!("c{n}"),
+            read,
+        )
+    };
+    for n in 10..18 {
+        let plan = accept(n).unwrap();
+        sharing::type_for_a_channel(conn, &plan.what, read).unwrap();
+    }
+    match accept(18) {
+        Err(Failed::Refused(refusal)) => assert_eq!(refusal.word, "too_many_typed"),
+        other => panic!("{other:?}"),
+    }
+    let persons: Vec<[u8; 32]> = sharing::keys_that_read(conn, read)
+        .unwrap()
+        .into_iter()
+        .map(|typed| typed.key)
+        .collect();
+    let own: Vec<[u8; 32]> = (10..18).map(|n| member(n).public_key()).collect();
+    assert_eq!(sorted(&persons), sorted(&own));
+    assert_eq!(asked_for(&s, read).len(), 9);
+}
+
+/// The agent of the follow's clone is subscribed to the channel taken,
+/// once, as the yes to follow said: the person unsubscribes it, and no
+/// later read subscribes it again. Where the clone is no mapped folder,
+/// none is, and that is kept with the typing.
+#[test]
+fn the_agent_of_the_clone_is_subscribed_once() {
+    let s = bob(1);
+    let now = s.now + 10;
+    maps_the_clone(&s);
+    let (channel, list) = joins(&s, 7, now);
+    let alice = member(1);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    let typing = typing_of(&s, &alice, read + 1);
+    let share = share_of(&s, &alice, 7, read);
+    assert_eq!(
+        handed_to(&s, &typing, &[share], read + 1),
+        Became::Taken(channel.id)
+    );
+    let subscribed = |s: &Several| crate::shared_messages::in_force(&s[0].conn).unwrap();
+    assert_eq!(subscribed(&s), [(channel.id, AGENT.to_string())]);
+    let unsubscribe = Subscription {
+        channel: channel.id,
+        agent: AGENT.into(),
+        subscribed: false,
+    };
+    acts(&s, 0, Do::Subscribe(unsubscribe), read + 2);
+    assert!(subscribed(&s).is_empty());
+    for later in 1..=3 {
+        reads(&s, &list, &commit('a'), read + later * READ);
+        assert!(subscribed(&s).is_empty());
+        assert!(typed_keys(&s).is_empty());
+    }
+
+    // A clone that is no mapped folder.
+    let s = bob(1);
+    let now = s.now + 10;
+    let (channel, list) = joins(&s, 7, now);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    let typing = typing_of(&s, &alice, read + 1);
+    let share = share_of(&s, &alice, 7, read);
+    assert_eq!(
+        handed_to(&s, &typing, &[share], read + 1),
+        Became::Taken(channel.id)
+    );
+    assert!(subscribed(&s).is_empty());
+    assert_eq!(
+        became_of(&s, &alice.public_key()),
+        (
+            Some(TAKEN.into()),
+            Some(format!(
+                "{FOLDER} is no mapped folder now, so no agent was subscribed."
+            ))
+        )
+    );
+}
+
+/// Where the person holds the 16 channels, or files another channel under
+/// the repository's `owner/name`, or syncs a folder as it, nothing is
+/// typed, and each says why in rule 6's line (rule 4.4). And the line of
+/// the wait, while this device looks.
+#[test]
+fn nothing_is_taken_without_room_or_the_name() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (_, list) = joins(&s, 7, now);
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    assert_eq!(typed_keys(&s).len(), 2);
+    assert!(
+        takes_in(&s[0].conn, &s[0].identity, &own_relays(), &row(&s).unwrap())
+            .unwrap()
+            .is_ok()
+    );
+    assert_eq!(
+        waiting_line(NAME, "2 minutes ago"),
+        "Waiting for a member's device to hand you team/project. Your list was read 2 minutes \
+         ago. A member's device hands it over once a member's clone has the merged list: a \
+         member runs git pull there."
+    );
+
+    holds(&s, 0, 8, NAME, read);
+    reads(&s, &list, &commit('a'), read + 1);
+    assert!(typed_keys(&s).is_empty());
+    assert_eq!(
+        not_taking(&s),
+        (
+            "name_taken",
+            "You file another channel as team/project: rename it with cordelia shared rename."
+                .into()
+        )
+    );
+    acts(&s, 0, Do::Drop(Shared::of(8).id), read + 2);
+
+    let mapped = serde_json::json!([{ "folder": "/home/bob/Work/elsewhere", "name": NAME }]);
+    meta::set(&s[0].conn, meta::SYNC_CLAUDE_MAPPINGS, &mapped.to_string()).unwrap();
+    reads(&s, &list, &commit('a'), read + 3);
+    assert!(typed_keys(&s).is_empty());
+    assert_eq!(not_taking(&s).0, "name_taken");
+    meta::remove(&s[0].conn, meta::SYNC_CLAUDE_MAPPINGS).unwrap();
+
+    for seed in 0..16u8 {
+        holds(&s, 0, 100 + seed, &format!("c{seed}"), read + 4);
+    }
+    reads(&s, &list, &commit('a'), read + 5);
+    assert!(typed_keys(&s).is_empty());
+    assert_eq!(
+        not_taking(&s),
+        (
+            "too_many_channels",
+            "You hold 16 shared channels, the most there can be.".into()
+        )
+    );
 }
 
 // ── The clones, read with git ────────────────────────────────────────
