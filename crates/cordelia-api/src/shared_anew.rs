@@ -616,7 +616,13 @@ fn staying_with_no_question(
         }
         stay.push(*key);
     }
-    let line = new_line_of(conn, held, row, &[], &stay)?;
+    // The keys of the removal or recovery that left the channel not clean
+    // are named whatever a list says (rule 5).
+    let removing = match st(rows::not_clean_of(conn, &row.channel))? {
+        Some(mark) => removed_at(conn, mark.since)?.unwrap_or_default(),
+        None => Vec::new(),
+    };
+    let line = new_line_of(conn, held, row, &removing, &[], &stay)?;
     Ok((
         stay,
         LeftOut {
@@ -1123,19 +1129,22 @@ pub struct NewLine {
 }
 
 /// Who the making anew of the channel of `row` leaves out, with the keys of
-/// `stay` staying, where a person left out each key of `chosen` that does
-/// not stay (decision 2026-11-06 (joining), rule 5). It decides nothing of
-/// who stays.
+/// `stay` staying, at a removal of the keys of `removing`, where a person
+/// left out each key of `chosen` that does not stay (decision 2026-11-06
+/// (joining), rule 5). It decides nothing of who stays.
 ///
 /// - **The list** is that of the repository this device follows whose
 ///   channel line names the channel, or a channel it was made anew or moved
 ///   from, back along the moves this device keeps: a line not merged yet
 ///   leaves the list naming an earlier channel.
-/// - **Left out,** and named after `without`: first each key the person
-///   removed, as this device knows them (`removed_known`), that the list
-///   names, or each, where no list does; a removed device held every seed
-///   of the person's, whether or not it wrote there. Then each key of
-///   `chosen` that the list names, or each, where no list does.
+/// - **Left out,** and named after `without`: first each key of `removing`,
+///   whatever the list says, so that a removal names the device it removes
+///   and a line that later lists it again does not let it in. Then each
+///   other key the person removed, as this device knows them
+///   (`removed_known`), that the list names, or each, where no list does; a
+///   removed device held every seed of the person's, whether or not it
+///   wrote there. Then each key of `chosen` that the list names, or each,
+///   where no list does.
 /// - **Carried over,** and named after `without` too: the `without` keys of
 ///   the list's channel line, and the keys this device's own makings anew
 ///   left out back along the moves, that the list still names, or each,
@@ -1155,6 +1164,7 @@ fn new_line_of(
     conn: &Connection,
     held: &Held,
     row: &Channel,
+    removing: &[[u8; 32]],
     chosen: &[[u8; 32]],
     stay: &[[u8; 32]],
 ) -> Result<NewLine, PersonError> {
@@ -1167,11 +1177,19 @@ fn new_line_of(
     // Back along the moves, to the channel the list names: what this
     // device's makings anew left out on the way is carried over.
     let made = st(follows::made_lines(conn))?;
+    let lists = crate::following::lists_followed(conn)?;
+    let naming = |channel: &[u8; 32]| {
+        lists.iter().find(|list| {
+            list.channel
+                .as_ref()
+                .is_some_and(|line| line.channel == *channel)
+        })
+    };
     let mut carried: Vec<[u8; 32]> = Vec::new();
     let mut list = None;
     let mut channel = row.channel;
     for _ in 0..=SHARED_MAX_DROPPED {
-        list = crate::following::list_naming(conn, &channel)?;
+        list = naming(&channel);
         if list.is_some() {
             break;
         }
@@ -1183,13 +1201,16 @@ fn new_line_of(
             _ => break,
         }
     }
-    if let Some(list) = &list {
+    if let Some(list) = list {
         let current = list.channel.iter().flat_map(|line| &line.without);
         carried.splice(0..0, current.copied());
     }
-    let named = |key: &[u8; 32]| list.as_ref().is_none_or(|list| list.lists(key));
+    let named = |key: &[u8; 32]| list.is_none_or(|list| list.lists(key));
     let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     let mut line = NewLine::default();
+    for key in removing {
+        once(&mut line.left_out, key);
+    }
     for key in removed.iter().filter(|key| named(key)) {
         once(&mut line.left_out, key);
     }
@@ -1573,7 +1594,7 @@ pub fn anew_plan(
         return refused("", STAY_PAST_64.into());
     }
     let left_out = listing.asked.len() - (stay.len() - listing.own_devices.len());
-    let line = new_line_of(conn, &held, &row, &listing.asked, &stay)?;
+    let line = new_line_of(conn, &held, &row, &[], &listing.asked, &stay)?;
     let at: Vec<String> = relays
         .iter()
         .map(|key| relay_shown(own_relays, key))

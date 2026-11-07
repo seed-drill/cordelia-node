@@ -3031,13 +3031,13 @@ fn a_key_and_its_twin_left_out_are_kept_once() {
 }
 
 /// A removal's making anew names the removed device after `without` (rule
-/// 5), whether or not it wrote in the channel: it held every seed of the
-/// person's. It names it where the list names it, or where no list names
-/// the channel. The tablet wrote in `review` and not in `design`; Bob's
-/// laptop follows a list naming `review` that still lists the tablet, and
-/// one naming `notes` that does not; no list names `design`. The removal
-/// says each line, after the line it says of each channel, and the end of
-/// the removal says the same, from what was kept.
+/// 5), whether or not it wrote in the channel, as it held every seed of the
+/// person's; and whatever the list says, so that a line that later lists
+/// it again does not let it in. The tablet wrote in `review` and not in
+/// `design`; Bob's laptop follows a list naming `review` that still lists
+/// the tablet, and one naming `notes` that does not; no list names
+/// `design`. The removal says each line, after the line it says of each
+/// channel, and the end of the removal says the same, from what was kept.
 #[test]
 fn a_removal_names_the_device_it_removed_after_without() {
     let mut s = bob(3);
@@ -3089,7 +3089,7 @@ fn a_removal_names_the_device_it_removed_after_without() {
     for (channel, name, named) in [
         (&review, "review", vec![tablet]),
         (&design, "design", vec![tablet]),
-        (&notes, "notes", vec![]),
+        (&notes, "notes", vec![tablet]),
     ] {
         let at = said
             .iter()
@@ -3219,6 +3219,23 @@ fn a_second_making_anew_before_the_removals_line_is_merged_names_the_removed_dev
     let (line, read) = line_in(&said);
     assert_eq!(read.without, [tablet, carol.public_key()], "{line}");
     assert_eq!(kept_of(&s, 0, &c2).left_out, [tablet, carol.public_key()]);
+}
+
+/// A key removed at an earlier removal is named by a later making anew only
+/// where the list names it (rule 5): after the laptop removed the tablet,
+/// it makes C2 anew with `shared anew`, under a list naming C1 that does
+/// not list the tablet. Its line does not name it.
+#[test]
+fn a_later_making_anew_names_an_earlier_removed_key_only_where_listed() {
+    let mut s = bob(3);
+    let (c1, alice) = removed_at_line_at(&mut s);
+    let now = s.now + 30;
+    let listed = [s.key(0), s.key(1), alice.public_key()];
+    follows_a_list(&s, 0, "example.org/team/project", &c1.id, &[], &listed, now);
+
+    let (said, _) = anew_keeping(&s, 0, "review", &[alice.public_key()], now);
+    let (line, read) = line_in(&said);
+    assert!(read.without.is_empty(), "{line}");
 }
 
 /// A key a removal leaves out only because it had not moved is not named,
