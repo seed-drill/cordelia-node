@@ -13,7 +13,8 @@
 //!   reader: the keys it shows that the offer does not seal to, less its own
 //!   devices, which follow their person.
 //! - **`shared anew`** ([`anew_plan`], [`make_anew`]): every key of the
-//!   device's table of the channel is listed before anything is asked; the
+//!   device's table of the channel, and every key not moved yet
+//!   ([`not_moved_yet`]), is listed before anything is asked; the
 //!   person answers each with `keep` or `out`, or `out for the rest`; the
 //!   maker's own devices stay and a removed key never does. The new seed is
 //!   sealed to each key that stays in the old channel, and the new channel
@@ -528,7 +529,8 @@ pub struct LeftOut {
 /// (decision 2026-10-24, rule 24): the person's own devices where
 /// `own_devices` says so, and then every key of the table of the channel
 /// of `row` but the removed keys and the person's own devices, in the
-/// order of the listing, 64 at most; and what it left out besides.
+/// order of the listing, 64 at most; and what it left out besides. A key
+/// not moved yet is not kept: rule 24 keeps the table alone.
 ///
 /// A channel past its bound that a removal makes anew is sealed to none of
 /// the person's own devices (§3.5): none of them holds the new channel, so
@@ -548,6 +550,10 @@ fn staying_with_no_question(
     };
     let mut past_64 = 0;
     for key in &listed.asked {
+        // A removal keeps the table's keys alone (rule 24).
+        if listed.not_moved.contains(key) {
+            continue;
+        }
         if stay.len() >= SHARED_MAX_KEYS {
             past_64 += 1;
             continue;
@@ -1028,6 +1034,11 @@ pub struct Listing {
     pub own_devices: Vec<[u8; 32]>,
     /// The keys asked about, in the order listed.
     pub asked: Vec<[u8; 32]>,
+    /// Of `asked`, the keys not moved yet: asked about at `shared anew`,
+    /// and not kept at a removal, which keeps the table alone (rule 24).
+    pub not_moved: Vec<[u8; 32]>,
+    /// The keys listed as left out because the person removed them.
+    pub removed: usize,
     /// How many rows the table let go, left out and counted.
     pub let_go: u64,
 }
@@ -1047,9 +1058,11 @@ pub const A_PERSONS_DEVICES: &str = "A device of a person who stays is left out 
 /// The listing of the channel of `row` (§7): the keys it shows, in the
 /// order of §2.4, then the keys beyond the 64, then the keys refused for
 /// room, each with when this device first held or first refused it, when
-/// it last wrote there, and whether its entries are stored or refused; the
-/// maker's own devices as staying; a key the statement removed as left
-/// out; and the rows the table let go, counted.
+/// it last wrote there, and whether its entries are stored or refused; then
+/// the keys not moved yet ([`not_moved_yet`]), but in a channel past a
+/// bound; the maker's own devices as staying; a key the statement removed
+/// as left out, in either part, counted; and the rows the table let go,
+/// counted.
 fn listing_of(
     conn: &Connection,
     held: &Held,
@@ -1116,6 +1129,7 @@ fn listing_of(
             listing
                 .lines
                 .push(format!("  {form}: left out, a device you removed"));
+            listing.removed += 1;
             continue;
         }
         let first = match (key.first_held, key.first_refused) {
@@ -1137,6 +1151,39 @@ fn listing_of(
             .lines
             .push(format!("  {form}: {first}{last}, {entries}"));
         listing.asked.push(key.key);
+    }
+    // The keys the offer that made this channel sealed to and that have
+    // not written here yet (§7, "not moved yet"): no table row holds them,
+    // so without this a making anew before they moved left them out
+    // unasked (#291). Each is asked about like any other key.
+    // A channel past its bound lists its table alone (§7).
+    let not_moved = match row.state {
+        State::NotInForce => Vec::new(),
+        _ => not_moved_yet(conn, own, &row.channel)?,
+    };
+    let not_moved: Vec<[u8; 32]> = not_moved
+        .into_iter()
+        .filter(|key| {
+            !listing.own_devices.contains(key) && !table.iter().any(|row| row.key == *key)
+        })
+        .collect();
+    if !not_moved.is_empty() {
+        listing.lines.push(format!(
+            "Sealed to when \"{shown_name}\" was made anew, and not moved here yet:"
+        ));
+        for key in not_moved {
+            let form = sender_form(conn, held, own, &key)?;
+            if removed.contains(&key) {
+                listing
+                    .lines
+                    .push(format!("  {form}: left out, a device you removed"));
+                listing.removed += 1;
+                continue;
+            }
+            listing.lines.push(format!("  {form}"));
+            listing.asked.push(key);
+            listing.not_moved.push(key);
+        }
     }
     listing.let_go = row.let_go;
     if row.state == State::NotInForce {
@@ -1294,15 +1341,7 @@ pub fn anew_plan(
         sharing::counted(stay.len() as u64, "key"),
         // The rows the table let go are an upper bound (`past_a_bound_line`).
         if listing.let_go > 0 { "up to " } else { "" },
-        sharing::counted(
-            (left_out
-                + crate::person::removed_known(conn, &held.statement.statement)?
-                    .iter()
-                    .filter(|key| st(kept::key(conn, row.id, key)).ok().flatten().is_some())
-                    .count()) as u64
-                + listing.let_go,
-            "key"
-        )
+        sharing::counted((left_out + listing.removed) as u64 + listing.let_go, "key")
     );
     Ok((
         listing,
@@ -1695,6 +1734,12 @@ pub fn make_move(
 
 /// The keys that the offer which made the channel `channel` sealed to and
 /// that have not written there yet, but this device: "not moved yet" (§7).
+/// An offer counts only where this device made it, or its maker has
+/// written in this channel and is not a key the person removed: only a
+/// holder of this channel's seed can write there. A key left out still
+/// holds the old channel, and can write an offer there that names this
+/// one, even with a seal of this device's copied from another; its keys
+/// are not taken (#291's reviews).
 pub fn not_moved_yet(
     conn: &Connection,
     own: &[u8; 32],
@@ -1714,9 +1759,18 @@ pub fn not_moved_yet(
         .filter(|key| key.first_held.is_some())
         .map(|key| key.key)
         .collect();
+    // A maker the person removed counts for nothing, though it wrote here.
+    let removed = match held(conn)? {
+        Some(held) => crate::person::removed_known(conn, &held.statement.statement)?,
+        None => Vec::new(),
+    };
     let mut keys = Vec::new();
     for offer in st(rows::offers_into(conn, channel))? {
         if offer.channel != from {
+            continue;
+        }
+        if offer.maker != *own && (!wrote.contains(&offer.maker) || removed.contains(&offer.maker))
+        {
             continue;
         }
         for key in offer.sealed_to {
