@@ -1,7 +1,7 @@
 //! Tests of following a repository (decision 2026-11-06 (joining), rules
 //! 2.3 to 2.5): the plan of `cordelia subscribe` in a clone for each case
-//! of rule 2.3, `--new` and the labels it makes, and the route over a real
-//! clone on the disk.
+//! of rule 2.3, `--new` and the labels it makes, what stops a follow, and
+//! the route over a real clone on the disk.
 
 use super::*;
 use crate::git_list::ListAt;
@@ -627,6 +627,73 @@ fn labels_for_the_list_are_made_from_each_devices_label() {
     );
     // Empty: a number alone.
     assert_eq!(given(&["", "笔记本", "!!"], &[]), ["-2", "-3", "-4"]);
+}
+
+/// `shared drop` of a channel stops every follow whose latest list names
+/// that channel, held back or not, in the drop's write, and says so; a
+/// follow whose list names another channel, or none, goes on (rule 2.5).
+#[test]
+fn a_drop_stops_each_follow_whose_list_names_the_channel() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let review = holds(&s, 0, 7, "review", now);
+    let design = holds(&s, 0, 8, "design", now);
+    let me = format!("{} bob-laptop\n", id(&s.key(0)));
+    let alice = member(1).public_key();
+    for (repository, list) in [
+        (
+            "example.org/team/a",
+            format!("{}\n{me}", channel_line(&review, &[])),
+        ),
+        (
+            "example.org/team/b",
+            format!("{}\n{me}", channel_line(&review, &[alice])),
+        ),
+        (
+            "example.org/team/c",
+            format!("{}\n{me}", channel_line(&design, &[])),
+        ),
+        ("example.org/team/d", me.clone()),
+    ] {
+        follows::follow(conn, repository, "origin", FOLDER, now).unwrap();
+        let read = LastRead {
+            commit: FIRST.into(),
+            at: now,
+            from_clone: true,
+        };
+        follows::read_done(conn, repository, &read, list.as_bytes()).unwrap();
+    }
+    let said = sharing::make_drop(conn, &s[0].identity, &review.id, "review", now + 1).unwrap();
+    assert_eq!(
+        said,
+        format!(
+            "Dropped \"review\" (channel {}): your devices hold it no more. This device follows \
+             example.org/team/a no more. This device follows example.org/team/b no more.",
+            channel_words(&review.id)
+        )
+    );
+    let left: Vec<String> = follows::follows(conn)
+        .unwrap()
+        .into_iter()
+        .map(|follow| follow.identity)
+        .collect();
+    assert_eq!(left, ["example.org/team/c", "example.org/team/d"]);
+}
+
+/// A device that leaves its person follows nothing after (rule 2.5): every
+/// follow goes, in the leave's write.
+#[test]
+fn leaving_deletes_every_follow() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    for repository in ["example.org/team/a", "example.org/team/b"] {
+        follows::follow(conn, repository, "origin", FOLDER, now).unwrap();
+    }
+    assert_eq!(follows::follows(conn).unwrap().len(), 2);
+    assert!(crate::leaving::forget(conn, &s[0].identity, false, now).unwrap());
+    assert!(follows::follows(conn).unwrap().is_empty());
 }
 
 // ── The route, over a real clone ─────────────────────────────────────

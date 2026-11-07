@@ -1,5 +1,6 @@
 //! Following a repository (decision 2026-11-06 (joining), rule 2):
-//! `cordelia subscribe` in a clone, with no name, and `--new`.
+//! `cordelia subscribe` in a clone, with no name, and `--new`; and what
+//! stops a follow (rule 2.5).
 //!
 //! - **The clone is read outside the node's lock** ([`read_of`]): the top
 //!   of the work tree the folder is in, the remote whose repository it is
@@ -18,6 +19,9 @@
 //! - **On the yes, in one transaction** ([`make`]): the subscription, the
 //!   follow, started afresh, and its first read; with `--new` (rule 2.4),
 //!   the channel made first, and the lines to add to the list said.
+//! - **A follow stops** where the person drops the channel its list names
+//!   ([`stop_following`], at `shared drop`); and every follow goes where
+//!   the device leaves its person (`leaving::forget`).
 
 use std::path::{Path, PathBuf};
 
@@ -536,6 +540,32 @@ pub fn list_labels(labels: &[String], taken: &[String]) -> Vec<String> {
         made.push(label);
     }
     made
+}
+
+// ── What stops a follow (rule 2.5) ───────────────────────────────────
+
+/// Stop every follow whose latest list names `channel` on its channel
+/// line, whether or not a key left out holds it back (rule 2.5): what
+/// `shared drop` of that channel does, in its write. Returns the
+/// repositories no longer followed.
+pub(crate) fn stop_following(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<String>, PersonError> {
+    let mut stopped = Vec::new();
+    for follow in follows::follows(conn)? {
+        let names = follow
+            .list
+            .as_deref()
+            .and_then(|list| members::read(list).ok())
+            .and_then(|members| members.channel)
+            .is_some_and(|line| line.channel == *channel);
+        if names {
+            follows::unfollow(conn, &follow.identity)?;
+            stopped.push(follow.identity);
+        }
+    }
+    Ok(stopped)
 }
 
 #[cfg(test)]
