@@ -225,6 +225,26 @@ pub fn read_done(
     Ok(changed == 1)
 }
 
+/// The last commit read of `identity`, when and from where, with the list
+/// kept as it was: a person's yes to follow it again, whose commit is
+/// where never-back starts over (rule 2.5), while the next read is
+/// compared with the list last read (rule 4.6). Nothing is done for a
+/// repository this device does not follow.
+pub fn set_last_read(
+    conn: &Connection,
+    identity: &str,
+    read: &LastRead,
+) -> Result<bool, CordeliaError> {
+    let changed = conn
+        .execute(
+            "UPDATE shared_follows SET last_commit = ?2, last_read_at = ?3, read_from = ?4
+             WHERE identity = ?1",
+            params![identity, read.commit, read.at, read.from_clone as i64],
+        )
+        .map_err(storage)?;
+    Ok(changed == 1)
+}
+
 /// The last key the node handed the channel of `identity` to: its next
 /// turn starts after it.
 pub fn set_last_handed(

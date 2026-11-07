@@ -93,6 +93,21 @@ fn following_again_starts_never_back_over_and_unfollowing_keeps_nothing() {
     );
     assert_eq!(typed(&conn, ID).unwrap().len(), 1);
     assert_eq!(notices(&conn, ID).unwrap().len(), 1);
+    // The yes's commit is where never-back starts over; the list stays.
+    let yes_again = || LastRead {
+        commit: commit('b'),
+        at: 12,
+        from_clone: true,
+    };
+    let yes = yes_again();
+    assert!(set_last_read(&conn, ID, &yes).unwrap());
+    let kept = follow_of(&conn, ID).unwrap().unwrap();
+    assert_eq!(
+        (kept.last, kept.list.as_deref()),
+        (Some(yes), Some(&b"list"[..]))
+    );
+    // Nothing is done for a repository not followed.
+    assert!(!set_last_read(&conn, "example.org/o/none", &yes_again()).unwrap());
     filled(&conn);
     unfollow(&conn, ID).unwrap();
     assert_eq!(follow_of(&conn, ID).unwrap(), None);

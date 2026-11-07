@@ -306,18 +306,27 @@ pub async fn follow(
         }
         crate::following::last_reads(&conn).map_err(crate::commands::refused)?
     };
-    let within = Duration::from_secs(2 * STREAM_TIMEOUT_SECS);
+    // One deadline for every step of git, made before any of them.
+    let secs = 2 * STREAM_TIMEOUT_SECS;
+    let deadline = Instant::now() + Duration::from_secs(secs);
     let data_dir = state.home_dir.clone();
     let folder = std::path::PathBuf::from(&body.folder);
     let remote = body.remote.clone();
     let reading = tokio::task::spawn_blocking(move || {
-        crate::following::read_of(&data_dir, &folder, remote.as_deref(), &lasts, within)
+        crate::following::read_of(
+            &data_dir,
+            &folder,
+            remote.as_deref(),
+            &lasts,
+            deadline,
+            secs,
+        )
     });
-    let read = match tokio::time::timeout(within, reading).await {
+    let read = match tokio::time::timeout_at(deadline.into(), reading).await {
         Ok(read) => read.map_err(|e| ApiError::Internal(format!("the read of the clone: {e}")))?,
         Err(_) => Err(Failed::Refused(Refusal {
             word: "late",
-            line: crate::following::late_line(within.as_secs()),
+            line: crate::following::late_line(secs),
         })),
     };
     match read {
