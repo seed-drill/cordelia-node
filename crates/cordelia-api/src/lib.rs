@@ -33,9 +33,8 @@
 //!
 //! A repository's list of the devices that share its channel is read with
 //! git through [`git_list`] (decision 2026-11-06 (joining)): which
-//! repository a clone is, the node's own fetch of a public one's list, a
-//! read of a clone's copy of it, and never back, each with nothing of the
-//! person's reaching git.
+//! repository a clone is, a read of the clone's copy of its list, and
+//! never back, each with nothing of the person's reaching git.
 //!
 //! A personal node serves [`configure_device_routes`]: it carries no
 //! channel of the older kind (decision 2026-10-04 §10). A node of any

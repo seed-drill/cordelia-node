@@ -1,9 +1,9 @@
-//! A repository's list, read with git (decision 2026-11-06 (joining),
-//! rules 2 and 3), against a server of git over HTTPS on loopback
-//! (`common`): the node's own fetch of a public repository's list; a read
-//! of a clone, at its remote's default branch and nothing else; never
-//! back; a partial clone; and nothing of the person's that reaches git,
-//! so that nothing asks, at a terminal too.
+//! A repository's list, read with git from a clone (decision 2026-11-06
+//! (joining), rules 2 and 3): a read of a clone, at its remote's default
+//! branch and nothing else; never back; a partial clone, whose promisor is
+//! a server of git over HTTPS on loopback (`common`), which no read may
+//! reach; and nothing of the person's that reaches git, so that nothing
+//! asks, at a terminal too.
 
 #![cfg(unix)]
 
@@ -19,9 +19,7 @@ use common::{
 use cordelia_api::git_list::{
     ClonedList, Git, GitVersion, Identity, ListAt, ListFailed, NotAnIdentity, RemoteRefused,
 };
-use cordelia_core::protocol::{
-    MEMBERS_FETCH_MAX_SECS, MEMBERS_FILE_MAX_BYTES, MEMBERS_GIT_TERM_SECS, MEMBERS_REPO_MAX_BYTES,
-};
+use cordelia_core::protocol::MEMBERS_FILE_MAX_BYTES;
 
 const LIST: &[u8] = b"# the list\ncordelia_pk1example alice-laptop\n";
 
@@ -132,356 +130,44 @@ impl Bench {
     }
 }
 
-// ── The fetch ────────────────────────────────────────────────────────
-
-/// The node fetches `HEAD` at a depth of one, with no tags, into
-/// `refs/cordelia/list` of a bare repository of its own that names its
-/// remote, and reads the one file there; a new commit brings the new
-/// list, and a commit with no list gives none (rule 3).
-#[test]
-fn a_fetch_reads_the_list_into_the_nodes_own_repository() {
-    let bench = Bench::new(Answers::Git);
-    // A file elsewhere in the repository, larger than the list may be.
-    let work = bench.tmp.path().join("work");
-    std::fs::create_dir_all(&work).unwrap();
-    std::fs::write(work.join("big.bin"), vec![b'x'; 100_000]).unwrap();
-    let first = bench.commit(Some(LIST));
-    git(&bench.home(), &bench.bare, &["tag", "v1", "main"]);
-    let node = bench.node("node");
-    assert!(
-        node.version()
-            .is_some_and(|v| v >= GitVersion { major: 2, minor: 0 })
-    );
-    let read = node.fetch_list(&identity(), &bench.url()).unwrap();
-    assert_eq!(
-        read,
-        ListAt {
-            commit: first.clone(),
-            file: Some(LIST.to_vec()),
-        }
-    );
-    let repo = node.repo_of(&identity());
-    assert!(repo.ends_with("repos/example.org/example/project.git"));
-    let ask = |args: &[&str]| git(&bench.home(), &repo, args);
-    assert_eq!(ask(&["rev-parse", "--is-bare-repository"]), "true");
-    assert_eq!(ask(&["rev-parse", "--is-shallow-repository"]), "true");
-    assert_eq!(ask(&["rev-parse", "refs/cordelia/list"]), first);
-    assert_eq!(ask(&["config", "remote.origin.url"]), bench.url());
-    assert_eq!(ask(&["for-each-ref", "refs/tags"]), "");
-    // A partial clone of its own, whose first step brings no file, and
-    // whose second brings the list's alone: neither the large file nor a
-    // small one is there, and the list is.
-    assert_eq!(ask(&["config", "remote.origin.promisor"]), "true");
-    assert_eq!(ask(&["config", "extensions.partialClone"]), "origin");
-    let readme = git(&bench.home(), &bench.bare, &["rev-parse", "main:README"]);
-    assert!(
-        !holds(&bench.home(), &repo, &readme),
-        "a small file was fetched"
-    );
-    let big = git(&bench.home(), &bench.bare, &["rev-parse", "main:big.bin"]);
-    let list = git(
-        &bench.home(),
-        &bench.bare,
-        &["rev-parse", "main:.cordelia/members"],
-    );
-    assert!(
-        !holds(&bench.home(), &repo, &big),
-        "the large file was fetched"
-    );
-    assert!(holds(&bench.home(), &repo, &list));
-    // The node asked in git's protocol 2, which the server was given.
-    assert!(
-        bench
-            .server
-            .seen()
-            .iter()
-            .any(|seen| seen.header("git-protocol") == Some("version=2"))
-    );
-    // A new commit.
-    let second = bench.commit(Some(b"# the list, changed\n"));
-    let read = node.fetch_list(&identity(), &bench.url()).unwrap();
-    assert_eq!(read.commit, second);
-    assert_eq!(read.file.as_deref(), Some(&b"# the list, changed\n"[..]));
-    assert_eq!(ask(&["rev-list", "--count", "refs/cordelia/list"]), "1");
-    // A commit with no list.
-    let third = bench.commit(None);
-    assert_eq!(
-        node.fetch_list(&identity(), &bench.url()).unwrap(),
-        ListAt {
-            commit: third,
-            file: None,
-        }
-    );
-    // A host that has no such repository, and one with no commit.
-    let missing = bench.server.url("example", "missing");
-    assert_eq!(
-        node.fetch_list(&identity(), &missing),
-        Err(ListFailed::NotFound)
-    );
-    bench.server.bare("example", "empty");
-    let empty = Identity::from_address("https://example.org/example/empty").unwrap();
-    assert_eq!(
-        node.fetch_list(&empty, &bench.server.url("example", "empty")),
-        Err(ListFailed::NoCommits)
-    );
-}
+// ── A clone ──────────────────────────────────────────────────────────
 
 /// The list must be a plain file of at most 16 KiB (rule 1): of that
-/// size it is read, a byte more is too large, and a folder or a link in
-/// its place is not a list.
+/// size it is read, a byte more is too large, a folder or a link in its
+/// place is not a list, and a commit with none gives none.
 #[test]
 fn the_list_is_a_plain_file_of_at_most_16_kib() {
     let bench = Bench::new(Answers::Git);
-    let node = bench.node("node");
-    let fetched = || node.fetch_list(&identity(), &bench.url());
     let largest = vec![b'#'; MEMBERS_FILE_MAX_BYTES];
     bench.commit(Some(&largest));
-    assert_eq!(fetched().unwrap().file, Some(largest.clone()));
+    let clone = bench.clone_of("clone");
+    let node = bench.node("node");
+    let read = || {
+        bench.fetch_into(&clone);
+        node.read_clone(&clone, "origin", &identity())
+            .map(|read| read.at.file)
+    };
+    assert_eq!(read(), Ok(Some(largest.clone())));
     let mut larger = largest;
     larger.push(b'\n');
     bench.commit(Some(&larger));
-    assert_eq!(fetched(), Err(ListFailed::TooLarge));
-    // Of 20,000 bytes that nothing makes smaller: too large to read, at a
-    // host that sends a file asked for by its ID whatever the filter, as
-    // git's own server does.
-    bench.commit(Some(&random_bytes(20_000, 1)));
-    assert_eq!(fetched(), Err(ListFailed::TooLarge));
+    assert_eq!(read(), Err(ListFailed::TooLarge));
     // A folder in its place.
     let work = bench.tmp.path().join("work");
     std::fs::remove_file(work.join(".cordelia/members")).unwrap();
     std::fs::create_dir_all(work.join(".cordelia/members")).unwrap();
     std::fs::write(work.join(".cordelia/members/list"), LIST).unwrap();
     commit_work(&bench.home(), &work, &bench.bare);
-    assert_eq!(fetched(), Err(ListFailed::NotAFile));
+    assert_eq!(read(), Err(ListFailed::NotAFile));
     // A link in its place.
     std::fs::remove_dir_all(work.join(".cordelia/members")).unwrap();
     std::os::unix::fs::symlink("../README", work.join(".cordelia/members")).unwrap();
     commit_work(&bench.home(), &work, &bench.bare);
-    assert_eq!(fetched(), Err(ListFailed::NotAFile));
+    assert_eq!(read(), Err(ListFailed::NotAFile));
+    // None.
+    bench.commit(None);
+    assert_eq!(read(), Ok(None));
 }
-
-/// `count` bytes that no compression makes smaller, the same for the same
-/// `seed`.
-fn random_bytes(count: usize, seed: u64) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
-    (0..count)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 24) as u8
-        })
-        .collect()
-}
-
-/// A list far larger than 16 KiB, of bytes that nothing makes smaller:
-/// git is stopped as it receives it, once the node's repository has grown
-/// by more than the file at its largest and its pack, so that what the
-/// host sends of it is bounded; it is too large, and not kept (rule 3).
-#[test]
-fn a_list_far_too_large_is_not_received() {
-    let bench = Bench::new(Answers::Git);
-    bench.commit(Some(&random_bytes(32 * 1024 * 1024, 2)));
-    let node = bench.node("node");
-    let began = Instant::now();
-    assert_eq!(
-        node.fetch_list(&identity(), &bench.url()),
-        Err(ListFailed::TooLarge)
-    );
-    let repo = node.repo_of(&identity());
-    let blob = git(
-        &bench.home(),
-        &bench.bare,
-        &["rev-parse", "main:.cordelia/members"],
-    );
-    assert!(!holds(&bench.home(), &repo, &blob), "the list was received");
-    let held = du(&repo.join("objects"));
-    assert!(held < 4 * 1024 * 1024, "the repository holds {held} bytes");
-    assert!(began.elapsed() < Duration::from_secs(MEMBERS_FETCH_MAX_SECS));
-}
-
-/// What the files under `dir` hold, together.
-fn du(dir: &Path) -> u64 {
-    let mut bytes = 0;
-    let mut dirs = vec![dir.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let meta = std::fs::symlink_metadata(entry.path()).unwrap();
-            if meta.is_dir() {
-                dirs.push(entry.path());
-            } else {
-                bytes += meta.len();
-            }
-        }
-    }
-    bytes
-}
-
-/// A folder on the way to the node's own repository that is a link, at
-/// the host's level or the owner's, is refused before anything is written
-/// or deleted there: what it leads to is left as it was (rule 3).
-#[test]
-fn a_link_on_the_way_to_the_nodes_repository_is_refused() {
-    let bench = Bench::new(Answers::Git);
-    bench.commit(Some(LIST));
-    let data = bench.tmp.path().join("node");
-    // A bound of one byte: a fetch would make the repository afresh.
-    let node = Git::given(&data, "git", bench.inherited())
-        .unwrap()
-        .with_repo_max_bytes(1);
-    let elsewhere = bench.tmp.path().join("elsewhere");
-    let kept = elsewhere.join("example/project.git/kept");
-    std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
-    std::fs::write(&kept, "not the node's").unwrap();
-    std::os::unix::fs::symlink(&elsewhere, data.join("repos/example.org")).unwrap();
-    let refused = node.fetch_list(&identity(), &bench.url()).unwrap_err();
-    assert!(refused.says().contains("is a link"), "{}", refused.says());
-    assert!(kept.exists());
-    // At the owner's level.
-    std::fs::remove_file(data.join("repos/example.org")).unwrap();
-    std::fs::create_dir_all(data.join("repos/example.org")).unwrap();
-    std::os::unix::fs::symlink(
-        elsewhere.join("example"),
-        data.join("repos/example.org/example"),
-    )
-    .unwrap();
-    let refused = node.fetch_list(&identity(), &bench.url()).unwrap_err();
-    assert!(refused.says().contains("is a link"), "{}", refused.says());
-    assert!(kept.exists());
-    assert!(bench.server.seen().is_empty(), "{:?}", bench.server.seen());
-}
-
-/// Whether the repository `repo` holds the object `object`, asked so that
-/// nothing is fetched for the asking.
-fn holds(home: &Path, repo: &Path, object: &str) -> bool {
-    test_git(home, repo, &["cat-file", "-e", object])
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .stderr(std::process::Stdio::null())
-        .status()
-        .unwrap()
-        .success()
-}
-
-/// The node's own repository is made afresh before a fetch where it holds
-/// more than its bound, `MEMBERS_REPO_MAX_BYTES`, and the list is fetched
-/// again; within its bound it is kept (rule 3).
-#[test]
-fn the_nodes_repository_is_made_afresh_past_its_bound() {
-    assert_eq!(MEMBERS_REPO_MAX_BYTES, 64 * 1024 * 1024);
-    let bench = Bench::new(Answers::Git);
-    bench.commit(Some(LIST));
-    let node = bench.node("node");
-    node.fetch_list(&identity(), &bench.url()).unwrap();
-    let repo = node.repo_of(&identity());
-    std::fs::write(repo.join("planted"), "a file of the node's repository").unwrap();
-    let second = bench.commit(Some(b"# the list, changed\n"));
-    assert_eq!(
-        node.fetch_list(&identity(), &bench.url()).unwrap().commit,
-        second
-    );
-    assert!(
-        repo.join("planted").exists(),
-        "made afresh within its bound"
-    );
-    // A bound it is past.
-    let small = Git::given(&bench.tmp.path().join("node"), "git", bench.inherited())
-        .unwrap()
-        .with_repo_max_bytes(1);
-    let third = bench.commit(Some(LIST));
-    assert_eq!(
-        small.fetch_list(&identity(), &bench.url()).unwrap(),
-        ListAt {
-            commit: third.clone(),
-            file: Some(LIST.to_vec()),
-        }
-    );
-    assert!(!repo.join("planted").exists(), "not made afresh");
-    assert_eq!(
-        git(&bench.home(), &repo, &["rev-parse", "refs/cordelia/list"]),
-        third
-    );
-}
-
-/// A redirect, as for a repository renamed or moved, is not followed:
-/// the host is asked once, and the fetch says that the repository has
-/// moved (rule 3).
-#[test]
-fn a_redirect_is_not_followed_and_says_the_repository_moved() {
-    let bench = Bench::new(Answers::Redirect);
-    let node = bench.node("node");
-    let failed = node.fetch_list(&identity(), &bench.url()).unwrap_err();
-    assert_eq!(failed, ListFailed::Moved);
-    assert!(failed.says().contains("has moved"), "{}", failed.says());
-    let seen = bench.server.seen();
-    assert_eq!(seen.len(), 1, "{seen:?}");
-    assert!(
-        seen[0].target.starts_with("/example/project.git/info/refs"),
-        "{seen:?}"
-    );
-}
-
-/// A fetch from a host that never answers is stopped at its deadline, by
-/// TERM and then KILL, and the node's own repository's locks are cleared;
-/// while it runs, a second fetch of the repository waits for the next
-/// read; and a lock that a stopped fetch left does not hold up the next
-/// (rule 3).
-#[test]
-fn a_fetch_that_does_not_end_is_stopped_and_its_locks_cleared() {
-    assert_eq!(MEMBERS_FETCH_MAX_SECS, 60);
-    let bench = Bench::new(Answers::Never);
-    let node = bench.node("node");
-    let repo = node.repo_of(&identity());
-    let began = Instant::now();
-    let (fetched, second) = std::thread::scope(|scope| {
-        let fetching = scope.spawn(|| {
-            node.fetch_list_by(&identity(), &bench.url(), began + Duration::from_secs(3))
-        });
-        // While git waits on the host, it holds locks of the node's
-        // repository, as a fetch that has begun to write does.
-        while bench.server.seen().is_empty() && began.elapsed() < Duration::from_secs(3) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            !bench.server.seen().is_empty() && !fetching.is_finished(),
-            "git did not reach the host before its deadline"
-        );
-        std::fs::create_dir_all(repo.join("refs/cordelia")).unwrap();
-        std::fs::write(repo.join("shallow.lock"), "").unwrap();
-        std::fs::write(repo.join("refs/cordelia/list.lock"), "").unwrap();
-        let second = node.fetch_list(&identity(), &bench.url());
-        (fetching.join().unwrap(), second)
-    });
-    let took = began.elapsed();
-    assert_eq!(second, Err(ListFailed::Busy));
-    assert_eq!(fetched, Err(ListFailed::Late { secs: 3 }));
-    assert!(took >= Duration::from_secs(3), "{took:?}");
-    assert!(
-        took < Duration::from_secs(3 + MEMBERS_GIT_TERM_SECS + 10),
-        "{took:?}"
-    );
-    assert!(!repo.join("shallow.lock").exists());
-    assert!(!repo.join("refs/cordelia/list.lock").exists());
-    assert!(repo.join("HEAD").exists());
-
-    // A stopped fetch's locks, left by a node that was stopped too, do not
-    // hold up a fetch that the host answers.
-    let bench = Bench::new(Answers::Git);
-    let first = bench.commit(Some(LIST));
-    let node = bench.node("node");
-    node.fetch_list(&identity(), &bench.url()).unwrap();
-    let repo = node.repo_of(&identity());
-    for lock in ["shallow.lock", "config.lock", "refs/cordelia/list.lock"] {
-        std::fs::write(repo.join(lock), "").unwrap();
-    }
-    let second = bench.commit(Some(LIST));
-    assert_ne!(first, second);
-    assert_eq!(
-        node.fetch_list(&identity(), &bench.url()).unwrap().commit,
-        second
-    );
-}
-
-// ── A clone ──────────────────────────────────────────────────────────
 
 /// A clone is read at `refs/remotes/<remote>/<branch>`, the branch that
 /// `refs/remotes/<remote>/HEAD` names: never the working tree, a local
@@ -1052,24 +738,6 @@ fn a_partial_clone_is_read_without_a_fetch_and_refused_to_an_older_git() {
         }
     );
     assert!(refused.says().contains("older than 2.44"));
-    // Nor does the node fetch with it: nothing is made, and nothing asked.
-    let refused_fetch = old.fetch_list(&identity(), &bench.url()).unwrap_err();
-    assert_eq!(
-        refused_fetch,
-        ListFailed::OldGitNoFetch {
-            version: Some(GitVersion {
-                major: 2,
-                minor: 43
-            })
-        }
-    );
-    assert!(
-        refused_fetch
-            .says()
-            .contains("git 2.43 is older than 2.44, so the node does not fetch the list itself")
-    );
-    assert!(!old.repo_of(&identity()).exists());
-    assert!(!bench.tmp.path().join("old-node/repos/example.org").exists());
     // Never back reads the clone's objects too, and is refused alike.
     assert_eq!(
         old.comes_after(&partial, &first, &"0".repeat(40)),
@@ -1192,120 +860,145 @@ impl Person {
     }
 
     /// A clone whose remote is SSH, with settings of its own that would
-    /// ask.
+    /// ask, or send git over SSH.
     fn clone_of(&self, bench: &Bench) -> PathBuf {
         let clone = bench.clone_of("ssh-clone");
-        let (bin, marks) = (self.root.join("bin"), self.root.join("marks"));
-        let mark = |name: &str, then: &str| marker(&bin, name, &marks, then).display().to_string();
-        let home = bench.home();
-        let set = |key: &str, value: &str| git(&home, &clone, &["config", key, value]);
+        self.settings_that_ask(bench, &clone);
+        let set = |key: &str, value: &str| git(&bench.home(), &clone, &["config", key, value]);
         set(
             "remote.origin.url",
             "ssh://git@example.org/example/project.git",
         );
+        // What would go to the test's server, sent over SSH instead.
+        let server = format!("https://127.0.0.1:{}/", bench.server.port);
+        let over_ssh = format!("ssh://git@127.0.0.1:{}/", bench.server.port);
+        set(&format!("url.{over_ssh}.insteadOf"), &server);
+        clone
+    }
+
+    /// A partial clone that lacks the list, whose promisor is the test's
+    /// server, which asks for a password: the one read of a clone that
+    /// could reach a host is a lazy fetch, and none may be made. It has
+    /// the settings that ask too, and no `insteadOf`, so that a lazy fetch
+    /// would reach the server, and be seen there.
+    fn partial_of(&self, bench: &Bench) -> PathBuf {
+        let home = bench.home();
+        let partial = bench.tmp.path().join("ssh-partial");
+        let from = format!("file://{}", bench.bare.display());
+        git(
+            &home,
+            bench.tmp.path(),
+            &[
+                "clone",
+                "--quiet",
+                "--filter=blob:none",
+                "--no-checkout",
+                &from,
+                "ssh-partial",
+            ],
+        );
+        let config = |args: &[&str]| git(&home, &partial, args);
+        config(&[
+            "remote",
+            "set-url",
+            "origin",
+            "git@example.org:example/project.git",
+        ]);
+        config(&["config", "remote.origin.promisor", "false"]);
+        config(&["remote", "add", "lazy", &bench.url()]);
+        config(&["config", "remote.lazy.promisor", "true"]);
+        config(&["config", "remote.lazy.partialclonefilter", "blob:none"]);
+        self.settings_that_ask(bench, &partial);
+        partial
+    }
+
+    /// A clone's own settings that would ask: a credential helper, an
+    /// askpass and an SSH command, each a program that writes a mark.
+    fn settings_that_ask(&self, bench: &Bench, clone: &Path) {
+        let (bin, marks) = (self.root.join("bin"), self.root.join("marks"));
+        let mark = |name: &str, then: &str| marker(&bin, name, &marks, then).display().to_string();
+        let set = |key: &str, value: &str| git(&bench.home(), clone, &["config", key, value]);
         set("credential.helper", &mark("helper-clone", "exit 0"));
         set("core.askPass", &mark("askpass-clone", "echo secret"));
         set("core.sshCommand", &mark("ssh-clone", "exit 255"));
-        set(
-            &format!("url.{}.insteadOf", bench.server.url("example", "x")),
-            "ssh://git@example.org/",
-        );
-        clone
     }
 }
 
-/// What the node does that could ask, and what it must give: a fetch from
-/// a host that asks for a password, a fetch over SSH and one from a file,
-/// and the reads of a clone whose remote is SSH.
-fn the_node_reads(
-    node: &Git,
-    bench_url: &str,
-    ssh_url: &str,
-    file_url: &str,
-    clone: &Path,
-) -> Vec<String> {
-    let deadline = || Instant::now() + Duration::from_secs(20);
+/// What the node does with a clone, and what it must give: which remote
+/// a clone whose remote is SSH names, a read of it, never back in it (`first`
+/// is its first commit, before the one read), and a read of a partial
+/// clone that lacks the list.
+fn the_node_reads(node: &Git, clone: &Path, partial: &Path, first: &str) -> Vec<String> {
     let mut said = Vec::new();
-    let failed = |read: Result<ListAt, ListFailed>| match read {
-        Ok(_) => "read".to_string(),
-        Err(failed) => failed.code().to_string(),
-    };
-    said.push(format!(
-        "password: {}",
-        failed(node.fetch_list_by(&identity(), bench_url, deadline()))
-    ));
-    said.push(format!(
-        "ssh: {}",
-        failed(node.fetch_list_by(&identity(), ssh_url, deadline()))
-    ));
-    said.push(format!(
-        "file: {}",
-        failed(node.fetch_list_by(&identity(), file_url, deadline()))
-    ));
     let chosen = node.identity_of_clone(clone, None);
     said.push(format!("remote: {:?}", chosen.map(|(remote, _)| remote)));
     let read = node.read_clone(clone, "origin", &identity());
     said.push(format!(
         "clone: {}",
-        failed(read.clone().map(|read| read.at))
+        read.as_ref()
+            .map_or_else(|failed| failed.code(), |_| "read")
     ));
     if let Ok(read) = read {
         said.push(format!(
             "after: {:?}",
-            node.comes_after(clone, &read.at.commit, &read.at.commit)
+            node.comes_after(clone, first, &read.at.commit)
         ));
     }
+    // Not read, and nothing fetched, whether git heeds GIT_NO_LAZY_FETCH
+    // (the clone lacks it) or is refused the partial clone (it is older).
+    let partial = match node.read_clone(partial, "origin", &identity()) {
+        Err(ListFailed::NotInClone { .. } | ListFailed::PartialOnOldGit { .. }) => "not read",
+        Ok(_) => "read",
+        Err(failed) => failed.code(),
+    };
+    said.push(format!("partial: {partial}"));
     said
 }
 
 /// What the node must have said, in [`the_node_reads`].
-const EXPECTED: [&str; 6] = [
-    "password: asks_for_password",
-    "ssh: not_https",
-    "file: not_https",
+const EXPECTED: [&str; 4] = [
     "remote: Ok(\"origin\")",
     "clone: read",
     "after: Ok(true)",
+    "partial: not read",
 ];
 
 /// Nothing of the person's reaches git, so nothing asks (rule 3): a
 /// credential helper, `GIT_ASKPASS`, `SSH_ASKPASS` and `core.sshCommand`,
 /// each set in the person's HOME, in the clone's own configuration and in
-/// the environment the node inherits, is a program that writes a mark,
-/// and none is written; the host is sent no password and nothing of the
-/// person's settings; nothing goes over SSH or from a file; and the clone
-/// is left as it was. Here the environment is handed to `Git::given`:
-/// that a node takes only what it should of the environment its own
-/// process inherits is shown by `nothing_asks_at_a_terminal` alone.
+/// the environment the node inherits, and an `insteadOf` to SSH in the
+/// clone's own, are programs and settings that would ask or run, and
+/// nothing is marked; the server that a partial clone's lazy fetch would
+/// ask is asked nothing, so no password, no `.netrc` and no header of the
+/// person's reaches it; and the clone is left as it was. Here the
+/// environment is handed to `Git::given`: that a node takes only what it
+/// should of the environment its own process inherits is shown by
+/// `nothing_asks_at_a_terminal` alone.
 #[test]
 fn nothing_of_the_persons_reaches_git_and_nothing_asks() {
     let bench = Bench::new(Answers::Password);
+    let first = bench.commit(Some(LIST));
     bench.commit(Some(LIST));
     let person = Person::of(&bench);
     let clone = person.clone_of(&bench);
+    let partial = person.partial_of(&bench);
     let node = Git::given(&bench.tmp.path().join("node"), "git", person.env.clone()).unwrap();
-    let before = snapshot(&clone);
-    let ssh_url = format!(
-        "ssh://git@127.0.0.1:{}/example/project.git",
-        bench.server.port
-    );
-    let file_url = format!("file://{}", bench.bare.display());
-    let said = the_node_reads(&node, &bench.url(), &ssh_url, &file_url, &clone);
+    let before = (snapshot(&clone), snapshot(&partial));
+    let said = the_node_reads(&node, &clone, &partial, &first);
     assert_eq!(said, EXPECTED);
     assert_eq!(person.marks(), Vec::<String>::new());
-    assert_eq!(snapshot(&clone), before, "a read changed the clone");
-    nothing_of_the_persons_reached(&bench.server);
+    assert_eq!(
+        (snapshot(&clone), snapshot(&partial)),
+        before,
+        "a read changed a clone"
+    );
+    nothing_reached(&bench.server);
 }
 
-/// The host was asked, and sent no password and no header that the
-/// person's settings add.
-fn nothing_of_the_persons_reached(server: &GitServer) {
+/// The server, which a lazy fetch would have asked, was asked nothing.
+fn nothing_reached(server: &GitServer) {
     let seen = server.seen();
-    assert!(!seen.is_empty());
-    for seen in &seen {
-        assert_eq!(seen.header("authorization"), None, "{seen:?}");
-        assert_eq!(seen.header("x-person"), None, "{seen:?}");
-    }
+    assert!(seen.is_empty(), "{seen:?}");
 }
 
 /// [`nothing_of_the_persons_reaches_git_and_nothing_asks`], run by a
@@ -1316,9 +1009,11 @@ fn nothing_asks_at_a_terminal() {
     use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
     use std::os::unix::process::CommandExt;
     let bench = Bench::new(Answers::Password);
+    let first = bench.commit(Some(LIST));
     bench.commit(Some(LIST));
     let person = Person::of(&bench);
     let clone = person.clone_of(&bench);
+    let partial = person.partial_of(&bench);
     let ours = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).expect("a terminal");
     grantpt(&ours).unwrap();
     unlockpt(&ours).unwrap();
@@ -1345,16 +1040,9 @@ fn nothing_asks_at_a_terminal() {
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|file| ("LLVM_PROFILE_FILE", file)))
         .env("CORDELIA_GIT_LIST_CHILD", &said_to)
         .env("CHILD_DATA", bench.tmp.path().join("node"))
-        .env("CHILD_URL", bench.url())
-        .env(
-            "CHILD_SSH_URL",
-            format!(
-                "ssh://git@127.0.0.1:{}/example/project.git",
-                bench.server.port
-            ),
-        )
-        .env("CHILD_FILE_URL", format!("file://{}", bench.bare.display()))
         .env("CHILD_CLONE", &clone)
+        .env("CHILD_PARTIAL", &partial)
+        .env("CHILD_FIRST", &first)
         .stdin(terminal)
         .stdout(log.try_clone().unwrap())
         .stderr(log);
@@ -1409,7 +1097,7 @@ fn nothing_asks_at_a_terminal() {
     assert_eq!(said.next(), Some("terminal: true"), "{log}");
     assert_eq!(said.collect::<Vec<_>>(), EXPECTED, "{log}");
     assert_eq!(person.marks(), Vec::<String>::new());
-    nothing_of_the_persons_reached(&bench.server);
+    nothing_reached(&bench.server);
 }
 
 /// The child of [`nothing_asks_at_a_terminal`]: the node's git made from
@@ -1431,10 +1119,9 @@ fn the_child_at_a_terminal() {
     let mut said = vec![format!("terminal: {terminal}")];
     said.extend(the_node_reads(
         &node,
-        &var("CHILD_URL"),
-        &var("CHILD_SSH_URL"),
-        &var("CHILD_FILE_URL"),
         Path::new(&var("CHILD_CLONE")),
+        Path::new(&var("CHILD_PARTIAL")),
+        &var("CHILD_FIRST"),
     ));
     std::fs::write(said_to, said.join("\n") + "\n").unwrap();
 }

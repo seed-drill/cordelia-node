@@ -140,7 +140,6 @@ fn test_an_ssh_alias_is_refused_with_a_reason_that_names_it() {
 fn test_an_identity_reads_back_from_its_text_alone() {
     let named = Identity::from_address("git@example.org:example/project.git").unwrap();
     assert_eq!(Identity::from_text(&named.to_string()), Some(named.clone()));
-    assert_eq!(named.https_url(), "https://example.org/example/project.git");
     for text in [
         "example.org/example",
         "example.org/example/project/more",
@@ -151,26 +150,6 @@ fn test_an_identity_reads_back_from_its_text_alone() {
     ] {
         assert_eq!(Identity::from_text(text), None, "{text}");
     }
-}
-
-/// The node's own repository for an identity is one folder under its
-/// repositories: `<host>/<owner>/<name>.git`.
-#[test]
-fn test_the_nodes_own_repository_is_under_its_folder() {
-    let tmp = tempfile::tempdir().unwrap();
-    let git = Git::given(tmp.path(), "git", std::env::vars_os()).unwrap();
-    let named = Identity::from_address("https://example.org/example/.github").unwrap();
-    assert_eq!(
-        git.repo_of(&named),
-        tmp.path().join("repos/example.org/example/.github.git")
-    );
-    assert!(tmp.path().join("git-home").is_dir());
-    assert_eq!(
-        std::fs::read_dir(tmp.path().join("git-home"))
-            .unwrap()
-            .count(),
-        0
-    );
 }
 
 /// One remote that names a repository is the one; several that name one
@@ -368,83 +347,6 @@ fn test_gits_version_is_read_from_what_it_prints() {
     assert!(v(3, 0) >= NO_LAZY_FETCH_SINCE);
 }
 
-/// Why a fetch failed, from git's words in the C locale.
-#[test]
-fn test_why_a_fetch_failed_is_read_from_gits_words() {
-    let at = "fatal: unable to access 'https://example.org/example/project.git/': ";
-    for (said, failed) in [
-        (
-            format!("{at}The requested URL returned error: 301\n"),
-            ListFailed::Moved,
-        ),
-        (
-            format!("{at}The requested URL returned error: 308\n"),
-            ListFailed::Moved,
-        ),
-        (
-            "fatal: could not read Username for 'https://example.org': terminal prompts disabled\n"
-                .to_string(),
-            ListFailed::AsksForPassword,
-        ),
-        (
-            format!("{at}The requested URL returned error: 403\n"),
-            ListFailed::AsksForPassword,
-        ),
-        (
-            "fatal: repository 'https://example.org/example/project.git/' not found\n".to_string(),
-            ListFailed::NotFound,
-        ),
-        (
-            "fatal: couldn't find remote ref HEAD\n".to_string(),
-            ListFailed::NoCommits,
-        ),
-        (
-            "fatal: transport 'ssh' not allowed\n".to_string(),
-            ListFailed::NotHttps,
-        ),
-        (
-            format!("{at}SSL certificate problem: unable to get local issuer certificate\n"),
-            ListFailed::Certificate(
-                "SSL certificate problem: unable to get local issuer certificate".to_string(),
-            ),
-        ),
-        (
-            format!("{at}Could not resolve host: example.org\n"),
-            ListFailed::NotReached("Could not resolve host: example.org".to_string()),
-        ),
-        (
-            format!("{at}Failed to connect to example.org port 443 after 0 ms\n"),
-            ListFailed::NotReached(
-                "Failed to connect to example.org port 443 after 0 ms".to_string(),
-            ),
-        ),
-        (
-            "remote: something\nfatal: the remote end hung up unexpectedly\n".to_string(),
-            ListFailed::Git("the remote end hung up unexpectedly".to_string()),
-        ),
-        // What the host says, on the lines git begins with `remote:`, is
-        // not read as git's own words.
-        (
-            "remote: fatal: The requested URL returned error: 301\n\
-             remote: fatal: could not read Username\n\
-             fatal: the remote end hung up unexpectedly\n"
-                .to_string(),
-            ListFailed::Git("the remote end hung up unexpectedly".to_string()),
-        ),
-        (
-            "remote: fatal: transport 'x' not allowed\n".to_string(),
-            ListFailed::Git("nothing".to_string()),
-        ),
-        // What a host says is shown only as printable ASCII, and short.
-        (
-            format!("fatal: \x1b[31m{}\n", "x".repeat(300)),
-            ListFailed::Git(format!("[31m{}", "x".repeat(116))),
-        ),
-    ] {
-        assert_eq!(fetch_failed(&said), failed, "{said}");
-    }
-}
-
 /// Every failure says why in words of its own, and has a word of its own.
 #[test]
 fn test_every_failure_says_why_and_has_a_word_of_its_own() {
@@ -452,20 +354,6 @@ fn test_every_failure_says_why_and_has_a_word_of_its_own() {
     let failures = [
         ListFailed::GitNotRun("No such file or directory".to_string()),
         ListFailed::Late { secs: 60 },
-        ListFailed::Busy,
-        ListFailed::OldGitNoFetch {
-            version: Some(GitVersion {
-                major: 2,
-                minor: 39,
-            }),
-        },
-        ListFailed::Moved,
-        ListFailed::AsksForPassword,
-        ListFailed::NotFound,
-        ListFailed::NoCommits,
-        ListFailed::NotReached("Could not resolve host".to_string()),
-        ListFailed::Certificate("unable to get local issuer certificate".to_string()),
-        ListFailed::NotHttps,
         ListFailed::NotARepository,
         ListFailed::NoSuchRemote(remote()),
         ListFailed::RemoteMoved { remote: remote() },
@@ -500,7 +388,6 @@ fn test_every_failure_says_why_and_has_a_word_of_its_own() {
             .says()
             .contains("git remote set-head origin --auto")
     );
-    assert!(ListFailed::Moved.says().contains("has moved"));
     assert!(
         ListFailed::PartialOnOldGit {
             version: Some(GitVersion {
@@ -512,11 +399,6 @@ fn test_every_failure_says_why_and_has_a_word_of_its_own() {
         .contains("git 2.43 is older than 2.44")
     );
     assert!(ListFailed::TooLarge.says().contains("16 KiB"));
-    assert_eq!(
-        ListFailed::OldGitNoFetch { version: None }.says(),
-        "the version of git is not known, so the node does not fetch the list itself: \
-         it is read from your clone; upgrade git for the node to fetch it"
-    );
 }
 
 /// A branch, a remote's name and a commit, as the node puts them in a
@@ -579,26 +461,6 @@ fn test_gits_home_is_kept_empty() {
         assert!(elsewhere.join(".gitconfig").exists());
         assert!(Git::given(tmp.path(), "git", std::env::vars_os()).is_err());
     }
-}
-
-/// What a repository of the node's own holds on the disk, links not
-/// followed.
-#[test]
-fn test_what_a_repository_holds_is_measured() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("r.git");
-    std::fs::create_dir_all(repo.join("objects/pack")).unwrap();
-    std::fs::write(repo.join("HEAD"), [0u8; 10]).unwrap();
-    std::fs::write(repo.join("objects/pack/pack-1.pack"), [0u8; 1000]).unwrap();
-    #[cfg(unix)]
-    {
-        let big = tmp.path().join("big");
-        std::fs::write(&big, vec![0u8; 100_000]).unwrap();
-        std::os::unix::fs::symlink(&big, repo.join("objects/linked")).unwrap();
-        std::os::unix::fs::symlink(tmp.path(), repo.join("objects/up")).unwrap();
-    }
-    assert_eq!(bytes_under(&repo), 1010);
-    assert_eq!(bytes_under(&tmp.path().join("none")), 0);
 }
 
 /// A `FETCH_HEAD` says the list is fresh only where it has a line for the
@@ -675,51 +537,6 @@ fn test_fetch_head_says_fresh_only_for_the_branch_of_the_repository() {
     }
 }
 
-/// What a git that was stopped leaves in the node's own repository is
-/// taken out, and nothing else.
-#[test]
-fn test_a_stopped_gits_locks_are_cleared() {
-    let tmp = tempfile::tempdir().unwrap();
-    let repo = tmp.path().join("r.git");
-    for dir in [
-        "refs/cordelia",
-        "refs/heads",
-        "objects/info",
-        "objects/pack",
-    ] {
-        std::fs::create_dir_all(repo.join(dir)).unwrap();
-    }
-    let stale = [
-        "shallow.lock",
-        "config.lock",
-        "packed-refs.lock",
-        "HEAD.lock",
-        "refs/cordelia/list.lock",
-        "objects/info/commit-graph.lock",
-        "objects/pack/tmp_pack_x1",
-        "objects/pack/tmp_idx_x1",
-        "objects/pack/multi-pack-index.lock",
-    ];
-    let kept = [
-        "shallow",
-        "config",
-        "HEAD",
-        "refs/cordelia/list",
-        "objects/pack/pack-1.pack",
-        "objects/pack/pack-1.idx",
-    ];
-    for file in stale.iter().chain(kept.iter()) {
-        std::fs::write(repo.join(file), "").unwrap();
-    }
-    clear_locks(&repo);
-    for file in stale {
-        assert!(!repo.join(file).exists(), "{file}");
-    }
-    for file in kept {
-        assert!(repo.join(file).exists(), "{file}");
-    }
-}
-
 /// Every git command runs in the cleared environment of rule 3, with the
 /// settings that stand over a clone's own, whatever the node inherited:
 /// only the kept variables come through.
@@ -747,7 +564,7 @@ fn test_every_git_command_runs_in_the_cleared_environment() {
     let git = Git::given(tmp.path(), "git", inherited).unwrap();
     let home = git.home().as_os_str().to_owned();
     let clone = tmp.path().join("clone");
-    for at in [At::Nowhere, At::Own(&clone), At::Clone(&clone)] {
+    for at in [At::Nowhere, At::Clone(&clone)] {
         let command = git.command(at);
         let envs: Vec<(String, Option<String>)> = command
             .get_envs()

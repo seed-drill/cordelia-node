@@ -1,7 +1,7 @@
-//! A repository's list, read with git (decision 2026-11-06 (joining),
-//! rules 2 and 3): which repository a clone is, the node's own fetch of a
-//! public repository's list, a read of a clone's copy of it, and whether a
-//! clone's commit comes after the last one read.
+//! A repository's list, read with git from a clone (decision 2026-11-06
+//! (joining), rules 2 and 3): which repository a clone is, a read of the
+//! clone's copy of its list, and whether a clone's commit comes after the
+//! last one read.
 //!
 //! - **The identity** ([`Identity`], rule 2.1) is `host/owner/name` in
 //!   lower case, from a remote's address in one of four forms:
@@ -12,16 +12,6 @@
 //! - **Which remote** ([`choose_remote`]): one that names a repository is
 //!   the one; several that name different repositories need the person to
 //!   choose (`--remote`).
-//! - **The fetch** ([`Git::fetch_list`], rule 3), only with git 2.44 or
-//!   later: `HEAD` of the repository's address over HTTPS, at a depth of
-//!   one, with no tags, and its trees and no file, into
-//!   `refs/cordelia/list` of a bare repository of the node's own,
-//!   `<repos>/<host>/<owner>/<name>.git`; then the one file, asked for by
-//!   its ID, with git stopped once more than the file at its largest has
-//!   come, and no more than 16 KiB of it read. A redirect is not followed:
-//!   the repository has moved. A repository of the node's own that has
-//!   grown past [`MEMBERS_REPO_MAX_BYTES`] is made afresh. With an older
-//!   git, the node does not fetch, and the list is read from the clone.
 //! - **The read of a clone** ([`Git::read_clone`], rule 3): the default
 //!   branch as the person's own git last fetched it,
 //!   `refs/remotes/<remote>/<branch>`, where `refs/remotes/<remote>/HEAD`
@@ -30,18 +20,23 @@
 //! - **Never back** ([`Git::comes_after`]): whether a clone's commit is
 //!   the last commit read or comes after it.
 //!
+//! **The node reads only the clone,** as the person's own git last
+//! fetched it, and its git reaches no network. Whether the node should
+//! also fetch a public repository's list itself, as rule 3 has it, is
+//! open: the person who owns the project rules on it.
+//!
 //! **Nothing of the person's reaches git, so nothing can ask.** Every git
 //! command here runs in a cleared environment ([`Git`]): only `PATH` and
 //! the variables of a proxy and of a certificate authority are kept;
 //! `HOME` and `XDG_CONFIG_HOME` are an empty folder of the node's, so no
 //! global setting and no `.netrc` is read; no system setting is read; no
 //! credential helper, no askpass, no terminal prompt; only `https` as a
-//! transport, so nothing goes over SSH; no lazy fetch; no redirect; no
-//! hooks, no `gc` and no maintenance; and git's own messages in the C
-//! locale, so that why it failed is read from them. No replace ref and
-//! no graft is heeded, so a commit is read as the host made it. A local
-//! clone's own
-//! objects, and those it borrows from another repository on the disk
+//! transport, so nothing goes over SSH; no lazy fetch, so a read of a
+//! partial clone fetches nothing; no redirect; no hooks, no `gc` and no
+//! maintenance; and git's own messages in the C locale, so that why it
+//! failed is read from them. No replace ref and no graft is heeded, so a
+//! commit is read as the host made it. A local clone's own objects, and
+//! those it borrows from another repository on the disk
 //! (`objects/info/alternates`), are read with `https` alone: a read of a
 //! clone fetches nothing, so it needs no `file` transport.
 
@@ -49,24 +44,20 @@ use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use cordelia_core::protocol::{
-    AGENT_MESSAGE_LINK_REPO_MAX_BYTES, MEMBERS_FETCH_MAX_SECS, MEMBERS_FILE_MAX_BYTES,
-    MEMBERS_GIT_TERM_SECS, MEMBERS_REPO_MAX_BYTES, STREAM_TIMEOUT_SECS,
+    AGENT_MESSAGE_LINK_REPO_MAX_BYTES, MEMBERS_FILE_MAX_BYTES, MEMBERS_GIT_TERM_SECS,
+    STREAM_TIMEOUT_SECS,
 };
 
-use crate::found::{GitBounds, GitRan, git_run_watched_by};
+use crate::found::{GitBounds, GitRan, git_run_by};
 
 #[cfg(test)]
 mod tests;
 
 /// Where the list is in a repository (rule 1).
 pub const MEMBERS_PATH: &str = ".cordelia/members";
-
-/// The ref of the node's own repository that a fetch writes (rule 3).
-pub const LIST_REF: &str = "refs/cordelia/list";
 
 /// The first git that heeds `GIT_NO_LAZY_FETCH`: an older one may fetch
 /// from a partial clone's promisor while it reads it.
@@ -206,13 +197,6 @@ impl Identity {
     pub fn name(&self) -> &str {
         &self.name
     }
-
-    /// The address the node fetches the list from: the repository over
-    /// HTTPS, with `.git`. A host may redirect an address without it to
-    /// one with it, and a redirect is not followed.
-    pub fn https_url(&self) -> String {
-        format!("https://{}/{}/{}.git", self.host, self.owner, self.name)
-    }
 }
 
 impl std::fmt::Display for Identity {
@@ -259,7 +243,7 @@ fn host_named(host: &str) -> Result<String, NotAnIdentity> {
 /// An owner or a name, in lower case: 1 to
 /// [`AGENT_MESSAGE_LINK_REPO_MAX_BYTES`] of letters, digits, `.`, `_` and
 /// `-`, not starting with `-`, and not `.` or `..`, so that it is one
-/// folder of the node's own repositories.
+/// part of a path wherever it is put in one.
 fn part_named(part: &str) -> Result<String, NotAnIdentity> {
     let part = part.to_ascii_lowercase();
     let good = !part.is_empty()
@@ -474,28 +458,6 @@ pub enum ListFailed {
     GitNotRun(String),
     /// Git had not ended within this many seconds, and was stopped.
     Late { secs: u64 },
-    /// A fetch of this repository is already running in this node.
-    Busy,
-    /// This git, older than 2.44 or of a version not known, would fetch
-    /// whole any file of the node's own repository that a read asked for:
-    /// the node does not fetch, and the list is read from the clone.
-    OldGitNoFetch { version: Option<GitVersion> },
-    /// The host answered with a redirect: the repository was renamed or
-    /// moved.
-    Moved,
-    /// The host asked for a password: the repository is private, or not
-    /// there.
-    AsksForPassword,
-    /// The host says there is no such repository.
-    NotFound,
-    /// The repository has no commit yet.
-    NoCommits,
-    /// The host could not be reached: git's words.
-    NotReached(String),
-    /// The host's certificate is not trusted: git's words.
-    Certificate(String),
-    /// The address is not one over HTTPS, and nothing else is used.
-    NotHttps,
     /// The folder is not in a git repository.
     NotARepository,
     /// The clone has no remote of this name.
@@ -513,8 +475,7 @@ pub enum ListFailed {
     NotInClone { remote: String, branch: String },
     /// `.cordelia/members` is not a plain file.
     NotAFile,
-    /// `.cordelia/members` is larger than [`MEMBERS_FILE_MAX_BYTES`]: in
-    /// the node's own repository, a fetch leaves it out.
+    /// `.cordelia/members` is larger than [`MEMBERS_FILE_MAX_BYTES`].
     TooLarge,
     /// Anything else: the last thing git said.
     Git(String),
@@ -526,15 +487,6 @@ impl ListFailed {
         match self {
             Self::GitNotRun(_) => "git_not_run",
             Self::Late { .. } => "late",
-            Self::Busy => "busy",
-            Self::OldGitNoFetch { .. } => "old_git_no_fetch",
-            Self::Moved => "moved",
-            Self::AsksForPassword => "asks_for_password",
-            Self::NotFound => "not_found",
-            Self::NoCommits => "no_commits",
-            Self::NotReached(_) => "not_reached",
-            Self::Certificate(_) => "certificate",
-            Self::NotHttps => "not_https",
             Self::NotARepository => "not_a_repository",
             Self::NoSuchRemote(_) => "no_such_remote",
             Self::RemoteMoved { .. } => "remote_moved",
@@ -553,28 +505,6 @@ impl ListFailed {
         match self {
             Self::GitNotRun(why) => format!("git could not be run: {}", shown(why)),
             Self::Late { secs } => format!("git did not finish within {secs} seconds"),
-            Self::Busy => "it is being fetched already".to_string(),
-            Self::OldGitNoFetch { version } => {
-                let older = match version {
-                    Some(version) => format!("git {version} is older than 2.44"),
-                    None => "the version of git is not known".to_string(),
-                };
-                format!(
-                    "{older}, so the node does not fetch the list itself: it is read from \
-                     your clone; upgrade git for the node to fetch it"
-                )
-            }
-            Self::Moved => {
-                "it has moved: run cordelia subscribe in a clone of it again".to_string()
-            }
-            Self::AsksForPassword => "it asks for a password, so it is private or not there: \
-                 its list is read from your clone"
-                .to_string(),
-            Self::NotFound => "the host says it is not there".to_string(),
-            Self::NoCommits => "it has no commit yet".to_string(),
-            Self::NotReached(why) => format!("its host was not reached: {why}"),
-            Self::Certificate(why) => format!("its host's certificate is not trusted: {why}"),
-            Self::NotHttps => "only an address over https is fetched".to_string(),
             Self::NotARepository => "that folder is not in a git repository".to_string(),
             Self::NoSuchRemote(remote) => {
                 format!("your clone has no remote named {}", shown(remote))
@@ -684,26 +614,6 @@ const SETTINGS: [&str; 8] = [
     "advice.graftFileDeprecated=false",
 ];
 
-/// The filter of the node's first step, and of its own repository as a
-/// partial clone: commits and trees, and no file.
-const TREES_FILTER: &str = "blob:none";
-
-/// The filter of the second step, which asks for the list's file by its
-/// ID: no file larger than the list may be. Git leaves out a blob of at
-/// least the limit's size, so the limit is one byte more than
-/// [`MEMBERS_FILE_MAX_BYTES`]. A host may send a file asked for by its ID
-/// whatever the filter, as git's own server and a large host do: what
-/// bounds that step is [`LIST_FETCH_MAX_BYTES`].
-fn list_filter() -> String {
-    format!("blob:limit={}", MEMBERS_FILE_MAX_BYTES + 1)
-}
-
-/// The most that the second step may add to the node's own repository:
-/// the file at its largest, deflated, which a file of random bytes is not
-/// made smaller by, and 8 KiB for the pack around it and its index. Git
-/// is stopped once its repository has grown by more, as it receives.
-const LIST_FETCH_MAX_BYTES: u64 = MEMBERS_FILE_MAX_BYTES as u64 + 8192;
-
 /// The most of what git says on stderr that is kept: its last 8 KiB.
 const STDERR_KEPT_BYTES: usize = 8192;
 
@@ -713,17 +623,14 @@ const SHORT_OUTPUT_BYTES: usize = 4096;
 /// The most of a clone's configuration that is read.
 const CONFIG_OUTPUT_BYTES: usize = 256 * 1024;
 
-/// The node's git: the program, an empty folder that is its `HOME`, the
-/// folder of the node's own repositories, what it keeps of the node's
-/// environment, and its version, read once.
+/// The node's git: the program, an empty folder that is its `HOME`, what
+/// it keeps of the node's environment, and its version, read once.
 #[derive(Debug)]
 pub struct Git {
     program: PathBuf,
     home: PathBuf,
-    repos: PathBuf,
     kept: Vec<(OsString, OsString)>,
     version: Option<GitVersion>,
-    repo_max_bytes: u64,
 }
 
 /// One git command's end, where it ended in time.
@@ -734,47 +641,17 @@ struct Ran {
     stderr: String,
 }
 
-/// Where a command runs: in no repository, in the node's own, or in a
-/// clone.
+/// Where a command runs: in no repository, or in a clone.
 #[derive(Clone, Copy)]
 enum At<'a> {
     Nowhere,
-    Own(&'a Path),
     Clone(&'a Path),
-}
-
-/// The repositories being fetched in this process: a second fetch of one
-/// waits for the next read, so that the locks the first holds are not
-/// taken for stale.
-static FETCHING: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
-
-/// A repository being fetched, while this lives.
-struct Fetching(PathBuf);
-
-impl Fetching {
-    fn of(repo: &Path) -> Result<Self, ListFailed> {
-        let mut fetching = FETCHING.lock().unwrap_or_else(|e| e.into_inner());
-        if fetching.insert(repo.to_path_buf()) {
-            Ok(Self(repo.to_path_buf()))
-        } else {
-            Err(ListFailed::Busy)
-        }
-    }
-}
-
-impl Drop for Fetching {
-    fn drop(&mut self) {
-        FETCHING
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
-    }
 }
 
 impl Git {
     /// The node's git under its data directory, `git` from the node's
-    /// `PATH`: `git-home/`, kept empty, is its `HOME`, and `repos/` holds
-    /// the node's own repositories.
+    /// `PATH`: `git-home/`, kept empty, is its `HOME`. It reads clones, and
+    /// that folder is the only one it makes.
     pub fn under(data_dir: &Path) -> std::io::Result<Self> {
         Self::given(data_dir, "git", std::env::vars_os())
     }
@@ -788,9 +665,7 @@ impl Git {
         inherited: impl IntoIterator<Item = (OsString, OsString)>,
     ) -> std::io::Result<Self> {
         let home = data_dir.join("git-home");
-        let repos = data_dir.join("repos");
         keep_empty(&home)?;
-        std::fs::create_dir_all(&repos)?;
         let kept = inherited
             .into_iter()
             .filter(|(name, _)| KEPT_VARIABLES.iter().any(|kept| OsStr::new(kept) == name))
@@ -798,21 +673,11 @@ impl Git {
         let mut git = Self {
             program: program.into(),
             home,
-            repos,
             kept,
             version: None,
-            repo_max_bytes: MEMBERS_REPO_MAX_BYTES,
         };
         git.version = git.read_version();
         Ok(git)
-    }
-
-    /// This git, with another bound than [`MEMBERS_REPO_MAX_BYTES`] on what
-    /// the node's own repository may hold before it is made afresh: for
-    /// tests.
-    pub fn with_repo_max_bytes(mut self, bytes: u64) -> Self {
-        self.repo_max_bytes = bytes;
-        self
     }
 
     /// Git's version, read once, when this was made: `None` where git
@@ -824,15 +689,6 @@ impl Git {
     /// The folder that is git's `HOME`.
     pub fn home(&self) -> &Path {
         &self.home
-    }
-
-    /// The node's own repository for `identity`:
-    /// `<repos>/<host>/<owner>/<name>.git`.
-    pub fn repo_of(&self, identity: &Identity) -> PathBuf {
-        self.repos
-            .join(&identity.host)
-            .join(&identity.owner)
-            .join(format!("{}.git", identity.name))
     }
 
     /// A git command in the cleared environment (rule 3), at `at`.
@@ -858,9 +714,6 @@ impl Git {
         }
         match at {
             At::Nowhere => {}
-            At::Own(repo) => {
-                git.arg("--git-dir").arg(repo);
-            }
             At::Clone(clone) => {
                 let mut safe = OsString::from("safe.directory=");
                 safe.push(clone);
@@ -874,23 +727,10 @@ impl Git {
     /// its output: `Late` (said as `secs`) where it did not end by then.
     fn run(
         &self,
-        git: Command,
-        deadline: Instant,
-        secs: u64,
-        stdout_max: usize,
-    ) -> Result<Ran, Outcome> {
-        self.run_watched(git, deadline, secs, stdout_max, &mut || false)
-    }
-
-    /// [`Git::run`], with git stopped where `stop_now` says so as it runs:
-    /// `Stopped`.
-    fn run_watched(
-        &self,
         mut git: Command,
         deadline: Instant,
         secs: u64,
         stdout_max: usize,
-        stop_now: &mut dyn FnMut() -> bool,
     ) -> Result<Ran, Outcome> {
         // A file that something put in git's HOME is a setting it would
         // read: it is taken out before git runs.
@@ -900,7 +740,7 @@ impl Git {
             stderr_max: STDERR_KEPT_BYTES,
             term_grace: Duration::from_secs(MEMBERS_GIT_TERM_SECS),
         };
-        match git_run_watched_by(&mut git, deadline, bounds, stop_now) {
+        match git_run_by(&mut git, deadline, bounds) {
             GitRan::Ended {
                 status,
                 stdout,
@@ -912,7 +752,6 @@ impl Git {
                 stderr: String::from_utf8_lossy(&stderr).into_owned(),
             }),
             GitRan::TooMuch => Err(Outcome::TooMuch),
-            GitRan::Stopped => Err(Outcome::Stopped),
             GitRan::Late => Err(Outcome::Failed(ListFailed::Late { secs })),
             GitRan::NotRun(e) => Err(Outcome::Failed(ListFailed::GitNotRun(e.to_string()))),
         }
@@ -929,223 +768,6 @@ impl Git {
         ran.success
             .then(|| GitVersion::from_output(&ran.stdout))
             .flatten()
-    }
-
-    // ── The fetch (rule 3) ───────────────────────────────────────────
-
-    /// Fetch the list of a public repository (rule 3) from `url`, its
-    /// address over HTTPS ([`Identity::https_url`], or another that a test
-    /// or a node's setting maps it to), into the node's own repository,
-    /// within [`MEMBERS_FETCH_MAX_SECS`], in two steps: the commit and its
-    /// trees, then the list's file alone. Only with git 2.44 or later,
-    /// which heeds `GIT_NO_LAZY_FETCH`: with an older git, or one whose
-    /// version is not known, it is [`ListFailed::OldGitNoFetch`], and
-    /// nothing is made or fetched.
-    pub fn fetch_list(&self, identity: &Identity, url: &str) -> Result<ListAt, ListFailed> {
-        let deadline = Instant::now() + Duration::from_secs(MEMBERS_FETCH_MAX_SECS);
-        self.fetch_list_by(identity, url, deadline)
-    }
-
-    /// [`Git::fetch_list`], with the fetch given until `deadline`: where
-    /// it has not ended by then, git is stopped, by TERM and then KILL,
-    /// and the node's repository's stale locks are cleared.
-    pub fn fetch_list_by(
-        &self,
-        identity: &Identity,
-        url: &str,
-        deadline: Instant,
-    ) -> Result<ListAt, ListFailed> {
-        // A git that does not heed GIT_NO_LAZY_FETCH would fetch whole any
-        // file that a read of the node's own repository asked for, which
-        // a partial clone lacks: the node does not fetch with it.
-        if self.version.is_none_or(|v| v < NO_LAZY_FETCH_SINCE) {
-            return Err(ListFailed::OldGitNoFetch {
-                version: self.version,
-            });
-        }
-        let secs = secs_until(deadline);
-        let repo = self.repo_of(identity);
-        let _fetching = Fetching::of(&repo)?;
-        self.no_link_to(identity)?;
-        // Each fetch adds what a commit changed, and nothing is pruned: a
-        // repository past its bound is made afresh, and fetched whole.
-        if repo.exists() && bytes_under(&repo) > self.repo_max_bytes {
-            std::fs::remove_dir_all(&repo).map_err(|e| ListFailed::Git(shown(&e.to_string())))?;
-        }
-        // What a fetch that was stopped, or a node that was, left behind:
-        // no other fetch of this repository runs.
-        clear_locks(&repo);
-        self.make_own(&repo, url, deadline, secs)?;
-        // The first step: the commit and its trees, and no file.
-        let mut git = self.command(At::Own(&repo));
-        git.args([
-            "fetch",
-            "--quiet",
-            "--depth",
-            "1",
-            "--no-tags",
-            "--no-recurse-submodules",
-        ])
-        .arg(format!("--filter={TREES_FILTER}"))
-        .arg("origin")
-        .arg(format!("+HEAD:{LIST_REF}"));
-        let ran = match self.run(git, deadline, secs, SHORT_OUTPUT_BYTES) {
-            Ok(ran) => ran,
-            Err(outcome) => {
-                clear_locks(&repo);
-                return Err(outcome.failed());
-            }
-        };
-        if !ran.success {
-            clear_locks(&repo);
-            return Err(fetch_failed(&ran.stderr));
-        }
-        let commit = self.commit_of(At::Own(&repo), LIST_REF, deadline, secs)?;
-        let lacks = Lacks::Filtered { repo: &repo };
-        let file = self.file_at(At::Own(&repo), &commit, deadline, secs, lacks)?;
-        Ok(ListAt { commit, file })
-    }
-
-    /// Refuse where a folder on the way to the node's own repository for
-    /// `identity` is a link: what is written there, or deleted, would be
-    /// wherever it leads.
-    fn no_link_to(&self, identity: &Identity) -> Result<(), ListFailed> {
-        let host = self.repos.join(&identity.host);
-        let owner = host.join(&identity.owner);
-        for folder in [host, owner, self.repo_of(identity)] {
-            if std::fs::symlink_metadata(&folder).is_ok_and(|meta| meta.file_type().is_symlink()) {
-                return Err(ListFailed::Git(format!(
-                    "{} is a link, and the node's repositories are never reached through one",
-                    shown(&folder.display().to_string())
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// The second step: the list's file, `object`, which the first step
-    /// left out, asked for by its ID. The node sends no commit it holds,
-    /// for the host would take it to hold the file too, and send nothing.
-    /// Git is stopped once the repository has grown by more than
-    /// [`LIST_FETCH_MAX_BYTES`]: the file is too large. A host that leaves
-    /// it out by the filter, or sends nothing, leaves it too large too.
-    fn bring_file(
-        &self,
-        repo: &Path,
-        object: &str,
-        deadline: Instant,
-        secs: u64,
-    ) -> Result<(), ListFailed> {
-        let objects = repo.join("objects");
-        let before = bytes_under(&objects);
-        let mut git = self.command(At::Own(repo));
-        // Received objects are kept as a pack, written to the disk as they
-        // come, so that what is received can be measured; not unpacked in
-        // memory first.
-        git.args([
-            "-c",
-            "fetch.negotiationAlgorithm=noop",
-            "-c",
-            "fetch.unpackLimit=1",
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--no-recurse-submodules",
-        ])
-        .arg(format!("--filter={}", list_filter()))
-        .args(["origin", object]);
-        let mut grown = || bytes_under(&objects).saturating_sub(before) > LIST_FETCH_MAX_BYTES;
-        match self.run_watched(git, deadline, secs, SHORT_OUTPUT_BYTES, &mut grown) {
-            Ok(ran) if ran.success => Ok(()),
-            Ok(ran) if ran.stderr.contains("did not send all necessary objects") => {
-                Err(ListFailed::TooLarge)
-            }
-            Ok(ran) => Err(fetch_failed(&ran.stderr)),
-            Err(Outcome::Stopped) => {
-                clear_locks(repo);
-                Err(ListFailed::TooLarge)
-            }
-            Err(outcome) => {
-                clear_locks(repo);
-                Err(outcome.failed())
-            }
-        }
-    }
-
-    /// Whether the repository at `at` holds `object`, asked so that
-    /// nothing is fetched for the asking.
-    fn holds(
-        &self,
-        at: At<'_>,
-        object: &str,
-        deadline: Instant,
-        secs: u64,
-    ) -> Result<bool, ListFailed> {
-        let mut git = self.command(at);
-        git.args(["cat-file", "-e", object]);
-        let held = self
-            .run(git, deadline, secs, SHORT_OUTPUT_BYTES)
-            .map_err(Outcome::failed)?;
-        Ok(held.success)
-    }
-
-    /// Make the node's own repository, where it is not there, and set it
-    /// up: `url` as its remote, and that remote as the promisor of a
-    /// partial clone, as git needs for a fetch with a filter. Each setting
-    /// is written only where it is not so already.
-    fn make_own(
-        &self,
-        repo: &Path,
-        url: &str,
-        deadline: Instant,
-        secs: u64,
-    ) -> Result<(), ListFailed> {
-        if !repo.join("HEAD").is_file() {
-            std::fs::create_dir_all(repo).map_err(|e| ListFailed::Git(shown(&e.to_string())))?;
-            let mut git = self.command(At::Own(repo));
-            git.args(["init", "--bare", "--quiet", "--template="]);
-            self.succeeds(git, deadline, secs)?;
-        }
-        let mut git = self.command(At::Own(repo));
-        git.args(["config", "--null", "--list"]);
-        let listed = self
-            .run(git, deadline, secs, CONFIG_OUTPUT_BYTES)
-            .map_err(Outcome::failed)?;
-        // The format's version first: git reads an extension only in a
-        // repository of version 1.
-        let wanted = [
-            ("core.repositoryformatversion", "1"),
-            ("extensions.partialclone", "origin"),
-            ("remote.origin.url", url),
-            ("remote.origin.promisor", "true"),
-            ("remote.origin.partialclonefilter", TREES_FILTER),
-        ];
-        for (key, value) in wanted {
-            let entry = format!("{key}\n{value}");
-            let set = listed
-                .stdout
-                .split(|b| *b == 0)
-                .any(|e| e == entry.as_bytes());
-            if !set {
-                let mut git = self.command(At::Own(repo));
-                git.args(["config", key, value]);
-                self.succeeds(git, deadline, secs)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Run `git`, which must succeed.
-    fn succeeds(&self, git: Command, deadline: Instant, secs: u64) -> Result<(), ListFailed> {
-        let ran = self
-            .run(git, deadline, secs, SHORT_OUTPUT_BYTES)
-            .map_err(Outcome::failed)?;
-        if ran.success {
-            Ok(())
-        } else {
-            Err(ListFailed::Git(last_said(&ran.stderr)))
-        }
     }
 
     /// The commit that the ref named `reference`, by its whole name, holds
@@ -1192,19 +814,6 @@ impl Git {
         })
     }
 
-    /// The commit of the node's own `reference`, which a fetch has just
-    /// written.
-    fn commit_of(
-        &self,
-        at: At<'_>,
-        reference: &str,
-        deadline: Instant,
-        secs: u64,
-    ) -> Result<String, ListFailed> {
-        self.commit_at(at, reference, deadline, secs)?
-            .ok_or_else(|| ListFailed::Git(format!("{reference} names no commit")))
-    }
-
     /// `.cordelia/members` at `commit`: `None` where the commit has none.
     /// Where it is there, it must be a plain file of at most
     /// [`MEMBERS_FILE_MAX_BYTES`], read with `git cat-file blob`. What a
@@ -1222,7 +831,7 @@ impl Git {
                 remote: remote.to_string(),
                 branch: branch.to_string(),
             },
-            Lacks::Whole | Lacks::Filtered { .. } => ListFailed::Git(last_said(said)),
+            Lacks::Whole => ListFailed::Git(last_said(said)),
         };
         let mut git = self.command(at);
         git.args(["ls-tree", "-z", "--full-tree", commit, "--", MEMBERS_PATH]);
@@ -1238,22 +847,9 @@ impl Git {
         // `<mode> <type> <object>\t<path>`
         let entry = String::from_utf8_lossy(entry);
         let mut words = entry.split([' ', '\t']);
-        let (mode, kind, object) = (words.next(), words.next(), words.next());
+        let (mode, kind) = (words.next(), words.next());
         if !matches!(mode, Some("100644" | "100755")) || kind != Some("blob") {
             return Err(ListFailed::NotAFile);
-        }
-        // In the node's own repository, the first step brought no file:
-        // the second brings the list's, where it is not there yet.
-        if let Lacks::Filtered { repo } = lacks {
-            let object = object
-                .filter(|object| is_a_commit(object))
-                .ok_or_else(|| ListFailed::Git(format!("{MEMBERS_PATH} has no object")))?;
-            if !self.holds(at, object, deadline, secs)? {
-                self.bring_file(repo, object, deadline, secs)?;
-                if !self.holds(at, object, deadline, secs)? {
-                    return Err(ListFailed::TooLarge);
-                }
-            }
         }
         let mut git = self.command(at);
         git.args(["cat-file", "blob"])
@@ -1464,7 +1060,6 @@ impl Git {
 /// a failure as it is said.
 enum Outcome {
     TooMuch,
-    Stopped,
     Failed(ListFailed),
 }
 
@@ -1472,7 +1067,6 @@ impl Outcome {
     fn failed(self) -> ListFailed {
         match self {
             Self::TooMuch => ListFailed::Git("git said more than was asked for".to_string()),
-            Self::Stopped => ListFailed::Git("git was stopped".to_string()),
             Self::Failed(failed) => failed,
         }
     }
@@ -1485,9 +1079,6 @@ enum Lacks<'a> {
     Whole,
     /// In a partial clone: the person's git has not brought it yet.
     Partial { remote: &'a str, branch: &'a str },
-    /// In the node's own repository, whose first step brings no file: the
-    /// second brings it, where it is not too large.
-    Filtered { repo: &'a Path },
 }
 
 /// A clone, as git places it.
@@ -1641,46 +1232,6 @@ impl CloneConfig {
     }
 }
 
-/// Why a fetch failed, from what git said in the C locale. What the host
-/// said, on lines that git begins with `remote:`, is not read: a host
-/// could say anything there.
-fn fetch_failed(said: &str) -> ListFailed {
-    let own: String = said
-        .lines()
-        .filter(|line| !line.starts_with("remote:"))
-        .map(|line| format!("{line}\n"))
-        .collect();
-    let said = own.as_str();
-    let line = last_line(said);
-    let has = |words: &str| said.contains(words);
-    if has("The requested URL returned error: 3") {
-        ListFailed::Moved
-    } else if has("could not read Username")
-        || has("could not read Password")
-        || has("Authentication failed")
-        || has("The requested URL returned error: 401")
-        || has("The requested URL returned error: 403")
-    {
-        ListFailed::AsksForPassword
-    } else if has("The requested URL returned error: 404")
-        || (has("repository '") && has("' not found"))
-    {
-        ListFailed::NotFound
-    } else if has("couldn't find remote ref HEAD") {
-        ListFailed::NoCommits
-    } else if has("transport '") && has("' not allowed") {
-        ListFailed::NotHttps
-    } else if has("certificate") {
-        ListFailed::Certificate(shown(after_the_address(line)))
-    } else if has("unable to access '") {
-        // Any other failure to reach the host: its name, a connection,
-        // TLS, or a proxy.
-        ListFailed::NotReached(shown(after_the_address(line)))
-    } else {
-        ListFailed::Git(shown(line))
-    }
-}
-
 /// The last thing git said itself (`fatal:` or `error:`), shown.
 fn last_said(said: &str) -> String {
     shown(last_line(said))
@@ -1698,18 +1249,6 @@ fn last_line(said: &str) -> &str {
         .or_else(|| said.lines().rev().find(|line| !line.trim().is_empty()))
         .unwrap_or("nothing")
         .trim()
-}
-
-/// What git said of an address, after it: `unable to access '<url>':
-/// <why>` gives `<why>`.
-fn after_the_address(line: &str) -> &str {
-    line.rsplit_once("': ").map_or(line, |(_, why)| why)
-}
-
-/// The seconds from now until `deadline`, rounded up, to say a late git.
-fn secs_until(deadline: Instant) -> u64 {
-    let left = deadline.saturating_duration_since(Instant::now());
-    left.as_secs() + u64::from(left.subsec_nanos() > 0)
 }
 
 /// An object's name as git gives it, a commit's or another's: 40 hex
@@ -1767,79 +1306,4 @@ fn keep_empty(dir: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
-}
-
-/// What the files under `dir` hold, together, links not followed.
-fn bytes_under(dir: &Path) -> u64 {
-    let mut bytes = 0u64;
-    let mut dirs = vec![dir.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
-                continue;
-            };
-            if meta.is_dir() {
-                dirs.push(entry.path());
-            } else if meta.is_file() {
-                bytes = bytes.saturating_add(meta.len());
-            }
-        }
-    }
-    bytes
-}
-
-/// Take out of the node's own repository what a git that was stopped
-/// left: every `*.lock` at its top, under `refs/`, in `objects/info/` and
-/// in `objects/pack/`, and a pack's temporary files. Only while no git of
-/// this node runs in it.
-fn clear_locks(repo: &Path) {
-    let remove_if = |dir: &Path, stale: &dyn Fn(&str) -> bool| {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let is_file = entry.file_type().is_ok_and(|t| t.is_file());
-            if is_file && name.to_str().is_some_and(stale) {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    };
-    let is_lock = |name: &str| name.ends_with(".lock");
-    remove_if(repo, &is_lock);
-    remove_if(&repo.join("objects/info"), &is_lock);
-    remove_if(&repo.join("objects/pack"), &|name: &str| {
-        name.ends_with(".lock") || name.starts_with("tmp_")
-    });
-    // A loose object's temporary file, in its folder of two hex digits.
-    if let Ok(entries) = std::fs::read_dir(repo.join("objects")) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let is_fanout = name.len() == 2
-                && name
-                    .to_str()
-                    .is_some_and(|n| n.bytes().all(|b| b.is_ascii_hexdigit()));
-            if is_fanout && entry.file_type().is_ok_and(|t| t.is_dir()) {
-                remove_if(&entry.path(), &|name: &str| name.starts_with("tmp_obj_"));
-            }
-        }
-    }
-    // The refs, to a depth that a ref of the node's own never passes.
-    let mut dirs = vec![(repo.join("refs"), 0)];
-    while let Some((dir, depth)) = dirs.pop() {
-        remove_if(&dir, &is_lock);
-        if depth >= 8 {
-            continue;
-        }
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                    dirs.push((entry.path(), depth + 1));
-                }
-            }
-        }
-    }
 }

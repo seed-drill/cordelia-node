@@ -5,9 +5,10 @@
 //! own git, which makes repositories, commits and clones in an
 //! environment of the test's own.
 //!
-//! The server answers each request with `Connection: close`, and keeps
-//! what it was asked, so that a test can say what reached it. It can
-//! answer instead with a redirect, with a demand for a password, or never.
+//! The server is a partial clone's promisor, which a read of the clone
+//! must never ask: it keeps what it was asked, so that a test can say
+//! that nothing reached it. It answers each request with `Connection:
+//! close`, as git's own server would, or with a demand for a password.
 
 #![allow(dead_code)]
 
@@ -24,12 +25,8 @@ use std::time::Duration;
 pub enum Answers {
     /// As git's own server does, through `git http-backend`.
     Git,
-    /// `301 Moved Permanently`, to the same path under `/moved`.
-    Redirect,
     /// `401 Unauthorized`, asking for a password.
     Password,
-    /// Never: the request is read, and the connection held open.
-    Never,
 }
 
 /// A request as the server saw it.
@@ -135,11 +132,9 @@ impl GitServer {
                     let Ok(tcp) = tcp else { continue };
                     let served = Served {
                         answers,
-                        port,
                         root: root.clone(),
                         home: home.clone(),
                         seen: seen.clone(),
-                        stop: stop.clone(),
                     };
                     std::thread::spawn(move || served.serve(tcp));
                 }
@@ -207,11 +202,9 @@ impl Drop for GitServer {
 /// One connection, and what it needs to be answered.
 struct Served {
     answers: Answers,
-    port: u16,
     root: PathBuf,
     home: PathBuf,
     seen: Arc<Mutex<Vec<Seen>>>,
-    stop: Arc<AtomicBool>,
 }
 
 /// A request: its line, its headers and its body.
@@ -232,24 +225,11 @@ impl Served {
         };
         self.seen.lock().unwrap().push(request.seen.clone());
         let answer = match self.answers {
-            Answers::Never => {
-                while !self.stop.load(Ordering::SeqCst) {
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-                return;
-            }
             Answers::Password => response(
                 "401 Unauthorized",
                 &[("WWW-Authenticate", "Basic realm=\"tests\"")],
                 b"",
             ),
-            Answers::Redirect => {
-                let to = format!(
-                    "https://127.0.0.1:{}/moved{}",
-                    self.port, request.seen.target
-                );
-                response("301 Moved Permanently", &[("Location", &to)], b"")
-            }
             Answers::Git => self.through_http_backend(&request),
         };
         let _ = stream.write_all(&answer);
