@@ -59,6 +59,17 @@ mod tests;
 /// Where the list is in a repository (rule 1).
 pub const MEMBERS_PATH: &str = ".cordelia/members";
 
+/// `commit` as a status shows it: its first
+/// [`MEMBERS_COMMIT_SHOWN_CHARS`](cordelia_core::protocol::MEMBERS_COMMIT_SHOWN_CHARS)
+/// characters (decision 2026-11-06 (joining), rule 7). A commit is hex, so
+/// a character is a byte.
+pub fn short(commit: &str) -> &str {
+    let end = commit
+        .len()
+        .min(cordelia_core::protocol::MEMBERS_COMMIT_SHOWN_CHARS);
+    commit.get(..end).unwrap_or(commit)
+}
+
 /// The first git that heeds `GIT_NO_LAZY_FETCH`: an older one may fetch
 /// from a partial clone's promisor while it reads it.
 pub const NO_LAZY_FETCH_SINCE: GitVersion = GitVersion {

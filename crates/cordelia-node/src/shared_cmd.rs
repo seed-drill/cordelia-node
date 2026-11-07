@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use cordelia_core::protocol::SHARED_MAX_KEYS;
+use cordelia_core::protocol::{MEMBERS_LABELS_SHOWN, SHARED_MAX_KEYS};
 use cordelia_crypto::bech32::decode_public_key;
 
 use crate::person_cmd::{NOT_A_YES, list, own_key, text, time_of};
@@ -425,7 +425,7 @@ pub fn show(config_path: &str, keys: bool, verbose: bool) -> anyhow::Result<()> 
     }
     for repository in repositories {
         lines.extend(
-            repository_lines(repository, verbose)
+            repository_lines(repository, verbose, true)
                 .into_iter()
                 .map(|line| format!("  {line}")),
         );
@@ -441,10 +441,11 @@ pub fn show(config_path: &str, keys: bool, verbose: bool) -> anyhow::Result<()> 
 /// name its channel is filed under; then, each indented, when and from
 /// where its list was read, the members by the list's labels, each in or
 /// not yet where this device can see it, what waits unread, and each line
-/// of rules 4 to 6, an amber one after "To know:", with any channel line
-/// it says to put in the list under it. The fingerprint words show only
-/// with `verbose` (#228).
-pub fn repository_lines(repository: &Value, verbose: bool) -> Vec<String> {
+/// of rules 4 to 6, with any channel line it says to put in the list under
+/// it. The members are each said with `every`, and else the first
+/// [`MEMBERS_LABELS_SHOWN`] and how many more. The fingerprint words show
+/// only with `verbose` (#228).
+pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<String> {
     let mut head = format!(
         "{}, for {}",
         text(repository, "identity"),
@@ -458,7 +459,13 @@ pub fn repository_lines(repository: &Value, verbose: bool) -> Vec<String> {
         Some(says) => lines.push(format!("  {says}")),
         None => lines.push("  The list has not been read yet.".into()),
     }
-    let members: Vec<String> = list(repository, "members")
+    let all: Vec<&Value> = list(repository, "members").collect();
+    let shown = match every {
+        true => all.len(),
+        false => all.len().min(MEMBERS_LABELS_SHOWN),
+    };
+    let mut members: Vec<String> = all[..shown]
+        .iter()
         .map(|member| {
             let mut shown = text(member, "label").to_string();
             match member["in"].as_bool() {
@@ -472,6 +479,9 @@ pub fn repository_lines(repository: &Value, verbose: bool) -> Vec<String> {
             shown
         })
         .collect();
+    if all.len() > shown {
+        members.push(format!("and {} more", all.len() - shown));
+    }
     if !members.is_empty() {
         lines.push(format!("  Members: {}.", members.join(", ")));
     }
@@ -483,11 +493,7 @@ pub fn repository_lines(repository: &Value, verbose: bool) -> Vec<String> {
         ));
     }
     for line in list(repository, "lines") {
-        let says = text(line, "says");
-        lines.push(match line["amber"] == true {
-            true => format!("  To know: {says}"),
-            false => format!("  {says}"),
-        });
+        lines.push(format!("  {}", text(line, "says")));
         if let Some(put) = line["line"].as_str() {
             lines.push(format!("    {put}"));
         }
@@ -499,18 +505,19 @@ pub fn repository_lines(repository: &Value, verbose: bool) -> Vec<String> {
 pub const SEEN_AT_A_TERMINAL: &str = "Run cordelia shared seen in a terminal: you clear these \
                                       notices, not an agent. Nothing was cleared.";
 
-/// `cordelia shared seen <name>` (decision 2026-11-06 (joining), rules
-/// 4.5, 5 and 6): at a terminal, and with no yes, it clears on this device
-/// the notices of the repository whose channel is `name`. A person clears
+/// `cordelia shared seen <name> [<label>]` (decision 2026-11-06 (joining),
+/// rules 4.5, 5 and 6): at a terminal, and with no yes, it clears on this
+/// device the joins and changed line of the repository whose channel is
+/// `name`, or with `label` rule 5's notice of that key alone. A person clears
 /// them, so it refuses where its input is not a terminal, as an agent's
 /// is not.
-pub fn seen(config_path: &str, name: &str) -> anyhow::Result<()> {
+pub fn seen(config_path: &str, name: &str, label: Option<&str>) -> anyhow::Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
         anyhow::bail!(SEEN_AT_A_TERMINAL);
     }
     refuse_another_version(config_path)?;
-    let body = json!({ "name": name });
+    let body = json!({ "name": name, "label": label });
     print_said(&asked(config_path, "/api/v1/shared/seen", &body)?);
     Ok(())
 }
@@ -954,7 +961,7 @@ mod tests {
                   "amber": true, "line": "channel 00 cordelia_pk1x without 0" },
             ],
         });
-        let lines = repository_lines(&repository, false);
+        let lines = repository_lines(&repository, false, false);
         assert_eq!(
             lines,
             [
@@ -964,7 +971,7 @@ mod tests {
                 "  Members: alice-laptop (in), bob-desktop (not yet).",
                 "  Unread: 2 by you, 1 by an agent.",
                 "  Handing team/project to bob-desktop: waiting for that device to take it.",
-                "  To know: team/project was made anew here: put its new channel line in \
+                "  team/project was made anew here: put its new channel line in \
                  .cordelia/members, in a pull request",
                 "    channel 00 cordelia_pk1x without 0",
             ]
@@ -974,7 +981,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("a b c d") || line.contains("one two"))
         );
-        let verbose = repository_lines(&repository, true);
+        let verbose = repository_lines(&repository, true, false);
         assert_eq!(
             verbose[0],
             "example.org/team/project, for team/project (channel a b c d)"
@@ -990,10 +997,24 @@ mod tests {
         for member in joiner["members"].as_array_mut().unwrap() {
             member["in"] = json!(null);
         }
-        let lines = repository_lines(&joiner, false);
+        let lines = repository_lines(&joiner, false, false);
         assert_eq!(lines[1], "  The list has not been read yet.");
         assert_eq!(lines[2], "  Members: alice-laptop, bob-desktop.");
         assert!(!lines.iter().any(|line| line.starts_with("  Unread")));
+        // The plain status shows the first few labels and how many more;
+        // `shared list` shows each.
+        let mut many = joiner.clone();
+        many["members"] = (1..=9)
+            .map(|n| json!({ "label": format!("m{n}"), "in": null }))
+            .collect();
+        assert_eq!(
+            repository_lines(&many, false, false)[2],
+            "  Members: m1, m2, m3, m4, m5, m6, and 3 more."
+        );
+        assert_eq!(
+            repository_lines(&many, false, true)[2],
+            "  Members: m1, m2, m3, m4, m5, m6, m7, m8, m9."
+        );
     }
 
     /// `cordelia shared seen <name>` takes a name, and `shared list` and
@@ -1003,9 +1024,22 @@ mod tests {
         let parsed = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
         match parsed(&["cordelia", "shared", "seen", "team/project"]) {
             Ok(Some(Commands::Shared {
-                what: SharedCommand::Seen { name },
+                what: SharedCommand::Seen { name, label: None },
             })) => assert_eq!(name, "team/project"),
             _ => panic!("shared seen"),
+        }
+        match parsed(&["cordelia", "shared", "seen", "team/project", "bob-desktop"]) {
+            Ok(Some(Commands::Shared {
+                what:
+                    SharedCommand::Seen {
+                        name,
+                        label: Some(label),
+                    },
+            })) => assert_eq!(
+                (name.as_str(), label.as_str()),
+                ("team/project", "bob-desktop")
+            ),
+            _ => panic!("shared seen <name> <label>"),
         }
         assert!(parsed(&["cordelia", "shared", "seen"]).is_err());
         match parsed(&["cordelia", "shared", "list", "-v"]) {

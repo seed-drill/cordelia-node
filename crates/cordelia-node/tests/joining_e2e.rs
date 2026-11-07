@@ -211,7 +211,10 @@ fn a_device_on_the_list_takes_the_channel_with_no_one_asked() {
     });
     subscribes_in(&alice, &alice_clone, &[], "which you hold");
     let commit = git(&alice, &alice_clone, &["rev-parse", "HEAD"]);
-    let joined = format!("bob-desktop joined {NAME} from the list at {commit}");
+    let joined = format!(
+        "bob-desktop joined {NAME} from the list at {}",
+        &commit[..12]
+    );
     let status = wait_for("Alice's status says Bob joined", &all, 120, || {
         let status = status_json(&alice);
         let says = status["shared"]["repositories"][0]["lines"]
@@ -230,7 +233,7 @@ fn a_device_on_the_list_takes_the_channel_with_no_one_asked() {
         plain.contains(&format!("  Following: {REPOSITORY}, for {NAME}")),
         "{plain}"
     );
-    assert!(plain.contains(&format!("    To know: {joined}")), "{plain}");
+    assert!(plain.contains(&format!("    {joined}")), "{plain}");
     assert!(
         plain.contains("Members: alice-laptop (in), bob-desktop (in)."),
         "{plain}"
@@ -248,10 +251,7 @@ fn a_device_on_the_list_takes_the_channel_with_no_one_asked() {
             .contains("shared_repository")
     );
     let said = alice.at_terminal(&["shared", "seen", NAME]).done();
-    assert!(
-        said.contains(&format!("Cleared 1 notice for {NAME} on this device.")),
-        "{said}"
-    );
+    assert!(said.contains(&format!("Cleared: {joined}")), "{said}");
     let status = status_json(&alice);
     assert!(
         !holds_of(&status)

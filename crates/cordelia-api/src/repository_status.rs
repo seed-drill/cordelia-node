@@ -27,10 +27,17 @@
 //! - **The ambers set a level.** The person ruled on 6 November that the
 //!   joining record's ambers stand beside the one fact of decision
 //!   2026-10-10 §9, property 16. Nothing else of a shared channel sets one.
+//! - **Worked out once for every follow** ([`Known`]): the person's
+//!   filings, the channels back along their moves, the channels offers
+//!   made them anew as, and the makings anew here, under one hold of the
+//!   lock at each status. An error in one follow's view is a line of that
+//!   view: the rest are said.
 //! - **`cordelia shared seen <name>`** ([`seen`]) clears, on this device,
-//!   the joins and a changed line, and the amber of rule 5 for each key it
-//!   shows. A key dropped from the list stays shown until it leaves the
-//!   channel or is listed again.
+//!   the joins and a changed line, and says each it clears. **`cordelia
+//!   shared seen <name> <label>`** clears rule 5's amber of that key alone:
+//!   a key left out comes back with a changed line, so the line's notice
+//!   must never take that amber with it. A key dropped from the list stays
+//!   shown until the list names the channel made anew without it.
 
 use rusqlite::Connection;
 use serde_json::{Value, json};
@@ -38,17 +45,17 @@ use serde_json::{Value, json};
 use cordelia_crypto::acts::Filing;
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
-use cordelia_storage::follows::{self, Follow, LastRead, MadeLine, NotRead, NoticeOf};
+use cordelia_storage::follows::{self, Follow, LastRead, MadeLine, NotRead, Notice, NoticeOf};
 use cordelia_storage::shared::{self as kept, State};
 use cordelia_storage::shared_anew as anew_rows;
 
 use crate::following::{
-    MOVED_FROM, back_along_moves, keys_in_channel, made_anew_from, name_of, no_channel_line,
+    MOVED_FROM, back_along_moves, keys_in_channel, made_anew_as, name_of, no_channel_line,
 };
-use crate::git_list::Identity;
+use crate::git_list::{Identity, short};
 use crate::let_go::ago;
 use crate::members::{self, Members, same_key};
-use crate::members_read::{ASKED, NotHanding, TAKEN, acts_in, takes_in, waiting_line};
+use crate::members_read::{ASKED, NotHanding, TAKEN, acts_in_with, takes_in_with, waiting_line};
 use crate::messages::cleaned;
 use crate::person::{PersonError, in_one};
 use crate::shared_routes::shell_word;
@@ -108,18 +115,99 @@ pub struct Made {
     pub at_removal: bool,
 }
 
-/// Every channel this device made anew, with what it kept of each.
-fn made_here(conn: &Connection) -> Result<Vec<Made>, PersonError> {
-    let rows = anew_rows::made_all(conn)?;
-    Ok(follows::made_lines(conn)?
-        .into_iter()
-        .map(|line| Made {
-            at_removal: rows
-                .iter()
-                .any(|row| row.channel == line.channel && row.at_removal),
-            line,
+/// The unread messages of each channel the person holds, by its ID: by an
+/// agent, and by the person (decision 2026-10-10 §9), where the status has
+/// worked them out already.
+pub type Unread = [([u8; 32], (usize, usize))];
+
+/// What every follow's view is worked out from, once, under the lock: the
+/// person's filings, with the channels back along each one's moves; the
+/// channels offers made a filed channel anew as, worked out where a view
+/// first needs them; and the makings anew here.
+pub struct Known {
+    filings: Vec<Filing>,
+    chains: Vec<Vec<[u8; 32]>>,
+    made_anew: std::cell::OnceCell<Vec<([u8; 32], usize)>>,
+    made: Vec<Made>,
+}
+
+impl Known {
+    /// What this device holds now.
+    pub fn of(conn: &Connection) -> Result<Self, PersonError> {
+        let filings = sharing::filed(conn)?;
+        let mut chains = Vec::with_capacity(filings.len());
+        for filing in &filings {
+            chains.push(back_along_moves(conn, &filing.channel)?);
+        }
+        let rows = anew_rows::made_all(conn)?;
+        let made = follows::made_lines(conn)?
+            .into_iter()
+            .map(|line| Made {
+                at_removal: rows
+                    .iter()
+                    .any(|row| row.channel == line.channel && row.at_removal),
+                line,
+            })
+            .collect();
+        Ok(Self {
+            filings,
+            chains,
+            made_anew: std::cell::OnceCell::new(),
+            made,
         })
-        .collect())
+    }
+
+    /// The filing of `channel`, where the person holds it.
+    fn filed(&self, channel: &[u8; 32]) -> Option<&Filing> {
+        self.filings
+            .iter()
+            .find(|filing| filing.channel == *channel)
+    }
+
+    /// The filing of the channel the person moved to from `channel`, back
+    /// along the moves this device keeps.
+    fn moved_to(&self, channel: &[u8; 32]) -> Option<&Filing> {
+        self.filings
+            .iter()
+            .zip(&self.chains)
+            .find(|(_, chain)| chain[1..].contains(channel))
+            .map(|(filing, _)| filing)
+    }
+
+    /// The filing of the channel that `channel` was made anew from, by an
+    /// offer that counts ([`crate::following::made_anew_from`]).
+    fn made_anew_from(
+        &self,
+        conn: &Connection,
+        identity: &NodeIdentity,
+        channel: &[u8; 32],
+    ) -> Result<Option<&Filing>, PersonError> {
+        let made_anew = match self.made_anew.get() {
+            Some(made_anew) => made_anew,
+            None => {
+                let mut found = Vec::new();
+                for (at, filing) in self.filings.iter().enumerate() {
+                    for new in made_anew_as(conn, identity, filing)? {
+                        found.push((new, at));
+                    }
+                }
+                self.made_anew.get_or_init(|| found)
+            }
+        };
+        Ok(made_anew
+            .iter()
+            .find(|(new, _)| new == channel)
+            .map(|(_, at)| &self.filings[*at]))
+    }
+
+    /// `channel` as a line says it: the person's name for it, or for the
+    /// channel they moved to from it, or else its words.
+    fn named(&self, channel: &[u8; 32]) -> String {
+        match self.filed(channel).or_else(|| self.moved_to(channel)) {
+            Some(filing) => cleaned(&filing.name),
+            None => format!("channel {}", channel_words(channel)),
+        }
+    }
 }
 
 /// The list kept for `follow`, read, where it reads.
@@ -132,51 +220,50 @@ fn kept_list(follow: &Follow) -> Option<Members> {
 /// name of the channel they hold that the named one was made anew from;
 /// or of the channel they moved to from the named one; or else the
 /// repository's `owner/name`, which a channel taken for it is filed under.
-fn shown_name(
+fn shown_name<'a>(
     conn: &Connection,
     identity: &NodeIdentity,
+    known: &'a Known,
     follow: &Follow,
     list: Option<&Members>,
-) -> Result<(String, Option<Filing>), PersonError> {
+) -> Result<(String, Option<&'a Filing>), PersonError> {
     let default = Identity::from_text(&follow.identity)
         .map(|of| name_of(&of))
         .unwrap_or_else(|| follow.identity.clone());
     let Some(line) = list.and_then(|list| list.channel.as_ref()) else {
         return Ok((default, None));
     };
-    let filings = sharing::filed(conn)?;
-    if let Some(filing) = filings.iter().find(|filing| filing.channel == line.channel) {
-        return Ok((filing.name.clone(), Some(filing.clone())));
+    if let Some(filing) = known.filed(&line.channel) {
+        return Ok((filing.name.clone(), Some(filing)));
     }
-    if let Some(from) = made_anew_from(conn, identity, &filings, &line.channel)? {
+    if let Some(from) = known.made_anew_from(conn, identity, &line.channel)? {
         return Ok((from.name.clone(), None));
     }
-    for filing in &filings {
-        if back_along_moves(conn, &filing.channel)?.contains(&line.channel) {
-            return Ok((filing.name.clone(), None));
-        }
+    if let Some(to) = known.moved_to(&line.channel) {
+        return Ok((to.name.clone(), None));
     }
     Ok((default, None))
 }
 
 // ── The lines ────────────────────────────────────────────────────────
 
-/// Rule 3's line of the list last read: from where, how old the clone's
-/// copy is, when it was read and at which commit. Where the clone does not
-/// say when it fetched, as with a person's `insteadOf`, it says that this
-/// is not known, and no more.
+/// Rule 3's line of the list last read, from the clone, the node's one
+/// source: how old the clone's copy is, when it was read and at which
+/// commit. Where the clone does not say when it fetched, as with a
+/// person's `insteadOf`, it says that this is not known, and no more.
 pub fn read_line(identity: &str, last: &LastRead, fetched_at: Option<i64>, now: i64) -> String {
-    let read = format!("Read {}, at commit {}.", ago(now - last.at), last.commit);
-    if !last.from_clone {
-        return format!("List of {identity} read from its host. {read}");
-    }
+    let read = format!(
+        "Read {}, at commit {}.",
+        ago(now - last.at),
+        short(&last.commit)
+    );
     match fetched_at {
         Some(at) => format!(
             "List of {identity} read from your clone, fetched {}. {read}",
             ago(now - at)
         ),
         None => format!(
-            "List of {identity} read from your clone; when your clone fetched it is not known. \
+            "List of {identity} read from your clone; your clone's last fetch is not known. \
              {read}"
         ),
     }
@@ -239,13 +326,14 @@ pub fn handing_line(name: &str, label: &str) -> String {
     format!("Handing {name} to {label}: waiting for that device to take it.")
 }
 
-/// Rule 4.5's line, amber, until a person clears it.
+/// Rule 4.5's line, amber, until a person clears it: `name` is the channel
+/// the key joined.
 pub fn joined_line(label: &str, name: &str, commit: &str) -> String {
-    format!("{label} joined {name} from the list at {commit}")
+    format!("{label} joined {name} from the list at {}", short(commit))
 }
 
-/// Rule 4.6's line, amber, until the key leaves the channel or is listed
-/// again.
+/// Rule 4.6's line, amber, until the key leaves the channel, as when the
+/// list names the channel made anew without it, or is listed again.
 pub fn dropped_line(label: &str, name: &str) -> String {
     format!(
         "{label} is no longer on the list of {name}: make it anew with cordelia shared anew {}",
@@ -256,7 +344,10 @@ pub fn dropped_line(label: &str, name: &str) -> String {
 /// Rule 6's line of a changed channel line, amber, until a person clears
 /// it.
 pub fn line_changed_line(identity: &str, name: &str, commit: &str) -> String {
-    format!("The list of {identity} names a new channel for {name} at {commit}.")
+    format!(
+        "The list of {identity} names a new channel for {name} at {}.",
+        short(commit)
+    )
 }
 
 /// Rule 5's line of a making anew here, amber, until the list names the
@@ -283,29 +374,57 @@ pub fn not_said_line(label: &str, name: &str) -> String {
     )
 }
 
+/// The line of a notice, with its word.
+fn notice_said(known: &Known, repository: &str, name: &str, notice: &Notice) -> Said {
+    match &notice.of {
+        NoticeOf::Joined { label, channel, .. } => Said::amber(
+            "joined",
+            joined_line(label, &known.named(channel), &notice.commit),
+        ),
+        NoticeOf::LineChanged => Said::amber(
+            "line_changed",
+            line_changed_line(repository, name, &notice.commit),
+        ),
+        NoticeOf::Dropped { label, .. } => {
+            Said::amber("no_longer_listed", dropped_line(label, name))
+        }
+    }
+}
+
 /// The lines of the follow `follow`, whose list kept is `list` and whose
-/// channel is said as `name`, at `now`, with `made` the makings anew here
-/// (see the module's documentation).
+/// channel is said as `name`, at `now` (see the module's documentation).
+/// `in_channel` is who is in the channel the list names, where the person
+/// holds it.
 #[allow(clippy::too_many_arguments)]
-pub fn lines_of(
+fn lines_of(
     conn: &Connection,
     identity: &NodeIdentity,
     own_relays: &[OwnRelay],
+    known: &Known,
     follow: &Follow,
     list: Option<&Members>,
+    in_channel: Option<&[[u8; 32]]>,
     name: &str,
-    made: &[Made],
     now: i64,
 ) -> Result<Vec<Said>, PersonError> {
     let repository = &follow.identity;
     let mut said = Vec::new();
-    let of_made = made_lines(conn, list, name, made)?;
+    let of_made = made_lines(conn, known, list, name)?;
     // First, a read that counted for nothing: the node handed nothing over
     // and took nothing at it, whatever the list read before says.
     if let Some(not) = &follow.not_read {
         said.push(Said::plain(&not.word, not_read_line(repository, not)));
     } else {
-        match takes_in(conn, identity, own_relays, follow)? {
+        let takes = takes_in_with(
+            conn,
+            identity,
+            own_relays,
+            follow,
+            list.cloned(),
+            &known.filings,
+            |channel| Ok(known.made_anew_from(conn, identity, channel)?.cloned()),
+        )?;
+        match takes {
             Ok(looks) => {
                 let when = follow
                     .last
@@ -318,9 +437,9 @@ pub fn lines_of(
                 said.extend(typed_lines(conn, repository, &looks.list)?);
             }
             Err(refusal) if refusal.word == "held" => {
-                if let Some(list) = list {
+                if let (Some(list), Some(in_channel)) = (list, in_channel) {
                     said.extend(handing(
-                        conn, identity, own_relays, follow, list, name, now,
+                        conn, identity, own_relays, known, follow, list, in_channel, name, now,
                     )?);
                 }
             }
@@ -341,16 +460,7 @@ pub fn lines_of(
         }
     }
     for notice in follows::notices(conn, repository)? {
-        said.push(match notice.of {
-            NoticeOf::Joined { label, .. } => {
-                Said::amber("joined", joined_line(&label, name, &notice.commit))
-            }
-            NoticeOf::LineChanged => Said::amber(
-                "line_changed",
-                line_changed_line(repository, name, &notice.commit),
-            ),
-            NoticeOf::Dropped { label, .. } => Said::amber("dropped", dropped_line(&label, name)),
-        });
+        said.push(notice_said(known, repository, name, &notice));
     }
     said.extend(of_made);
     Ok(said)
@@ -358,17 +468,22 @@ pub fn lines_of(
 
 /// The lines of a member, whose person holds the channel `list` names
 /// (rules 4.1, 4.2 and 4.7): why nothing is handed over, or each listed key
-/// the node's share waits for that has not taken it.
+/// the node's share waits for that has not taken it. `in_channel` is who
+/// is in the channel.
+#[allow(clippy::too_many_arguments)]
 fn handing(
     conn: &Connection,
     identity: &NodeIdentity,
     own_relays: &[OwnRelay],
+    known: &Known,
     follow: &Follow,
     list: &Members,
+    in_channel: &[[u8; 32]],
     name: &str,
     now: i64,
 ) -> Result<Vec<Said>, PersonError> {
-    let line = match acts_in(conn, identity, own_relays, list)? {
+    let acts = acts_in_with(conn, identity, own_relays, list, &known.filings, in_channel)?;
+    let line = match acts {
         Ok((line, _)) => line,
         Err(NotHanding::LeftOut(labels)) => {
             return Ok(labels
@@ -381,7 +496,6 @@ fn handing(
             return Ok(vec![Said::plain(why.word(), says)]);
         }
     };
-    let in_channel = keys_in_channel(conn, &identity.public_key(), list)?;
     let mut said = Vec::new();
     for share in sharing::waiting(conn, now)? {
         if !share.by_node
@@ -466,9 +580,9 @@ fn not_said<'a>(
 /// each by its label.
 fn made_lines(
     conn: &Connection,
+    known: &Known,
     list: Option<&Members>,
     name: &str,
-    made: &[Made],
 ) -> Result<Vec<Said>, PersonError> {
     let Some(list) = list else {
         return Ok(Vec::new());
@@ -477,7 +591,7 @@ fn made_lines(
         return Ok(Vec::new());
     };
     let mut said = Vec::new();
-    for one in made {
+    for one in &known.made {
         let Some(put) = &one.line.line else {
             continue;
         };
@@ -513,7 +627,7 @@ fn made_lines(
             ..Said::amber(word, says)
         });
     }
-    for (_, keys) in not_said(conn, list, made)? {
+    for (_, keys) in not_said(conn, list, &known.made)? {
         for key in keys {
             if let Some(label) = list.label_of(&key) {
                 said.push(Said::amber("not_said", not_said_line(label, name)));
@@ -526,153 +640,284 @@ fn made_lines(
 // ── The view ─────────────────────────────────────────────────────────
 
 /// The view of each repository this device follows, by identity, at
-/// `now` (rule 7). `own_relays` are the device's relays known by their
-/// keys.
+/// `now` (rule 7), from what is worked out once ([`Known`]). `own_relays`
+/// are the device's relays known by their keys; `unread`, the unread
+/// messages of each channel held, where the status has them already. An
+/// error in one view is a line of it, so that the others are said; where
+/// the follows themselves cannot be read, there are none to say.
 pub fn views(
     conn: &Connection,
     identity: &NodeIdentity,
     own_relays: &[OwnRelay],
+    unread: Option<&Unread>,
     now: i64,
-) -> Result<Vec<Value>, PersonError> {
-    let made = made_here(conn)?;
-    let subscriptions = crate::shared_messages::in_force(conn)?;
-    let mut views = Vec::new();
-    for follow in follows::follows(conn)? {
-        let list = kept_list(&follow);
-        let (name, filing) = shown_name(conn, identity, &follow, list.as_ref())?;
-        let name = cleaned(&name);
-        let lines = lines_of(
-            conn,
-            identity,
-            own_relays,
-            &follow,
-            list.as_ref(),
-            &name,
-            &made,
-            now,
-        )?;
-        let channel = list.as_ref().and_then(|list| list.channel.as_ref());
-        // Who is in the channel only a device that holds it sees.
-        let row = match &filing {
-            Some(filing) => {
-                kept::channel(conn, &filing.channel)?.filter(|row| row.state == State::Held)
-            }
-            None => None,
-        };
-        let in_channel = match (&row, &list) {
-            (Some(_), Some(list)) => Some(keys_in_channel(conn, &identity.public_key(), list)?),
-            _ => None,
-        };
-        let mut members = Vec::new();
-        for device in list.iter().flat_map(|list| &list.devices) {
-            let is_in = in_channel
-                .as_ref()
-                .map(|keys| keys.iter().any(|key| same_key(key, &device.key)));
-            members.push(json!({
-                "label": device.label,
-                "key": encode_public_key(&device.key)?,
-                "words": six_words(&device.key),
-                "in": is_in,
-            }));
+) -> Vec<Value> {
+    let followed = match follows::follows(conn) {
+        Ok(followed) => followed,
+        Err(e) => {
+            tracing::warn!("the repositories followed were not read: {e}");
+            return Vec::new();
         }
-        let (unread_by_an_agent, unread_by_a_person) = match &row {
-            Some(row) => {
-                let subscribed: Vec<&str> = subscriptions
-                    .iter()
-                    .filter(|(of, _)| *of == row.channel)
-                    .map(|(_, agent)| agent.as_str())
-                    .collect();
-                crate::shared_status::unread_in(conn, identity, row, &subscribed, now)?
-            }
-            None => (0, 0),
-        };
-        let read = follow.last.as_ref().map(|last| {
-            json!({
-                "at": rfc3339(last.at),
-                "commit": last.commit,
-                "from": if last.from_clone { "clone" } else { "host" },
-                "fetched": follow.fetched_at.map(rfc3339),
-                "says": read_line(&follow.identity, last, follow.fetched_at, now),
-            })
-        });
-        views.push(json!({
-            "identity": follow.identity,
-            "name": name,
-            "held": filing.is_some(),
-            "channel": channel.map(|line| hex::encode(line.channel)),
-            "words": channel.map(|line| channel_words(&line.channel)),
-            "read": read,
-            "members": members,
-            "unread_by_an_agent": unread_by_an_agent,
-            "unread_by_a_person": unread_by_a_person,
-            "lines": lines.iter().map(Said::to_json).collect::<Vec<_>>(),
-        }));
-    }
-    Ok(views)
+    };
+    let known = Known::of(conn);
+    let mut subscriptions = None;
+    followed
+        .iter()
+        .map(|follow| {
+            let known = match &known {
+                Ok(known) => known,
+                Err(e) => return not_worked_out(follow, &e.to_string()),
+            };
+            let view = view_of(
+                conn,
+                identity,
+                own_relays,
+                known,
+                follow,
+                unread,
+                &mut subscriptions,
+                now,
+            );
+            view.unwrap_or_else(|e| not_worked_out(follow, &e.to_string()))
+        })
+        .collect()
 }
 
-// ── cordelia shared seen <name> ──────────────────────────────────────
+/// The view of a follow whose view could not be worked out: its identity,
+/// and a line that says why.
+fn not_worked_out(follow: &Follow, why: &str) -> Value {
+    let said = Said::plain(
+        "not_worked_out",
+        format!(
+            "This device could not work out how {} stands: {why}.",
+            follow.identity
+        ),
+    );
+    json!({
+        "identity": follow.identity,
+        "name": null,
+        "held": false,
+        "channel": null,
+        "words": null,
+        "read": null,
+        "members": [],
+        "unread_by_an_agent": 0,
+        "unread_by_a_person": 0,
+        "lines": [said.to_json()],
+    })
+}
+
+/// One follow's view (rule 7). `subscriptions` are the subscriptions in
+/// force, read where a view first needs them.
+#[allow(clippy::too_many_arguments)]
+fn view_of(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    own_relays: &[OwnRelay],
+    known: &Known,
+    follow: &Follow,
+    unread: Option<&Unread>,
+    subscriptions: &mut Option<Vec<([u8; 32], String)>>,
+    now: i64,
+) -> Result<Value, PersonError> {
+    let list = kept_list(follow);
+    let (name, filing) = shown_name(conn, identity, known, follow, list.as_ref())?;
+    let name = cleaned(&name);
+    let channel = list.as_ref().and_then(|list| list.channel.as_ref());
+    // Who is in the channel only a device that holds it sees.
+    let in_channel = match (filing, &list) {
+        (Some(_), Some(list)) => Some(keys_in_channel(conn, &identity.public_key(), list)?),
+        _ => None,
+    };
+    let row = match filing {
+        Some(filing) => {
+            kept::channel(conn, &filing.channel)?.filter(|row| row.state == State::Held)
+        }
+        None => None,
+    };
+    let lines = lines_of(
+        conn,
+        identity,
+        own_relays,
+        known,
+        follow,
+        list.as_ref(),
+        in_channel.as_deref(),
+        &name,
+        now,
+    )?;
+    let shown_in = in_channel.as_ref().filter(|_| row.is_some());
+    let mut members = Vec::new();
+    for device in list.iter().flat_map(|list| &list.devices) {
+        let is_in = shown_in.map(|keys| keys.iter().any(|key| same_key(key, &device.key)));
+        members.push(json!({
+            "label": device.label,
+            "key": encode_public_key(&device.key)?,
+            "words": six_words(&device.key),
+            "in": is_in,
+        }));
+    }
+    let (unread_by_an_agent, unread_by_a_person) = match (&row, unread) {
+        (Some(row), Some(unread)) => unread
+            .iter()
+            .find(|(of, _)| *of == row.channel)
+            .map_or((0, 0), |(_, counts)| *counts),
+        (Some(row), None) => {
+            let subscriptions = match subscriptions {
+                Some(subscriptions) => subscriptions,
+                None => subscriptions.insert(crate::shared_messages::in_force(conn)?),
+            };
+            let subscribed: Vec<&str> = subscriptions
+                .iter()
+                .filter(|(of, _)| *of == row.channel)
+                .map(|(_, agent)| agent.as_str())
+                .collect();
+            crate::shared_status::unread_in(conn, identity, row, &subscribed, now)?
+        }
+        (None, _) => (0, 0),
+    };
+    let read = follow.last.as_ref().map(|last| {
+        json!({
+            "at": rfc3339(last.at),
+            "commit": last.commit,
+            "from": "clone",
+            "fetched": follow.fetched_at.map(rfc3339),
+            "says": read_line(&follow.identity, last, follow.fetched_at, now),
+        })
+    });
+    Ok(json!({
+        "identity": follow.identity,
+        "name": name,
+        "held": filing.is_some(),
+        "channel": channel.map(|line| hex::encode(line.channel)),
+        "words": channel.map(|line| channel_words(&line.channel)),
+        "read": read,
+        "members": members,
+        "unread_by_an_agent": unread_by_an_agent,
+        "unread_by_a_person": unread_by_a_person,
+        "lines": lines.iter().map(Said::to_json).collect::<Vec<_>>(),
+    }))
+}
+
+// ── cordelia shared seen ─────────────────────────────────────────────
 
 /// What `cordelia shared seen` says where this device follows no
 /// repository whose channel is `name`: another device's follows are its
 /// own (decision 2026-11-06 (joining), rule 6).
-pub fn not_read_here_line(name: &str) -> String {
+pub fn not_followed_line(name: &str) -> String {
+    format!("This device follows no repository whose channel is {name}.")
+}
+
+/// What `cordelia shared seen <name>` says of a key left out that rule 5's
+/// amber still shows: it is cleared on its own.
+pub fn still_shown_line(label: &str, name: &str) -> String {
     format!(
-        "This device does not read the list of {name}: run cordelia subscribe in a clone of its \
-         repository."
+        "Still shown: {}. If you brought it back on purpose, run cordelia shared seen {} {label}.",
+        not_said_line(label, name),
+        shell_word(name)
     )
 }
 
-/// `cordelia shared seen <name>` (rules 4.5, 5 and 6), in one write: for
-/// each repository this device follows whose channel is said as `name`,
-/// or whose identity is `name`, the joins and a changed channel line go,
-/// and so does the amber of rule 5 for each key it shows now. A key
-/// dropped from the list stays shown until it leaves the channel. It needs
-/// no yes: it only clears notices on this device. Returns what it says.
-pub fn seen(conn: &Connection, identity: &NodeIdentity, name: &str) -> Out<Vec<String>> {
+/// What `cordelia shared seen <name>` says where a key no longer on the
+/// list is still shown.
+pub const DROPPED_STAYS: &str = "A key no longer on the list stays shown until the list names \
+                                 the channel made anew without it.";
+
+/// `cordelia shared seen <name>`, and with `label`, `cordelia shared seen
+/// <name> <label>` (rules 4.5, 5 and 6), in one write, for each repository
+/// this device follows whose channel is said as `name`, or whose identity
+/// is `name`. With no label, the joins and a changed channel line go, each
+/// said as it goes, and rule 5's amber of a key left out is said again,
+/// with how to clear it: a key left out comes back with a changed line,
+/// and clearing that must not take the one alarm with it. With a label,
+/// rule 5's amber of the key the list gives that label goes, and nothing
+/// else. A key dropped from the list stays shown until it leaves the
+/// channel. No yes: it only clears notices on this device. Returns what it
+/// says.
+pub fn seen(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    name: &str,
+    label: Option<&str>,
+) -> Out<Vec<String>> {
     let shown = cleaned(name);
     let done = in_one(conn, || {
-        let made = made_here(conn)?;
+        let known = Known::of(conn)?;
         let mut followed = false;
-        let (mut cleared, mut dropped) = (0usize, 0usize);
+        let mut cleared = Vec::new();
+        let mut still = Vec::new();
         for follow in follows::follows(conn)? {
             let list = kept_list(&follow);
-            let (of, _) = shown_name(conn, identity, &follow, list.as_ref())?;
+            let (of, _) = shown_name(conn, identity, &known, &follow, list.as_ref())?;
             if cleaned(&of) != shown && follow.identity != name {
                 continue;
             }
             followed = true;
-            cleared += follows::seen(conn, &follow.identity)?;
-            if let Some(list) = &list {
-                for (one, keys) in not_said(conn, list, &made)? {
-                    cleared += follows::not_left_out(conn, &one.line.channel, &keys)?;
+            let of = cleaned(&of);
+            let left_out = match &list {
+                Some(list) => not_said(conn, list, &known.made)?,
+                None => Vec::new(),
+            };
+            let by_label = |key: &[u8; 32]| {
+                list.as_ref()
+                    .and_then(|list| list.label_of(key))
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            match label {
+                Some(label) => {
+                    for (one, keys) in &left_out {
+                        let keys: Vec<[u8; 32]> = keys
+                            .iter()
+                            .filter(|key| by_label(key) == label)
+                            .copied()
+                            .collect();
+                        follows::not_left_out(conn, &one.line.channel, &keys)?;
+                        for _ in &keys {
+                            cleared.push(not_said_line(label, &of));
+                        }
+                    }
+                }
+                None => {
+                    for notice in follows::notices(conn, &follow.identity)? {
+                        match notice.of {
+                            NoticeOf::Joined { .. } | NoticeOf::LineChanged => {
+                                cleared
+                                    .push(notice_said(&known, &follow.identity, &of, &notice).says);
+                            }
+                            NoticeOf::Dropped { .. } => {
+                                if !still.iter().any(|line| line == DROPPED_STAYS) {
+                                    still.push(DROPPED_STAYS.to_string());
+                                }
+                            }
+                        }
+                    }
+                    follows::seen(conn, &follow.identity)?;
+                    for (_, keys) in &left_out {
+                        for key in keys {
+                            still.push(still_shown_line(&by_label(key), &of));
+                        }
+                    }
                 }
             }
-            dropped += follows::notices(conn, &follow.identity)?
-                .iter()
-                .filter(|notice| matches!(notice.of, NoticeOf::Dropped { .. }))
-                .count();
         }
-        Ok((followed, cleared, dropped))
+        Ok((followed, cleared, still))
     });
-    let (followed, cleared, dropped) = done.map_err(sharing::Failed::Error)?;
+    let (followed, cleared, still) = done.map_err(sharing::Failed::Error)?;
     if !followed {
-        return sharing::refused("not_followed", not_read_here_line(&shown));
+        return sharing::refused("not_followed", not_followed_line(&shown));
     }
-    let mut said = vec![match cleared {
-        0 => format!("Nothing to clear for {shown} on this device."),
-        n => format!(
-            "Cleared {} for {shown} on this device.",
-            sharing::counted(n as u64, "notice")
-        ),
-    }];
-    if dropped > 0 {
-        said.push(format!(
-            "A key no longer on the list stays shown until it leaves the channel: make {shown} \
-             anew with cordelia shared anew {}.",
-            shell_word(&shown)
-        ));
+    let mut said: Vec<String> = cleared
+        .iter()
+        .map(|line| format!("Cleared: {line}"))
+        .collect();
+    if said.is_empty() {
+        said.push(match label {
+            Some(label) => format!("Nothing to clear for {label} in {shown} on this device."),
+            None => format!("Nothing to clear for {shown} on this device."),
+        });
     }
+    said.extend(still);
     Ok(said)
 }
 

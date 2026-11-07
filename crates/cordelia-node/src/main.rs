@@ -701,13 +701,18 @@ enum SharedCommand {
     },
     /// Clear the notices of a repository's channel on this device
     ///
-    /// Run it in a terminal once you have read them in cordelia status:
-    /// who joined, a new channel line, and a key you left out that the
-    /// list does not name after without. A key no longer on the list stays
-    /// shown until you make the channel anew. It asks no yes.
+    /// Run it in a terminal once you have read them in cordelia status. It
+    /// clears who joined and a new channel line, and says each one. A key
+    /// you left out that the list names again stays shown: if you brought
+    /// it back on purpose, clear it with its label. A key no longer on the
+    /// list stays shown until the list names the channel made anew without
+    /// it. It asks no yes.
     Seen {
         /// The channel's name, as cordelia status shows it
         name: String,
+        /// The label of a key you left out and brought back on purpose: its
+        /// notice alone is cleared
+        label: Option<String>,
     },
     /// File a shared channel under another name, on every device of yours
     Rename {
@@ -1011,7 +1016,9 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Shared { what }) => match what {
             SharedCommand::New { name, relays } => shared_cmd::new(&cli.config, &name, &relays),
             SharedCommand::List { keys, verbose } => shared_cmd::show(&cli.config, keys, verbose),
-            SharedCommand::Seen { name } => shared_cmd::seen(&cli.config, &name),
+            SharedCommand::Seen { name, label } => {
+                shared_cmd::seen(&cli.config, &name, label.as_deref())
+            }
             SharedCommand::Rename {
                 name,
                 new_name,
@@ -1785,8 +1792,10 @@ fn cmd_status(
             }
             // What the node says of the shared channels, as it gave it,
             // where it gives it (decision 2026-10-10 §9): apart from
-            // `messages`, never mixed in one count. The level reads one
-            // fact of it alone ([`indicator::shared`]).
+            // `messages`, never mixed in one count. The level reads two
+            // facts of it alone: a removed device that holds a channel, and
+            // each amber line of a repository followed (decision 2026-11-06
+            // (joining), rule 7; [`indicator::shared`]).
             if live["shared"].is_object() {
                 out["shared"] = live["shared"].clone();
             }
@@ -2034,7 +2043,7 @@ fn cmd_status(
                 // lines, its ambers among them (decision 2026-11-06
                 // (joining), rule 7).
                 for repository in person_cmd::list(&live["shared"], "repositories") {
-                    let lines = shared_cmd::repository_lines(repository, verbose);
+                    let lines = shared_cmd::repository_lines(repository, verbose, false);
                     for (n, line) in lines.iter().enumerate() {
                         let line = history_cmd::printable(line);
                         match n {

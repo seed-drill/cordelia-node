@@ -1025,8 +1025,8 @@ fn a_clone_behind_a_failed_read_and_a_list_that_does_not_parse_leave_the_last_li
         not.why,
         format!(
             "your clone is at commit {}, which does not come after commit {}, the last one read",
-            commit('b'),
-            commit('a')
+            &commit('b')[..12],
+            &commit('a')[..12]
         )
     );
     stands(&s, "behind");
@@ -1477,7 +1477,7 @@ fn nothing_is_taken_where_this_device_is_left_out_or_its_key_is_not_listed() {
             format!(
                 "The list of {REPOSITORY} at {} names channel {words}, which no device of yours \
                  holds or can move to.",
-                commit('c')
+                &commit('c')[..12]
             )
         )
     );
@@ -1488,7 +1488,7 @@ fn nothing_is_taken_where_this_device_is_left_out_or_its_key_is_not_listed() {
             "not_listed",
             format!(
                 "Your key is not on the list of {REPOSITORY} at {}.",
-                commit('d')
+                &commit('d')[..12]
             )
         )
     );

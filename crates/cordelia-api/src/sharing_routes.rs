@@ -363,9 +363,8 @@ pub async fn list(
         .map_err(crate::commands::refused)?;
     // Each repository this device follows (decision 2026-11-06 (joining),
     // rule 7), as the status says it.
-    listed["repositories"] = crate::repository_status::views(&conn, &state.identity, &own, now)
-        .map_err(crate::commands::refused)?
-        .into();
+    listed["repositories"] =
+        crate::repository_status::views(&conn, &state.identity, &own, None, now).into();
     std::mem::drop(conn);
     listed["this_device"] = this_device(&state)?.into();
     Ok(HttpResponse::Ok().json(listed))
@@ -377,17 +376,26 @@ pub async fn list(
 #[serde(deny_unknown_fields)]
 pub struct SeenRequest {
     pub name: String,
+    /// A label of the list: rule 5's amber of its key alone is cleared.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
-/// `cordelia shared seen <name>` (decision 2026-11-06 (joining), rules
-/// 4.5, 5 and 6): no yes, since it only clears notices on this device.
+/// `cordelia shared seen <name> [<label>]` (decision 2026-11-06 (joining),
+/// rules 4.5, 5 and 6): no yes, since it only clears notices on this
+/// device.
 pub async fn seen(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<SeenRequest>,
 ) -> Result<HttpResponse, ApiError> {
     crate::commands::asked(&req, &state)?;
-    let said = crate::repository_status::seen(&db(&state), &state.identity, &body.name);
+    let said = crate::repository_status::seen(
+        &db(&state),
+        &state.identity,
+        &body.name,
+        body.label.as_deref(),
+    );
     match said {
         Ok(said) => Ok(HttpResponse::Ok().json(json!({ "said": said }))),
         Err(failed) => answer_of(failed),

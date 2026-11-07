@@ -413,8 +413,12 @@ pub fn untype(conn: &Connection, identity: &str, key: &[u8; 32]) -> Result<(), C
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoticeOf {
     /// A key that joined the channel from the list, with its label there
-    /// (rule 4.5). Kept until a person clears it.
-    Joined { key: [u8; 32], label: String },
+    /// and the channel it joined (rule 4.5). Kept until a person clears it.
+    Joined {
+        key: [u8; 32],
+        label: String,
+        channel: [u8; 32],
+    },
     /// The list's channel line changed (rule 6). Kept until a person clears
     /// it; a later change takes the place of an earlier one not yet cleared.
     LineChanged,
@@ -435,11 +439,16 @@ pub struct Notice {
 /// a changed line takes the place of one not yet cleared, with its commit.
 /// Returns whether anything was written.
 pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool, CordeliaError> {
-    let (kind, key, label): (i64, Vec<u8>, Option<&str>) = match &notice.of {
-        NoticeOf::Joined { key, label } => (1, key.to_vec(), Some(label)),
-        NoticeOf::LineChanged => (2, Vec::new(), None),
-        NoticeOf::Dropped { key, label } => (3, key.to_vec(), Some(label)),
-    };
+    let (kind, key, label, channel): (i64, Vec<u8>, Option<&str>, Option<&[u8; 32]>) =
+        match &notice.of {
+            NoticeOf::Joined {
+                key,
+                label,
+                channel,
+            } => (1, key.to_vec(), Some(label), Some(channel)),
+            NoticeOf::LineChanged => (2, Vec::new(), None, None),
+            NoticeOf::Dropped { key, label } => (3, key.to_vec(), Some(label), None),
+        };
     let on_conflict = match kind {
         2 => {
             "DO UPDATE SET at_commit = excluded.at_commit, at = excluded.at
@@ -450,11 +459,20 @@ pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool
     let written = conn
         .execute(
             &format!(
-                "INSERT INTO shared_follow_notices (identity, kind, key, label, at_commit, at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO shared_follow_notices
+                     (identity, kind, key, label, at_commit, at, channel)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT (identity, kind, key) {on_conflict}"
             ),
-            params![identity, kind, key, label, notice.commit, notice.at],
+            params![
+                identity,
+                kind,
+                key,
+                label,
+                notice.commit,
+                notice.at,
+                channel.map(|channel| &channel[..])
+            ],
         )
         .map_err(storage)?;
     Ok(written == 1)
@@ -463,7 +481,7 @@ pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool
 /// The notices of `identity`, oldest first.
 pub fn notices(conn: &Connection, identity: &str) -> Result<Vec<Notice>, CordeliaError> {
     conn.prepare(
-        "SELECT kind, key, label, at_commit, at FROM shared_follow_notices
+        "SELECT kind, key, label, at_commit, at, channel FROM shared_follow_notices
              WHERE identity = ?1 ORDER BY at, kind, key",
     )
     .map_err(storage)?
@@ -472,9 +490,17 @@ pub fn notices(conn: &Connection, identity: &str) -> Result<Vec<Notice>, Cordeli
         let key: Vec<u8> = row.get(1)?;
         let key: [u8; 32] = key.try_into().unwrap_or([0; 32]);
         let label: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+        let channel: Option<Vec<u8>> = row.get(5)?;
+        let channel: [u8; 32] = channel
+            .and_then(|channel| channel.try_into().ok())
+            .unwrap_or([0; 32]);
         Ok(Notice {
             of: match kind {
-                1 => NoticeOf::Joined { key, label },
+                1 => NoticeOf::Joined {
+                    key,
+                    label,
+                    channel,
+                },
                 3 => NoticeOf::Dropped { key, label },
                 _ => NoticeOf::LineChanged,
             },

@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::{MEMBERS_LABEL_MAX_CHARS, SHARED_MAX_KEYS};
+use cordelia_core::protocol::{MEMBERS_LABEL_MAX_CHARS, SHARED_MAX_CHANNELS, SHARED_MAX_KEYS};
 use cordelia_crypto::acts::{Filing, Subscription};
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
@@ -279,6 +279,15 @@ pub fn plan(
         Some(line) => followed_elsewhere(conn, &repository, &line.channel)?,
         None => None,
     };
+    // A device follows as many repositories as it holds shared channels at
+    // most: each follow's list names one, and the status works out each
+    // follow under the lock.
+    let followed = follows::follows(conn)?;
+    let adds_one =
+        replaces.is_none() && !followed.iter().any(|follow| follow.identity == repository);
+    if adds_one && followed.len() >= SHARED_MAX_CHANNELS {
+        return sharing::refused("too_many_follows", too_many_follows_line());
+    }
     let own = identity.public_key();
     // Only this device's key as `cordelia id` prints it counts: a member's
     // share to its twin is in another share pair channel, which this
@@ -512,6 +521,15 @@ pub fn plan(
     planned(asks, Then::Nothing)
 }
 
+/// What `subscribe` in a clone says where this device follows as many
+/// repositories as there can be.
+pub(crate) fn too_many_follows_line() -> String {
+    format!(
+        "This device follows {SHARED_MAX_CHANNELS} repositories, the most it can. To follow \
+         another, first drop the channel of one with cordelia shared drop. Nothing was done."
+    )
+}
+
 /// What is said where the list of `repository` names a twin of this
 /// device's key `own`, and not the key as `cordelia id` prints it (rule
 /// 4.4).
@@ -533,10 +551,12 @@ pub(crate) fn name_of(identity: &Identity) -> String {
 /// (rule 6): no other channel is filed as it, and no folder is synced as
 /// it. Refused, as `name_taken`, with what frees it.
 pub(crate) fn name_free(conn: &Connection, name: &str) -> Out<()> {
-    if sharing::filed(conn)?
-        .iter()
-        .any(|filing| filing.name == name)
-    {
+    name_free_in(conn, &sharing::filed(conn)?, name)
+}
+
+/// [`name_free`], given the person's filings.
+pub(crate) fn name_free_in(conn: &Connection, filings: &[Filing], name: &str) -> Out<()> {
+    if filings.iter().any(|filing| filing.name == name) {
         return sharing::refused(
             "name_taken",
             format!("You file another channel as {name}: rename it with cordelia shared rename."),
@@ -569,23 +589,33 @@ pub(crate) fn made_anew_from<'a>(
     channel: &[u8; 32],
 ) -> Result<Option<&'a Filing>, PersonError> {
     for filing in filings {
-        let Some(row) = kept::channel(conn, &filing.channel)? else {
-            continue;
-        };
-        let counts = crate::shared_anew::judged(conn, identity, &row, None)?
-            .iter()
-            .any(|one| {
-                one.offer.new_channel == *channel
-                    && matches!(
-                        one.is,
-                        OfferIs::ForThisDevice(_) | OfferIs::SealedElsewhere(_)
-                    )
-            });
-        if counts {
+        if made_anew_as(conn, identity, filing)?.contains(channel) {
             return Ok(Some(filing));
         }
     }
     Ok(None)
+}
+
+/// Each channel that an offer read in the channel of `filing` made it anew
+/// as, where the offer counts as [`made_anew_from`] counts one.
+pub(crate) fn made_anew_as(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    filing: &Filing,
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    let Some(row) = kept::channel(conn, &filing.channel)? else {
+        return Ok(Vec::new());
+    };
+    Ok(crate::shared_anew::judged(conn, identity, &row, None)?
+        .into_iter()
+        .filter(|one| {
+            matches!(
+                one.is,
+                OfferIs::ForThisDevice(_) | OfferIs::SealedElsewhere(_)
+            )
+        })
+        .map(|one| one.offer.new_channel)
+        .collect())
 }
 
 /// The other repository this device follows whose list kept names the

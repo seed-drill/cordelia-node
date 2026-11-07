@@ -254,7 +254,10 @@ pub enum Gone {
 /// drop is not kept. A move is a channel filed now that came from it, by
 /// its filing, or back along the moves this device keeps: one moved from
 /// twice, as after two makings anew before a list names either, is moved
-/// from, and not dropped.
+/// from, and not dropped. So is a channel past its bound that a removal
+/// made anew on this device, whose drop is the removal's (§3.5): the
+/// follow goes on, and says to put the new line in the list (decision
+/// 2026-11-06 (joining), rule 5). The person's other devices see a drop.
 pub(crate) fn dropped_or_moved(
     conn: &Connection,
     channel: &[u8; 32],
@@ -267,15 +270,15 @@ pub(crate) fn dropped_or_moved(
     {
         return Ok(None);
     }
-    let mut moved = false;
+    let mut moved = st(rows::made_of_channel(conn, channel))?
+        .is_some_and(|made| made.at_removal && made.past_bound);
     for (act, _) in &holds.filings {
-        let filed = &act.item;
-        if filed.came == Came::Moved(*channel)
-            || crate::following::back_along_moves(conn, &filed.channel)?[1..].contains(channel)
-        {
-            moved = true;
+        if moved {
             break;
         }
+        let filed = &act.item;
+        moved = filed.came == Came::Moved(*channel)
+            || crate::following::back_along_moves(conn, &filed.channel)?[1..].contains(channel);
     }
     Ok(Some(match moved {
         true => Gone::Moved,

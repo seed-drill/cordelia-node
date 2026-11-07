@@ -1362,3 +1362,38 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
     assert_eq!(refused["error"]["code"], "not_a_repository", "{refused}");
     assert_eq!(refused["error"]["message"], NOT_IN_A_CLONE);
 }
+
+/// A device follows 16 repositories at most, as many as the shared
+/// channels it can hold: `subscribe` in a clone of a 17th is refused, and
+/// nothing is done; following one of the 16 again is not refused.
+#[test]
+fn a_seventeenth_follow_is_refused() {
+    let s = devices(1);
+    let now = s.now + 10;
+    for n in 0..cordelia_core::protocol::SHARED_MAX_CHANNELS {
+        follows::follow(
+            &s[0].conn,
+            &format!("example.org/team/p{n}"),
+            "origin",
+            FOLDER,
+            now,
+        )
+        .unwrap();
+    }
+    let list = format!("{}   bob-laptop\n", id(&s.key(0)));
+    assert_eq!(
+        refusal(planned(&s, Some(&list), FIRST, false)),
+        (
+            "too_many_follows",
+            "This device follows 16 repositories, the most it can. To follow another, first drop \
+             the channel of one with cordelia shared drop. Nothing was done."
+                .to_string()
+        )
+    );
+    assert!(follow_row(&s).is_none());
+    // One of the sixteen, followed again from another clone, is a follow
+    // no more.
+    follows::unfollow(&s[0].conn, "example.org/team/p0").unwrap();
+    follows::follow(&s[0].conn, REPOSITORY, "origin", FOLDER, now).unwrap();
+    assert!(planned(&s, Some(&list), FIRST, false).is_ok());
+}

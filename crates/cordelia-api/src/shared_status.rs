@@ -206,7 +206,20 @@ pub fn status_of(
 
         // Each repository this device follows (decision 2026-11-06
         // (joining), rule 7).
-        let repositories = crate::repository_status::views(conn, identity, beside.own_relays, now)?;
+        // The unread messages of each channel, as worked out above.
+        let unread: Vec<([u8; 32], (usize, usize))> = channels
+            .iter()
+            .filter_map(|channel| {
+                let id: [u8; 32] = hex::decode(channel["id"].as_str()?).ok()?.try_into().ok()?;
+                let count = |field: &str| channel[field].as_u64().unwrap_or(0) as usize;
+                Some((
+                    id,
+                    (count("unread_by_an_agent"), count("unread_by_a_person")),
+                ))
+            })
+            .collect();
+        let repositories =
+            crate::repository_status::views(conn, identity, beside.own_relays, Some(&unread), now);
 
         Ok(Some(json!({
             "channels": channels,

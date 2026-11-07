@@ -1884,7 +1884,8 @@ CREATE TABLE shared_anew_not_clean (
 /// - `shared_follow_notices`: a key that joined from the list (1) and a
 ///   changed channel line (2), each kept until a person clears it with
 ///   `cordelia shared seen`; and a key the list dropped (3), kept until it
-///   leaves the channel. Each with its commit, and a key's with its label.
+///   leaves the channel. Each with its commit, a key's with its label, and
+///   a join's with the channel it joined.
 /// - `shared_shares.by_node`: whether the node made the share, not a person.
 /// - `shared_anew_made.left_out`, `line`, `cut` and `named_at`: the keys a
 ///   making anew left out, 32 bytes each (up to the 1,024 rows a table
@@ -1946,6 +1947,9 @@ CREATE TABLE shared_follow_notices (
                               AND length(CAST(label AS BLOB)) BETWEEN 1 AND 32)),
     at_commit  TEXT NOT NULL CHECK(typeof(at_commit) = 'text' AND length(at_commit) IN (40, 64)),
     at         INTEGER NOT NULL CHECK(typeof(at) = 'integer'),
+    channel    BLOB CHECK(channel IS NULL
+                          OR (typeof(channel) = 'blob' AND length(channel) = 32)),
+    CHECK((kind = 1) = (channel IS NOT NULL)),
     PRIMARY KEY (identity, kind, key)
 );
 
@@ -7644,13 +7648,16 @@ mod tests {
             "INSERT INTO shared_follow_typed (identity, key, typed_at) VALUES ('example.org/o/n', zeroblob(31), 9)".to_string(),
             format!("INSERT INTO shared_follow_typed (identity, key, typed_at, became) VALUES ('example.org/o/n', zeroblob(32), 9, '{}')", "b".repeat(65)),
             format!("INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at) VALUES ('example.org/o/n', 4, zeroblob(32), '{commit}', 9)"),
-            format!("INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at) VALUES ('example.org/o/n', 1, zeroblob(0), '{commit}', 9)"),
+            format!("INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at, channel) VALUES ('example.org/o/n', 1, zeroblob(0), '{commit}', 9, zeroblob(32))"),
             format!("INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at) VALUES ('example.org/o/n', 2, zeroblob(32), '{commit}', 9)"),
             format!("INSERT INTO shared_follow_notices (identity, kind, key, label, at_commit, at) VALUES ('example.org/o/n', 2, zeroblob(0), 'alice', '{commit}', 9)"),
-            format!("INSERT INTO shared_follow_notices (identity, kind, key, label, at_commit, at) VALUES ('example.org/o/n', 1, zeroblob(32), '{}', '{commit}', 9)", "a".repeat(33)),
-            format!("INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at) VALUES ('a/b', 1, zeroblob(32), '{commit}', 9)"),
+            format!("INSERT INTO shared_follow_notices (identity, kind, key, label, at_commit, at, channel) VALUES ('example.org/o/n', 1, zeroblob(32), '{}', '{commit}', 9, zeroblob(32))", "a".repeat(33)),
+            format!("INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at, channel) VALUES ('a/b', 1, zeroblob(32), '{commit}', 9, zeroblob(32))"),
             "INSERT INTO shared_follow_typed (identity, key, typed_at) VALUES ('a/b', zeroblob(32), 9)".to_string(),
-            "INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at) VALUES ('example.org/o/n', 1, zeroblob(32), 'abc', 9)".to_string(),
+            "INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at, channel) VALUES ('example.org/o/n', 1, zeroblob(32), 'abc', 9, zeroblob(32))".to_string(),
+            format!("INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at) VALUES ('example.org/o/n', 1, zeroblob(32), '{commit}', 9)"),
+            format!("INSERT INTO shared_follow_notices (identity, kind, key, at_commit, at, channel) VALUES ('example.org/o/n', 1, zeroblob(32), '{commit}', 9, zeroblob(31))"),
+            format!("INSERT INTO shared_follow_notices (identity, kind, key, label, at_commit, at, channel) VALUES ('example.org/o/n', 3, zeroblob(32), 'bob', '{commit}', 9, zeroblob(32))"),
             "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone, by_node) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 1, 9, 0, 2)".to_string(),
             "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, left_out) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, zeroblob(33))".to_string(),
             format!("INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, line) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, '{}')", "c".repeat(16385)),
@@ -7663,9 +7670,9 @@ mod tests {
         for taken in [
             format!("INSERT INTO shared_follows VALUES ('example.org/o/n', 'origin', '/r', 9, '{commit}', 9, 1, 8, zeroblob(16384), zeroblob(32), 'git', '{}')", "w".repeat(1024)),
             "INSERT INTO shared_follow_typed VALUES ('example.org/o/n', zeroblob(32), 9, 'taken', NULL)".to_string(),
-            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 1, zeroblob(32), 'alice-laptop', '{commit}', 9)"),
-            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 2, zeroblob(0), NULL, '{}', 9)", "d".repeat(64)),
-            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 3, zeroblob(32), 'bob', '{commit}', 9)"),
+            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 1, zeroblob(32), 'alice-laptop', '{commit}', 9, zeroblob(32))"),
+            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 2, zeroblob(0), NULL, '{}', 9, NULL)", "d".repeat(64)),
+            format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 3, zeroblob(32), 'bob', '{commit}', 9, NULL)"),
             "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone, by_node) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 1, 9, 0, 1)".to_string(),
             "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, left_out, line, cut, named_at) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, zeroblob(64), 'channel x without 0', 2, 9)".to_string(),
         ] {

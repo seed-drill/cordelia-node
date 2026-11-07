@@ -53,7 +53,7 @@ use cordelia_storage::shared_sharing as share_rows;
 
 use crate::following::{
     MOVED_FROM, channel_named, followed_elsewhere, followed_from_line, keys_in_channel,
-    made_anew_from, name_free, name_of, no_channel_line, twin_line,
+    made_anew_from, name_free_in, name_of, no_channel_line, twin_line,
 };
 use crate::git_list::{ClonedList, Git, Identity, ListFailed};
 use crate::lists::Do;
@@ -295,8 +295,10 @@ fn latest_of(read: &CloneRead) -> Result<Latest, NotRead> {
         return Err(NotRead {
             word: "behind".into(),
             why: format!(
-                "your clone is at commit {commit}, which does not come after commit {last}, the \
-                 last one read"
+                "your clone is at commit {}, which does not come after commit {}, the last one \
+                 read",
+                crate::git_list::short(commit),
+                crate::git_list::short(last)
             ),
         });
     }
@@ -416,6 +418,7 @@ fn joined(
                 of: NoticeOf::Joined {
                     key: key.key,
                     label: label.to_string(),
+                    channel: line.channel,
                 },
                 commit: commit.to_string(),
                 at: now,
@@ -527,7 +530,7 @@ impl NotHanding {
             NotHanding::NotHeld => "not_held",
             NotHanding::MovedFrom => "moved",
             NotHanding::NotClean => "not_clean",
-            NotHanding::MadeAnew { .. } => "made_anew",
+            NotHanding::MadeAnew { .. } => "offer_read",
             NotHanding::NotReached => "not_reached",
             NotHanding::Full => "channel_full",
         }
@@ -548,10 +551,30 @@ pub fn acts_in<'a>(
     own_relays: &[OwnRelay],
     list: &'a Members,
 ) -> Result<Result<(&'a ChannelLine, Filing), NotHanding>, PersonError> {
+    let in_channel = keys_in_channel(conn, &identity.public_key(), list)?;
+    acts_in_with(
+        conn,
+        identity,
+        own_relays,
+        list,
+        &sharing::filed(conn)?,
+        &in_channel,
+    )
+}
+
+/// [`acts_in`], given the person's filings and the keys in the channel the
+/// list names, as a status works them out once.
+pub(crate) fn acts_in_with<'a>(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    own_relays: &[OwnRelay],
+    list: &'a Members,
+    filings: &[Filing],
+    in_channel: &[[u8; 32]],
+) -> Result<Result<(&'a ChannelLine, Filing), NotHanding>, PersonError> {
     let Some(line) = &list.channel else {
         return Ok(Err(NotHanding::NoChannel));
     };
-    let in_channel = keys_in_channel(conn, &identity.public_key(), list)?;
     let left_out: Vec<String> = list
         .gated(|key| in_channel.iter().any(|one| same_key(one, key)))
         .into_iter()
@@ -568,9 +591,10 @@ pub fn acts_in<'a>(
         State::Moved => return Ok(Err(NotHanding::MovedFrom)),
         _ => return Ok(Err(NotHanding::NotHeld)),
     }
-    let filing = sharing::filed(conn)?
-        .into_iter()
-        .find(|filing| filing.channel == line.channel);
+    let filing = filings
+        .iter()
+        .find(|filing| filing.channel == line.channel)
+        .cloned();
     let Some(filing) = filing else {
         return Ok(Err(NotHanding::NotHeld));
     };
@@ -712,21 +736,47 @@ pub fn takes_in(
     own_relays: &[OwnRelay],
     follow: &Follow,
 ) -> Result<Result<Looks, Refusal>, PersonError> {
+    let list = follow
+        .list
+        .as_deref()
+        .and_then(|list| members::read(list).ok());
+    let filings = sharing::filed(conn)?;
+    takes_in_with(
+        conn,
+        identity,
+        own_relays,
+        follow,
+        list,
+        &filings,
+        |channel| Ok(made_anew_from(conn, identity, &filings, channel)?.cloned()),
+    )
+}
+
+/// [`takes_in`], given the list kept, read, the person's filings, and what
+/// says which filing a channel was made anew from, as a status works them
+/// out once.
+pub(crate) fn takes_in_with(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    own_relays: &[OwnRelay],
+    follow: &Follow,
+    list: Option<Members>,
+    filings: &[Filing],
+    made_anew_from: impl FnOnce(&[u8; 32]) -> Result<Option<Filing>, PersonError>,
+) -> Result<Result<Looks, Refusal>, PersonError> {
     let not = |word: &'static str, line: String| Ok(Err(Refusal { word, line }));
     let repository = &follow.identity;
     if let Some(not_read) = &follow.not_read {
         return not("not_read", not_read.why.clone());
     }
-    let list = follow
-        .list
-        .as_deref()
-        .and_then(|list| members::read(list).ok());
     let Some((line, list)) = list.and_then(|list| Some((list.channel.clone()?, list))) else {
         return not("no_channel", no_channel_line(repository));
     };
     let words = channel_words(&line.channel);
-    let commit = follow.last.as_ref().map_or("", |last| last.commit.as_str());
-    let filings = sharing::filed(conn)?;
+    let commit = follow
+        .last
+        .as_ref()
+        .map_or("", |last| crate::git_list::short(&last.commit));
     if let Some(filing) = filings.iter().find(|filing| filing.channel == line.channel) {
         let name = cleaned(&filing.name);
         return not(
@@ -744,7 +794,7 @@ pub fn takes_in(
         }
         None => {}
     }
-    if let Some(from) = made_anew_from(conn, identity, &filings, &line.channel)? {
+    if let Some(from) = made_anew_from(&line.channel)? {
         return not(
             "made_anew",
             format!(
@@ -803,7 +853,7 @@ pub fn takes_in(
         return Err(PersonError::Held(format!("{repository} is no repository")));
     };
     let name = name_of(&of);
-    match name_free(conn, &name) {
+    match name_free_in(conn, filings, &name) {
         Ok(()) => {}
         Err(Failed::Refused(refusal)) => return Ok(Err(refusal)),
         Err(Failed::Error(e)) => return Err(e),

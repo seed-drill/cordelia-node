@@ -23,8 +23,7 @@ const RECORD: &str =
 
 /// The view on device 0 of the repository `repository` at `now`.
 fn view_of(s: &Several, repository: &str, now: i64) -> Value {
-    views(&s[0].conn, &s[0].identity, &own_relays(), now)
-        .unwrap()
+    views(&s[0].conn, &s[0].identity, &own_relays(), None, now)
         .into_iter()
         .find(|view| view["identity"] == repository)
         .unwrap_or_else(|| panic!("no view of {repository}"))
@@ -92,11 +91,31 @@ fn members_of(view: &Value) -> Vec<(String, Value)> {
 
 /// `cordelia shared seen <name>` on device 0: what it says, or why not.
 fn seen_on(s: &Several, name: &str) -> Result<Vec<String>, (&'static str, String)> {
-    match seen(&s[0].conn, &s[0].identity, name) {
+    seen_of(s, name, None)
+}
+
+/// `cordelia shared seen <name> <label>` on device 0: what it says, or why
+/// not.
+fn seen_key(s: &Several, name: &str, label: &str) -> Vec<String> {
+    seen_of(s, name, Some(label)).unwrap()
+}
+
+/// `cordelia shared seen` on device 0, of `name`, with `label` or none.
+fn seen_of(
+    s: &Several,
+    name: &str,
+    label: Option<&str>,
+) -> Result<Vec<String>, (&'static str, String)> {
+    match seen(&s[0].conn, &s[0].identity, name, label) {
         Ok(said) => Ok(said),
         Err(sharing::Failed::Refused(refusal)) => Err((refusal.word, refusal.line)),
         Err(sharing::Failed::Error(e)) => panic!("{e}"),
     }
+}
+
+/// `commit(c)` as a status shows it.
+fn short_of(c: char) -> String {
+    commit(c)[..12].to_string()
 }
 
 /// A list naming `channel`, with `without`, and `devices` by their labels.
@@ -140,9 +159,9 @@ fn a_members_view_says_the_list_its_members_and_who_it_hands_the_channel_to() {
     assert_eq!(
         view["read"]["says"],
         format!(
-            "List of {REPOSITORY} read from your clone; when your clone fetched it is not known. \
+            "List of {REPOSITORY} read from your clone; your clone's last fetch is not known. \
              Read 2 minutes ago, at commit {}.",
-            commit('a')
+            short_of('a')
         )
     );
     assert_eq!(
@@ -275,16 +294,16 @@ fn the_read_says_how_old_the_clones_copy_is_or_that_it_is_not_known() {
         format!(
             "List of {REPOSITORY} read from your clone, fetched 2 hours ago. Read 5 minutes ago, \
              at commit {}.",
-            commit('a')
+            short_of('a')
         )
     );
     let unknown = read_line(REPOSITORY, &last, None, now);
     assert_eq!(
         unknown,
         format!(
-            "List of {REPOSITORY} read from your clone; when your clone fetched it is not known. \
+            "List of {REPOSITORY} read from your clone; your clone's last fetch is not known. \
              Read 5 minutes ago, at commit {}.",
-            commit('a')
+            short_of('a')
         )
     );
     assert!(!unknown.contains("stale") && !unknown.contains("old"));
@@ -310,7 +329,7 @@ fn the_read_says_how_old_the_clones_copy_is_or_that_it_is_not_known() {
         format!(
             "List of {REPOSITORY} read from your clone, fetched 3 hours ago. Read 2 hours ago, at \
              commit {}.",
-            commit('b')
+            short_of('b')
         )
     );
 }
@@ -339,7 +358,10 @@ fn a_read_that_counted_for_nothing_says_why_before_anything_else() {
     // Alice is dropped: a notice that stays through what follows.
     let carol_only = list_named(&channel.id, &[], &devices[1..]);
     reads(&s, &carol_only, &commit('b'), now + READ + 1);
-    assert_eq!(words(&view_now(&s, now + READ + 1)), ["handing", "dropped"]);
+    assert_eq!(
+        words(&view_now(&s, now + READ + 1)),
+        ["handing", "no_longer_listed"]
+    );
 
     let behind = after_read(
         &s[0].conn,
@@ -351,15 +373,15 @@ fn a_read_that_counted_for_nothing_says_why_before_anything_else() {
     .unwrap();
     assert!(matches!(behind, Done::NotRead(_)), "{behind:?}");
     let view = view_now(&s, now + 2 * READ);
-    assert_eq!(words(&view), ["behind", "dropped"]);
+    assert_eq!(words(&view), ["behind", "no_longer_listed"]);
     assert_eq!(
         lines(&view)[0].1,
         format!(
             "Your clone of {REPOSITORY} is behind: your clone is at commit {}, which does not come \
              after commit {}, the last one read. The last list read stands. Run git pull there; if \
              its history was rewritten, run cordelia subscribe there again.",
-            commit('c'),
-            commit('b')
+            short_of('c'),
+            short_of('b')
         )
     );
 
@@ -381,7 +403,7 @@ fn a_read_that_counted_for_nothing_says_why_before_anything_else() {
     )
     .unwrap();
     let view = view_now(&s, now + 3 * READ);
-    assert_eq!(words(&view), ["no_remote_head", "dropped"]);
+    assert_eq!(words(&view), ["no_remote_head", "no_longer_listed"]);
     assert_eq!(
         lines(&view)[0].1,
         format!(
@@ -404,11 +426,14 @@ fn a_read_that_counted_for_nothing_says_why_before_anything_else() {
     // goes at the first, and she waits out that read (rule 4.2); at the
     // next she is handed it again, and that is said.
     reads(&s, &carol_only, &commit('d'), now + 5 * READ);
-    assert_eq!(words(&view_of(&s, REPOSITORY, now + 5 * READ)), ["dropped"]);
+    assert_eq!(
+        words(&view_of(&s, REPOSITORY, now + 5 * READ)),
+        ["no_longer_listed"]
+    );
     reads(&s, &carol_only, &commit('d'), now + 6 * READ);
     assert_eq!(
         words(&view_of(&s, REPOSITORY, now + 6 * READ)),
-        ["handing", "dropped"]
+        ["handing", "no_longer_listed"]
     );
 }
 
@@ -470,7 +495,7 @@ fn a_joiners_lines_say_the_wait_or_why_it_takes_nothing() {
             "not_listed".to_string(),
             format!(
                 "Your key is not on the list of {REPOSITORY} at {}.",
-                commit('b')
+                short_of('b')
             ),
             false
         )]
@@ -502,7 +527,7 @@ fn a_joiners_lines_say_the_wait_or_why_it_takes_nothing() {
             format!(
                 "The list of {REPOSITORY} at {} names channel {}, which no device of yours holds \
                  or can move to.",
-                commit('d'),
+                short_of('d'),
                 channel_words(&channel.id)
             ),
             true
@@ -542,7 +567,7 @@ fn a_member_says_why_it_hands_nothing_over() {
     assert_eq!(
         lines(&view_now(&s, now + 1)),
         [(
-            "made_anew".to_string(),
+            "offer_read".to_string(),
             "review was made anew by alice-laptop: nothing is handed over until the list names \
              the new channel."
                 .to_string(),
@@ -574,7 +599,7 @@ fn a_member_whose_channel_is_not_reached_says_so() {
     let list = list_with(Some((&channel.id, &[])), &listed(1..=1));
     follows_at(&s, &list, &commit('a'), now);
     let only_the_lines = vec![own_relays()[1].clone()];
-    let views = views(&s[0].conn, &s[0].identity, &only_the_lines, now).unwrap();
+    let views = views(&s[0].conn, &s[0].identity, &only_the_lines, None, now);
     assert_eq!(
         lines(&views[0]),
         [(
@@ -667,11 +692,14 @@ fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
     let without_carol = list_named(&channel.id, &[], &[all[0], all[2]]);
     reads(&s, &without_carol, &commit('b'), now + READ);
     let view = view_now(&s, now + READ);
-    assert_eq!(amber_words(&view), ["joined", "dropped"]);
+    assert_eq!(amber_words(&view), ["joined", "no_longer_listed"]);
     assert_eq!(
         ambers(&view),
         [
-            format!("dave-laptop joined review from the list at {}", commit('b')),
+            format!(
+                "dave-laptop joined review from the list at {}",
+                short_of('b')
+            ),
             "carol-laptop is no longer on the list of review: make it anew with cordelia shared \
              anew review"
                 .to_string(),
@@ -689,25 +717,38 @@ fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
     );
     let view = view_now(&s, now + READ + 1);
     assert_eq!(view["name"], "notes", "the channel the list names now");
-    assert_eq!(amber_words(&view), ["joined", "dropped", "line_changed"]);
+    assert_eq!(
+        amber_words(&view),
+        ["joined", "no_longer_listed", "line_changed"]
+    );
     assert_eq!(
         ambers(&view)[2],
         format!(
             "The list of {REPOSITORY} names a new channel for notes at {}.",
-            commit('c')
+            short_of('c')
         )
     );
 
+    // Each it clears is said, by label; the join is said against the
+    // channel it joined.
     assert_eq!(
         seen_on(&s, "notes").unwrap(),
         [
-            "Cleared 2 notices for notes on this device.".to_string(),
-            "A key no longer on the list stays shown until it leaves the channel: make notes \
-             anew with cordelia shared anew notes."
-                .to_string()
+            format!(
+                "Cleared: dave-laptop joined review from the list at {}",
+                short_of('b')
+            ),
+            format!(
+                "Cleared: The list of {REPOSITORY} names a new channel for notes at {}.",
+                short_of('c')
+            ),
+            DROPPED_STAYS.to_string(),
         ]
     );
-    assert_eq!(amber_words(&view_now(&s, now + READ + 2)), ["dropped"]);
+    assert_eq!(
+        amber_words(&view_now(&s, now + READ + 2)),
+        ["no_longer_listed"]
+    );
     assert_eq!(
         view_of(&s, elsewhere, now + READ + 2)["lines"][0]["word"],
         "joined",
@@ -732,9 +773,7 @@ fn seen_where_this_device_follows_no_list_of_the_name_says_so() {
         seen_on(&s, "review"),
         Err((
             "not_followed",
-            "This device does not read the list of review: run cordelia subscribe in a clone of \
-             its repository."
-                .to_string()
+            "This device follows no repository whose channel is review.".to_string()
         ))
     );
 }
@@ -870,12 +909,25 @@ fn a_making_anew_here_shows_its_line_and_then_each_key_left_out_the_line_does_no
         "the gate holds Carol, and Dave's stays"
     );
 
-    // Dave was brought back on purpose: `shared seen` ends his amber, and
-    // keeps him as left out no more. Carol's line goes, and nothing is
-    // amber.
+    // `shared seen` alone does not end Dave's amber: it says it is still
+    // shown, and how to clear it. Dave was brought back on purpose: `shared
+    // seen review dave-laptop` ends it, and keeps him as left out no more.
+    // Carol's line goes, and nothing is amber.
     assert_eq!(
         seen_on(&s, "review").unwrap(),
-        ["Cleared 1 notice for review on this device."]
+        [
+            "Nothing to clear for review on this device.".to_string(),
+            still_shown_line("dave-laptop", "review"),
+        ]
+    );
+    assert_eq!(ambers(&view_now(&s, now + 11))[1..], [gone_amiss]);
+    assert_eq!(
+        seen_key(&s, "review", "carol-laptop"),
+        ["Nothing to clear for carol-laptop in review on this device."]
+    );
+    assert_eq!(
+        seen_key(&s, "review", "dave-laptop"),
+        [format!("Cleared: {gone_amiss}")]
     );
     assert_eq!(
         follows::made_lines(&s[0].conn).unwrap()[0].left_out,
@@ -961,6 +1013,163 @@ fn made_anew_twice_before_a_merge_says_the_later_line_alone() {
     let view = view_now(&s, now + 4);
     assert_eq!(amber_words(&view), ["put_the_line"], "{view}");
     assert_eq!(view["lines"][0]["line"], put.as_str(), "{view}");
+}
+
+/// A key left out comes back in the list with a changed channel line, as
+/// in the record's §10: `shared seen <name>` clears the changed line and
+/// says each line it clears, and says that the key's amber is still
+/// shown; `shared seen <name> <label>` clears that amber alone.
+#[test]
+fn seen_clears_a_changed_line_and_never_a_key_left_out_which_its_label_clears() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let old = holds_at_line_at(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &old, &[&alice, &carol], now);
+    let devices = [
+        (alice.public_key(), "alice-laptop"),
+        (carol.public_key(), "carol-laptop"),
+    ];
+    follows_line_at(&s, &old.id, &[], &devices, now);
+    anew_keeping(&s, 0, "review", &[alice.public_key()], now + 1);
+    let new = filed_as(&s, 0, "review");
+    let back = list_of_line_at(&new.id, &[], &devices);
+    reads(&s, &back, &commit('b'), now + 2);
+    let view = view_now(&s, now + 3);
+    assert_eq!(amber_words(&view), ["line_changed", "not_said"], "{view}");
+    let not_said = not_said_line("carol-laptop", "review");
+    assert_eq!(
+        seen_on(&s, "review").unwrap(),
+        [
+            format!(
+                "Cleared: The list of {REPOSITORY} names a new channel for review at {}.",
+                short_of('b')
+            ),
+            still_shown_line("carol-laptop", "review"),
+        ]
+    );
+    assert_eq!(ambers(&view_now(&s, now + 4)), std::slice::from_ref(&not_said));
+    assert_eq!(
+        seen_key(&s, "review", "carol-laptop"),
+        [format!("Cleared: {not_said}")]
+    );
+    assert!(ambers(&view_now(&s, now + 5)).is_empty());
+    assert_eq!(
+        seen_key(&s, "review", "carol-laptop"),
+        ["Nothing to clear for carol-laptop in review on this device."]
+    );
+}
+
+/// Rule 5's "from then on" holds for a channel made anew from this
+/// device's new one: Alice makes it anew again, Bob's device moves to it,
+/// the list names it, and Carol, left out by Bob's making anew, listed and
+/// not after `without`, is amber.
+#[test]
+fn rule_5s_amber_holds_for_a_channel_made_anew_from_the_new_one() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let old = holds_at_line_at(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &old, &[&alice, &carol], now);
+    let devices = [
+        (alice.public_key(), "alice-laptop"),
+        (carol.public_key(), "carol-laptop"),
+    ];
+    follows_line_at(&s, &old.id, &[], &devices, now);
+    anew_keeping(&s, 0, "review", &[alice.public_key()], now + 1);
+    let ours = filed_as(&s, 0, "review");
+    written_by(&s, 0, &ours, &[&alice], now + 2);
+    let keys = [alice.public_key(), s.key(0)];
+    stores(&s, 0, &offer_by(&alice, &ours, 30, &keys, now + 3), now + 3);
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let plan =
+        crate::shared_anew::move_plan(conn, identity, &own_relays(), "review", None, None, now)
+            .unwrap();
+    crate::shared_anew::make_move(conn, identity, &plan.what, now + 3).unwrap();
+    let later = filed_as(&s, 0, "review");
+    assert_ne!(later.id, ours.id);
+    let named = list_of_line_at(&later.id, &[], &devices);
+    reads(&s, &named, &commit('b'), now + 4);
+    assert_eq!(
+        follows::made_lines(&s[0].conn).unwrap()[0].named_at,
+        Some(now + 4)
+    );
+    assert!(
+        amber_words(&view_now(&s, now + 5)).contains(&"not_said".to_string()),
+        "{}",
+        view_now(&s, now + 5)
+    );
+}
+
+/// A channel past its bound that a removal made anew on this device is
+/// dropped by the removal's own act: here that drop is a move, so the
+/// follow goes on, and the removal's line shows until the list names the
+/// new channel. On a device that did not make it anew, it is a drop, and
+/// the follow stops (rule 2.5).
+#[test]
+fn a_removals_drop_past_a_bound_keeps_the_follow_on_its_device() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let old = holds_at_line_at(&s, 0, 7, "review", now);
+    let alice = (member(1).public_key(), "alice-laptop");
+    let list = follows_line_at(&s, &old.id, &[], &[alice], now);
+    let new = Shared::of(9);
+    crate::shared::tests::acts(&s, 0, crate::lists::Do::DropPastBound(vec![old.id]), now);
+    let conn = &s[0].conn;
+    anew_rows::made(
+        conn,
+        &MadeRow {
+            channel: old.id,
+            new_channel: new.id,
+            rev: 2,
+            made_at: now,
+            at_removal: true,
+            delivering: true,
+            past_64: 0,
+            let_go: 0,
+            past_bound: true,
+        },
+    )
+    .unwrap();
+    let removed = member(5).public_key();
+    let put = list_of_line_at(&new.id, &[removed], &[])
+        .trim_end()
+        .to_string();
+    follows::made_line(conn, &old.id, &[removed], &put, 0).unwrap();
+    let gone = || crate::shared_anew::dropped_or_moved(&s[0].conn, &old.id).unwrap();
+    assert_eq!(gone(), Some(crate::shared_anew::Gone::Moved));
+    reads(&s, &list, &commit('a'), now + 1);
+    assert!(row(&s).is_some(), "the follow goes on");
+    assert_eq!(
+        amber_words(&view_now(&s, now + 2)),
+        ["made_anew_at_removal"]
+    );
+    // Where the making anew is not kept, as on the person's other devices,
+    // the drop stops the follow.
+    anew_rows::forget_made(&s[0].conn, &old.id).unwrap();
+    assert_eq!(gone(), Some(crate::shared_anew::Gone::Dropped));
+    reads(&s, &list, &commit('a'), now + 3);
+    assert!(row(&s).is_none());
+}
+
+/// A view that cannot be worked out is a line of that view, so that the
+/// status and `shared list` still say the rest (L2 of slice 7's review).
+#[test]
+fn a_view_that_cannot_be_worked_out_says_so_in_a_line() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (_, list) = joins(&s, 7, now);
+    let view = not_worked_out(&row(&s).unwrap(), "a fault");
+    assert_eq!(view["identity"], REPOSITORY);
+    assert_eq!(
+        lines(&view),
+        [(
+            "not_worked_out".to_string(),
+            format!("This device could not work out how {REPOSITORY} stands: a fault."),
+            false
+        )]
+    );
+    assert!(!list.is_empty());
 }
 
 /// A making anew at a removal shows its own line, with its new channel
@@ -1058,7 +1267,7 @@ fn the_record_says_each_line() {
         handing_line("<name>", "<label>"),
         put_the_line("<name>", true),
         not_said_line("<label>", "<name>"),
-        not_read_here_line("<name>"),
+        not_followed_line("<name>"),
     ];
     for line in lines {
         assert!(RECORD.contains(&line), "the record does not say: {line}");
@@ -1073,4 +1282,76 @@ fn the_record_says_each_line() {
         assert!(RECORD.contains(part), "{part}");
     }
     assert!(FOLDER.starts_with('/'));
+}
+
+// ── What it costs ────────────────────────────────────────────────────
+
+/// What the views and the status's `shared` object cost under the lock,
+/// with 16 follows, the most there can be, each of a held channel whose
+/// list names 64 keys, half of them in it; and the object with the same
+/// channels and no follow, to compare: printed, for a person to read. Run
+/// by hand, in release: `cargo test --release -p cordelia-api --lib
+/// the_cost_of_the_views -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measure, run by hand in release"]
+fn the_cost_of_the_views_of_16_follows_of_64_keys() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let mut lists = Vec::new();
+    for n in 0..16u32 {
+        let channel = holds(&s, 0, 20 + n as u8, &format!("c{n}"), now);
+        let devices: Vec<([u8; 32], String)> = (0..64u32)
+            .map(|k| (member(n * 100 + k).public_key(), format!("m{n}-{k}")))
+            .collect();
+        for k in 0..32 {
+            stores(
+                &s,
+                0,
+                &crate::shared::tests::anew(&member(n * 100 + k), &channel, 1),
+                now,
+            );
+        }
+        lists.push(list_with(Some((&channel.id, &[])), &devices));
+    }
+    let own = own_relays();
+    let said = crate::state::SharedSaid::default();
+    let beside = crate::shared_status::Beside {
+        own_relays: &own,
+        connected: &[],
+        said: &said,
+    };
+    let time = |what: &dyn Fn()| {
+        let mut took: Vec<u128> = (0..9)
+            .map(|_| {
+                let at = std::time::Instant::now();
+                what();
+                at.elapsed().as_micros()
+            })
+            .collect();
+        took.sort();
+        took[4]
+    };
+    let status = || {
+        crate::shared_status::status_of(&s[0].conn, &s[0].identity, &beside, now)
+            .unwrap()
+            .unwrap();
+    };
+    let no_follow = time(&status);
+    for (n, list) in lists.iter().enumerate() {
+        follows_as(
+            &s,
+            &format!("example.org/team/p{n}"),
+            list,
+            &commit('a'),
+            now,
+        );
+    }
+    let views_took = time(&|| {
+        assert_eq!(views(&s[0].conn, &s[0].identity, &own, None, now).len(), 16);
+    });
+    let with_follows = time(&status);
+    println!(
+        "median of 9: views alone {views_took} µs; status_of {with_follows} µs with the 16 \
+         follows, {no_follow} µs without them"
+    );
 }

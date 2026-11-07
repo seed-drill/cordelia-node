@@ -200,6 +200,7 @@ fn a_notice_is_kept_once_until_seen_and_a_dropped_key_until_it_leaves() {
         of: NoticeOf::Joined {
             key: [5; 32],
             label: "alice-laptop".into(),
+            channel: [7; 32],
         },
         commit: commit('a'),
         at: 9,
