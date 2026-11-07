@@ -215,6 +215,10 @@ you to type yes, then asks for the phrase.
 - After a removal, run `cordelia shared anew <name>` once on each of your
   other devices, for each shared channel. `cordelia status` says how many
   are left.
+- A removal makes each shared channel anew with your own devices and the
+  keys its repository's list names, or, for a channel you shared by hand,
+  the keys you labelled. Share it again with anyone else. If you follow a
+  repository, take the removed device's access to it away there too.
 - A device removed by mistake comes back only as a new device: run
   `cordelia init --new-key` on it, then add it.
 
