@@ -4,9 +4,10 @@
 //! - **The follows** (`shared_follows`): each repository this device
 //!   follows, by its identity (`host/owner/name`), with the clone's remote
 //!   and path, the last commit read with when and from where, the bytes of
-//!   the last list read, and the last key the node handed the channel to,
-//!   after which its next turn starts (rule 4.2). Following again starts
-//!   never-back over, and keeps the rest (rule 2.5).
+//!   the last list read, the last key the node handed the channel to,
+//!   after which its next turn starts (rule 4.2), and why the latest read
+//!   counted for nothing, where it did (rules 1 and 3). Following again
+//!   starts never-back over, and keeps the rest (rule 2.5).
 //! - **The node's typings** (`shared_follow_typed`): the listed keys the node
 //!   looks for shares from (rule 4.4), apart from the person's own typings
 //!   (`shared_typed_keys`), with what became of each.
@@ -75,6 +76,17 @@ pub struct Follow {
     /// The last key the node handed the channel to: its next turn starts
     /// after it, in the list's order.
     pub last_handed: Option<[u8; 32]>,
+    /// Why the latest read counted for nothing, where it did: the last
+    /// list read stands.
+    pub not_read: Option<NotRead>,
+}
+
+/// Why a read of the list counted for nothing (rules 1 and 3): a word, as
+/// a status's JSON carries it, and why, said plainly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotRead {
+    pub word: String,
+    pub why: String,
 }
 
 /// When the last list was read, its commit, and whether it came from the
@@ -86,14 +98,16 @@ pub struct LastRead {
     pub from_clone: bool,
 }
 
-const FOLLOW_COLUMNS: &str =
-    "identity, remote, clone, followed_at, last_commit, last_read_at, read_from, list, last_handed";
+const FOLLOW_COLUMNS: &str = "identity, remote, clone, followed_at, last_commit, last_read_at, \
+                              read_from, list, last_handed, not_read, not_read_why";
 
 fn follow_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Follow> {
     let commit: Option<String> = row.get(4)?;
     let at: Option<i64> = row.get(5)?;
     let from: Option<i64> = row.get(6)?;
     let last_handed: Option<Vec<u8>> = row.get(8)?;
+    let word: Option<String> = row.get(9)?;
+    let why: Option<String> = row.get(10)?;
     Ok(Follow {
         identity: row.get(0)?,
         remote: row.get(1)?,
@@ -109,6 +123,10 @@ fn follow_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Follow> {
         },
         list: row.get(7)?,
         last_handed: last_handed.and_then(|key| key.try_into().ok()),
+        not_read: match (word, why) {
+            (Some(word), Some(why)) => Some(NotRead { word, why }),
+            _ => None,
+        },
     })
 }
 
@@ -207,7 +225,8 @@ pub fn follow_of(conn: &Connection, identity: &str) -> Result<Option<Follow>, Co
 }
 
 /// A list of `identity` was read: its commit, when, from where, and its
-/// bytes. Nothing is done for a repository this device does not follow.
+/// bytes. Why an earlier read counted for nothing goes. Nothing is done for
+/// a repository this device does not follow.
 pub fn read_done(
     conn: &Connection,
     identity: &str,
@@ -217,13 +236,34 @@ pub fn read_done(
     let changed = conn
         .execute(
             "UPDATE shared_follows SET last_commit = ?2, last_read_at = ?3, read_from = ?4,
-                 list = ?5
+                 list = ?5, not_read = NULL, not_read_why = NULL
              WHERE identity = ?1",
             params![identity, read.commit, read.at, read.from_clone as i64, list],
         )
         .map_err(storage)?;
     Ok(changed == 1)
 }
+
+/// A read of the list of `identity` counted for nothing, for `not`: the
+/// last list read stands, and this is kept until a read counts. A `why`
+/// longer than the row keeps is cut, at a character.
+pub fn not_read(conn: &Connection, identity: &str, not: &NotRead) -> Result<(), CordeliaError> {
+    let mut end = not.why.len().min(NOT_READ_WHY_MAX_BYTES);
+    while !not.why.is_char_boundary(end) {
+        end -= 1;
+    }
+    let why = &not.why[..end];
+    conn.execute(
+        "UPDATE shared_follows SET not_read = ?2, not_read_why = ?3 WHERE identity = ?1",
+        params![identity, not.word, why],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// The most of why a read counted for nothing that a row keeps, as schema
+/// step 33 bounds it.
+const NOT_READ_WHY_MAX_BYTES: usize = 1024;
 
 /// The last key the node handed the channel of `identity` to: its next
 /// turn starts after it.

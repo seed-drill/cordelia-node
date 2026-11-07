@@ -36,7 +36,8 @@
 //! repository a clone is, the node's own fetch of a public one's list, a
 //! read of a clone's copy of it, and never back, each with nothing of the
 //! person's reaching git. Following a repository, `cordelia subscribe` in a
-//! clone, is [`following`].
+//! clone, is [`following`]; the node's read of each list it follows, and
+//! what it then does, is [`members_read`].
 //!
 //! A personal node serves [`configure_device_routes`]: it carries no
 //! channel of the older kind (decision 2026-10-04 §10). A node of any
@@ -69,6 +70,7 @@ pub mod local;
 pub mod look;
 pub mod marks;
 pub mod members;
+pub mod members_read;
 pub mod messages;
 pub mod names;
 pub mod own_read;

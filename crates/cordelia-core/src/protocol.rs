@@ -2942,6 +2942,21 @@ pub const MEMBERS_GIT_TERM_SECS: u64 = 2;
 /// afresh.
 pub const MEMBERS_REPO_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// How often the node reads each list it follows (decision 2026-11-06
+/// (joining), rules 3 and 4): every ten minutes, at its start, and when a
+/// person follows a repository. As `RELAY_ASK_AGAIN_SECS`: a join waits
+/// about ten minutes on each side once the list is read, one for the
+/// member's device to hand the channel over and one for the new member's
+/// to take it.
+pub const MEMBERS_READ_INTERVAL_SECS: u64 = 600;
+
+/// How many listed keys the node hands a repository's channel to at each
+/// read (decision 2026-11-06 (joining), rule 4.2): the next four in the
+/// list's order. Derived: a share lives for two reads, so at most
+/// `MAX_TYPED_KEYS` of the node's wait at once, and a device that is off
+/// for days holds no place.
+pub const MEMBERS_HANDED_AT_ONCE: usize = MAX_TYPED_KEYS / 2;
+
 // Checked at compile time (decision 2026-10-10 §14). The largest card is
 // the seed and two relays behind their count: with the form, the time and
 // the key it is for, it fits a share; and it fits an anew record, whose

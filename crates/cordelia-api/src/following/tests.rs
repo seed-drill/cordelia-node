@@ -966,13 +966,13 @@ fn git(home: &Path, dir: &Path, args: &[&str]) -> String {
 /// A clone of `https://example.org/team/project` with no network: a
 /// repository whose `origin` names it, and whose copy of the remote's
 /// default branch, `refs/remotes/origin/main`, is the commit of the list.
-struct OnDisk {
+pub(crate) struct OnDisk {
     home: PathBuf,
-    top: PathBuf,
+    pub(crate) top: PathBuf,
 }
 
 impl OnDisk {
-    fn new(under: &Path) -> Self {
+    pub(crate) fn new(under: &Path) -> Self {
         let home = under.join("home");
         let top = under.join("project");
         std::fs::create_dir_all(&home).unwrap();
@@ -995,7 +995,7 @@ impl OnDisk {
 
     /// Commit `list`, and make it the remote's default branch as a fetch
     /// would. Returns the commit.
-    fn fetched(&self, list: &str) -> String {
+    pub(crate) fn fetched(&self, list: &str) -> String {
         std::fs::write(self.top.join(".cordelia/members"), list).unwrap();
         git(&self.home, &self.top, &["add", "-A"]);
         git(&self.home, &self.top, &["commit", "--quiet", "-m", "list"]);
@@ -1019,7 +1019,7 @@ impl OnDisk {
 
     /// Commit `list` on a branch with no history, and make it the remote's
     /// default branch: a commit that comes after no other. Returns it.
-    fn rewritten(&self, list: &str) -> String {
+    pub(crate) fn rewritten(&self, list: &str) -> String {
         git(
             &self.home,
             &self.top,

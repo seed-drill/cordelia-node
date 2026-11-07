@@ -48,6 +48,44 @@ fn a_follow_is_kept_read_and_turned() {
     assert!(!read_done(&conn, "example.org/o/other", &other, b"x").unwrap());
 }
 
+/// A read that counted for nothing is kept with its word and why, the
+/// last list standing, until a read counts; a why longer than the row
+/// keeps is cut at a character (rules 1 and 3).
+#[test]
+fn a_read_that_counted_for_nothing_is_kept_until_one_counts() {
+    let conn = db();
+    follow(&conn, ID, "origin", "/work/project", 7).unwrap();
+    let read = LastRead {
+        commit: commit('a'),
+        at: 9,
+        from_clone: true,
+    };
+    read_done(&conn, ID, &read, b"list").unwrap();
+    assert_eq!(follow_of(&conn, ID).unwrap().unwrap().not_read, None);
+    let behind = NotRead {
+        word: "behind".into(),
+        why: "your clone is behind".into(),
+    };
+    not_read(&conn, ID, &behind).unwrap();
+    let kept = follow_of(&conn, ID).unwrap().unwrap();
+    assert_eq!(kept.not_read, Some(behind));
+    assert_eq!(
+        (kept.last, kept.list.as_deref()),
+        (Some(read.clone()), Some(&b"list"[..])),
+        "the last list stands"
+    );
+    // Cut at a character: 1,023 bytes and a character of two do not fit.
+    let long = NotRead {
+        word: "git".into(),
+        why: format!("{}é", "w".repeat(1023)),
+    };
+    not_read(&conn, ID, &long).unwrap();
+    let kept = follow_of(&conn, ID).unwrap().unwrap().not_read.unwrap();
+    assert_eq!(kept.why, "w".repeat(1023));
+    read_done(&conn, ID, &read, b"list").unwrap();
+    assert_eq!(follow_of(&conn, ID).unwrap().unwrap().not_read, None);
+}
+
 /// Following again starts never-back over, and keeps the rest; unfollowing
 /// keeps nothing (rule 2.5). The list and the notices stay because the
 /// next read is compared with the list last read (rule 4.6), and a notice
