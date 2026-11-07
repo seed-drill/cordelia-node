@@ -1609,8 +1609,10 @@ pub fn drop_plan(
     })
 }
 
-/// Drop the channel `channel` on every device of the person's (§3.4).
-/// Returns the line said after the yes.
+/// Drop the channel `channel` on every device of the person's (§3.4), and,
+/// in the same write, stop each repository this device follows whose list
+/// names it (decision 2026-11-06 (joining), rule 2.5). Returns the line
+/// said after the yes.
 pub fn make_drop(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -1619,11 +1621,20 @@ pub fn make_drop(
     now: i64,
 ) -> Out<String> {
     let held = standing(conn)?;
-    act(conn, identity, &held, Do::Drop(*channel), now)?;
-    Ok(format!(
+    let stopped = in_one(conn, || -> Result<Out<Vec<String>>, PersonError> {
+        if let Err(failed) = act(conn, identity, &held, Do::Drop(*channel), now) {
+            return Ok(Err(failed));
+        }
+        crate::following::stop_following(conn, channel).map(Ok)
+    })??;
+    let mut said = format!(
         "Dropped \"{name}\" (channel {}): your devices hold it no more.",
         channel_words(channel)
-    ))
+    );
+    for repository in stopped {
+        said.push_str(&format!(" This device follows {repository} no more."));
+    }
+    Ok(said)
 }
 
 // ── The empty anew record ────────────────────────────────────────────

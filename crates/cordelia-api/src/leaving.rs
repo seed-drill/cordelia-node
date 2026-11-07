@@ -242,8 +242,8 @@ fn own_word(
 /// every secret, the change entries it keeps, the records of additions,
 /// what its store holds of every channel that it can name under those
 /// secrets, what it keeps of the hand-overs it made, and what a person
-/// typed, cleared and was to be told there. It then follows no phrase.
-/// Returns whether it followed one.
+/// typed, cleared and was to be told there. It then follows no phrase,
+/// and no repository. Returns whether it followed one.
 ///
 /// It keeps the names it holds: they are its folders' names, and each
 /// has its channel again under the statement it next applies. Its folders
@@ -305,6 +305,9 @@ pub fn forget(
         }
         cordelia_storage::shared_sharing::forget_all(conn)?;
         cordelia_storage::shared_anew::forget_all(conn)?;
+        // And every repository it follows: a device that leaves its person
+        // follows nothing (decision 2026-11-06 (joining), rule 2.5).
+        cordelia_storage::follows::unfollow_all(conn)?;
         if let Some(word) = word {
             entries::store(conn, &word, now)?;
         }
