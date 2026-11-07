@@ -544,7 +544,7 @@ fn to_add(conn: &Connection, members: &Members) -> Result<Vec<[u8; 32]>, PersonE
 /// device holds it ("in the channel", the record's words): in its table of
 /// the channel's keys, or not moved yet (#291). None where the list has no
 /// channel line, or the device holds no row of the channel.
-fn keys_in_channel(
+pub(crate) fn keys_in_channel(
     conn: &Connection,
     own: &[u8; 32],
     members: &Members,
@@ -769,4 +769,4 @@ pub fn list_labels(labels: &[String], taken: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
