@@ -2143,8 +2143,9 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
     // Who stays, before the yes (rule 24).
     assert!(
         before_yes.contains(
-            "In each, your own devices stay, with the keys that the list of a repository you \
-             follow names, or, where you follow none for it, the keys a device of yours labelled."
+            "In each, your own devices stay. A channel that follows a repository this device \
+             follows keeps the keys its list names. Any other keeps a key only where this device \
+             saw it in the channel and a device of yours that still counts labelled it."
         ),
         "{before_yes}"
     );

@@ -3704,17 +3704,32 @@ fn a_device_that_does_not_follow_keeps_what_a_channel_shared_by_hand_keeps() {
 }
 
 /// The machine of a recovery makes a channel anew with what a removal
-/// keeps (decision 2026-10-24, rule 24): its own devices, and a key a
-/// device that counts labelled, Alice; not Carol, who wrote there and whom
-/// no label names.
+/// keeps (decision 2026-10-24, rule 24): its own devices alone, where the
+/// labeller no longer counts. Device 1 labelled Alice, and device 0, the
+/// machine of the recovery, holds that label; the recovery removes device
+/// 1, so its label keeps no one, and neither Alice nor Carol, who wrote
+/// there, is sealed to. A label of device 0's own, Dave's, keeps him.
 #[test]
 fn a_recovery_makes_a_channel_anew_with_what_a_removal_keeps() {
     let mut s = bob(2);
     let now = s.now + 10;
     let channel = holds(&s, 0, 7, "review", now);
-    let (alice, carol) = (member(1), member(2));
-    labels(&s, 0, &alice.public_key(), Some("alice"), now);
-    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    let (alice, carol, dave) = (member(1), member(2), member(3));
+    labels(&s, 1, &alice.public_key(), Some("alice"), now);
+    labels(&s, 0, &dave.public_key(), Some("dave"), now);
+    s.meet(&[0, 1]);
+    for n in 0..2 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    written_by(&s, 0, &channel, &[&alice, &carol, &dave], now);
+    let alice_label = crate::lists::holds(&s[0].conn)
+        .unwrap()
+        .labels
+        .into_iter()
+        .find(|(act, _)| act.item.key == alice.public_key())
+        .unwrap();
+    assert_eq!(alice_label.0.maker, s.key(1), "device 1 labelled Alice");
     s.change(0, &[0], &[1]);
     let now = s.now + 20;
     let conn = &s[0].conn;
@@ -3722,6 +3737,6 @@ fn a_recovery_makes_a_channel_anew_with_what_a_removal_keeps() {
     assert_eq!(make_owed(conn, &s[0].identity, now, &|_| true).unwrap(), 1);
     assert_eq!(
         sealed_to(&s, 0, &channel),
-        vec![s.key(0), alice.public_key()]
+        vec![s.key(0), dave.public_key()]
     );
 }

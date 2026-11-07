@@ -2014,15 +2014,24 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
              there, and delete its line from .cordelia/members in a pull request."
         ));
     }
+    // Follows are a device's own: another device of the person's, or the
+    // removed one, may follow a repository this device does not.
+    lines.push(ACCESS_ELSEWHERE.into());
     lines
 }
 
+/// What a removal says of the repositories this device does not follow
+/// (decision 2026-10-24, rule 24).
+const ACCESS_ELSEWHERE: &str = "\nAlso take its access away in any other repository a device of \
+                                yours follows, or that the removed device could push to.";
+
 /// Who stays in a shared channel that a removal makes anew (decision
 /// 2026-10-24, rule 24), said before its yes.
-const STAYS_AT_A_REMOVAL: &str = "In each, your own devices stay, with the keys that the list of \
-                                  a repository you follow names, or, where you follow none for \
-                                  it, the keys a device of yours labelled. Anyone else is left \
-                                  out: share the new channel with them again.";
+const STAYS_AT_A_REMOVAL: &str = "In each, your own devices stay. A channel that follows a \
+                                  repository this device follows keeps the keys its list names. \
+                                  Any other keeps a key only where this device saw it in the \
+                                  channel and a device of yours that still counts labelled it. \
+                                  Anyone else is left out: share the new channel with them again.";
 
 /// What a removal says of the things that a device being removed lists
 /// as names and that are no names as this version would map one: how
@@ -3677,8 +3686,9 @@ mod tests {
     /// A removal says before its yes who stays in each shared channel it
     /// makes anew, and names each repository this device follows, to take
     /// the removed device's access away there (decision 2026-10-24, rule
-    /// 24, condition 1 of the person's ruling of 7 November). A change
-    /// that removes no device says none of it.
+    /// 24, condition 1 of the person's ruling of 7 November), and then any
+    /// other a device of the person's follows or the removed one could push
+    /// to. A change that removes no device says none of it.
     #[test]
     fn a_removal_names_each_repository_this_device_follows() {
         let f = Fixture::new();
@@ -3698,6 +3708,11 @@ mod tests {
             );
             assert!(said.contains(&line), "{said:?}");
         }
+        assert_eq!(said.last(), Some(&ACCESS_ELSEWHERE.to_string()), "{said:?}");
+        // Said where this device follows none too.
+        handed["repositories"] = json!([]);
+        let said = shared_at_a_removal(&f.read(&handed).unwrap(), &removes);
+        assert!(said.contains(&ACCESS_ELSEWHERE.to_string()), "{said:?}");
         assert!(shared_at_a_removal(&read, &f.statement.statement).is_empty());
     }
 
