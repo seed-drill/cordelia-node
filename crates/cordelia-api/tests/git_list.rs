@@ -168,10 +168,16 @@ fn a_fetch_reads_the_list_into_the_nodes_own_repository() {
     assert_eq!(ask(&["rev-parse", "refs/cordelia/list"]), first);
     assert_eq!(ask(&["config", "remote.origin.url"]), bench.url());
     assert_eq!(ask(&["for-each-ref", "refs/tags"]), "");
-    // A partial clone of its own, whose fetch leaves out every file larger
-    // than the list may be: the large file is not there, and the list is.
+    // A partial clone of its own, whose first step brings no file, and
+    // whose second brings the list's alone: neither the large file nor a
+    // small one is there, and the list is.
     assert_eq!(ask(&["config", "remote.origin.promisor"]), "true");
     assert_eq!(ask(&["config", "extensions.partialClone"]), "origin");
+    let readme = git(&bench.home(), &bench.bare, &["rev-parse", "main:README"]);
+    assert!(
+        !holds(&bench.home(), &repo, &readme),
+        "a small file was fetched"
+    );
     let big = git(&bench.home(), &bench.bare, &["rev-parse", "main:big.bin"]);
     let list = git(
         &bench.home(),
@@ -235,13 +241,11 @@ fn the_list_is_a_plain_file_of_at_most_16_kib() {
     larger.push(b'\n');
     bench.commit(Some(&larger));
     assert_eq!(fetched(), Err(ListFailed::TooLarge));
-    // The fetch left it out.
-    let blob = git(
-        &bench.home(),
-        &bench.bare,
-        &["rev-parse", "main:.cordelia/members"],
-    );
-    assert!(!holds(&bench.home(), &node.repo_of(&identity()), &blob));
+    // Of 20,000 bytes that nothing makes smaller: too large to read, at a
+    // host that sends a file asked for by its ID whatever the filter, as
+    // git's own server does.
+    bench.commit(Some(&random_bytes(20_000, 1)));
+    assert_eq!(fetched(), Err(ListFailed::TooLarge));
     // A folder in its place.
     let work = bench.tmp.path().join("work");
     std::fs::remove_file(work.join(".cordelia/members")).unwrap();
@@ -254,6 +258,97 @@ fn the_list_is_a_plain_file_of_at_most_16_kib() {
     std::os::unix::fs::symlink("../README", work.join(".cordelia/members")).unwrap();
     commit_work(&bench.home(), &work, &bench.bare);
     assert_eq!(fetched(), Err(ListFailed::NotAFile));
+}
+
+/// `count` bytes that no compression makes smaller, the same for the same
+/// `seed`.
+fn random_bytes(count: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    (0..count)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// A list far larger than 16 KiB, of bytes that nothing makes smaller:
+/// git is stopped as it receives it, once the node's repository has grown
+/// by more than the file at its largest and its pack, so that what the
+/// host sends of it is bounded; it is too large, and not kept (rule 3).
+#[test]
+fn a_list_far_too_large_is_not_received() {
+    let bench = Bench::new(Answers::Git);
+    bench.commit(Some(&random_bytes(32 * 1024 * 1024, 2)));
+    let node = bench.node("node");
+    let began = Instant::now();
+    assert_eq!(
+        node.fetch_list(&identity(), &bench.url()),
+        Err(ListFailed::TooLarge)
+    );
+    let repo = node.repo_of(&identity());
+    let blob = git(
+        &bench.home(),
+        &bench.bare,
+        &["rev-parse", "main:.cordelia/members"],
+    );
+    assert!(!holds(&bench.home(), &repo, &blob), "the list was received");
+    let held = du(&repo.join("objects"));
+    assert!(held < 4 * 1024 * 1024, "the repository holds {held} bytes");
+    assert!(began.elapsed() < Duration::from_secs(MEMBERS_FETCH_MAX_SECS));
+}
+
+/// What the files under `dir` hold, together.
+fn du(dir: &Path) -> u64 {
+    let mut bytes = 0;
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+            let meta = std::fs::symlink_metadata(entry.path()).unwrap();
+            if meta.is_dir() {
+                dirs.push(entry.path());
+            } else {
+                bytes += meta.len();
+            }
+        }
+    }
+    bytes
+}
+
+/// A folder on the way to the node's own repository that is a link, at
+/// the host's level or the owner's, is refused before anything is written
+/// or deleted there: what it leads to is left as it was (rule 3).
+#[test]
+fn a_link_on_the_way_to_the_nodes_repository_is_refused() {
+    let bench = Bench::new(Answers::Git);
+    bench.commit(Some(LIST));
+    let data = bench.tmp.path().join("node");
+    // A bound of one byte: a fetch would make the repository afresh.
+    let node = Git::given(&data, "git", bench.inherited())
+        .unwrap()
+        .with_repo_max_bytes(1);
+    let elsewhere = bench.tmp.path().join("elsewhere");
+    let kept = elsewhere.join("example/project.git/kept");
+    std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
+    std::fs::write(&kept, "not the node's").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, data.join("repos/example.org")).unwrap();
+    let refused = node.fetch_list(&identity(), &bench.url()).unwrap_err();
+    assert!(refused.says().contains("is a link"), "{}", refused.says());
+    assert!(kept.exists());
+    // At the owner's level.
+    std::fs::remove_file(data.join("repos/example.org")).unwrap();
+    std::fs::create_dir_all(data.join("repos/example.org")).unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.join("example"),
+        data.join("repos/example.org/example"),
+    )
+    .unwrap();
+    let refused = node.fetch_list(&identity(), &bench.url()).unwrap_err();
+    assert!(refused.says().contains("is a link"), "{}", refused.says());
+    assert!(kept.exists());
+    assert!(bench.server.seen().is_empty(), "{:?}", bench.server.seen());
 }
 
 /// Whether the repository `repo` holds the object `object`, asked so that
@@ -728,9 +823,61 @@ fn a_default_branch_renamed_at_the_host_is_not_known_to_be_fresh() {
     assert!(read.fetched.is_some());
 }
 
+/// A `FETCH_HEAD` that is a named pipe, or a link, is not read: a read of
+/// the clone ends at once, with no time of a fetch (rule 3).
+#[test]
+fn a_fetch_head_that_is_a_pipe_or_a_link_is_not_read() {
+    let bench = Bench::new(Answers::Git);
+    bench.commit(Some(LIST));
+    let clone = bench.clone_of("clone");
+    bench.fetch_into(&clone);
+    let node = bench.node("node");
+    assert!(
+        node.read_clone(&clone, "origin", &identity())
+            .unwrap()
+            .fetched
+            .is_some()
+    );
+    let fetch_head = clone.join(".git/FETCH_HEAD");
+    let copy = bench.tmp.path().join("FETCH_HEAD-copy");
+    std::fs::rename(&fetch_head, &copy).unwrap();
+    // A link to a FETCH_HEAD that would say it is fresh.
+    std::os::unix::fs::symlink(&copy, &fetch_head).unwrap();
+    assert_eq!(
+        node.read_clone(&clone, "origin", &identity())
+            .unwrap()
+            .fetched,
+        None
+    );
+    // A named pipe, which nothing writes to.
+    std::fs::remove_file(&fetch_head).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fetch_head)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let (tx, read) = std::sync::mpsc::channel();
+    {
+        let (clone, node) = (clone.clone(), bench.node("node"));
+        // Not joined: a read that waits on the pipe waits for ever, and
+        // ends with the tests' process.
+        std::thread::spawn(move || {
+            let _ = tx.send(node.read_clone(&clone, "origin", &identity()));
+        });
+    }
+    let Ok(read) = read.recv_timeout(Duration::from_secs(10)) else {
+        panic!("a read of the clone waited on a named pipe");
+    };
+    assert_eq!(read.unwrap().fetched, None);
+}
+
 /// A clone's remote branch is looked up by its whole name, and nothing
-/// else that git could take the name for (rule 3): a tag or a local branch
-/// of the same name, or a symbolic ref in its place, is not read.
+/// else that git could take the name for (rule 3): a tag whose name is
+/// the branch's whole name, and a local branch of the same short name,
+/// are not read. A symbolic ref in the branch's place leaves no default
+/// branch known, as git follows it from `refs/remotes/origin/HEAD`; the
+/// node's own refusal of a symbolic ref, a second guard, is not reached
+/// here.
 #[test]
 fn a_clones_remote_branch_is_looked_up_by_its_whole_name() {
     let bench = Bench::new(Answers::Git);
@@ -905,6 +1052,24 @@ fn a_partial_clone_is_read_without_a_fetch_and_refused_to_an_older_git() {
         }
     );
     assert!(refused.says().contains("older than 2.44"));
+    // Nor does the node fetch with it: nothing is made, and nothing asked.
+    let refused_fetch = old.fetch_list(&identity(), &bench.url()).unwrap_err();
+    assert_eq!(
+        refused_fetch,
+        ListFailed::OldGitNoFetch {
+            version: Some(GitVersion {
+                major: 2,
+                minor: 43
+            })
+        }
+    );
+    assert!(
+        refused_fetch
+            .says()
+            .contains("git 2.43 is older than 2.44, so the node does not fetch the list itself")
+    );
+    assert!(!old.repo_of(&identity()).exists());
+    assert!(!bench.tmp.path().join("old-node/repos/example.org").exists());
     // Never back reads the clone's objects too, and is refused alike.
     assert_eq!(
         old.comes_after(&partial, &first, &"0".repeat(40)),
