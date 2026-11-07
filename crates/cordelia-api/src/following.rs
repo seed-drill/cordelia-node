@@ -1,38 +1,43 @@
 //! Following a repository (decision 2026-11-06 (joining), rule 2):
-//! `cordelia subscribe` in a clone, with no name, and `--new`; and what
-//! stops a follow (rule 2.5).
+//! `cordelia subscribe` in a clone, with no name, and `--new`.
 //!
-//! - **The clone is read outside the node's lock** ([`read_of`]): the top
-//!   of the work tree the folder is in, the remote whose repository it is
-//!   (`--remote` chooses among several), and the list at that remote's
-//!   default branch, each by [`crate::git_list`]. Where any of it fails,
+//! - **The clone is read outside the node's lock** ([`read_of`]), within
+//!   one deadline: the top of the work tree the folder is in, the remote
+//!   whose repository it is (`--remote` chooses among several), the list
+//!   at that remote's default branch, and, where this device follows the
+//!   repository already, whether the clone's commit comes after the last
+//!   one read. Each is by [`crate::git_list`]. Where any of it fails,
 //!   nothing is done, and it says why.
-//! - **Under the lock, the plan** ([`plan`], rule 2.3): a person who holds
-//!   the channel the list names follows the repository, and the folder's
-//!   agent is subscribed to it; one who does not, and whose key is on the
-//!   list, follows and waits; one whose key is not on the list, or who
-//!   dropped that channel, is refused. What it shows is rule 2.2's: the
-//!   repository, the commit, the channel the list names, and whether this
-//!   device's key is on the list. So its yes names the commit (rule 2.5),
-//!   and a yes typed against another commit is refused, as any yes to a
-//!   text that changed is.
-//! - **On the yes, in one transaction** ([`make`]): the subscription, the
-//!   follow, started afresh, and its first read; with `--new` (rule 2.4),
-//!   the channel made first, and the lines to add to the list said.
-//! - **A follow stops** where the person drops the channel its list names
-//!   ([`stop_following`], at `shared drop`); and every follow goes where
-//!   the device leaves its person (`leaving::forget`).
+//! - **Under the lock, the plan** ([`plan`], rule 2.3), on the list's
+//!   channel line whatever rule 1's gate says: a person who holds that
+//!   channel follows the repository, and the folder's agent is subscribed
+//!   to it, once the gate lets it; one who does not, and whose key is on
+//!   the list, follows and waits; one whose key is not on the list, or who
+//!   dropped or moved from that channel, is refused. What it shows is rule
+//!   2.2's: the repository, the commit, the channel the list names, and
+//!   whether this device's key is on the list; and the clone and its
+//!   remote, and where this device read last. So its yes names the commit
+//!   and the clone (rule 2.5), and a yes typed against another is refused,
+//!   as any yes to a text that changed is.
+//! - **On the yes, in one transaction** ([`make`]): the subscription, and
+//!   the follow, with its first read; or, following again, never-back
+//!   started over. With `--new` (rule 2.4), the channel is made first, and
+//!   the lines to add to the list are said.
+//! - **Every follow goes** where the device leaves its person
+//!   (`leaving::forget`, rule 2.5).
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::MEMBERS_LABEL_MAX_CHARS;
+use cordelia_core::protocol::{MEMBERS_LABEL_MAX_CHARS, SHARED_MAX_KEYS};
 use cordelia_crypto::acts::{Came, Subscription};
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_storage::follows::{self, LastRead};
 use cordelia_storage::shared as kept;
+use cordelia_storage::shared_anew as kept_anew;
 
 use crate::git_list::{ClonedList, Git, Identity, ListFailed, RemoteRefused};
 use crate::lists::Do;
@@ -44,13 +49,39 @@ use crate::sharing::{self, Failed, New, Out, OwnRelay, Plan, Refusal, channel_wo
 // ── The clone, read outside the lock ─────────────────────────────────
 
 /// What `subscribe` read of a clone: the repository, the remote whose
-/// address names it, the top of the clone's work tree, and the list.
+/// address names it, the top of the clone's work tree, the list, and,
+/// where this device follows the repository already, how the clone's
+/// commit stands against the last one read.
 #[derive(Debug, Clone)]
 pub struct ClonedRead {
     pub identity: Identity,
     pub remote: String,
     pub top: PathBuf,
     pub list: ClonedList,
+    pub after_last: Option<AfterLast>,
+}
+
+/// The last commit this device read of a repository it follows, and
+/// whether the clone's commit is it or comes after it (rule 3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AfterLast {
+    pub last: String,
+    pub comes_after: bool,
+}
+
+/// The last commit read of each repository this device follows, by its
+/// identity: taken in a short hold of the lock before the clone is read.
+pub fn last_reads(conn: &Connection) -> Result<Vec<(String, String)>, PersonError> {
+    Ok(follows::follows(conn)?
+        .into_iter()
+        .filter_map(|follow| follow.last.map(|last| (follow.identity, last.commit)))
+        .collect())
+}
+
+/// What `subscribe` with no name says where git did not answer within the
+/// `secs` its whole read is given.
+pub fn late_line(secs: u64) -> String {
+    format!("git did not answer in {secs} seconds, so nothing was done.")
 }
 
 /// What `subscribe` with no name says in a folder of no repository.
@@ -66,23 +97,46 @@ pub const MOVED_FROM: &str = "The list names the channel you moved from. The dev
                               .cordelia/members.";
 
 /// Read the clone that `folder` is in, with the node's git under
-/// `data_dir` (rules 2.1 and 3). It runs outside the node's lock: git may
-/// take seconds. `chosen` is the remote `--remote` named.
-pub fn read_of(data_dir: &Path, folder: &Path, chosen: Option<&str>) -> Out<ClonedRead> {
+/// `data_dir` (rules 2.1 and 3), all of it `within` one bound. It runs
+/// outside the node's lock: git may take seconds. `chosen` is the remote
+/// `--remote` named; `lasts` are [`last_reads`].
+pub fn read_of(
+    data_dir: &Path,
+    folder: &Path,
+    chosen: Option<&str>,
+    lasts: &[(String, String)],
+    within: Duration,
+) -> Out<ClonedRead> {
+    let deadline = Instant::now() + within;
     let git =
         Git::under(data_dir).map_err(|e| PersonError::Held(format!("the node's git: {e}")))?;
-    read_with(&git, folder, chosen)
+    read_with(&git, folder, chosen, lasts, deadline, within.as_secs())
 }
 
-/// [`read_of`], with the node's git given.
-pub fn read_with(git: &Git, folder: &Path, chosen: Option<&str>) -> Out<ClonedRead> {
-    let top = match git.top_of(folder) {
+/// [`read_of`], with the node's git given, and the deadline, which is
+/// `secs` from when it began. No step of git begins after it.
+pub fn read_with(
+    git: &Git,
+    folder: &Path,
+    chosen: Option<&str>,
+    lasts: &[(String, String)],
+    deadline: Instant,
+    secs: u64,
+) -> Out<ClonedRead> {
+    let late = || sharing::refused("late", late_line(secs));
+    if Instant::now() >= deadline {
+        return late();
+    }
+    let top = match git.top_of(folder, deadline) {
         Ok(top) => top,
         Err(ListFailed::NotARepository) => {
             return sharing::refused("not_a_repository", NOT_IN_A_CLONE.into());
         }
         Err(failed) => return not_read(None, &failed),
     };
+    if Instant::now() >= deadline {
+        return late();
+    }
     let (remote, identity) = match git.identity_of_clone(&top, chosen) {
         Ok(chosen) => chosen,
         Err(RemoteRefused::Git(failed)) => return not_read(None, &failed),
@@ -90,15 +144,38 @@ pub fn read_with(git: &Git, folder: &Path, chosen: Option<&str>) -> Out<ClonedRe
             return sharing::refused(why.code(), format!("{} Nothing was done.", why.says()));
         }
     };
+    if Instant::now() >= deadline {
+        return late();
+    }
     let list = match git.read_clone(&top, &remote, &identity) {
         Ok(list) => list,
         Err(failed) => return not_read(Some(&identity), &failed),
+    };
+    // Where this device follows the repository already: whether this
+    // clone's commit goes back from the last one read (rule 3), for the
+    // yes to say so (rule 2.5).
+    let followed = identity.to_string();
+    let after_last = match lasts.iter().find(|(of, _)| *of == followed) {
+        Some((_, last)) => {
+            if Instant::now() >= deadline {
+                return late();
+            }
+            match git.comes_after(&top, last, &list.at.commit) {
+                Ok(comes_after) => Some(AfterLast {
+                    last: last.clone(),
+                    comes_after,
+                }),
+                Err(failed) => return not_read(Some(&identity), &failed),
+            }
+        }
+        None => None,
     };
     Ok(ClonedRead {
         identity,
         remote,
         top,
         list,
+        after_last,
     })
 }
 
@@ -186,11 +263,7 @@ pub fn plan(
     };
     let own = identity.public_key();
     // A twin of this device's key is its key (rule 1).
-    let label = members
-        .devices
-        .iter()
-        .find(|device| same_key(&device.key, &own))
-        .map(|device| device.label.clone());
+    let label = members.label_of(&own).map(str::to_string);
     let key_line = match &label {
         Some(label) => format!("Your key is on the list, as {label}."),
         None => "Your key is not on the list.".to_string(),
@@ -204,16 +277,48 @@ pub fn plan(
             ),
         )
     };
+    let clone = read.top.display().to_string();
+    // The yes names this clone and its remote, so that it is a yes to no
+    // other clone or remote of the repository at this commit.
     let mut asks = vec![format!(
-        "This reads the list of {repository} at commit {commit}, from your clone."
+        "This reads the list of {repository} at commit {commit}, from your clone at {}, \
+         through its remote {}.",
+        cleaned(&clone),
+        cleaned(&read.remote)
     )];
+    // Following again starts never-back over (rule 2.5): the yes says where
+    // this device read last, and whether this clone would go back from it.
+    if let Some(row) = follows::follow_of(conn, &repository)? {
+        let last = row.last.map(|last| last.commit);
+        if last != read.after_last.as_ref().map(|after| after.last.clone()) {
+            // The follow was read again while the clone was read.
+            return sharing::refused("changed", crate::sharing_routes::CHANGED.into());
+        }
+        let from = cleaned(&row.clone);
+        asks.push(match &last {
+            Some(last) => {
+                format!("This device follows {repository} already, from {from} at {last}.")
+            }
+            None => format!("This device follows {repository} already, from {from}."),
+        });
+        if read
+            .after_last
+            .as_ref()
+            .is_some_and(|after| !after.comes_after)
+        {
+            asks.push(format!(
+                "Your clone is at {commit}, which does not come after it: you would read an older \
+                 list."
+            ));
+        }
+    }
     let planned = |asks: Vec<String>, then: Then| -> Out<Plan<Following>> {
         Ok(Plan {
             asks: asks.join("\n"),
             what: Following {
                 identity: repository.clone(),
                 remote: read.remote.clone(),
-                clone: read.top.display().to_string(),
+                clone: clone.clone(),
                 commit: commit.clone(),
                 list: file.clone(),
                 agent: agent.clone(),
@@ -234,6 +339,29 @@ pub fn plan(
         }
         // Filed under the repository's `owner/name` (§14, answer 2).
         let name = format!("{}/{}", read.identity.owner(), read.identity.name());
+        if sharing::filed(conn)?
+            .iter()
+            .any(|filing| filing.name == name)
+        {
+            return sharing::refused(
+                "name_taken",
+                format!(
+                    "You file another channel as {name}: rename it with cordelia shared rename."
+                ),
+            );
+        }
+        // The lines it says to add must leave a list of at most 64 (rule 1).
+        let would = members.devices.len() + to_add(conn, &members)?.len();
+        if would > SHARED_MAX_KEYS {
+            return sharing::refused(
+                "channel_full",
+                format!(
+                    "With your devices, the list of {repository} would name {would}, and a list \
+                     names 64 at most: delete some lines in a pull request first. Nothing was \
+                     made."
+                ),
+            );
+        }
         let made = sharing::new_plan(conn, own_relays, &name, &[])?;
         asks.push(no_channel_line(&repository));
         asks.push(key_line);
@@ -245,10 +373,7 @@ pub fn plan(
         ));
         return planned(asks, Then::Make(made.what));
     }
-    let in_channel = keys_in_channel(conn, &own, &members)?;
-    // The list names no channel: it has no channel line, or a key left out
-    // is still listed (rule 1).
-    let Some(line) = members.names(|key| in_channel.iter().any(|kept| same_key(kept, key))) else {
+    let Some(line) = &members.channel else {
         if label.is_none() {
             return not_listed();
         }
@@ -261,17 +386,36 @@ pub fn plan(
         return planned(asks, Then::Nothing);
     };
     let words = channel_words(&line.channel);
-    if let Some(filing) = sharing::filed(conn)?
+    // Rule 2.3's cases are taken on the channel line, whatever rule 1's gate
+    // says; the gate then says what waits for it.
+    let in_channel = keys_in_channel(conn, &own, &members)?;
+    let gated: Vec<String> = members
+        .gated(|key| in_channel.iter().any(|kept| same_key(kept, key)))
         .into_iter()
-        .find(|filing| filing.channel == line.channel)
-    {
+        .map(|device| device.label.clone())
+        .collect();
+    let gate_lines = |name: &str| -> Vec<String> {
+        gated
+            .iter()
+            .map(|label| {
+                format!(
+                    "{label} is on the list of {name} but was left out of it: nothing is handed \
+                     over until its line goes, or it writes in the channel."
+                )
+            })
+            .collect()
+    };
+    let filings = sharing::filed(conn)?;
+    if let Some(filing) = filings.iter().find(|filing| filing.channel == line.channel) {
+        let name = cleaned(&filing.name);
         asks.push(format!(
-            "It names the shared channel \"{}\" (channel {words}), which you hold.",
-            cleaned(&filing.name)
+            "It names the shared channel \"{name}\" (channel {words}), which you hold."
         ));
         asks.push(key_line);
+        asks.extend(gate_lines(&name));
         asks.push(format!("This follows {repository}."));
-        // Where the agent subscribes already, it still follows.
+        // Where the agent subscribes already, it still follows. Where the
+        // gate holds the list back, the agent is subscribed once it lets go.
         let subscribing = crate::shared_routes::subscribe_plan(
             conn,
             identity,
@@ -280,16 +424,23 @@ pub fn plan(
             Some(&words),
         )?;
         let then = match subscribing {
+            Err(already) => {
+                asks.push(already);
+                Then::Nothing
+            }
+            Ok(_) if !gated.is_empty() => {
+                asks.push(format!(
+                    "The agent of this folder, {}, is subscribed to it once the list names it.",
+                    cleaned(&agent)
+                ));
+                Then::Nothing
+            }
             Ok(subscribing) => {
                 asks.push(subscribing.asks);
                 Then::Subscribe {
                     subscription: subscribing.what,
-                    name: filing.name,
+                    name: filing.name.clone(),
                 }
-            }
-            Err(already) => {
-                asks.push(already);
-                Then::Nothing
             }
         };
         return planned(asks, then);
@@ -299,7 +450,7 @@ pub fn plan(
     // is said as rules 2.3 and 6 say it. The drop keeps no name, so the
     // channel is said by its words.
     if crate::shared_anew::held_or_dropped(conn, None)?.contains(&line.channel) {
-        let moved = sharing::filed(conn)?
+        let moved = filings
             .iter()
             .any(|filing| filing.came == Came::Moved(line.channel));
         return match moved {
@@ -310,16 +461,53 @@ pub fn plan(
             ),
         };
     }
+    // The person holds the channel the named one was made anew from: they
+    // move to it, and nobody hands it to them (rule 6).
+    let made_anew_from = kept_anew::offers_into(conn, &line.channel)?
+        .into_iter()
+        .find_map(|offer| {
+            filings
+                .iter()
+                .find(|filing| filing.channel == offer.channel)
+        });
+    if let Some(from) = made_anew_from {
+        asks.push(format!("It names channel {words}, which you do not hold."));
+        asks.push(key_line);
+        asks.push(format!(
+            "Run cordelia shared move {}: the list names the channel it was made anew as.",
+            crate::shared_routes::shell_word(&from.name)
+        ));
+        asks.push(format!("This follows {repository}."));
+        return planned(asks, Then::Nothing);
+    }
     if label.is_none() {
         return not_listed();
     }
     asks.push(format!("It names channel {words}, which you do not hold."));
     asks.push(key_line);
-    asks.push(format!(
-        "This follows {repository}. A member's device hands you its channel once it reads the \
-         list. cordelia status shows how it goes."
-    ));
+    match gated.is_empty() {
+        true => asks.push(format!(
+            "This follows {repository}. A member's device hands you its channel once it reads the \
+             list. cordelia status shows how it goes."
+        )),
+        false => {
+            asks.extend(gate_lines(&format!("channel {words}")));
+            asks.push(format!(
+                "This follows {repository}. cordelia status shows how it goes."
+            ));
+        }
+    }
     planned(asks, Then::Nothing)
+}
+
+/// The keys of the person's devices that count and that `members` does not
+/// name, a twin counting as its key: those `--new` says to add (rule 2.4).
+fn to_add(conn: &Connection, members: &Members) -> Result<Vec<[u8; 32]>, PersonError> {
+    Ok(crate::person::who_counts(conn)?
+        .keys()
+        .into_iter()
+        .filter(|key| !members.lists(key))
+        .collect())
 }
 
 /// The keys in the channel that the list's channel line names, as this
@@ -349,7 +537,8 @@ fn keys_in_channel(
 
 /// Do what `following` was planned to (rule 2.3), at `now`, in one
 /// transaction: the subscription, or with `--new` the channel made and
-/// subscribed to; then the follow, started afresh, and its first read.
+/// subscribed to; then the follow, with its first read, or, where this
+/// device follows the repository already, never-back started over.
 /// Returns the lines said.
 pub fn make(
     conn: &Connection,
@@ -379,11 +568,13 @@ pub fn make(
                 lines = to_add;
             }
         }
-        // Subscribing again starts afresh (decision 2026-11-06 (joining),
-        // rule 2.5): the follow begins again at this commit, and whether
-        // it comes after the last commit read is not asked
-        // (`Git::comes_after`). So a history that was rewritten is
-        // followed again this way.
+        // Subscribing again starts never-back over (decision 2026-11-06
+        // (joining), rule 2.5), for a history that was rewritten: the yes
+        // said whether this clone goes back from the last commit read, and
+        // the follow forgets that commit. It keeps the list last read,
+        // which the node's next read, woken now, is compared with (rule
+        // 4.6). A first follow keeps this read.
+        let again = follows::follow_of(conn, &following.identity)?.is_some();
         follows::follow(
             conn,
             &following.identity,
@@ -391,12 +582,14 @@ pub fn make(
             &following.clone,
             now,
         )?;
-        let read = LastRead {
-            commit: following.commit.clone(),
-            at: now,
-            from_clone: true,
-        };
-        follows::read_done(conn, &following.identity, &read, &following.list)?;
+        if !again {
+            let read = LastRead {
+                commit: following.commit.clone(),
+                at: now,
+                from_clone: true,
+            };
+            follows::read_done(conn, &following.identity, &read, &following.list)?;
+        }
         said.push(format!(
             "Following {}, from its list at commit {}. cordelia status shows how it goes.",
             following.identity, following.commit
@@ -442,23 +635,24 @@ fn make_channel(
     ];
     // A key the list names already is not added again: a key twice does
     // not parse (rule 1).
-    let listed = members::read(&following.list)
-        .map(|members| members.devices)
-        .unwrap_or_default();
-    let mut keys = Vec::new();
+    let listed = members::read(&following.list).unwrap_or(Members {
+        channel: None,
+        devices: Vec::new(),
+    });
+    let keys = to_add(conn, &listed)?;
     let mut labels = Vec::new();
-    for key in crate::person::who_counts(conn)?.keys() {
-        if listed.iter().any(|device| same_key(&device.key, &key)) {
-            continue;
-        }
+    for key in &keys {
         labels.push(crate::reader::label_of(
             conn,
             &held.statement.statement,
-            &key,
+            key,
         )?);
-        keys.push(key);
     }
-    let taken: Vec<String> = listed.into_iter().map(|device| device.label).collect();
+    let taken: Vec<String> = listed
+        .devices
+        .into_iter()
+        .map(|device| device.label)
+        .collect();
     for (key, label) in keys.iter().zip(list_labels(&labels, &taken)) {
         lines.push(format!("{}   {label}", encode_public_key(key)?));
     }
@@ -540,32 +734,6 @@ pub fn list_labels(labels: &[String], taken: &[String]) -> Vec<String> {
         made.push(label);
     }
     made
-}
-
-// ── What stops a follow (rule 2.5) ───────────────────────────────────
-
-/// Stop every follow whose latest list names `channel` on its channel
-/// line, whether or not a key left out holds it back (rule 2.5): what
-/// `shared drop` of that channel does, in its write. Returns the
-/// repositories no longer followed.
-pub(crate) fn stop_following(
-    conn: &Connection,
-    channel: &[u8; 32],
-) -> Result<Vec<String>, PersonError> {
-    let mut stopped = Vec::new();
-    for follow in follows::follows(conn)? {
-        let names = follow
-            .list
-            .as_deref()
-            .and_then(|list| members::read(list).ok())
-            .and_then(|members| members.channel)
-            .is_some_and(|line| line.channel == *channel);
-        if names {
-            follows::unfollow(conn, &follow.identity)?;
-            stopped.push(follow.identity);
-        }
-    }
-    Ok(stopped)
 }
 
 #[cfg(test)]

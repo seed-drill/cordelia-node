@@ -48,9 +48,14 @@ fn a_follow_is_kept_read_and_turned() {
     assert!(!read_done(&conn, "example.org/o/other", &other, b"x").unwrap());
 }
 
-/// Following again starts afresh, and unfollowing keeps nothing (rule 2.5).
+/// Following again starts never-back over, and keeps the rest; unfollowing
+/// keeps nothing (rule 2.5). The list and the notices stay because the
+/// next read is compared with the list last read (rule 4.6), and a notice
+/// goes only as rules 4.5 and 4.6 say: a dropped key's stays until the key
+/// leaves the channel. The first `followed_at` stays because no key's join
+/// before it is noticed (rule 4.5).
 #[test]
-fn following_again_starts_afresh_and_unfollowing_keeps_nothing() {
+fn following_again_starts_never_back_over_and_unfollowing_keeps_nothing() {
     let conn = db();
     let key = [3; 32];
     let filled = |conn: &Connection| {
@@ -77,10 +82,17 @@ fn following_again_starts_afresh_and_unfollowing_keeps_nothing() {
     filled(&conn);
     follow(&conn, ID, "upstream", "/work/fork", 11).unwrap();
     let kept = follow_of(&conn, ID).unwrap().unwrap();
-    assert_eq!((kept.remote.as_str(), kept.followed_at), ("upstream", 11));
-    assert_eq!((kept.last, kept.list, kept.last_handed), (None, None, None));
-    assert!(typed(&conn, ID).unwrap().is_empty());
-    assert!(notices(&conn, ID).unwrap().is_empty());
+    assert_eq!(
+        (kept.remote.as_str(), kept.clone.as_str(), kept.followed_at),
+        ("upstream", "/work/fork", 7)
+    );
+    assert_eq!(kept.last, None, "never-back starts over");
+    assert_eq!(
+        (kept.list.as_deref(), kept.last_handed),
+        (Some(&b"list"[..]), Some([2; 32]))
+    );
+    assert_eq!(typed(&conn, ID).unwrap().len(), 1);
+    assert_eq!(notices(&conn, ID).unwrap().len(), 1);
     filled(&conn);
     unfollow(&conn, ID).unwrap();
     assert_eq!(follow_of(&conn, ID).unwrap(), None);

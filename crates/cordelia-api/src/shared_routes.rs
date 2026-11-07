@@ -24,6 +24,7 @@ use serde_json::{Value, json};
 
 use cordelia_core::protocol::{
     AGENT_MESSAGE_BODY_MAX_BYTES, AGENT_MESSAGE_ID_BYTES, AGENT_MESSAGE_SUMMARY_WAIT_MS,
+    STREAM_TIMEOUT_SECS,
 };
 use cordelia_crypto::acts::Subscription;
 use cordelia_crypto::bech32::encode_public_key;
@@ -288,29 +289,37 @@ pub struct FollowRequest {
 ///
 /// The folder must be mapped before git is run. The clone is read at the
 /// look and again at the yes, so a yes to a list at another commit is
-/// refused as `changed`. On the yes, the node is asked to read the lists
-/// it follows now.
+/// refused as `changed`. All of git's work is given 20 seconds, so the
+/// command, which waits 30, is always answered. On the yes, the node is
+/// asked to read the lists it follows now.
 pub async fn follow(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<FollowRequest>,
 ) -> Result<HttpResponse, ApiError> {
     crate::commands::asked(&req, &state)?;
-    {
+    let lasts = {
         let conn = db(&state);
         if let Err(failed) = sharing::standing(&conn).and_then(|_| agent_here(&conn, &body.folder))
         {
             return answer_of(failed);
         }
-    }
+        crate::following::last_reads(&conn).map_err(crate::commands::refused)?
+    };
+    let within = Duration::from_secs(2 * STREAM_TIMEOUT_SECS);
     let data_dir = state.home_dir.clone();
     let folder = std::path::PathBuf::from(&body.folder);
     let remote = body.remote.clone();
-    let read = tokio::task::spawn_blocking(move || {
-        crate::following::read_of(&data_dir, &folder, remote.as_deref())
-    })
-    .await
-    .map_err(|e| ApiError::Internal(format!("the read of the clone: {e}")))?;
+    let reading = tokio::task::spawn_blocking(move || {
+        crate::following::read_of(&data_dir, &folder, remote.as_deref(), &lasts, within)
+    });
+    let read = match tokio::time::timeout(within, reading).await {
+        Ok(read) => read.map_err(|e| ApiError::Internal(format!("the read of the clone: {e}")))?,
+        Err(_) => Err(Failed::Refused(Refusal {
+            word: "late",
+            line: crate::following::late_line(within.as_secs()),
+        })),
+    };
     match read {
         Ok(read) => follow_read(&state, &body, &read),
         Err(failed) => answer_of(failed),
