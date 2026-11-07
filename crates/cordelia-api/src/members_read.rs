@@ -860,6 +860,11 @@ pub const ASKED: &str = "asked";
 /// taken.
 pub const TAKEN: &str = "taken";
 
+/// What became of a typing of the node's whose take failed, the error its
+/// line: it is not asked for again until the next read types its key
+/// again.
+pub const FAILED: &str = "failed";
+
 /// A key the node typed for the follow of `of`, at the read at `typed_at`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Typing {
@@ -935,8 +940,36 @@ pub fn judge(
 /// `owner/name`, as taken from the key. A share of any other channel is
 /// not one to take. Then the agent of the follow's clone is subscribed to
 /// it, as the yes to follow said, once. What became of the typing is kept
-/// with it.
+/// with it, and so is a take that failed, once its write is undone: else a
+/// typing that failed at every pass would keep its place among those asked
+/// for, ahead of every later follow's ([`to_ask`]).
+///
+/// Nothing is kept where it is [`Became::NotNow`], and that does not come
+/// again at the next pass: the typing that does not read now is not given
+/// to ask for, by the same tests, and the follow that went took its
+/// typings with it. A share pair channel can be derived for every listed
+/// key but this device's own, which is never typed; and the device stands
+/// with a phrase wherever a relay could be read.
 pub fn take(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    typing: &Typing,
+    found: &[CheckedEntry],
+    own_relays: &[OwnRelay],
+    now: i64,
+) -> Result<Became, PersonError> {
+    let took = take_in_one(conn, identity, typing, found, own_relays, now);
+    if let Err(e) = &took
+        && reads_now(conn, typing, now).unwrap_or(false)
+    {
+        let detail = e.to_string();
+        let _ = follows::typed_became(conn, &typing.of, &typing.key, FAILED, Some(&detail));
+    }
+    took
+}
+
+/// [`take`], in one transaction.
+fn take_in_one(
     conn: &Connection,
     identity: &NodeIdentity,
     typing: &Typing,

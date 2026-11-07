@@ -1526,6 +1526,63 @@ fn a_pass_asks_for_at_most_32_typings_across_every_follow() {
     assert_eq!(to_ask(&s[0].conn, read + 2).unwrap().len(), 40 - 32);
 }
 
+/// A typing whose take failed is kept as failed, with the error, and not
+/// asked for again until the next read types its key again (the review of
+/// slice 5b): so a follow that comes first, whose takes fail at every
+/// pass, does not keep a later follow's typings from being asked for.
+#[test]
+fn a_follow_whose_takes_fail_does_not_keep_a_later_follows_keys_from_being_asked() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    // The first follow by its identity, which is no repository's, so that
+    // each of its takes fails.
+    let broken = "aaaaa";
+    let first = bobs_list(&s, &Shared::of(8), 1..=40, &[]);
+    follows_as(&s, broken, &first, &commit('a'), now);
+    let read = now + READ;
+    for n in 1..=40 {
+        follows::type_key(conn, broken, &member(n).public_key(), read).unwrap();
+    }
+    let (_, list) = joins(&s, 7, now);
+    reads(&s, &list, &commit('a'), read);
+    let later = sorted(&[member(1).public_key(), member(2).public_key()]);
+    let of_later = |asked: &[Typing]| -> Vec<[u8; 32]> {
+        let keys: Vec<[u8; 32]> = asked
+            .iter()
+            .filter(|typing| typing.of == REPOSITORY)
+            .map(|typing| typing.key)
+            .collect();
+        sorted(&keys)
+    };
+
+    let asked = to_ask(conn, read + 1).unwrap();
+    assert_eq!(asked.len(), MEMBERS_ASKED_PER_PASS);
+    assert!(of_later(&asked).is_empty(), "the first follow's come first");
+    for typing in &asked {
+        let took = take(conn, &s[0].identity, typing, &[], &own_relays(), read + 1);
+        assert!(took.is_err(), "{took:?}");
+    }
+    let failed: Vec<follows::Typed> = follows::typed(conn, broken)
+        .unwrap()
+        .into_iter()
+        .filter(|typed| typed.became.as_deref() == Some(FAILED))
+        .collect();
+    assert_eq!(failed.len(), MEMBERS_ASKED_PER_PASS);
+    assert!(
+        failed[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("is no repository")
+    );
+    // The next pass asks for the first follow's eight left, and the later
+    // follow's.
+    let asked = to_ask(conn, read + 2).unwrap();
+    assert_eq!(asked.len(), 40 - MEMBERS_ASKED_PER_PASS + 2);
+    assert_eq!(of_later(&asked), later);
+}
+
 /// What became of a typing is kept, its line cut at a character to what
 /// the row keeps, so that a long one does not undo the take (the review
 /// of slice 5b, L4): here, the line that a clone with a long path is no
