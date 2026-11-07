@@ -153,7 +153,7 @@ channel <new ID> <relay keys> without 2 <key> <key>
 
 **Keys that cannot be named:** a key whose row the table let go, and anyone who wrote in a channel past a bound (§6.3 and §7 there). Where such a key is listed, it is handed the new channel. That errs toward the list, which decides.
 
-**A removal** makes each shared channel anew as today (§3.5 there), and prints each new channel line, with the removed device after `without`. For each repository channel it shows amber until the list names the new channel: `<name> was made anew at a removal: put its new channel line in .cordelia/members`, with the line.
+**A removal** makes each shared channel anew as today (§3.5 there), and prints each new channel line, with the removed device after `without`. The keys a removal leaves out only for room or because they had not moved are not named, and the list decides for them, as for keys that cannot be named. For each repository channel it shows amber until the list names the new channel: `<name> was made anew at a removal: put its new channel line in .cordelia/members`, with the line.
 
 ## 6. No silent waits
 
@@ -213,7 +213,7 @@ The notices of rules 4.5 to 4.7 show only on devices that follow the repository.
 - **A program that runs as a member** can change the clone, and so the list, for example with `git update-ref`. It can already run `share` with a yes (the README's security section). Each join's notice names the commit, for the person to check.
 - **A list in a public repository** shows the channel's ID, its relays, its keys and their labels. None of it lets anyone read the channel: that needs a member to hand it over. Nor can a stranger with the channel's ID and relays write there, or fill its room at a relay. A relay hands a channel only on a proof made with its secret, and takes an entry only where it is signed by the channel's own key, which comes from the seed (§2.1 and §10 there; decision 2026-10-04 §2.4).
 - **A member can still hand the channel to a key that is not listed,** by hand: a channel stays flat. `log` shows that key, with no label of the person's.
-- **A known limit:** a device that does not follow the repository, making its channel anew, cannot carry the current line's `without` keys. Where one of those keys is still listed and the person does not carry it over, it is let back in once the new line is merged. The device that left it out shows amber until the line names it again (rule 5).
+- **A known limit:** a device that does not follow the repository, making its channel anew, cannot carry the current line's `without` keys. Nor can any device carry what another device's making anew left out, before that line is merged. Where one of those keys is still listed and the person does not carry it over, it is let back in once the new line is merged. The device that left it out shows amber until the line names it again (rule 5). So merge the lines in order.
 - **The reader shows listed keys as it shows any other key** (§2.4 there). They are not labelled for the person, and share the hour and the room of keys the person does not know (§6.3 there), until the person labels them.
 
 ## 11. Constants

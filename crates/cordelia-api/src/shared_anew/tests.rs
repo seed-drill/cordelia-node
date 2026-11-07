@@ -1016,7 +1016,7 @@ fn shared_anew_asks_about_a_key_not_moved_yet() {
     assert_eq!(what.left_out, 0);
     // A removal keeps the table's keys alone.
     let held = crate::person::held(conn).unwrap().unwrap();
-    let (stay, _) =
+    let (stay, ..) =
         staying_with_no_question(conn, &held, &s.key(0), &row(&s, 0, &new), true).unwrap();
     assert!(stay.contains(&alice.public_key()), "{stay:?}");
     assert!(!stay.contains(&dave.public_key()), "{stay:?}");
@@ -2720,4 +2720,629 @@ fn a_shared_push_picked_before_a_removal_is_not_sent_after_it() {
             .unwrap()
             .is_empty()
     );
+}
+
+// ── The new channel line (decision 2026-11-06 (joining), rule 5) ─────
+
+/// The relay of the channels of these tests whose new channel line is
+/// printed: a key that can be used, as a relay's is, since a line names
+/// only such a key. [`AT`] is not one, so its channels print no line.
+fn line_at() -> [u8; 32] {
+    NodeIdentity::from_seed([0x52; 32]).unwrap().public_key()
+}
+
+fn line_relays() -> Vec<OwnRelay> {
+    vec![OwnRelay {
+        name: "relay.example.org:9474".into(),
+        key: line_at(),
+    }]
+}
+
+/// The card made from `seed`, at [`line_at`].
+fn card_at_line_at(seed: u8) -> Card {
+    let mut bytes = vec![seed; 32];
+    bytes.extend_from_slice(&Relays::new(&[line_at()]).unwrap().to_bytes());
+    Card::from_bytes(&bytes).unwrap()
+}
+
+/// `key` with its top bit flipped: another key to Ed25519, the same to
+/// X25519.
+fn twin(key: [u8; 32]) -> [u8; 32] {
+    let mut twin = key;
+    twin[31] ^= 0x80;
+    twin
+}
+
+/// Device `n` files the channel of the card made from `seed`, at
+/// [`line_at`], as `name`.
+fn holds_at_line_at(s: &Several, n: usize, seed: u8, name: &str, now: i64) -> Shared {
+    let card = card_at_line_at(seed);
+    let filing = Filing {
+        channel: card.channel_id().unwrap(),
+        card: card.clone(),
+        name: name.into(),
+        came: Came::Made,
+    };
+    acts(s, n, Do::File(filing), now);
+    Shared {
+        secret: card.secret().unwrap(),
+        id: card.channel_id().unwrap(),
+    }
+}
+
+/// Device `n` follows `repository`, whose list read at `at` has the
+/// channel line of `channel` with `without`, and a line for each of
+/// `devices`.
+fn follows_a_list(
+    s: &Several,
+    n: usize,
+    repository: &str,
+    channel: &[u8; 32],
+    without: &[[u8; 32]],
+    devices: &[[u8; 32]],
+    at: i64,
+) {
+    let mut list = ChannelLine {
+        channel: *channel,
+        relays: vec![line_at()],
+        without: without.to_vec(),
+    }
+    .to_line()
+    .unwrap();
+    list.push('\n');
+    for (k, key) in devices.iter().enumerate() {
+        list.push_str(&format!("{}   d{k}\n", encode_public_key(key).unwrap()));
+    }
+    let conn = &s[n].conn;
+    follows::follow(conn, repository, "origin", "/home/bob/Work/project", at).unwrap();
+    let read = follows::LastRead {
+        commit: "c".repeat(40),
+        at,
+        from_clone: true,
+    };
+    follows::read_done(conn, repository, &read, list.as_bytes(), None).unwrap();
+}
+
+/// Device `n` makes the channel `name` anew with `shared anew`, keeping the
+/// keys of `keep` and leaving out every other key it is asked about.
+/// Returns what it said, and the keys it left out in the order asked.
+fn anew_keeping(
+    s: &Several,
+    n: usize,
+    name: &str,
+    keep: &[[u8; 32]],
+    now: i64,
+) -> (Vec<String>, Vec<[u8; 32]>) {
+    let (conn, identity) = (&s[n].conn, &s[n].identity);
+    let as_typed = |keys: &[[u8; 32]]| -> Vec<String> {
+        keys.iter()
+            .map(|key| encode_public_key(key).unwrap())
+            .collect()
+    };
+    let (listing, _) =
+        anew_plan(conn, identity, &line_relays(), name, None, &[], None, now).unwrap();
+    let listed = as_typed(&listing.asked);
+    let typed = as_typed(keep);
+    let (listing, plan) = anew_plan(
+        conn,
+        identity,
+        &line_relays(),
+        name,
+        None,
+        &[],
+        Some((&typed, &listed)),
+        now,
+    )
+    .unwrap();
+    let said = make_anew(conn, identity, &line_relays(), &plan.unwrap().what, now).unwrap();
+    out(s, n, now);
+    let left = listing
+        .asked
+        .into_iter()
+        .filter(|key| !keep.contains(key))
+        .collect();
+    (said, left)
+}
+
+/// The new channel line said in `said`: the line after [`PUT_THE_LINE`],
+/// read as a list reads it.
+fn line_in(said: &[String]) -> (String, ChannelLine) {
+    let at = said
+        .iter()
+        .position(|line| line == PUT_THE_LINE)
+        .unwrap_or_else(|| panic!("no new channel line in {said:?}"));
+    let line = said[at + 1].clone();
+    let read = crate::members::read(line.as_bytes()).unwrap();
+    assert!(read.devices.is_empty(), "{line}");
+    (line, read.channel.unwrap())
+}
+
+/// What device `n` kept of its making anew of `channel`.
+fn kept_of(s: &Several, n: usize, channel: &Shared) -> follows::MadeLine {
+    follows::made_lines(&s[n].conn)
+        .unwrap()
+        .into_iter()
+        .find(|made| made.channel == channel.id)
+        .unwrap()
+}
+
+/// `shared anew` on a channel a follow's list names (rule 5): its line
+/// names after `without` the keys it left out that the list names, Carol's
+/// and not Dave's, which the list does not name; and carries over the
+/// current line's `without` keys that the list still names, Erin's,
+/// whose line is still there, and not Frank's, whose line went. Alice
+/// stays and is named nowhere. The line is printed after the line that
+/// says where to put it, reads back as the same channel line, and is kept
+/// with every key left out.
+#[test]
+fn shared_anew_names_the_listed_keys_it_left_out_and_carries_the_current_ones() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds_at_line_at(&s, 0, 7, "review", now);
+    let (alice, carol, dave) = (member(1), member(2), member(3));
+    let (erin, frank) = (member(4).public_key(), member(5).public_key());
+    written_by(&s, 0, &channel, &[&alice, &carol, &dave], now);
+    let listed = [s.key(0), alice.public_key(), carol.public_key(), erin];
+    follows_a_list(
+        &s,
+        0,
+        "example.org/team/project",
+        &channel.id,
+        &[erin, frank],
+        &listed,
+        now,
+    );
+    // Another follow's list, of another channel, changes nothing here.
+    let other = Shared::of(9).id;
+    let dave_key = dave.public_key();
+    follows_a_list(
+        &s,
+        0,
+        "example.org/team/other",
+        &other,
+        &[dave_key],
+        &[dave_key],
+        now,
+    );
+
+    let (said, left) = anew_keeping(&s, 0, "review", &[alice.public_key()], now);
+    let new = filed_as(&s, 0, "review");
+    let (line, read) = line_in(&said);
+    assert!(said[0].starts_with("Made \"review\" anew"), "{said:?}");
+    assert_eq!(said[1], PUT_THE_LINE);
+    assert_eq!(
+        read,
+        ChannelLine {
+            channel: new.id,
+            relays: vec![line_at()],
+            without: vec![erin, carol.public_key()],
+        }
+    );
+    assert_eq!(read.to_line().unwrap(), line);
+    // Kept, with every key it left out.
+    let kept = kept_of(&s, 0, &channel);
+    assert_eq!(kept.new_channel, new.id);
+    assert_eq!(kept.line.as_deref(), Some(line.as_str()));
+    assert_eq!(kept.left_out, left);
+    let mut out = left.clone();
+    out.sort();
+    let mut expected = vec![carol.public_key(), dave_key];
+    expected.sort();
+    assert_eq!(out, expected);
+}
+
+/// `shared anew` on a channel no follow's list names (rule 5): its line
+/// names every key it left out, as listed, and nothing else: a follow of
+/// another repository, whose list names another channel, neither cuts it
+/// nor adds to it.
+#[test]
+fn shared_anew_where_no_list_names_the_channel_names_every_key_left_out() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds_at_line_at(&s, 0, 7, "review", now);
+    let (alice, carol, dave) = (member(1), member(2), member(3));
+    written_by(&s, 0, &channel, &[&alice, &carol, &dave], now);
+    let other = Shared::of(9).id;
+    let erin = member(4).public_key();
+    follows_a_list(
+        &s,
+        0,
+        "example.org/team/other",
+        &other,
+        &[erin],
+        &[erin, alice.public_key()],
+        now,
+    );
+
+    let (said, left) = anew_keeping(&s, 0, "review", &[alice.public_key()], now);
+    let (line, read) = line_in(&said);
+    assert_eq!(left.len(), 2);
+    assert_eq!(read.without, left, "{line}");
+    assert_eq!(read.channel, filed_as(&s, 0, "review").id);
+    assert_eq!(
+        kept_of(&s, 0, &channel).line.as_deref(),
+        Some(line.as_str())
+    );
+}
+
+/// A twin counts as its key (rule 5): the current line names Carol's twin
+/// after `without`, and `shared anew` leaves Carol out again, so the new
+/// line names her once; it names Alice's twin, and Alice stays, so the new
+/// line does not name her at all.
+#[test]
+fn a_twin_is_named_once() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds_at_line_at(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    let (alice_key, carol_key) = (alice.public_key(), carol.public_key());
+    let without = [twin(carol_key), twin(alice_key)];
+    let listed = [s.key(0), alice_key, carol_key];
+    follows_a_list(
+        &s,
+        0,
+        "example.org/team/project",
+        &channel.id,
+        &without,
+        &listed,
+        now,
+    );
+
+    let (said, left) = anew_keeping(&s, 0, "review", &[alice_key], now);
+    assert_eq!(left, [carol_key]);
+    let (line, read) = line_in(&said);
+    assert_eq!(read.without, [twin(carol_key)], "{line}");
+    assert_eq!(kept_of(&s, 0, &channel).left_out, [carol_key]);
+}
+
+/// A key and its twin left out are one key, kept and named once (rule 5):
+/// Bob's laptop moves by Alice's offer, which seals to Carol and to her
+/// twin, neither of which has moved yet; `shared anew` there asks about
+/// both, and leaves both out.
+#[test]
+fn a_key_and_its_twin_left_out_are_kept_once() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds_at_line_at(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2).public_key());
+    written_by(&s, 0, &channel, &[&alice], now);
+    let card = card_at_line_at(21);
+    let sealed_to = [alice.public_key(), s.key(0), carol, twin(carol)];
+    let offer = Offer::make(now as u64, &channel.id, &card, &sealed_to).unwrap();
+    let value = Anew::Offer(offer).to_value().unwrap();
+    stores(&s, 0, &anew_of(&alice, &channel, 2, value), now);
+    {
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let plan = move_plan(conn, identity, &line_relays(), "review", None, None, now).unwrap();
+        make_move(conn, identity, &plan.what, now).unwrap();
+    }
+    let new = Shared {
+        secret: card.secret().unwrap(),
+        id: card.channel_id().unwrap(),
+    };
+    stores(&s, 0, &anew(&alice, &new, 1), now);
+
+    let (said, left) = anew_keeping(&s, 0, "review", &[alice.public_key()], now);
+    assert_eq!(left, [carol, twin(carol)], "both are asked about");
+    let (line, read) = line_in(&said);
+    assert_eq!(read.without, [carol], "{line}");
+    assert_eq!(kept_of(&s, 0, &new).left_out, [carol]);
+}
+
+/// A removal's making anew names the removed device after `without` (rule
+/// 5), whether or not it wrote in the channel, as it held every seed of the
+/// person's; and whatever the list says, so that a line that later lists
+/// it again does not let it in. The tablet wrote in `review` and not in
+/// `design`; Bob's laptop follows a list naming `review` that still lists
+/// the tablet, and one naming `notes` that does not; no list names
+/// `design`. The removal says each line, after the line it says of each
+/// channel, and the end of the removal says the same, from what was kept.
+#[test]
+fn a_removal_names_the_device_it_removed_after_without() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let review = holds_at_line_at(&s, 0, 7, "review", now);
+    let design = holds_at_line_at(&s, 0, 8, "design", now);
+    let notes = holds_at_line_at(&s, 0, 9, "notes", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    let alice = member(1);
+    for channel in [&review, &design, &notes] {
+        written_by(&s, 0, channel, &[&alice], now);
+    }
+    let tablet = crate::several::identity_of(2).public_key();
+    stores(
+        &s,
+        0,
+        &anew(&crate::several::identity_of(2), &review, 1),
+        now,
+    );
+    let mut listed = vec![s.key(0), s.key(1), alice.public_key()];
+    follows_a_list(
+        &s,
+        0,
+        "example.org/team/notes",
+        &notes.id,
+        &[],
+        &listed,
+        now,
+    );
+    listed.push(tablet);
+    follows_a_list(
+        &s,
+        0,
+        "example.org/team/project",
+        &review.id,
+        &[],
+        &listed,
+        now,
+    );
+
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    let said = anew_at_removal(conn, &s[0].identity, &line_relays(), now).unwrap();
+    for (channel, name, named) in [
+        (&review, "review", vec![tablet]),
+        (&design, "design", vec![tablet]),
+        (&notes, "notes", vec![tablet]),
+    ] {
+        let at = said
+            .iter()
+            .position(|line| line.starts_with(&format!("\"{name}\" is made anew")))
+            .unwrap_or_else(|| panic!("{said:?}"));
+        assert_eq!(said[at + 1], PUT_THE_LINE, "{said:?}");
+        let (line, read) = line_in(&said[at..]);
+        assert_eq!(read.without, named, "{name}: {line}");
+        assert_eq!(read.channel, filed_as(&s, 0, name).id);
+        let kept = kept_of(&s, 0, channel);
+        assert_eq!(kept.line.as_deref(), Some(line.as_str()));
+        assert_eq!(kept.left_out, named);
+    }
+    let mut at_the_end = made_at_the_last_removal(conn, Some(0)).unwrap();
+    let mut said = said;
+    at_the_end.sort();
+    said.sort();
+    assert_eq!(at_the_end, said);
+}
+
+/// After a recovery, a channel made anew in the background keeps its new
+/// channel line, for the status to show (rule 5): nothing hears it at a
+/// terminal. It names the device the recovery removed.
+#[test]
+fn a_channel_made_anew_after_a_recovery_keeps_its_line() {
+    let mut s = bob(2);
+    let now = s.now + 10;
+    let channel = holds_at_line_at(&s, 0, 7, "review", now);
+    s.change(0, &[0], &[1]);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    recovered(conn, &[s.key(1)], now).unwrap();
+    assert_eq!(make_owed(conn, &s[0].identity, now, &|_| true).unwrap(), 1);
+    let kept = kept_of(&s, 0, &channel);
+    let new = filed_as(&s, 0, "review");
+    assert_eq!(kept.new_channel, new.id);
+    assert_eq!(kept.left_out, [s.key(1)]);
+    let line = kept.line.unwrap();
+    let read = crate::members::read(line.as_bytes())
+        .unwrap()
+        .channel
+        .unwrap();
+    assert_eq!(
+        read,
+        ChannelLine {
+            channel: new.id,
+            relays: vec![line_at()],
+            without: vec![s.key(1)],
+        }
+    );
+}
+
+// ── The fix round of slice 6 ─────────────────────────────────────────
+
+/// Bob's three devices hold `review` at [`line_at`], each following the
+/// others' lists, with Alice's key shown on the laptop, and the laptop
+/// removes the tablet and makes `review` anew (decision 2026-10-24, rule
+/// 24). Returns the channel made anew, C1, and Alice; the laptop then holds
+/// C2 as `review`.
+fn removed_at_line_at(s: &mut Several) -> (Shared, NodeIdentity) {
+    let now = s.now + 10;
+    let c1 = holds_at_line_at(s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(s, n, now);
+    }
+    let alice = member(1);
+    written_by(s, 0, &c1, &[&alice], now);
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    anew_at_removal(&s[0].conn, &s[0].identity, &line_relays(), now).unwrap();
+    out(s, 0, now);
+    (c1, alice)
+}
+
+/// A later making anew still names a removed device that the list names
+/// (the review of slice 6, high 1, probe A; §12: "a removed device that is
+/// still listed is never handed the new channel"): the laptop removes the
+/// tablet, which never wrote in `review`, and makes C1 into C2. The desktop
+/// follows the filing, holds C2 not clean, and makes it anew itself (rule
+/// 23), while the list still names C1 and lists the tablet. Its line names
+/// the tablet.
+#[test]
+fn a_making_anew_on_another_device_after_a_removal_names_the_removed_device() {
+    let mut s = bob(3);
+    let (c1, alice) = removed_at_line_at(&mut s);
+    let tablet = s.key(2);
+    let now = s.now + 30;
+    follows(&mut s, 0, 1, now);
+    let c2 = filed_as(&s, 1, "review");
+    assert_ne!(c2.id, c1.id);
+    assert!(is_not_clean(&s[1].conn, &c2.id).unwrap(), "rule 23");
+    let listed = [s.key(0), s.key(1), tablet, alice.public_key()];
+    follows_a_list(&s, 1, "example.org/team/project", &c1.id, &[], &listed, now);
+
+    let (said, _) = anew_keeping(&s, 1, "review", &[], now);
+    let (line, read) = line_in(&said);
+    assert_eq!(read.without, [tablet], "{line}");
+    assert_eq!(kept_of(&s, 1, &c2).left_out, [tablet]);
+}
+
+/// A second `shared anew` before the removal's line is merged names the
+/// removed device again (the review of slice 6, high 1, probe B): the list
+/// still names C1, and lists the tablet and Carol; the laptop makes C2 anew
+/// and leaves Carol out. Its line names both.
+#[test]
+fn a_second_making_anew_before_the_removals_line_is_merged_names_the_removed_device() {
+    let mut s = bob(3);
+    let (c1, alice) = removed_at_line_at(&mut s);
+    let tablet = s.key(2);
+    let now = s.now + 30;
+    let c2 = filed_as(&s, 0, "review");
+    let carol = member(2);
+    written_by(&s, 0, &c2, &[&alice, &carol], now);
+    let listed = [
+        s.key(0),
+        s.key(1),
+        tablet,
+        alice.public_key(),
+        carol.public_key(),
+    ];
+    follows_a_list(&s, 0, "example.org/team/project", &c1.id, &[], &listed, now);
+
+    let (said, left) = anew_keeping(&s, 0, "review", &[alice.public_key()], now);
+    assert_eq!(left, [carol.public_key()]);
+    let (line, read) = line_in(&said);
+    assert_eq!(read.without, [tablet, carol.public_key()], "{line}");
+    assert_eq!(kept_of(&s, 0, &c2).left_out, [tablet, carol.public_key()]);
+}
+
+/// A key removed at an earlier removal is named by a later making anew only
+/// where the list names it (rule 5): after the laptop removed the tablet,
+/// it makes C2 anew with `shared anew`, under a list naming C1 that does
+/// not list the tablet. Its line does not name it.
+#[test]
+fn a_later_making_anew_names_an_earlier_removed_key_only_where_listed() {
+    let mut s = bob(3);
+    let (c1, alice) = removed_at_line_at(&mut s);
+    let now = s.now + 30;
+    let listed = [s.key(0), s.key(1), alice.public_key()];
+    follows_a_list(&s, 0, "example.org/team/project", &c1.id, &[], &listed, now);
+
+    let (said, _) = anew_keeping(&s, 0, "review", &[alice.public_key()], now);
+    let (line, read) = line_in(&said);
+    assert!(read.without.is_empty(), "{line}");
+}
+
+/// A key a removal leaves out only because it had not moved is not named,
+/// and the list decides for it (the review of slice 6, medium 1): Bob keeps
+/// Carol when he makes C0 into C1, and removes the tablet before Carol
+/// moves. Rule 24 leaves Carol out of C2, and the line names the tablet
+/// alone, so the list, which lists Carol, is not held back by her.
+#[test]
+fn a_key_a_removal_leaves_out_only_as_not_moved_is_not_named() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let c0 = holds_at_line_at(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    let carol = member(2).public_key();
+    written_by(&s, 0, &c0, &[&member(2)], now);
+    let tablet = s.key(2);
+    let listed = [s.key(0), s.key(1), tablet, carol];
+    follows_a_list(&s, 0, "example.org/team/project", &c0.id, &[], &listed, now);
+    anew_keeping(&s, 0, "review", &[carol], now);
+    let c1 = filed_as(&s, 0, "review");
+    assert!(
+        not_moved_yet(&s[0].conn, &s.key(0), &c1.id)
+            .unwrap()
+            .contains(&carol)
+    );
+
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    let said = anew_at_removal(conn, &s[0].identity, &line_relays(), now).unwrap();
+    let offer = st(rows::offer_from(conn, &c1.id, &s.key(0)))
+        .unwrap()
+        .unwrap();
+    assert!(
+        !offer.sealed_to.contains(&carol),
+        "rule 24 keeps the table alone"
+    );
+    let (line, read) = line_in(&said);
+    assert_eq!(read.without, [tablet], "{line}");
+    assert_eq!(kept_of(&s, 0, &c1).left_out, [tablet]);
+}
+
+/// A chain of makings anew carries the keys left out on purpose (the review
+/// of slice 6, medium 2): the list names C0, with Frank after `without`,
+/// and still lists Erin and Frank. Bob leaves Erin out of C1, then makes C1
+/// and C2 anew again, each before the line of the one before is merged.
+/// Each line names Frank, from the list's line, and Erin, from what this
+/// device left out back along the moves.
+#[test]
+fn a_chain_of_makings_anew_carries_the_keys_left_out_along_it() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let c0 = holds_at_line_at(&s, 0, 7, "review", now);
+    let (dave, erin) = (member(3), member(4));
+    let frank = member(5).public_key();
+    written_by(&s, 0, &c0, &[&dave, &erin], now);
+    let listed = [s.key(0), dave.public_key(), erin.public_key(), frank];
+    follows_a_list(
+        &s,
+        0,
+        "example.org/team/project",
+        &c0.id,
+        &[frank],
+        &listed,
+        now,
+    );
+
+    let (said, left) = anew_keeping(&s, 0, "review", &[dave.public_key()], now);
+    assert_eq!(left, [erin.public_key()]);
+    assert_eq!(line_in(&said).1.without, [frank, erin.public_key()]);
+    for _ in 0..2 {
+        let (said, left) = anew_keeping(&s, 0, "review", &[dave.public_key()], now);
+        assert!(left.is_empty(), "{left:?}");
+        let (line, read) = line_in(&said);
+        assert_eq!(read.without, [frank, erin.public_key()], "{line}");
+    }
+}
+
+/// A line longer than a list holds is cut, and says so (the review of slice
+/// 6, low 1): with 300 keys left out and no list, the line names as many as
+/// fit in 16 KiB, and says how many it does not.
+#[test]
+fn a_line_longer_than_a_list_is_cut_and_says_so() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds_at_line_at(&s, 0, 7, "review", now);
+    let members: Vec<NodeIdentity> = (0..300).map(|k| member(1_000 + k)).collect();
+    let refs: Vec<&NodeIdentity> = members.iter().collect();
+    written_by(&s, 0, &channel, &refs, now);
+
+    let (said, left) = anew_keeping(&s, 0, "review", &[], now);
+    assert_eq!(left.len(), 300);
+    let (line, read) = line_in(&said);
+    assert!(line.len() <= MEMBERS_FILE_MAX_BYTES, "{}", line.len());
+    assert!(line.len() + 71 > MEMBERS_FILE_MAX_BYTES, "as many as fit");
+    let cut = 300 - read.without.len();
+    assert!(cut > 0);
+    assert_eq!(read.without, left[..read.without.len()]);
+    let at = said.iter().position(|said| *said == line).unwrap();
+    assert_eq!(
+        said[at + 1],
+        format!("The line is cut: {cut} keys left out are not on it.")
+    );
+    let kept = kept_of(&s, 0, &channel);
+    assert_eq!((kept.cut, kept.left_out.len()), (cut as u64, 300));
 }

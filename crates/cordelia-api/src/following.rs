@@ -612,6 +612,18 @@ pub(crate) fn followed_elsewhere(
     Ok(None)
 }
 
+/// The list kept of each repository this device follows, read, in the
+/// order of the follows: one whose channel line names a channel is the list
+/// of that channel, as a channel follows one repository (rule 2.5). Rule 1's
+/// gate is not asked: the line names the channel whether or not the list
+/// holds it back.
+pub(crate) fn lists_followed(conn: &Connection) -> Result<Vec<Members>, PersonError> {
+    Ok(follows::follows(conn)?
+        .into_iter()
+        .filter_map(|follow| members::read(follow.list.as_deref()?).ok())
+        .collect())
+}
+
 /// What the yes of `subscribe` in a clone says where it replaces the
 /// follow of `other`, whose list names `name` too (rule 2.5).
 pub(crate) fn stops_following_line(other: &str, name: &str) -> String {

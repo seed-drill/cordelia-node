@@ -3621,15 +3621,28 @@ fn past_a_bound(
     s: &Several,
     while_held: &dyn Fn(&Several, &crate::shared::tests::Shared, &NodeIdentity),
 ) -> PastABound {
+    past_a_bound_at(s, [3; 32], while_held)
+}
+
+/// [`past_a_bound`], with `review` at the relay of `relay`.
+fn past_a_bound_at(
+    s: &Several,
+    relay: [u8; 32],
+    while_held: &dyn Fn(&Several, &crate::shared::tests::Shared, &NodeIdentity),
+) -> PastABound {
     use crate::shared::tests::{Shared, anew, given, key_row, key_rows, member, row, stores};
     use cordelia_storage::shared::State;
 
     sync_on(s);
     let (laptop, desktop, phone) = (0, 1, 2);
     let t0 = s.now + 10;
-    on(s, phone, Do::File(filing(1, "review")), t0);
+    let of_review = filing_at(1, "review", relay);
+    on(s, phone, Do::File(of_review.clone()), t0);
     all_fetch(s, &[laptop, desktop, phone], t0 + 1, 2);
-    let review = Shared::of(1);
+    let review = Shared {
+        secret: of_review.card.secret().unwrap(),
+        id: of_review.channel,
+    };
     crate::shared::tests::out(s, laptop, t0 + 1);
     assert_eq!(row(s, laptop, &review).state, State::Held);
     // Two members write there: the first is let go below, the second held.
@@ -4193,6 +4206,86 @@ fn a_removal_makes_a_channel_past_its_bound_anew() {
         status["made_anew_past_a_bound"].as_array().unwrap().len(),
         1,
         "{status}"
+    );
+}
+
+/// A channel past its bound that a removal makes anew keeps its new
+/// channel line, and the removal says it (decision 2026-11-06 (joining),
+/// rule 5). With the channel of `past_a_bound`, at a relay whose key a line
+/// can name, the laptop removes the phone, which never wrote there: the
+/// line names the phone after `without`. It names neither the member whose
+/// row the table let go nor Dave, who wrote there past the bound: neither
+/// can be named. Nor the member who stays, nor the person's own devices,
+/// to none of which the offer seals: they are not left out by the line,
+/// and one that someone in it shares the new channel with is let in.
+#[test]
+fn a_channel_past_its_bound_made_anew_at_a_removal_keeps_its_line() {
+    use crate::shared_anew::PUT_THE_LINE;
+
+    let mut s = person(3, 3);
+    let (laptop, desktop, phone) = (0, 1, 2);
+    let relay = NodeIdentity::from_seed([0x52; 32]).unwrap().public_key();
+    let PastABound {
+        review,
+        gone,
+        kept,
+        dave,
+        t2,
+    } = past_a_bound_at(&s, relay, &|_, _, _| {});
+    s.now = t2 + 10;
+    s.change(laptop, &[laptop, desktop], &[phone]);
+    let now = s.now + 1;
+    let conn = &s[laptop].conn;
+    let own_relays: Vec<crate::sharing::OwnRelay> = [[3; 32], relay]
+        .into_iter()
+        .map(|key| crate::sharing::OwnRelay {
+            name: "relay.example.org:9474".into(),
+            key,
+        })
+        .collect();
+    let said =
+        crate::shared_anew::anew_at_removal(conn, &s[laptop].identity, &own_relays, now).unwrap();
+    let at = said
+        .iter()
+        .position(|line| line.starts_with("\"review\" is made anew"))
+        .unwrap_or_else(|| panic!("{said:?}"));
+    assert_eq!(said[at + 1], PUT_THE_LINE, "{said:?}");
+    let line = &said[at + 2];
+    let made = cordelia_storage::shared_anew::made_of_channel(conn, &review.id)
+        .unwrap()
+        .unwrap();
+    assert!(made.past_bound);
+    let read = crate::members::read(line.as_bytes())
+        .unwrap()
+        .channel
+        .unwrap();
+    assert_eq!(
+        read,
+        crate::members::ChannelLine {
+            channel: made.new_channel,
+            relays: vec![relay],
+            without: vec![s.key(phone)],
+        }
+    );
+    for not_named in [&gone, &kept, &dave] {
+        assert!(!read.leaves_out(&not_named.public_key()));
+    }
+    let kept_line = cordelia_storage::follows::made_lines(conn)
+        .unwrap()
+        .into_iter()
+        .find(|made| made.channel == review.id)
+        .unwrap();
+    assert_eq!(kept_line.line.as_deref(), Some(line.as_str()));
+    assert_eq!(kept_line.left_out, [s.key(phone)]);
+    // The end of the removal says it too, after its line of the channel.
+    let look = crate::shared_anew::made_at_the_last_removal(conn, Some(now)).unwrap();
+    let at = look
+        .iter()
+        .position(|said| said.starts_with("\"review\" is made anew"))
+        .unwrap();
+    assert_eq!(
+        look[at + 1..at + 3],
+        [PUT_THE_LINE.to_string(), line.clone()]
     );
 }
 
