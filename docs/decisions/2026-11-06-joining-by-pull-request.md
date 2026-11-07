@@ -222,6 +222,7 @@ The notices of rules 4.5 to 4.7 show only on devices that follow the repository.
 |---|---|---|
 | `MEMBERS_READ_INTERVAL_SECS` | 600 | As `RELAY_ASK_AGAIN_SECS`: a join waits about ten minutes on each side once the list is read |
 | `MEMBERS_HANDED_AT_ONCE` | 4 | Derived: half of `MAX_TYPED_KEYS`, as a share lives for two reads (rule 4.2) |
+| `MEMBERS_ASKED_PER_PASS` | 32 | The node's typings asked of the relays in one pass, across every follow, so the shared pass stays within its requests (rule 4.4) |
 | `MEMBERS_FILE_MAX_BYTES` | 16,384 | The members record, rule 1 |
 | `MEMBERS_LABEL_MAX_CHARS` | 32 | Rule 1 |
 | `MEMBERS_GIT_TERM_SECS` | 2 | After TERM, before git is killed (rule 3) |
