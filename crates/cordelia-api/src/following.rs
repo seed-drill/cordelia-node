@@ -208,6 +208,9 @@ pub struct Following {
     pub list: Vec<u8>,
     /// When the person's git had last fetched it, where the clone says.
     pub fetched_at: Option<i64>,
+    /// The other repository this device follows whose list names the same
+    /// channel, where one does: this follow takes its place (rule 2.5).
+    pub replaces: Option<String>,
     /// The agent of the folder it was run in.
     pub agent: String,
     pub then: Then,
@@ -264,6 +267,12 @@ pub fn plan(
                 ),
             );
         }
+    };
+    // A channel follows one repository (rule 2.5): a follow of another
+    // whose list names this list's channel is replaced by this one.
+    let replaces = match &members.channel {
+        Some(line) => followed_elsewhere(conn, &repository, &line.channel)?,
+        None => None,
     };
     let own = identity.public_key();
     // A twin of this device's key is its key (rule 1).
@@ -326,6 +335,7 @@ pub fn plan(
                 commit: commit.clone(),
                 list: file.clone(),
                 fetched_at: read.list.fetched_at(),
+                replaces: replaces.clone(),
                 agent: agent.clone(),
                 then,
             },
@@ -430,12 +440,12 @@ pub fn plan(
     };
     let filings = sharing::filed(conn)?;
     // A channel follows one repository, so that no two lists hand it over,
-    // or delete its shares (rule 2.5).
-    if let Some(other) = followed_elsewhere(conn, &repository, &line.channel)? {
-        return sharing::refused(
-            "followed_elsewhere",
-            followed_elsewhere_line(&other, &channel_named(conn, &line.channel)?),
-        );
+    // or delete its shares (rule 2.5): the yes says which follow stops.
+    if let Some(other) = &replaces {
+        asks.push(stops_following_line(
+            other,
+            &channel_named(conn, &line.channel)?,
+        ));
     }
     if let Some(filing) = filings.iter().find(|filing| filing.channel == line.channel) {
         let name = cleaned(&filing.name);
@@ -563,11 +573,22 @@ pub(crate) fn followed_elsewhere(
     Ok(None)
 }
 
-/// What is said of a list that names `name`, a channel the list of
-/// `other` names too.
-pub(crate) fn followed_elsewhere_line(other: &str, name: &str) -> String {
+/// What the yes of `subscribe` in a clone says where it replaces the
+/// follow of `other`, whose list names `name` too (rule 2.5).
+pub(crate) fn stops_following_line(other: &str, name: &str) -> String {
     format!(
-        "This device follows {other}, whose list names {name} too: a channel follows one repository."
+        "This stops following {other}, whose list names {name} too: a channel follows one \
+         repository."
+    )
+}
+
+/// What is said of a read of the list of `repository` that names `name`,
+/// which this device follows from `other`: the read counts for nothing
+/// (rules 2.5 and 6).
+pub(crate) fn followed_from_line(repository: &str, name: &str, other: &str) -> String {
+    format!(
+        "The list of {repository} names {name}, which this device follows from {other}: run \
+         cordelia subscribe in a clone of the one it should follow."
     )
 }
 
@@ -661,6 +682,11 @@ pub fn make(
         // now, compares the list it reads with it (rule 4.6). So is when
         // it was read, since when that read notices a key's join (rule
         // 4.5). A first follow keeps this read whole.
+        // The follow this one replaces stops first, in the same write: a
+        // channel follows one repository (rule 2.5).
+        if let Some(other) = &following.replaces {
+            follows::unfollow(conn, other)?;
+        }
         let earlier = follows::follow_of(conn, &following.identity)?;
         follows::follow(
             conn,

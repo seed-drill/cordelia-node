@@ -407,13 +407,15 @@ fn a_dropped_channel_is_refused() {
     assert!(follow_row(&s).is_none());
 }
 
-/// A list that names a channel another follow's list names is not
-/// followed: a channel follows one repository (rule 2.5; the review of
-/// slice 5a, M2). The channel is said by its name where the person holds
-/// it, and else by its words; and a follow of the same repository again
-/// is not refused by its own list.
+/// A list that names a channel another follow's list names replaces that
+/// follow: a channel follows one repository (rule 2.5), and a repository
+/// renamed, or a fork left for upstream, is followed anew this way. The
+/// yes says which follow stops, naming the channel by the person's name
+/// where they hold it, and else by its words; the plan stops nothing, and
+/// the yes stops the other follow as this one begins. A follow of the same
+/// repository again replaces nothing.
 #[test]
-fn a_channel_another_follow_names_is_refused() {
+fn a_channel_another_follow_names_replaces_that_follow() {
     let s = devices(1);
     let now = s.now + 10;
     let conn = &s[0].conn;
@@ -441,27 +443,36 @@ fn a_channel_another_follow_names_is_refused() {
             from_clone: true,
         };
         follows::read_done(conn, other, &read, line_of(channel).as_bytes(), None).unwrap();
-        assert_eq!(
-            refusal(planned(&s, Some(&line_of(channel)), FIRST, false)),
-            (
-                "followed_elsewhere",
-                format!(
-                    "This device follows {other}, whose list names {name} too: a channel follows \
-                     one repository."
-                )
-            )
+        let planned = planned(&s, Some(&line_of(channel)), FIRST, false).unwrap();
+        let stops = format!(
+            "This stops following {other}, whose list names {name} too: a channel follows one \
+             repository."
         );
-        assert!(follow_row(&s).is_none());
-        follows::unfollow(conn, other).unwrap();
+        assert!(planned.asks.contains(&stops), "{}", planned.asks);
+        assert!(
+            follows::follow_of(conn, other).unwrap().is_some(),
+            "a plan stops nothing"
+        );
+        yes(&s, &planned, now + 1);
+        assert!(follows::follow_of(conn, other).unwrap().is_none());
+        assert!(follow_row(&s).is_some());
+        follows::unfollow(conn, REPOSITORY).unwrap();
     }
-    // Its own list does not refuse a follow of the same repository again.
+    // Its own list replaces nothing where the same repository is followed
+    // again.
     let list = line_of(&held);
     yes(
         &s,
         &planned(&s, Some(&list), FIRST, false).unwrap(),
-        now + 1,
+        now + 2,
     );
-    assert!(planned(&s, Some(&list), SECOND, false).is_ok());
+    let again = planned(&s, Some(&list), SECOND, false).unwrap();
+    assert!(
+        !again.asks.contains("This stops following"),
+        "{}",
+        again.asks
+    );
+    assert_eq!(again.what.replaces, None);
 }
 
 /// The gate line of rule 6, for `label` on the list of `name`.

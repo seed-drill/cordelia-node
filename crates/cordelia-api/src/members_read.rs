@@ -39,9 +39,7 @@ use cordelia_storage::follows::{self, Follow, LastRead, NotRead, Notice, NoticeO
 use cordelia_storage::shared::{self as kept, State};
 use cordelia_storage::shared_sharing as share_rows;
 
-use crate::following::{
-    channel_named, followed_elsewhere, followed_elsewhere_line, keys_in_channel,
-};
+use crate::following::{channel_named, followed_elsewhere, followed_from_line, keys_in_channel};
 use crate::git_list::{ClonedList, Git, Identity, ListFailed};
 use crate::members::{self, ChannelLine, Members, same_key};
 use crate::person::{Held, PersonError, in_one};
@@ -178,7 +176,11 @@ pub fn after_read(
         {
             let not = NotRead {
                 word: "followed_elsewhere".into(),
-                why: followed_elsewhere_line(&other, &channel_named(conn, &line.channel)?),
+                why: followed_from_line(
+                    &follow.identity,
+                    &channel_named(conn, &line.channel)?,
+                    &other,
+                ),
             };
             follows::not_read(conn, &follow.identity, &not)?;
             return Ok(Done::NotRead(not));

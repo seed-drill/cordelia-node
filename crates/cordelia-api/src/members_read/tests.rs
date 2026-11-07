@@ -763,6 +763,7 @@ fn following_again_notices_a_join_since_the_read_before_it() {
         commit: commit('b'),
         list: list.as_bytes().to_vec(),
         fetched_at: None,
+        replaces: None,
         agent: "project".into(),
         then: crate::following::Then::Nothing,
     };
@@ -916,8 +917,8 @@ fn a_list_that_names_a_channel_another_follow_names_counts_for_nothing() {
     let not = NotRead {
         word: "followed_elsewhere".into(),
         why: format!(
-            "This device follows {REPOSITORY}, whose list names \"review\" too: a channel \
-             follows one repository."
+            "The list of {OTHER} names \"review\", which this device follows from {REPOSITORY}: \
+             run cordelia subscribe in a clone of the one it should follow."
         ),
     };
     let read = reads_as(&s, OTHER, &names_review, &commit('b'), now + READ);
