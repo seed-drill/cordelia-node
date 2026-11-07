@@ -573,6 +573,24 @@ pub(crate) fn followed_elsewhere(
     Ok(None)
 }
 
+/// The list kept of the repository this device follows whose channel line
+/// names the channel `channel`, where it follows one: a channel follows one
+/// repository (rule 2.5). Rule 1's gate is not asked: the line names the
+/// channel whether or not the list holds it back.
+pub(crate) fn list_naming(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Option<Members>, PersonError> {
+    Ok(follows::follows(conn)?
+        .into_iter()
+        .filter_map(|follow| members::read(follow.list.as_deref()?).ok())
+        .find(|list| {
+            list.channel
+                .as_ref()
+                .is_some_and(|line| line.channel == *channel)
+        }))
+}
+
 /// What the yes of `subscribe` in a clone says where it replaces the
 /// follow of `other`, whose list names `name` too (rule 2.5).
 pub(crate) fn stops_following_line(other: &str, name: &str) -> String {

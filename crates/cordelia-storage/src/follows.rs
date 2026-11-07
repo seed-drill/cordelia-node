@@ -31,6 +31,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use cordelia_core::CordeliaError;
+use cordelia_core::protocol::{MEMBERS_FILE_MAX_BYTES, SHARED_KEYS_KEPT};
 
 fn storage(e: rusqlite::Error) -> CordeliaError {
     CordeliaError::Storage(e.to_string())
@@ -544,14 +545,18 @@ pub fn shares_by_node(conn: &Connection) -> Result<Vec<NodeShare>, CordeliaError
 /// What the making anew of `channel` here left out, and the channel line
 /// it printed (rule 5). Nothing is done where this device did not make it
 /// anew. Write it after `shared_anew::made`, in the same write: `made`
-/// writes its row afresh.
+/// writes its row afresh. The row keeps the first of the keys up to the
+/// 1,024 rows a table keeps, and a line no longer than a list, as schema
+/// step 33 bounds them, so that a making anew never fails on them: a
+/// longer line is not kept.
 pub fn made_line(
     conn: &Connection,
     channel: &[u8; 32],
     left_out: &[[u8; 32]],
     line: &str,
 ) -> Result<bool, CordeliaError> {
-    let left_out: Vec<u8> = left_out.concat();
+    let left_out: Vec<u8> = left_out[..left_out.len().min(SHARED_KEYS_KEPT)].concat();
+    let line = (line.len() <= MEMBERS_FILE_MAX_BYTES).then_some(line);
     let changed = conn
         .execute(
             "UPDATE shared_anew_made SET left_out = ?2, line = ?3 WHERE channel = ?1",
