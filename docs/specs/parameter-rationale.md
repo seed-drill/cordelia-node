@@ -3375,6 +3375,8 @@ reason there:
 
 **`MEMBERS_FILE_MAX_BYTES` = 16,384.** The most bytes of `.cordelia/members` a device reads. A channel line with two relays and a `without` of 64 keys is 4,769 bytes, and 64 devices' lines with labels of 32 characters are 6,656 bytes: 11.1 KiB together. 16 KiB holds both, with room for comments. A larger file is not read, and the last list read stands.
 
+**`MEMBERS_LABEL_MAX_CHARS` = 32.** A label is for people reading the file: short enough to stay on one line beside a key, long enough for `alice-laptop-2026` and the like. The characters are `a-z`, `0-9`, `.`, `_` and `-`, so a label needs no escaping anywhere it is shown.
+
 **`MEMBERS_GIT_TERM_SECS` = 2.** How long git is given after TERM, where a read of a clone has not ended within `STREAM_TIMEOUT_SECS`, before its process group is killed (rule 3). A read of a clone is a few local commands of git, each of which ends in milliseconds; one that has not ended in ten seconds is stuck, on a disk or a lock. Git ends on TERM in milliseconds, removing whatever it was writing for itself; two seconds is room for a loaded machine, and KILL ends the rest. The node's reads of a clone write nothing in it.
 
 ## 13. Memory Across Connections (Change F)

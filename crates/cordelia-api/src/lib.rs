@@ -65,6 +65,7 @@ pub mod lists;
 pub mod local;
 pub mod look;
 pub mod marks;
+pub mod members;
 pub mod messages;
 pub mod names;
 pub mod own_read;

@@ -662,6 +662,7 @@ version = "0.2.0-alpha.18"
 dependencies = [
  "actix-rt",
  "actix-web",
+ "bech32",
  "chrono",
  "cordelia-core",
  "cordelia-crypto",

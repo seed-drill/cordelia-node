@@ -43,6 +43,8 @@ rusqlite = { workspace = true, features = ["trace"] }
 # both: this adds no crate to the build.
 rustls = { workspace = true }
 rcgen = { workspace = true }
+# Another spelling of a key, which a repository's list refuses (members.rs).
+bech32 = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 # A terminal of a test's own, at which nothing that git runs may ask. The
