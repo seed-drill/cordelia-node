@@ -256,19 +256,55 @@ enum Commands {
         none: bool,
     },
     /// Show the agent of this folder the messages of a shared channel, on
-    /// every device of yours
+    /// every device of yours, or follow the repository you are in
     ///
-    /// Run it in a terminal, in the folder. It is shown a count of what
-    /// waits there, can read it, and can write there with
+    /// Run it in a terminal, in the folder. It says what it will do and
+    /// asks you to type yes.
+    ///
+    /// With a name, the agent of this folder is shown a count of what
+    /// waits in that shared channel, can read it, and can write there with
     /// `cordelia msg send --channel <name>`. What was written there before
     /// is in `cordelia msg log` only.
+    ///
+    /// With no name, in a clone of a git repository, this device follows
+    /// the repository. It reads the list in `.cordelia/members`, as your
+    /// own git last fetched it.
+    ///
+    /// - If you hold the channel the list names, the agent of this folder
+    ///   is subscribed to it.
+    ///
+    /// - If you do not, and your key is on the list, a member's device
+    ///   hands you the channel once it reads the list. `cordelia status`
+    ///   shows how it goes.
+    ///
+    /// - If your key is not on the list, add it with a pull request, then
+    ///   run this again.
+    ///
+    /// With `--new`, it makes the repository's channel, for a list that
+    /// names none yet. It prints the lines to add to `.cordelia/members` in
+    /// a pull request.
     Subscribe {
-        /// The name you file the shared channel under
-        name: String,
+        /// The name you file the shared channel under. Leave it out to
+        /// follow the repository you are in
+        name: Option<String>,
         /// The channel's four words, where two shared channels of yours
         /// have one name
-        #[arg(long, value_name = "FOUR WORDS")]
+        // A conflict lifts a `requires` in clap: `--new` conflicts with the
+        // name, so `--words` is refused beside it in its own right.
+        #[arg(
+            long,
+            value_name = "FOUR WORDS",
+            requires = "name",
+            conflicts_with_all = ["new", "remote"]
+        )]
         words: Option<String>,
+        /// Make the repository's channel, where its list names none yet
+        #[arg(long, conflicts_with = "name")]
+        new: bool,
+        /// The remote of your clone that names the repository, where its
+        /// remotes name more than one
+        #[arg(long, value_name = "REMOTE", conflicts_with = "name")]
+        remote: Option<String>,
     },
     /// Stop showing an agent a shared channel, on every device of yours
     ///
@@ -934,9 +970,19 @@ fn main() -> anyhow::Result<()> {
             let label = if none { None } else { label };
             shared_cmd::label(&cli.config, &key, label.as_deref())
         }
-        Some(Commands::Subscribe { name, words }) => {
-            shared_cmd::subscribe(&cli.config, &name, words.as_deref())
-        }
+        Some(Commands::Subscribe {
+            name: Some(name),
+            words,
+            ..
+        }) => shared_cmd::subscribe(&cli.config, &name, words.as_deref()),
+        // With no name, it follows the repository it is run in (decision
+        // 2026-11-06 (joining), rule 2).
+        Some(Commands::Subscribe {
+            name: None,
+            new,
+            remote,
+            ..
+        }) => shared_cmd::follow(&cli.config, new, remote.as_deref()),
         Some(Commands::Unsubscribe { name, agent, words }) => {
             shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
         }
