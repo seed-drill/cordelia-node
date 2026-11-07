@@ -1057,17 +1057,19 @@ impl Git {
 
     /// The top of the work tree that `folder` is in, as a real path: the
     /// clone that `cordelia subscribe` follows, run in any folder of it
-    /// (decision 2026-11-06 (joining), rule 2). `NotARepository` where it
-    /// is in no repository, or in one with no work tree.
-    pub fn top_of(&self, folder: &Path) -> Result<PathBuf, ListFailed> {
-        let deadline = Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS);
+    /// (decision 2026-11-06 (joining), rule 2), with git given until
+    /// `deadline`, and no longer than [`STREAM_TIMEOUT_SECS`].
+    /// `NotARepository` where it is in no repository, or in one with no
+    /// work tree.
+    pub fn top_of(&self, folder: &Path, deadline: Instant) -> Result<PathBuf, ListFailed> {
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS));
         let folder = folder
             .canonicalize()
             .map_err(|_| ListFailed::NotARepository)?;
         let mut git = self.command(At::Clone(&folder));
         git.args(["rev-parse", "--show-toplevel"]);
         let ran = self
-            .run(git, deadline, STREAM_TIMEOUT_SECS, SHORT_OUTPUT_BYTES)
+            .run(git, deadline, secs_until(deadline), SHORT_OUTPUT_BYTES)
             .map_err(Outcome::failed)?;
         let said = String::from_utf8_lossy(&ran.stdout);
         let top = said.strip_suffix('\n').unwrap_or(&said);

@@ -1,7 +1,7 @@
 //! Tests of following a repository (decision 2026-11-06 (joining), rules
 //! 2.3 to 2.5): the plan of `cordelia subscribe` in a clone for each case
-//! of rule 2.3, `--new` and the labels it makes, what stops a follow, and
-//! the route over a real clone on the disk.
+//! of rule 2.3, `--new` and the labels it makes, leaving, and the route
+//! over a real clone on the disk.
 
 use super::*;
 use crate::git_list::ListAt;
@@ -78,8 +78,10 @@ fn channel_line(channel: &Shared, without: &[[u8; 32]]) -> String {
     .unwrap()
 }
 
-/// What was read of a clone at `commit`, with `list` (or none).
-fn read_at(list: Option<&str>, commit: &str) -> ClonedRead {
+/// What device 0 read of its clone at `commit`, with `list` (or none):
+/// where it follows the repository, whether `commit` comes after the last
+/// one read is `comes_after`.
+fn read_on(s: &Several, list: Option<&str>, commit: &str, comes_after: bool) -> ClonedRead {
     ClonedRead {
         identity: Identity::from_address("https://example.org/team/project").unwrap(),
         remote: "origin".into(),
@@ -92,18 +94,32 @@ fn read_at(list: Option<&str>, commit: &str) -> ClonedRead {
             branch: "main".into(),
             fetched: None,
         },
+        after_last: follow_row(s)
+            .and_then(|row| row.last)
+            .map(|last| AfterLast {
+                last: last.commit,
+                comes_after,
+            }),
     }
 }
 
-/// The plan of device 0 in [`FOLDER`], with `list` at `commit`.
+/// The plan of device 0 in [`FOLDER`], of what was read.
+fn plan_of(s: &Several, read: &ClonedRead, new: bool) -> Out<Plan<Following>> {
+    plan(&s[0].conn, &s[0].identity, &own_relays(), FOLDER, read, new)
+}
+
+/// The plan of device 0 in [`FOLDER`], with `list` at `commit`, which
+/// comes after any commit it read last.
 fn planned(s: &Several, list: Option<&str>, commit: &str, new: bool) -> Out<Plan<Following>> {
-    plan(
-        &s[0].conn,
-        &s[0].identity,
-        &own_relays(),
-        FOLDER,
-        &read_at(list, commit),
-        new,
+    plan_of(s, &read_on(s, list, commit, true), new)
+}
+
+/// The yes's first line, of the list at `commit` from the clone at
+/// [`FOLDER`] through `origin`.
+fn reads(commit: &str) -> String {
+    format!(
+        "This reads the list of {REPOSITORY} at commit {commit}, from your clone at {FOLDER}, \
+         through its remote origin."
     )
 }
 
@@ -147,7 +163,7 @@ fn a_list_that_names_this_device_and_no_channel_is_followed_and_waits() {
     assert_eq!(
         planned.asks,
         [
-            &format!("This reads the list of {REPOSITORY} at commit {FIRST}, from your clone."),
+            &reads(FIRST),
             NO_CHANNEL_YET,
             "Your key is on the list, as bob-laptop.",
             "This follows example.org/team/project. A member's device hands you its channel \
@@ -198,7 +214,7 @@ fn a_device_on_the_list_of_a_channel_it_does_not_hold_waits_to_be_handed_it() {
     assert_eq!(
         planned.asks,
         [
-            &format!("This reads the list of {REPOSITORY} at commit {FIRST}, from your clone."),
+            &reads(FIRST),
             &format!(
                 "It names channel {}, which you do not hold.",
                 channel_words(&channel.id)
@@ -258,9 +274,8 @@ fn a_twin_of_this_devices_key_is_on_the_list() {
 /// A person who holds the channel the list names follows the repository,
 /// and the folder's agent is subscribed to it, with the channel shown by
 /// the person's name for it (rules 2.2 and 2.3). Where the agent
-/// subscribes already, it still follows. Subscribing again starts the row
-/// afresh at the commit read, whether or not it comes after the last one
-/// (rule 2.5). A holder whose key is not on the list follows too.
+/// subscribes already, it still follows, and never-back starts over (rule
+/// 2.5). A holder whose key is not on the list follows too.
 #[test]
 fn a_holder_follows_and_its_agent_is_subscribed() {
     let mut s = devices(1);
@@ -274,7 +289,7 @@ fn a_holder_follows_and_its_agent_is_subscribed() {
     let first = planned(&s, Some(&list), FIRST, false).unwrap();
     let words = channel_words(&channel.id);
     let head = [
-        format!("This reads the list of {REPOSITORY} at commit {FIRST}, from your clone."),
+        reads(FIRST),
         format!("It names the shared channel \"review\" (channel {words}), which you hold."),
         "Your key is on the list, as bob-laptop.".to_string(),
         format!("This follows {REPOSITORY}."),
@@ -293,9 +308,17 @@ fn a_holder_follows_and_its_agent_is_subscribed() {
     assert!(subscribed(&s, &channel));
     assert_eq!(follow_row(&s).unwrap().last.unwrap().commit, FIRST);
 
-    // Subscribed already: it still follows, at the commit now read.
+    // Subscribed already: it still follows. The yes says where this
+    // device read last, and names the commit now read.
     let later = s.tick() + 10;
     let again = planned(&s, Some(&list), SECOND, false).unwrap();
+    assert!(
+        again.asks.contains(&format!(
+            "\nThis device follows {REPOSITORY} already, from {FOLDER} at {FIRST}.\n"
+        )),
+        "{}",
+        again.asks
+    );
     assert!(
         again.asks.ends_with(
             "This follows example.org/team/project.\nproject subscribes to \"review\" already."
@@ -303,18 +326,16 @@ fn a_holder_follows_and_its_agent_is_subscribed() {
         "{}",
         again.asks
     );
+    assert!(!again.asks.contains("does not come after"));
     assert_ne!(again.asks, first.asks, "the yes names the commit");
     yes(&s, &again, later);
+    // Never-back starts over: the last commit read goes, and the list,
+    // and when it was first followed, stay (rule 2.5).
     let row = follow_row(&s).unwrap();
     assert_eq!(
-        (row.last.unwrap().commit, row.followed_at),
-        (SECOND.into(), later)
+        (row.last, row.followed_at, row.list.as_deref()),
+        (None, now + 1, Some(list.as_bytes()))
     );
-    // Never back does not hold for a subscribe: the row starts afresh at
-    // the commit read, here the earlier one.
-    let back = planned(&s, Some(&list), FIRST, false).unwrap();
-    yes(&s, &back, later + 1);
-    assert_eq!(follow_row(&s).unwrap().last.unwrap().commit, FIRST);
 
     // A holder that the list does not name follows too, and says so.
     let others = format!(
@@ -376,10 +397,20 @@ fn a_dropped_channel_is_refused() {
     assert!(follow_row(&s).is_none());
 }
 
+/// The gate line of rule 6, for `label` on the list of `name`.
+fn gate_line(label: &str, name: &str) -> String {
+    format!(
+        "{label} is on the list of {name} but was left out of it: nothing is handed over until \
+         its line goes, or it writes in the channel."
+    )
+}
+
 /// A key left out of the channel and still listed holds the list back
-/// (rule 1): the list names no channel, so the holder follows and waits,
-/// and no agent is subscribed. Once that key writes in the channel, the
-/// list names it again.
+/// (rule 1). A holder of the line's channel is still a holder (rule 2.3):
+/// it follows, the yes says the gate line of rule 6 for each such key,
+/// and that the folder's agent is subscribed once the list names the
+/// channel; nothing promises a hand-over. Once that key writes in the
+/// channel, the list names it again, and the agent is subscribed.
 #[test]
 fn a_key_left_out_and_still_listed_holds_the_list_back() {
     let s = devices(1);
@@ -393,14 +424,24 @@ fn a_key_left_out_and_still_listed_holds_the_list_back() {
         id(&s.key(0))
     );
     let held_back = planned(&s, Some(&list), FIRST, false).unwrap();
-    assert!(
-        held_back.asks.contains(NO_CHANNEL_YET),
-        "{}",
-        held_back.asks
+    let words = channel_words(&channel.id);
+    assert_eq!(
+        held_back.asks,
+        [
+            reads(FIRST),
+            format!("It names the shared channel \"review\" (channel {words}), which you hold."),
+            "Your key is on the list, as bob-laptop.".to_string(),
+            gate_line("alice-laptop", "review"),
+            format!("This follows {REPOSITORY}."),
+            "The agent of this folder, project, is subscribed to it once the list names it."
+                .to_string(),
+        ]
+        .join("\n")
     );
     assert!(matches!(held_back.what.then, Then::Nothing));
     yes(&s, &held_back, now + 1);
     assert!(!subscribed(&s, &channel));
+    assert!(follow_row(&s).is_some());
     // Alice writes there: she is in the channel, and the list names it.
     stores(
         &s,
@@ -414,6 +455,177 @@ fn a_key_left_out_and_still_listed_holds_the_list_back() {
         "{}",
         named.asks
     );
+}
+
+/// Rule 2.3's cases are taken on the list's channel line, whatever the gate
+/// says: a channel dropped, or moved from, is refused though a key left
+/// out holds the list back; and a device that does not hold the channel
+/// follows and is told the gate line, by the channel's words, with no
+/// hand-over promised.
+#[test]
+fn the_cases_of_rule_2_3_are_taken_on_the_line_whatever_the_gate_says() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let alice = member(1).public_key();
+    let gated_list = |channel: &Shared| {
+        format!(
+            "{}\n{} alice-laptop\n{} bob-laptop\n",
+            channel_line(channel, &[alice]),
+            id(&alice),
+            id(&s.key(0))
+        )
+    };
+    let dropped = holds(&s, 0, 8, "old", now);
+    sharing::make_drop(&s[0].conn, &s[0].identity, &dropped.id, "old", now + 1).unwrap();
+    assert_eq!(
+        refusal(planned(&s, Some(&gated_list(&dropped)), FIRST, false)).0,
+        "dropped"
+    );
+    let moved = holds(&s, 0, 9, "review", now + 2);
+    let mut to = crate::lists::tests::filing(10, "review-2");
+    to.came = Came::Moved(moved.id);
+    crate::shared::tests::acts(&s, 0, Do::Move { from: moved.id, to }, now + 3);
+    assert_eq!(
+        refusal(planned(&s, Some(&gated_list(&moved)), FIRST, false)).0,
+        "moved"
+    );
+    assert!(follow_row(&s).is_none());
+    // Not held: it follows, and says what holds the list back.
+    let other = Shared::of(11);
+    let planned = planned(&s, Some(&gated_list(&other)), FIRST, false).unwrap();
+    let words = channel_words(&other.id);
+    assert_eq!(
+        planned.asks,
+        [
+            reads(FIRST),
+            format!("It names channel {words}, which you do not hold."),
+            "Your key is on the list, as bob-laptop.".to_string(),
+            gate_line("alice-laptop", &format!("channel {words}")),
+            format!("This follows {REPOSITORY}. cordelia status shows how it goes."),
+        ]
+        .join("\n")
+    );
+}
+
+/// A person who holds the channel that the list's channel was made anew
+/// from is told to move to it (rule 6), and follows; nothing promises a
+/// hand-over.
+#[test]
+fn a_holder_of_the_channel_it_was_made_anew_from_is_told_to_move() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let old = holds(&s, 0, 7, "review", now);
+    let new = Shared::of(12);
+    let offer = kept_anew::OfferRow {
+        channel: old.id,
+        maker: member(1).public_key(),
+        rev: 1,
+        made: 0,
+        new_channel: new.id,
+        relays: cordelia_crypto::share::Relays::new(&[relay()])
+            .unwrap()
+            .to_bytes(),
+        sealed_to: vec![s.key(0)],
+        own_seal: None,
+        first_held: now,
+        stayed: false,
+    };
+    kept_anew::keep_offer(&s[0].conn, &offer).unwrap();
+    let list = format!(
+        "{}\n{} bob-laptop\n",
+        channel_line(&new, &[]),
+        id(&s.key(0))
+    );
+    let planned = planned(&s, Some(&list), FIRST, false).unwrap();
+    assert_eq!(
+        planned.asks,
+        [
+            reads(FIRST),
+            format!(
+                "It names channel {}, which you do not hold.",
+                channel_words(&new.id)
+            ),
+            "Your key is on the list, as bob-laptop.".to_string(),
+            "Run cordelia shared move review: the list names the channel it was made anew as."
+                .to_string(),
+            format!("This follows {REPOSITORY}."),
+        ]
+        .join("\n")
+    );
+    assert!(matches!(planned.what.then, Then::Nothing));
+}
+
+/// Following again, the yes says where this device read last; where the
+/// clone's commit does not come after it, that the list would go back
+/// (rules 2.5 and 3); and it names the clone and its remote, so that a yes
+/// is good for no other. A follow read again while the clone was read is
+/// refused as changed.
+#[test]
+fn following_again_says_where_it_read_last_and_whether_the_clone_goes_back() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let list = format!("{} bob-laptop\n", id(&s.key(0)));
+    yes(&s, &planned(&s, Some(&list), SECOND, false).unwrap(), now);
+    let back = plan_of(&s, &read_on(&s, Some(&list), FIRST, false), false).unwrap();
+    let asks: Vec<&str> = back.asks.lines().collect();
+    assert_eq!(
+        asks[..3],
+        [
+            reads(FIRST).as_str(),
+            &format!("This device follows {REPOSITORY} already, from {FOLDER} at {SECOND}."),
+            &format!(
+                "Your clone is at {FIRST}, which does not come after it: you would read an older \
+                 list."
+            ),
+        ]
+    );
+    let on = planned(&s, Some(&list), FIRST, false).unwrap();
+    assert!(!on.asks.contains("does not come after"), "{}", on.asks);
+    // Another remote, or another clone, at the same commit: another yes.
+    let mut upstream = read_on(&s, Some(&list), FIRST, true);
+    upstream.remote = "upstream".into();
+    assert_ne!(plan_of(&s, &upstream, false).unwrap().asks, on.asks);
+    let mut elsewhere = read_on(&s, Some(&list), FIRST, true);
+    elsewhere.top = PathBuf::from("/home/bob/Work/project-2");
+    assert_ne!(plan_of(&s, &elsewhere, false).unwrap().asks, on.asks);
+    // A read that checked another last commit than the follow now has.
+    let mut stale = read_on(&s, Some(&list), FIRST, true);
+    stale.after_last = None;
+    assert_eq!(refusal(plan_of(&s, &stale, false)).0, "changed");
+}
+
+/// Following again keeps what the node's reads need (rule 2.5): the list
+/// last read, the notices, the last key handed, and when it was first
+/// followed. Only the last commit read goes.
+#[test]
+fn following_again_keeps_the_list_and_the_notices() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let list = format!("{} bob-laptop\n", id(&s.key(0)));
+    yes(&s, &planned(&s, Some(&list), FIRST, false).unwrap(), now);
+    let dropped = follows::Notice {
+        of: follows::NoticeOf::Dropped {
+            key: member(1).public_key(),
+            label: "alice-laptop".into(),
+        },
+        commit: FIRST.into(),
+        at: now,
+    };
+    follows::notice(conn, REPOSITORY, &dropped).unwrap();
+    follows::set_last_handed(conn, REPOSITORY, &member(2).public_key()).unwrap();
+    let changed = format!("# the team\n{list}");
+    yes(
+        &s,
+        &planned(&s, Some(&changed), SECOND, false).unwrap(),
+        now + 5,
+    );
+    let row = follow_row(&s).unwrap();
+    assert_eq!(row.last, None);
+    assert_eq!(row.followed_at, now);
+    assert_eq!(row.list.as_deref(), Some(list.as_bytes()));
+    assert_eq!(row.last_handed, Some(member(2).public_key()));
+    assert_eq!(follows::notices(conn, REPOSITORY).unwrap(), [dropped]);
 }
 
 /// A list that does not parse is refused, naming its line, and nothing is
@@ -523,8 +735,8 @@ fn new_makes_the_channel_follows_and_says_the_lines_to_add() {
 }
 
 /// `--new` is refused where the list has a channel line already, held
-/// back or not, and where the name `owner/name` is taken, with today's
-/// refusal; and nothing is done.
+/// back or not, and where another channel is filed as `owner/name`, with
+/// rule 6's line; and nothing is done.
 #[test]
 fn new_is_refused_where_the_list_names_a_channel_or_the_name_is_taken() {
     let s = devices(1);
@@ -549,9 +761,86 @@ fn new_is_refused_where_the_list_names_a_channel_or_the_name_is_taken() {
     }
     holds(&s, 0, 5, "team/project", now);
     let filed = sharing::filed(&s[0].conn).unwrap().len();
-    assert_eq!(refusal(planned(&s, Some(&me), FIRST, true)).0, "name_taken");
+    assert_eq!(
+        refusal(planned(&s, Some(&me), FIRST, true)),
+        (
+            "name_taken",
+            "You file another channel as team/project: rename it with cordelia shared rename."
+                .to_string()
+        )
+    );
     assert_eq!(sharing::filed(&s[0].conn).unwrap().len(), filed);
     assert!(follow_row(&s).is_none());
+}
+
+/// `--new` whose subscription is refused, the agents holding the most
+/// subscriptions there may be, makes nothing: no channel is filed or held,
+/// nothing is stored, and nothing is followed, as the channel it made is
+/// undone with the refusal.
+#[test]
+fn new_whose_subscription_is_refused_makes_nothing() {
+    use cordelia_core::protocol::SHARED_MAX_SUBSCRIPTIONS;
+    let s = devices(1);
+    let now = s.now + 10;
+    let review = holds(&s, 0, 7, "review", now);
+    for n in 0..SHARED_MAX_SUBSCRIPTIONS {
+        let subscription = Subscription {
+            channel: review.id,
+            agent: format!("agent-{n}"),
+            subscribed: true,
+        };
+        crate::shared::tests::acts(&s, 0, Do::Subscribe(subscription), now);
+    }
+    let me = format!("{} bob-laptop\n", id(&s.key(0)));
+    let filed = sharing::filed(&s[0].conn).unwrap();
+    let held = kept::channels(&s[0].conn).unwrap().len();
+    let stored = s[0].stored().len();
+    let planned = planned(&s, Some(&me), FIRST, true).unwrap();
+    let refused = make(&s[0].conn, &s[0].identity, &planned.what, now + 1);
+    assert_eq!(refusal(refused).0, "too_many_subscriptions");
+    assert_eq!(sharing::filed(&s[0].conn).unwrap(), filed);
+    assert_eq!(kept::channels(&s[0].conn).unwrap().len(), held);
+    assert_eq!(s[0].stored().len(), stored);
+    assert!(follow_row(&s).is_none());
+}
+
+/// `--new` is refused where the list, with the lines it would say to add,
+/// would name more than 64 devices (rule 1); at 64 it is not.
+#[test]
+fn new_is_refused_where_the_list_would_pass_64_devices() {
+    let s = devices(1);
+    let others = |count: u32| -> String {
+        (1..=count)
+            .map(|n| format!("{} member-{n}\n", id(&member(n).public_key())))
+            .collect()
+    };
+    assert!(planned(&s, Some(&others(63)), FIRST, true).is_ok());
+    assert_eq!(
+        refusal(planned(&s, Some(&others(64)), FIRST, true)),
+        (
+            "channel_full",
+            format!(
+                "With your devices, the list of {REPOSITORY} would name 65, and a list names 64 \
+                 at most: delete some lines in a pull request first. Nothing was made."
+            )
+        )
+    );
+}
+
+/// The whole read of a clone is given one deadline: past it, no step of git
+/// begins, and it says so plainly (the route's twenty seconds).
+#[test]
+fn a_read_past_its_deadline_is_refused_plainly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let git = Git::under(tmp.path()).unwrap();
+    let past = Instant::now();
+    assert_eq!(
+        refusal(read_with(&git, tmp.path(), None, &[], past, 20)),
+        (
+            "late",
+            "git did not answer in 20 seconds, so nothing was done.".to_string()
+        )
+    );
 }
 
 /// Where the subscription is refused after the channel is made, what was
@@ -627,58 +916,6 @@ fn labels_for_the_list_are_made_from_each_devices_label() {
     );
     // Empty: a number alone.
     assert_eq!(given(&["", "笔记本", "!!"], &[]), ["-2", "-3", "-4"]);
-}
-
-/// `shared drop` of a channel stops every follow whose latest list names
-/// that channel, held back or not, in the drop's write, and says so; a
-/// follow whose list names another channel, or none, goes on (rule 2.5).
-#[test]
-fn a_drop_stops_each_follow_whose_list_names_the_channel() {
-    let s = devices(1);
-    let now = s.now + 10;
-    let conn = &s[0].conn;
-    let review = holds(&s, 0, 7, "review", now);
-    let design = holds(&s, 0, 8, "design", now);
-    let me = format!("{} bob-laptop\n", id(&s.key(0)));
-    let alice = member(1).public_key();
-    for (repository, list) in [
-        (
-            "example.org/team/a",
-            format!("{}\n{me}", channel_line(&review, &[])),
-        ),
-        (
-            "example.org/team/b",
-            format!("{}\n{me}", channel_line(&review, &[alice])),
-        ),
-        (
-            "example.org/team/c",
-            format!("{}\n{me}", channel_line(&design, &[])),
-        ),
-        ("example.org/team/d", me.clone()),
-    ] {
-        follows::follow(conn, repository, "origin", FOLDER, now).unwrap();
-        let read = LastRead {
-            commit: FIRST.into(),
-            at: now,
-            from_clone: true,
-        };
-        follows::read_done(conn, repository, &read, list.as_bytes()).unwrap();
-    }
-    let said = sharing::make_drop(conn, &s[0].identity, &review.id, "review", now + 1).unwrap();
-    assert_eq!(
-        said,
-        format!(
-            "Dropped \"review\" (channel {}): your devices hold it no more. This device follows \
-             example.org/team/a no more. This device follows example.org/team/b no more.",
-            channel_words(&review.id)
-        )
-    );
-    let left: Vec<String> = follows::follows(conn)
-        .unwrap()
-        .into_iter()
-        .map(|follow| follow.identity)
-        .collect();
-    assert_eq!(left, ["example.org/team/c", "example.org/team/d"]);
 }
 
 /// A device that leaves its person follows nothing after (rule 2.5): every
@@ -779,6 +1016,26 @@ impl OnDisk {
         );
         commit
     }
+
+    /// Commit `list` on a branch with no history, and make it the remote's
+    /// default branch: a commit that comes after no other. Returns it.
+    fn rewritten(&self, list: &str) -> String {
+        git(
+            &self.home,
+            &self.top,
+            &["checkout", "--quiet", "--orphan", "side"],
+        );
+        self.fetched(list)
+    }
+
+    /// Make `commit` the remote's default branch.
+    fn at(&self, commit: &str) {
+        git(
+            &self.home,
+            &self.top,
+            &["update-ref", "refs/remotes/origin/main", commit],
+        );
+    }
 }
 
 /// What the route answered: its status, and its body.
@@ -809,9 +1066,12 @@ async fn read_asked(state: &crate::state::AppState) -> bool {
 }
 
 /// The route, over a real clone on the disk and no server: it follows the
-/// repository at the commit its yes named, and asks the node to read the
-/// list; a second subscribe, at a new commit, needs a new yes, and a yes
-/// to the old one is refused as changed, with nothing done; a mapped
+/// repository at the commit its yes named, from the clone and remote its
+/// yes named, and asks the node to read the list; a second subscribe, at a
+/// new commit, needs a new yes, and a yes to the old one is refused as
+/// changed, with nothing done; its yes says where this device read last,
+/// and that a commit that does not come after it would read an older list,
+/// and, once given, starts never-back over and keeps the list; a mapped
 /// folder below the clone's top follows the clone, by its top, and the
 /// command itself sends the top from any folder of it; a folder that is
 /// not mapped, and a mapped one in no repository, are refused.
@@ -847,7 +1107,8 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
     let asks = looked["asks"].as_str().unwrap().to_string();
     assert!(
         asks.starts_with(&format!(
-            "This reads the list of {REPOSITORY} at commit {first}, from your clone."
+            "This reads the list of {REPOSITORY} at commit {first}, from your clone at {top}, \
+             through its remote origin.\n"
         )),
         "{asks}"
     );
@@ -873,10 +1134,30 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
     assert!(!read_asked(&state).await);
     let (_, looked) = asked(&state, json!({ "folder": top, "look": true })).await;
     let again = looked["asks"].as_str().unwrap().to_string();
+    let follows_already =
+        format!("This device follows {REPOSITORY} already, from {top} at {first}.");
     assert!(again.contains(&second), "{again}");
+    assert!(again.contains(&follows_already), "{again}");
+    assert!(!again.contains("does not come after"), "{again}");
+    // A history rewritten: its commit does not come after the last one
+    // read, and the yes says so, as git in the clone finds it.
+    let side = clone.rewritten(&format!("# rewritten\n{me}"));
+    let (_, looked) = asked(&state, json!({ "folder": top, "look": true })).await;
+    let back = looked["asks"].as_str().unwrap();
+    assert!(
+        back.contains(&format!(
+            "{follows_already}\nYour clone is at {side}, which does not come after it: you \
+             would read an older list."
+        )),
+        "{back}"
+    );
+    clone.at(&second);
     let (status, _) = asked(&state, json!({ "folder": top, "said_yes_to": again })).await;
     assert_eq!(status, 200);
-    assert_eq!(row(&state).unwrap().last.unwrap().commit, second);
+    let again = row(&state).unwrap();
+    assert_eq!(again.last, None, "never-back starts over");
+    assert_eq!(again.followed_at, followed.followed_at);
+    assert_eq!(again.list.as_deref(), Some(me.as_bytes()));
 
     // A mapped folder below the top follows the clone, by its top.
     {
