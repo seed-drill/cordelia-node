@@ -39,7 +39,8 @@
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{
-    MEMBERS_FILE_MAX_BYTES, SEALED_SECRET_BYTES, SHARED_MAX_KEYS, SHARED_OFFER_DELIVERED_SECS,
+    MEMBERS_FILE_MAX_BYTES, SEALED_SECRET_BYTES, SHARED_MAX_DROPPED, SHARED_MAX_KEYS,
+    SHARED_OFFER_DELIVERED_SECS,
 };
 use cordelia_crypto::acts::{Came, Filing};
 use cordelia_crypto::bech32::encode_public_key;
@@ -615,7 +616,7 @@ fn staying_with_no_question(
         }
         stay.push(*key);
     }
-    let line = new_line_of(conn, row, &listed, &stay)?;
+    let line = new_line_of(conn, held, row, &[], &stay)?;
     Ok((
         stay,
         LeftOut {
@@ -724,7 +725,7 @@ pub fn anew_at_removal(
             Ok(made) => {
                 for ((row, _, left, _), (new, line)) in past.iter().zip(made) {
                     said.push(made_anew_past_a_bound_line(&row.name, &new, *left));
-                    said.extend(line_said(line));
+                    said.extend(line);
                 }
             }
             Err(Failed::Refused(refusal)) => {
@@ -833,7 +834,7 @@ fn anew_one_at_removal(
     match made {
         Ok((new, line)) => {
             let mut said = vec![made_anew_line(&row.name, &new, left)];
-            said.extend(line_said(line));
+            said.extend(line);
             Ok(said)
         }
         Err(Failed::Refused(refusal)) => Ok(vec![could_not_be_made_anew(&row.name, &refusal.line)]),
@@ -892,7 +893,7 @@ pub(crate) fn recovered(conn: &Connection, gone: &[[u8; 32]], now: i64) -> Resul
 /// old one's place, with each subscription of the old one; this device's
 /// empty anew record in the new one; and the new channel line, its keys
 /// after `without` those of `line`, kept (decision 2026-11-06 (joining),
-/// rule 5). Returns the new channel, and its line.
+/// rule 5). Returns the new channel, and what it says of its line.
 #[allow(clippy::too_many_arguments)]
 fn make_anew_of(
     conn: &Connection,
@@ -904,7 +905,7 @@ fn make_anew_of(
     at_removal: Option<LeftOut>,
     line: &NewLine,
     now: i64,
-) -> Out<([u8; 32], Option<String>)> {
+) -> Out<([u8; 32], Vec<String>)> {
     let held = standing(conn)?;
     let agents: Vec<String> = crate::shared_messages::in_force(conn)?
         .into_iter()
@@ -1061,14 +1062,14 @@ type PastBound = (Channel, Vec<[u8; 32]>, LeftOut, NewLine);
 /// for all: an act writes a list of the new generation, in which a channel
 /// past a bound that it does not drop is carried by no list, and is
 /// forgotten. Each new channel line is kept (decision 2026-11-06
-/// (joining), rule 5). Returns the new channels, each with its line, in
-/// the order of `past`.
+/// (joining), rule 5). Returns the new channels, each with what it says of
+/// its line, in the order of `past`.
 fn make_anew_past_bound(
     conn: &Connection,
     identity: &NodeIdentity,
     past: &[PastBound],
     now: i64,
-) -> Out<Vec<([u8; 32], Option<String>)>> {
+) -> Out<Vec<([u8; 32], Vec<String>)>> {
     let held = standing(conn)?;
     let mut refusal = None;
     let mut made = Vec::new();
@@ -1114,73 +1115,94 @@ pub const PUT_THE_LINE: &str = "If this channel follows a repository's list, put
 /// 2026-11-06 (joining), rule 5), worked out before it is made.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NewLine {
-    /// Every key it leaves out that it can name, each once: the keys the
-    /// person removed first, then the others in the order listed.
+    /// Every key it leaves out that it names, each once: the keys the person
+    /// removed first, then those a person left out, in the order listed.
     pub left_out: Vec<[u8; 32]>,
     /// The keys its line names after `without`, each once.
     pub without: Vec<[u8; 32]>,
 }
 
-/// Who the making anew of the channel of `row` leaves out, by its
-/// `listing`, with the keys of `stay` staying (decision 2026-11-06
-/// (joining), rule 5). It decides nothing of who stays.
+/// Who the making anew of the channel of `row` leaves out, with the keys of
+/// `stay` staying, where a person left out each key of `chosen` that does
+/// not stay (decision 2026-11-06 (joining), rule 5). It decides nothing of
+/// who stays.
 ///
-/// - **Left out:** each key the person removed that held the channel: those
-///   listed, and those removed by the removal that left it not clean,
-///   since each held every seed of the person's, whether or not it wrote
-///   there.
-///   Then each key asked about that does not stay. A twin counts as its key.
-///   The rows the table let go, and anyone who wrote there past a bound, are
-///   in no listing and cannot be named: where one is listed, it is handed
-///   the new channel, which errs toward the list.
-/// - **After `without`,** where this device follows a repository whose
-///   list's channel line names the channel: the keys the person removed,
-///   whatever the list says, so that a removal names the device it removed;
-///   then the current line's `without` keys that the list still names,
-///   carried over, so that a later making anew never frees a key left out
-///   before; then the others left out that the list names. A key that stays
-///   is named in neither.
-/// - **Where it follows no such repository,** every key left out, and the
-///   person may cut those that are not listed. It cannot know the current
-///   line's `without` keys (§10, the known limit).
+/// - **The list** is that of the repository this device follows whose
+///   channel line names the channel, or a channel it was made anew or moved
+///   from, back along the moves this device keeps: a line not merged yet
+///   leaves the list naming an earlier channel.
+/// - **Left out,** and named after `without`: first each key the person
+///   removed, as this device knows them (`removed_known`), that the list
+///   names, or each, where no list does; a removed device held every seed
+///   of the person's, whether or not it wrote there. Then each key of
+///   `chosen` that the list names, or each, where no list does.
+/// - **Carried over,** and named after `without` too: the `without` keys of
+///   the list's channel line, and the keys this device's own makings anew
+///   left out back along the moves, that the list still names, or each,
+///   where no list does, so that a later making anew never frees a key
+///   left out before. What another device's making anew left out cannot be
+///   known here (§10, the known limit).
+/// - **A twin counts as its key.** A key that stays is neither named nor
+///   kept, but a key the person removed is named though its twin stays.
+///   The rows the table let go, and anyone who wrote there past a bound,
+///   are in no listing and cannot be named: where one is listed, it is
+///   handed the new channel, which errs toward the list.
+///
+/// A removal and a recovery pass no `chosen`: the keys they leave out only
+/// for room or because they had not moved are not named, and the list
+/// decides for them.
 fn new_line_of(
     conn: &Connection,
+    held: &Held,
     row: &Channel,
-    listing: &Listing,
+    chosen: &[[u8; 32]],
     stay: &[[u8; 32]],
 ) -> Result<NewLine, PersonError> {
     let among = |keys: &[[u8; 32]], key: &[u8; 32]| keys.iter().any(|one| same_key(one, key));
     let once = |keys: &mut Vec<[u8; 32]>, key: &[u8; 32]| {
-        if !keys.iter().any(|one| same_key(one, key)) {
+        if !among(keys, key) {
             keys.push(*key);
         }
     };
-    let mut removed = listing.removed.clone();
-    if let Some(mark) = st(rows::not_clean_of(conn, &row.channel))? {
-        removed.extend(removed_at(conn, mark.since)?.unwrap_or_default());
+    // Back along the moves, to the channel the list names: what this
+    // device's makings anew left out on the way is carried over.
+    let made = st(follows::made_lines(conn))?;
+    let mut carried: Vec<[u8; 32]> = Vec::new();
+    let mut list = None;
+    let mut channel = row.channel;
+    for _ in 0..=SHARED_MAX_DROPPED {
+        list = crate::following::list_naming(conn, &channel)?;
+        if list.is_some() {
+            break;
+        }
+        if let Some(made) = made.iter().find(|made| made.new_channel == channel) {
+            carried.extend(&made.left_out);
+        }
+        match st(kept::channel(conn, &channel))?.map(|row| row.came) {
+            Some(kept::Came::Moved(from)) => channel = from,
+            _ => break,
+        }
     }
+    if let Some(list) = &list {
+        let current = list.channel.iter().flat_map(|line| &line.without);
+        carried.splice(0..0, current.copied());
+    }
+    let named = |key: &[u8; 32]| list.as_ref().is_none_or(|list| list.lists(key));
+    let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     let mut line = NewLine::default();
-    for key in &removed {
+    for key in removed.iter().filter(|key| named(key)) {
         once(&mut line.left_out, key);
     }
     line.without = line.left_out.clone();
-    for key in listing.asked.iter().filter(|key| !among(stay, key)) {
-        once(&mut line.left_out, key);
+    for key in carried.iter().filter(|key| named(key) && !among(stay, key)) {
+        once(&mut line.without, key);
     }
-    let others = &line.left_out[line.without.len()..];
-    match crate::following::list_naming(conn, &row.channel)? {
-        Some(list) => {
-            let current = list.channel.iter().flat_map(|current| &current.without);
-            for key in current.chain(others) {
-                if list.lists(key) && !among(stay, key) {
-                    once(&mut line.without, key);
-                }
-            }
-        }
-        None => {
-            for key in others {
-                once(&mut line.without, key);
-            }
+    // Every key a person left out is kept, whether or not the list names
+    // it: the status compares it with the list as it comes to be.
+    for key in chosen.iter().filter(|key| !among(stay, key)) {
+        once(&mut line.left_out, key);
+        if named(key) {
+            once(&mut line.without, key);
         }
     }
     Ok(line)
@@ -1191,22 +1213,23 @@ fn new_line_of(
 /// rule 5), kept with the keys it left out, for the status to show: in the
 /// write that made it, after its row ([`rows::made`]). A line longer than
 /// a list holds could never be put in one, so the keys past that are not
-/// named, as keys that cannot be named are not. A line that would not
-/// read back, as of a card whose relays a list cannot name, is not said,
-/// and nothing is kept: no list could name its channel. Returns the line.
+/// named, as keys that cannot be named are not, and it says so. A line that
+/// would not read back, as of a card whose relays a list cannot name, is
+/// not said, and nothing is kept: no list could name its channel. Returns
+/// the lines it says.
 fn keep_line(
     conn: &Connection,
     old: &[u8; 32],
     card: &Card,
     line: &NewLine,
-) -> Result<Option<String>, PersonError> {
+) -> Result<Vec<String>, PersonError> {
     let mut named = ChannelLine {
         channel: card.channel_id()?,
         relays: card.relays().keys().to_vec(),
         without: Vec::new(),
     };
     let Ok(bare) = named.to_line() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
     // The line's length without its count, which is 0 in the bare line;
     // each key adds itself and a space, and the count its digits.
@@ -1221,16 +1244,28 @@ fn keep_line(
         named.without.push(*key);
     }
     let Ok(said) = named.to_line() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    st(follows::made_line(conn, old, &line.left_out, &said))?;
-    Ok(Some(said))
+    let cut = (line.without.len() - named.without.len()) as u64;
+    st(follows::made_line(conn, old, &line.left_out, &said, cut))?;
+    Ok(line_said(Some(said), cut))
 }
 
-/// The lines a making anew says of its new channel line, where it has one.
-fn line_said(line: Option<String>) -> Vec<String> {
-    line.map(|line| vec![PUT_THE_LINE.to_string(), line])
-        .unwrap_or_default()
+/// The lines a making anew says of its new channel line, where it has one,
+/// and of the keys left out that a cut line does not name.
+fn line_said(line: Option<String>, cut: u64) -> Vec<String> {
+    let Some(line) = line else {
+        return Vec::new();
+    };
+    let mut said = vec![PUT_THE_LINE.to_string(), line];
+    if cut > 0 {
+        said.push(format!(
+            "The line is cut: {} left out {} not on it.",
+            sharing::counted(cut, "key"),
+            if cut == 1 { "is" } else { "are" }
+        ));
+    }
+    said
 }
 
 /// What `shared anew` lists of a channel's table of keys before it asks
@@ -1247,7 +1282,7 @@ pub struct Listing {
     /// and not kept at a removal, which keeps the table alone (rule 24).
     pub not_moved: Vec<[u8; 32]>,
     /// The keys listed as left out because the person removed them.
-    pub removed: Vec<[u8; 32]>,
+    pub removed: usize,
     /// How many rows the table let go, left out and counted.
     pub let_go: u64,
 }
@@ -1338,7 +1373,7 @@ fn listing_of(
             listing
                 .lines
                 .push(format!("  {form}: left out, a device you removed"));
-            listing.removed.push(key.key);
+            listing.removed += 1;
             continue;
         }
         let first = match (key.first_held, key.first_refused) {
@@ -1386,7 +1421,7 @@ fn listing_of(
                 listing
                     .lines
                     .push(format!("  {form}: left out, a device you removed"));
-                listing.removed.push(key);
+                listing.removed += 1;
                 continue;
             }
             listing.lines.push(format!("  {form}"));
@@ -1538,7 +1573,7 @@ pub fn anew_plan(
         return refused("", STAY_PAST_64.into());
     }
     let left_out = listing.asked.len() - (stay.len() - listing.own_devices.len());
-    let line = new_line_of(conn, &row, &listing, &stay)?;
+    let line = new_line_of(conn, &held, &row, &listing.asked, &stay)?;
     let at: Vec<String> = relays
         .iter()
         .map(|key| relay_shown(own_relays, key))
@@ -1554,10 +1589,7 @@ pub fn anew_plan(
         sharing::counted(stay.len() as u64, "key"),
         // The rows the table let go are an upper bound (`past_a_bound_line`).
         if listing.let_go > 0 { "up to " } else { "" },
-        sharing::counted(
-            (left_out + listing.removed.len()) as u64 + listing.let_go,
-            "key"
-        )
+        sharing::counted((left_out + listing.removed) as u64 + listing.let_go, "key")
     );
     Ok((
         listing,
@@ -1613,7 +1645,7 @@ pub fn make_anew(
         channel_words(&new),
         at.join(" and ")
     )];
-    lines.extend(line_said(line));
+    lines.extend(line);
     lines.extend(sharing::who_wrote(
         conn,
         &held,
@@ -2643,11 +2675,9 @@ pub(crate) fn made_at_the_last_removal(
             true => made_anew_past_a_bound_line(&name, &made.new_channel, left),
             false => made_anew_line(&name, &made.new_channel, left),
         });
-        let line = kept_lines
-            .iter()
-            .find(|kept| kept.channel == made.channel)
-            .and_then(|kept| kept.line.clone());
-        lines.extend(line_said(line));
+        if let Some(kept) = kept_lines.iter().find(|kept| kept.channel == made.channel) {
+            lines.extend(line_said(kept.line.clone(), kept.cut));
+        }
     }
     Ok(lines)
 }

@@ -285,18 +285,20 @@ fn the_nodes_shares_and_what_a_making_anew_printed_are_kept() {
             &conn,
             &[0; 32],
             &[[7; 32], [8; 32]],
-            "channel 09 without 2 a b"
+            "channel 09 without 2 a b",
+            3
         )
         .unwrap()
     );
     assert!(
-        !made_line(&conn, &[4; 32], &[], "x").unwrap(),
+        !made_line(&conn, &[4; 32], &[], "x", 0).unwrap(),
         "not made here"
     );
     let made = &made_lines(&conn).unwrap()[0];
     assert_eq!(made.new_channel, [9; 32]);
     assert_eq!(made.left_out, vec![[7; 32], [8; 32]]);
     assert_eq!(made.line.as_deref(), Some("channel 09 without 2 a b"));
+    assert_eq!(made.cut, 3);
 }
 
 /// What a making anew printed is kept within the bounds of schema step 33,
@@ -319,12 +321,12 @@ fn what_a_making_anew_printed_is_kept_within_its_bounds() {
         })
         .collect();
     let longest = "c".repeat(MEMBERS_FILE_MAX_BYTES);
-    assert!(made_line(&conn, &[0; 32], &keys, &longest).unwrap());
+    assert!(made_line(&conn, &[0; 32], &keys, &longest, 0).unwrap());
     let made = &made_lines(&conn).unwrap()[0];
     assert_eq!(made.left_out, keys[..SHARED_KEYS_KEPT]);
     assert_eq!(made.line.as_deref(), Some(longest.as_str()));
     let longer = "c".repeat(MEMBERS_FILE_MAX_BYTES + 1);
-    assert!(made_line(&conn, &[0; 32], &keys[..1], &longer).unwrap());
+    assert!(made_line(&conn, &[0; 32], &keys[..1], &longer, 0).unwrap());
     let made = &made_lines(&conn).unwrap()[0];
     assert_eq!((made.left_out.len(), made.line.as_deref()), (1, None));
 }

@@ -19,8 +19,8 @@
 //!   key's with its label, which its line may no longer give.
 
 //! - **The node's shares** (`shared_shares.by_node`), and **what a making
-//!   anew left out and the line it printed** (`shared_anew_made.left_out`
-//!   and `line`, rule 5).
+//!   anew left out, the line it printed and how many keys it was cut short
+//!   of** (`shared_anew_made.left_out`, `line` and `cut`, rule 5).
 //!
 //! Nothing here reads a list or decides anything: that is done where these
 //! are read. Every time here is the node's.
@@ -542,25 +542,27 @@ pub fn shares_by_node(conn: &Connection) -> Result<Vec<NodeShare>, CordeliaError
     .map_err(storage)
 }
 
-/// What the making anew of `channel` here left out, and the channel line
-/// it printed (rule 5). Nothing is done where this device did not make it
-/// anew. Write it after `shared_anew::made`, in the same write: `made`
-/// writes its row afresh. The row keeps the first of the keys up to the
-/// 1,024 rows a table keeps, and a line no longer than a list, as schema
-/// step 33 bounds them, so that a making anew never fails on them: a
-/// longer line is not kept.
+/// What the making anew of `channel` here left out, the channel line it
+/// printed, and how many keys that line was cut short of, to fit a list
+/// (rule 5). Nothing is done where this device did not make it anew. Write
+/// it after `shared_anew::made`, in the same write: `made` writes its row
+/// afresh. The row keeps the first of the keys up to the 1,024 rows a table
+/// keeps, and a line no longer than a list, as schema step 33 bounds them,
+/// so that a making anew never fails on them: a longer line is not kept.
 pub fn made_line(
     conn: &Connection,
     channel: &[u8; 32],
     left_out: &[[u8; 32]],
     line: &str,
+    cut: u64,
 ) -> Result<bool, CordeliaError> {
     let left_out: Vec<u8> = left_out[..left_out.len().min(SHARED_KEYS_KEPT)].concat();
     let line = (line.len() <= MEMBERS_FILE_MAX_BYTES).then_some(line);
+    let cut = i64::try_from(cut).unwrap_or(i64::MAX);
     let changed = conn
         .execute(
-            "UPDATE shared_anew_made SET left_out = ?2, line = ?3 WHERE channel = ?1",
-            params![&channel[..], left_out, line],
+            "UPDATE shared_anew_made SET left_out = ?2, line = ?3, cut = ?4 WHERE channel = ?1",
+            params![&channel[..], left_out, line, cut],
         )
         .map_err(storage)?;
     Ok(changed == 1)
@@ -574,12 +576,14 @@ pub struct MadeLine {
     pub new_channel: [u8; 32],
     pub left_out: Vec<[u8; 32]>,
     pub line: Option<String>,
+    /// How many keys the line was cut short of, to fit a list.
+    pub cut: u64,
 }
 
 /// Every channel this device made anew, with what it left out and printed.
 pub fn made_lines(conn: &Connection) -> Result<Vec<MadeLine>, CordeliaError> {
     conn.prepare(
-        "SELECT channel, new_channel, left_out, line FROM shared_anew_made
+        "SELECT channel, new_channel, left_out, line, cut FROM shared_anew_made
              ORDER BY made_at, channel",
     )
     .map_err(storage)?
@@ -592,6 +596,7 @@ pub fn made_lines(conn: &Connection) -> Result<Vec<MadeLine>, CordeliaError> {
             new_channel: new_channel.try_into().unwrap_or([0; 32]),
             left_out: left_out.unwrap_or_default().as_chunks::<32>().0.to_vec(),
             line: row.get(3)?,
+            cut: row.get::<_, i64>(4)?.max(0) as u64,
         })
     })
     .map_err(storage)?
