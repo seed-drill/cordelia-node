@@ -2932,10 +2932,11 @@ pub const MEMBERS_FETCH_MAX_SECS: u64 = 60;
 pub const MEMBERS_GIT_TERM_SECS: u64 = 2;
 
 /// The most the node's own repository of a repository's list may hold on
-/// the disk (decision 2026-11-06 (joining), rule 3): 64 MiB. Each fetch
-/// adds what a commit changed, and nothing is pruned, so a repository
-/// that holds more before a fetch is deleted, and the list is fetched
-/// afresh.
+/// the disk (decision 2026-11-06 (joining), rule 3): 64 MiB. It holds
+/// trees and the list's file alone, a few MiB even for a large
+/// repository. Each fetch adds the trees a commit changed, and nothing is
+/// pruned, so a repository that holds more before a fetch is deleted, and
+/// the list is fetched afresh.
 pub const MEMBERS_REPO_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 // Checked at compile time (decision 2026-10-10 §14). The largest card is

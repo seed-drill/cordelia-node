@@ -173,6 +173,9 @@ pub enum GitRan {
     TooMuch,
     /// It had not ended by its deadline, and was stopped.
     Late,
+    /// What watched it said to stop it, and it was stopped
+    /// ([`git_run_watched_by`]).
+    Stopped,
     /// It could not be run.
     NotRun(std::io::Error),
 }
@@ -188,6 +191,19 @@ pub enum GitRan {
 /// group's ID cannot be another's: whether git has ended is asked without
 /// reaping it.
 pub fn git_run_by(git: &mut Command, deadline: std::time::Instant, bounds: GitBounds) -> GitRan {
+    git_run_watched_by(git, deadline, bounds, &mut || false)
+}
+
+/// [`git_run_by`], with `stop_now` asked as git runs, each time git is
+/// looked at: where it says so, git is stopped, by TERM and then KILL, and
+/// gives [`GitRan::Stopped`]. For a bound that git's output does not show,
+/// as what a fetch writes to the disk.
+pub fn git_run_watched_by(
+    git: &mut Command,
+    deadline: std::time::Instant,
+    bounds: GitBounds,
+    stop_now: &mut dyn FnMut() -> bool,
+) -> GitRan {
     use std::process::Stdio;
     use std::time::{Duration, Instant};
     #[cfg(unix)]
@@ -217,6 +233,10 @@ pub fn git_run_by(git: &mut Command, deadline: std::time::Instant, bounds: GitBo
         if Instant::now() >= deadline {
             stop(&mut child, bounds.term_grace);
             return GitRan::Late;
+        }
+        if stop_now() {
+            stop(&mut child, bounds.term_grace);
+            return GitRan::Stopped;
         }
         if let Some(reading) = stdout.take_if(|reading| reading.is_finished()) {
             match reading.join() {
@@ -2210,6 +2230,43 @@ mod tests {
         assert!(began.elapsed() < Duration::from_secs(10));
         let pid = std::fs::read_to_string(&pid_file).unwrap();
         assert!(!is_running(pid.trim()));
+    }
+
+    /// Git that what watches it says to stop is stopped as it runs, long
+    /// before its deadline, and nothing of it is left running; where it
+    /// says nothing, git runs as `git_run_by` runs it.
+    #[cfg(unix)]
+    #[test]
+    fn test_git_run_watched_by_stops_git_when_told() {
+        use std::time::{Duration, Instant};
+        let tmp = tempfile::tempdir().unwrap();
+        let grows = tmp.path().join("grows");
+        let pid_file = tmp.path().join("pid");
+        let mut git = script(
+            tmp.path(),
+            "echo $$ > \"$PID_FILE\"\nwhile :; do echo more >> \"$GROWS\"; sleep 0.01; done",
+        );
+        git.env("PID_FILE", &pid_file).env("GROWS", &grows);
+        let began = Instant::now();
+        let mut too_much = || std::fs::metadata(&grows).is_ok_and(|meta| meta.len() > 100);
+        let ran = git_run_watched_by(
+            &mut git,
+            began + Duration::from_secs(30),
+            bounds(64, 64, 100),
+            &mut too_much,
+        );
+        assert!(matches!(ran, GitRan::Stopped));
+        assert!(began.elapsed() < Duration::from_secs(10));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        assert!(!is_running(pid.trim()));
+        let mut git = script(tmp.path(), "echo quick");
+        let ran = git_run_watched_by(
+            &mut git,
+            Instant::now() + Duration::from_secs(30),
+            bounds(64, 64, 100),
+            &mut || false,
+        );
+        assert!(matches!(ran, GitRan::Ended { ref stdout, .. } if stdout == b"quick\n"));
     }
 
     /// At its deadline, git is sent TERM first, and given its grace to

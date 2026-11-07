@@ -453,6 +453,12 @@ fn test_every_failure_says_why_and_has_a_word_of_its_own() {
         ListFailed::GitNotRun("No such file or directory".to_string()),
         ListFailed::Late { secs: 60 },
         ListFailed::Busy,
+        ListFailed::OldGitNoFetch {
+            version: Some(GitVersion {
+                major: 2,
+                minor: 39,
+            }),
+        },
         ListFailed::Moved,
         ListFailed::AsksForPassword,
         ListFailed::NotFound,
@@ -506,6 +512,11 @@ fn test_every_failure_says_why_and_has_a_word_of_its_own() {
         .contains("git 2.43 is older than 2.44")
     );
     assert!(ListFailed::TooLarge.says().contains("16 KiB"));
+    assert_eq!(
+        ListFailed::OldGitNoFetch { version: None }.says(),
+        "the version of git is not known, so the node does not fetch the list itself: \
+         it is read from your clone; upgrade git for the node to fetch it"
+    );
 }
 
 /// A branch, a remote's name and a commit, as the node puts them in a
