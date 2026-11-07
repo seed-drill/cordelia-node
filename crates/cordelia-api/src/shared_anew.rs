@@ -251,7 +251,10 @@ pub enum Gone {
 /// while its drop is kept: what `subscribe` in a clone refuses, and what
 /// stops the node's follow of a list that names it, but for a move
 /// (decision 2026-11-06 (joining), rules 2.3, 2.5 and 6). None where its
-/// drop is not kept.
+/// drop is not kept. A move is a channel filed now that came from it, by
+/// its filing, or back along the moves this device keeps: one moved from
+/// twice, as after two makings anew before a list names either, is moved
+/// from, and not dropped.
 pub(crate) fn dropped_or_moved(
     conn: &Connection,
     channel: &[u8; 32],
@@ -264,10 +267,16 @@ pub(crate) fn dropped_or_moved(
     {
         return Ok(None);
     }
-    let moved = holds
-        .filings
-        .iter()
-        .any(|(act, _)| act.item.came == Came::Moved(*channel));
+    let mut moved = false;
+    for (act, _) in &holds.filings {
+        let filed = &act.item;
+        if filed.came == Came::Moved(*channel)
+            || crate::following::back_along_moves(conn, &filed.channel)?[1..].contains(channel)
+        {
+            moved = true;
+            break;
+        }
+    }
     Ok(Some(match moved {
         true => Gone::Moved,
         false => Gone::Dropped,
@@ -2784,4 +2793,4 @@ pub fn at_a_removal(conn: &Connection, own_relays: &[OwnRelay]) -> Result<AtARem
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -19,23 +19,23 @@ use cordelia_crypto::share::{Share, share_name};
 use cordelia_crypto::shared::{Anew, Offer};
 use cordelia_storage::meta;
 
-const REPOSITORY: &str = "example.org/team/project";
+pub(crate) const REPOSITORY: &str = "example.org/team/project";
 
 /// Another repository the device follows.
-const OTHER: &str = "example.org/team/other";
-const FOLDER: &str = "/home/bob/Work/project";
+pub(crate) const OTHER: &str = "example.org/team/other";
+pub(crate) const FOLDER: &str = "/home/bob/Work/project";
 
 /// A read's interval, as the node keeps it.
-const READ: i64 = 600;
+pub(crate) const READ: i64 = 600;
 
 /// The relay of these tests' channels, known by its key: that of
 /// [`filing`]'s card.
-const AT: [u8; 32] = [3; 32];
+pub(crate) const AT: [u8; 32] = [3; 32];
 
 /// The device's relays known by their keys: that of [`filing`]'s card,
 /// where a channel lives, and that of a channel line ([`line_relay`]),
 /// which a device that takes the channel reads (rule 4.4).
-fn own_relays() -> Vec<OwnRelay> {
+pub(crate) fn own_relays() -> Vec<OwnRelay> {
     vec![
         OwnRelay {
             name: "relay.example.org:9474".into(),
@@ -50,11 +50,11 @@ fn own_relays() -> Vec<OwnRelay> {
 
 /// The key a channel line of these tests gives its relay: one that can be
 /// used, as a relay's is. Only a device that takes the channel reads it.
-fn line_relay() -> [u8; 32] {
+pub(crate) fn line_relay() -> [u8; 32] {
     NodeIdentity::from_seed([0x52; 32]).unwrap().public_key()
 }
 
-fn commit(c: char) -> String {
+pub(crate) fn commit(c: char) -> String {
     c.to_string().repeat(40)
 }
 
@@ -68,7 +68,10 @@ fn twin(key: &[u8; 32]) -> [u8; 32] {
 
 /// A list: the channel line of `channel`, with `without`, where it has one;
 /// then a line for each key, with its label.
-fn list_of(channel: Option<(&[u8; 32], &[[u8; 32]])>, devices: &[([u8; 32], &str)]) -> String {
+pub(crate) fn list_of(
+    channel: Option<(&[u8; 32], &[[u8; 32]])>,
+    devices: &[([u8; 32], &str)],
+) -> String {
     let mut list = String::new();
     if let Some((channel, without)) = channel {
         let line = ChannelLine {
@@ -86,7 +89,7 @@ fn list_of(channel: Option<(&[u8; 32], &[[u8; 32]])>, devices: &[([u8; 32], &str
 }
 
 /// The keys of members `numbers`, each labelled `m<n>`.
-fn listed(numbers: impl IntoIterator<Item = u32>) -> Vec<([u8; 32], String)> {
+pub(crate) fn listed(numbers: impl IntoIterator<Item = u32>) -> Vec<([u8; 32], String)> {
     numbers
         .into_iter()
         .map(|n| (member(n).public_key(), format!("m{n}")))
@@ -94,7 +97,10 @@ fn listed(numbers: impl IntoIterator<Item = u32>) -> Vec<([u8; 32], String)> {
 }
 
 /// [`list_of`], of `devices` as [`listed`] gives them.
-fn list_with(channel: Option<(&[u8; 32], &[[u8; 32]])>, devices: &[([u8; 32], String)]) -> String {
+pub(crate) fn list_with(
+    channel: Option<(&[u8; 32], &[[u8; 32]])>,
+    devices: &[([u8; 32], String)],
+) -> String {
     let devices: Vec<([u8; 32], &str)> = devices
         .iter()
         .map(|(key, label)| (*key, label.as_str()))
@@ -104,12 +110,12 @@ fn list_with(channel: Option<(&[u8; 32], &[[u8; 32]])>, devices: &[([u8; 32], St
 
 /// Device 0 follows the repository from `at`, with its list `list` at
 /// `commit` read then: as `subscribe` in a clone leaves it.
-fn follows_at(s: &Several, list: &str, commit: &str, at: i64) {
+pub(crate) fn follows_at(s: &Several, list: &str, commit: &str, at: i64) {
     follows_as(s, REPOSITORY, list, commit, at);
 }
 
 /// [`follows_at`], of the repository `repository`.
-fn follows_as(s: &Several, repository: &str, list: &str, commit: &str, at: i64) {
+pub(crate) fn follows_as(s: &Several, repository: &str, list: &str, commit: &str, at: i64) {
     let conn = &s[0].conn;
     follows::follow(conn, repository, "origin", FOLDER, at).unwrap();
     let read = LastRead {
@@ -121,23 +127,23 @@ fn follows_as(s: &Several, repository: &str, list: &str, commit: &str, at: i64) 
 }
 
 /// The follow on device 0.
-fn row(s: &Several) -> Option<Follow> {
+pub(crate) fn row(s: &Several) -> Option<Follow> {
     row_of(s, REPOSITORY)
 }
 
 /// The follow of `repository` on device 0.
-fn row_of(s: &Several, repository: &str) -> Option<Follow> {
+pub(crate) fn row_of(s: &Several, repository: &str) -> Option<Follow> {
     follows::follow_of(&s[0].conn, repository).unwrap()
 }
 
 /// What device 0 read of its clone: `list` at `commit`, for the follow as
 /// it is now, with never-back's answer `comes_after`.
-fn read_of(s: &Several, list: &str, commit: &str, comes_after: bool) -> CloneRead {
+pub(crate) fn read_of(s: &Several, list: &str, commit: &str, comes_after: bool) -> CloneRead {
     read_as(s, REPOSITORY, list, commit, comes_after)
 }
 
 /// [`read_of`], of the repository `repository`.
-fn read_as(
+pub(crate) fn read_as(
     s: &Several,
     repository: &str,
     list: &str,
@@ -161,12 +167,12 @@ fn read_as(
 }
 
 /// Device 0 does what `read` came to at `now`.
-fn done(s: &Several, read: &CloneRead, now: i64) -> Done {
+pub(crate) fn done(s: &Several, read: &CloneRead, now: i64) -> Done {
     after_read(&s[0].conn, &s[0].identity, &own_relays(), read, now).unwrap()
 }
 
 /// Device 0 reads `list` at `commit`, at `now`.
-fn reads(s: &Several, list: &str, commit: &str, now: i64) -> Done {
+pub(crate) fn reads(s: &Several, list: &str, commit: &str, now: i64) -> Done {
     done(s, &read_of(s, list, commit, true), now)
 }
 
@@ -209,7 +215,7 @@ fn not_handing(done: Done) -> NotHanding {
 
 /// The node's shares waiting on device 0, each key with when it was made,
 /// by key.
-fn node_shares(s: &Several) -> Vec<([u8; 32], i64)> {
+pub(crate) fn node_shares(s: &Several) -> Vec<([u8; 32], i64)> {
     let mut shares: Vec<([u8; 32], i64)> = follows::shares_by_node(&s[0].conn)
         .unwrap()
         .into_iter()
@@ -220,7 +226,7 @@ fn node_shares(s: &Several) -> Vec<([u8; 32], i64)> {
 }
 
 /// The keys of the node's shares waiting on device 0, by key.
-fn node_keys(s: &Several) -> Vec<[u8; 32]> {
+pub(crate) fn node_keys(s: &Several) -> Vec<[u8; 32]> {
     node_shares(s).into_iter().map(|(key, _)| key).collect()
 }
 
@@ -260,7 +266,7 @@ fn share_by_hand(s: &Several, name: &str, key: &[u8; 32], now: i64) -> Result<()
 
 /// Each of `writers` writes its empty anew record in `channel`, and device
 /// 0 stores it at `now`: each is then in the channel, first held at `now`.
-fn write_in(s: &Several, channel: &Shared, writers: &[&NodeIdentity], now: i64) {
+pub(crate) fn write_in(s: &Several, channel: &Shared, writers: &[&NodeIdentity], now: i64) {
     for writer in writers {
         stores(s, 0, &anew(writer, channel, 1), now);
     }
@@ -268,7 +274,7 @@ fn write_in(s: &Several, channel: &Shared, writers: &[&NodeIdentity], now: i64) 
 
 /// The offer of `maker` that makes `old` anew as the card of `seed`,
 /// sealed to `keys`, at revision `rev`.
-fn offer_by(
+pub(crate) fn offer_by(
     maker: &NodeIdentity,
     old: &Shared,
     seed: u8,
@@ -906,6 +912,44 @@ fn a_drop_on_this_device_or_another_stops_the_follow() {
     assert!(row(&s).is_none());
 }
 
+/// A channel moved from twice, as after two makings anew before a list
+/// names either, is moved from, not dropped: a read of a list that still
+/// names it does not stop the follow, and the take says to put the new
+/// line in the list (rules 2.5 and 6).
+#[test]
+fn a_channel_moved_from_twice_is_not_taken_for_one_dropped() {
+    use crate::shared_anew::tests::{anew_keeping, filed_as, holds_at_line_at, written_by};
+    let s = bob(1);
+    let now = s.now + 10;
+    let old = holds_at_line_at(&s, 0, 7, "review", now);
+    let (alice, carol, dave) = (member(1), member(2), member(3));
+    written_by(&s, 0, &old, &[&alice, &carol, &dave], now);
+    let mut list = ChannelLine {
+        channel: old.id,
+        relays: vec![line_relay()],
+        without: Vec::new(),
+    }
+    .to_line()
+    .unwrap();
+    list.push('\n');
+    for (key, label) in [(alice.public_key(), "alice"), (carol.public_key(), "carol")] {
+        list.push_str(&format!("{}   {label}\n", encode_public_key(&key).unwrap()));
+    }
+    follows_at(&s, &list, &commit('a'), now);
+    let keep = [alice.public_key(), dave.public_key()];
+    anew_keeping(&s, 0, "review", &keep, now + 1);
+    let first = filed_as(&s, 0, "review");
+    written_by(&s, 0, &first, &[&alice, &dave], now + 2);
+    anew_keeping(&s, 0, "review", &keep[..1], now + 3);
+    assert_eq!(
+        crate::shared_anew::dropped_or_moved(&s[0].conn, &old.id).unwrap(),
+        Some(crate::shared_anew::Gone::Moved)
+    );
+    reads(&s, &list, &commit('a'), now + 4);
+    assert!(row(&s).is_some(), "a move is not a drop");
+    assert_eq!(not_taking(&s).0, "moved");
+}
+
 // ── One follow for each channel (rule 2.5) ───────────────────────────
 
 /// A list that names a channel another follow's list names counts for
@@ -1087,10 +1131,10 @@ fn a_follow_made_again_on_the_same_clone_is_not_written_over_by_a_stale_read() {
 const NAME: &str = "team/project";
 
 /// The agent of [`FOLDER`], the clone of the follow.
-const AGENT: &str = "project";
+pub(crate) const AGENT: &str = "project";
 
 /// Device 0 maps [`FOLDER`] to [`AGENT`].
-fn maps_the_clone(s: &Several) {
+pub(crate) fn maps_the_clone(s: &Several) {
     let mapped = serde_json::json!([{ "folder": FOLDER, "name": AGENT }]);
     meta::set(&s[0].conn, meta::SYNC_CLAUDE_MAPPINGS, &mapped.to_string()).unwrap();
 }
@@ -1098,7 +1142,7 @@ fn maps_the_clone(s: &Several) {
 /// The list of these tests' takes: the channel line of `channel`, with
 /// `without`, and members `numbers` and every device of Bob's, each
 /// labelled.
-fn bobs_list(
+pub(crate) fn bobs_list(
     s: &Several,
     channel: &Shared,
     numbers: impl IntoIterator<Item = u32>,
@@ -1114,7 +1158,7 @@ fn bobs_list(
 /// Device 0 follows a list that names the channel of the card of `seed`,
 /// Alice and Carol (members 1 and 2) and each device of Bob's, from `now`:
 /// the channel and the list.
-fn joins(s: &Several, seed: u8, now: i64) -> (Shared, String) {
+pub(crate) fn joins(s: &Several, seed: u8, now: i64) -> (Shared, String) {
     let channel = Shared::of(seed);
     let list = bobs_list(s, &channel, 1..=2, &[]);
     follows_at(s, &list, &commit('a'), now);
@@ -1123,7 +1167,7 @@ fn joins(s: &Several, seed: u8, now: i64) -> (Shared, String) {
 
 /// A share by `from` of the channel of the card of `seed`, for device 0,
 /// made at `made`, in their share pair channel.
-fn share_of(s: &Several, from: &NodeIdentity, seed: u8, made: i64) -> CheckedEntry {
+pub(crate) fn share_of(s: &Several, from: &NodeIdentity, seed: u8, made: i64) -> CheckedEntry {
     let card = filing(seed, "x").card;
     let to = s.key(0);
     let (_, secret) = crate::shared_pass::share_pair(from, &to).unwrap();
@@ -1164,7 +1208,7 @@ fn asked_for(s: &Several, now: i64) -> Vec<[u8; 32]> {
 
 /// The node's typing of `from`'s key on device 0 that it asks its relays
 /// for at `now`.
-fn typing_of(s: &Several, from: &NodeIdentity, now: i64) -> Typing {
+pub(crate) fn typing_of(s: &Several, from: &NodeIdentity, now: i64) -> Typing {
     let key = from.public_key();
     to_ask(&s[0].conn, now)
         .unwrap()
@@ -1176,7 +1220,12 @@ fn typing_of(s: &Several, from: &NodeIdentity, now: i64) -> Typing {
 /// What device 0's pass does with `entries`, handed from the share pair
 /// channel of `typing`'s key at `now`: each judged, and those that pass
 /// given to the take.
-fn handed_to(s: &Several, typing: &Typing, entries: &[CheckedEntry], now: i64) -> Became {
+pub(crate) fn handed_to(
+    s: &Several,
+    typing: &Typing,
+    entries: &[CheckedEntry],
+    now: i64,
+) -> Became {
     let (conn, identity) = (&s[0].conn, &s[0].identity);
     let found: Vec<CheckedEntry> = entries
         .iter()
