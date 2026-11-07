@@ -142,7 +142,7 @@ fn the_shared_commands_say_what_this_record_says() {
             &[&words, &alice_six, "no label of yours", &alice_six]
         )
     );
-    let lines = make_share(conn, identity, &relays(), &plan.what, now).unwrap();
+    let lines = make_share(conn, identity, &relays(), &plan.what, false, now).unwrap();
     assert_eq!(
         lines[..4].join("\n"),
         says(
@@ -506,7 +506,7 @@ fn the_shared_commands_say_what_this_record_says() {
             now,
         )
         .unwrap();
-        make_share(conn, identity, &relays(), &plan.what, now).unwrap();
+        make_share(conn, identity, &relays(), &plan.what, false, now).unwrap();
     }
     let ninth = encode_public_key(&member(20).public_key()).unwrap();
     assert_eq!(

@@ -182,15 +182,22 @@ pub struct Judged {
 }
 
 impl Judged {
-    /// Whether it pauses this device's sending in the old channel
-    /// (decision 2026-10-24, rule 26): it seals to this person and leaves
-    /// out a key, is no fault, and no person here stayed after it.
-    pub fn pauses(&self) -> bool {
+    /// Whether it made the old channel anew for this person: it seals to
+    /// them and leaves out a key, and is no fault, whether they then moved,
+    /// stayed or are still paused. The node hands nothing over in such a
+    /// channel (decision 2026-11-06 (joining), rule 4.1).
+    pub fn made_anew_for_you(&self) -> bool {
         matches!(
             self.is,
             OfferIs::ForThisDevice(_) | OfferIs::SealedElsewhere(_)
         ) && !self.left_out.is_empty()
-            && !self.offer.stayed
+    }
+
+    /// Whether it pauses this device's sending in the old channel
+    /// (decision 2026-10-24, rule 26): it made it anew for this person,
+    /// and no person here stayed after it.
+    pub fn pauses(&self) -> bool {
+        self.made_anew_for_you() && !self.offer.stayed
     }
 }
 
