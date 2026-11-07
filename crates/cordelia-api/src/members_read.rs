@@ -234,6 +234,7 @@ pub fn after_read(
             now,
         )?;
         shares_go(conn, identity, &follow, kept_list.as_ref(), list, now)?;
+        first_named(conn, list, now)?;
         let (handed, not_handing) = match acts_in(conn, identity, own_relays, list)? {
             Ok((line, filing)) => {
                 let turn = Turn {
@@ -420,6 +421,25 @@ fn joined(
                 at: now,
             };
             follows::notice(conn, &follow.identity, &notice)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rule 5's "from then on": the first read whose channel line names the
+/// channel that a making anew here made, or one made anew from it, is kept
+/// with that making, at `now`. From then on, its device shows amber while
+/// a key it left out is listed and the line does not name it after
+/// `without` (decision 2026-11-06 (joining), rule 5;
+/// [`crate::repository_status`]).
+fn first_named(conn: &Connection, list: &Members, now: i64) -> Result<(), PersonError> {
+    let Some(line) = &list.channel else {
+        return Ok(());
+    };
+    let back = crate::following::back_along_moves(conn, &line.channel)?;
+    for made in follows::made_lines(conn)? {
+        if made.named_at.is_none() && back.contains(&made.new_channel) {
+            follows::named(conn, &made.channel, now)?;
         }
     }
     Ok(())
@@ -1091,4 +1111,4 @@ pub fn read_each(state: &AppState, now: impl Fn() -> i64) -> Result<Vec<ReadOf>,
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

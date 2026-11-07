@@ -690,6 +690,28 @@ pub(crate) fn keys_in_channel(
     Ok(keys)
 }
 
+/// The channel `channel`, then each channel it was made anew from, back
+/// along the moves this device keeps (a row's `came`), nearest first: at
+/// most one more than the 64 drops a list keeps. A channel made anew past
+/// a bound is filed by no device, so its chain is itself alone.
+pub(crate) fn back_along_moves(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    let mut chain = vec![*channel];
+    let mut at = *channel;
+    for _ in 0..cordelia_core::protocol::SHARED_MAX_DROPPED {
+        match kept::channel(conn, &at)?.map(|row| row.came) {
+            Some(kept::Came::Moved(from)) if !chain.contains(&from) => {
+                chain.push(from);
+                at = from;
+            }
+            _ => break,
+        }
+    }
+    Ok(chain)
+}
+
 // ── On the yes ───────────────────────────────────────────────────────
 
 /// Do what `following` was planned to (rule 2.3), at `now`, in one

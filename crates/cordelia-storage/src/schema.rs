@@ -1886,11 +1886,12 @@ CREATE TABLE shared_anew_not_clean (
 ///   `cordelia shared seen`; and a key the list dropped (3), kept until it
 ///   leaves the channel. Each with its commit, and a key's with its label.
 /// - `shared_shares.by_node`: whether the node made the share, not a person.
-/// - `shared_anew_made.left_out`, `line` and `cut`: the keys a making anew
-///   left out, 32 bytes each (up to the 1,024 rows a table keeps, as a
-///   device that does not follow names every key it left out), the channel
-///   line it printed, and how many keys the line was cut short of, to fit a
-///   list.
+/// - `shared_anew_made.left_out`, `line`, `cut` and `named_at`: the keys a
+///   making anew left out, 32 bytes each (up to the 1,024 rows a table
+///   keeps, as a device that does not follow names every key it left out),
+///   the channel line it printed, how many keys the line was cut short of,
+///   to fit a list, and when a list this device follows first named the new
+///   channel, or one made anew from it (rule 5's "from then on").
 ///
 /// A relay keeps nothing in any of them.
 const MIGRATION_V33: &str = r#"
@@ -1958,6 +1959,9 @@ ALTER TABLE shared_anew_made ADD COLUMN line TEXT CHECK(line IS NULL
 
 ALTER TABLE shared_anew_made ADD COLUMN cut INTEGER NOT NULL DEFAULT 0
     CHECK(typeof(cut) = 'integer' AND cut >= 0);
+
+ALTER TABLE shared_anew_made ADD COLUMN named_at INTEGER
+    CHECK(named_at IS NULL OR typeof(named_at) = 'integer');
 "#;
 
 /// Run `sql` and set the schema version to `version` as one transaction:
@@ -7469,7 +7473,7 @@ mod tests {
     /// The step to version 33 (decision 2026-11-06 (joining), rules 2 to 6):
     /// from a database at step 32 that holds rows of the steps before it,
     /// it adds the tables of the repositories followed, the node's own
-    /// typings and the notices, empty; a column to `shared_shares` and two
+    /// typings and the notices, empty; a column to `shared_shares` and four
     /// to `shared_anew_made`, the rows there keeping their values with the
     /// new columns at their defaults; and changes no other row or
     /// definition. A failure leaves none of it, and the step asked for
@@ -7591,7 +7595,7 @@ mod tests {
             .skip(1)
             .map(|rest| rest.split(';').next().unwrap())
             .collect();
-        assert_eq!(added.len(), 4);
+        assert_eq!(added.len(), 5);
         for (table, old) in altered.iter().zip(&old_sql) {
             let mut new = sql(&conn, table);
             for column in &added {
@@ -7599,15 +7603,24 @@ mod tests {
             }
             assert_eq!(&new, old, "{table}");
         }
-        let defaults: (i64, Option<Vec<u8>>, Option<String>, i64) = conn
+        type Defaults = (i64, Option<Vec<u8>>, Option<String>, i64, Option<i64>);
+        let defaults: Defaults = conn
             .query_row(
-                "SELECT s.by_node, m.left_out, m.line, m.cut FROM shared_shares s,
+                "SELECT s.by_node, m.left_out, m.line, m.cut, m.named_at FROM shared_shares s,
                      shared_anew_made m",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
             )
             .unwrap();
-        assert_eq!(defaults, (0, None, None, 0));
+        assert_eq!(defaults, (0, None, None, 0, None));
         migrate_in_one(&conn, MIGRATION_V33, 33).unwrap();
         init_db(&conn).unwrap();
         assert_eq!((but(&conn), rows(&conn)), before);
@@ -7643,6 +7656,7 @@ mod tests {
             format!("INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, line) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, '{}')", "c".repeat(16385)),
             "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, cut) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, -1)".to_string(),
             "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, cut) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 'one')".to_string(),
+            "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, named_at) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, 'nine')".to_string(),
         ] {
             assert!(conn.execute(&refused, []).is_err(), "{refused}");
         }
@@ -7653,7 +7667,7 @@ mod tests {
             format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 2, zeroblob(0), NULL, '{}', 9)", "d".repeat(64)),
             format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 3, zeroblob(32), 'bob', '{commit}', 9)"),
             "INSERT INTO shared_shares (key, channel, pair, relays, rev, made, gone, by_node) VALUES (zeroblob(32), zeroblob(32), zeroblob(32), zeroblob(33), 1, 9, 0, 1)".to_string(),
-            "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, left_out, line, cut) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, zeroblob(64), 'channel x without 0', 2)".to_string(),
+            "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering, left_out, line, cut, named_at) VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1, zeroblob(64), 'channel x without 0', 2, 9)".to_string(),
         ] {
             assert_eq!(conn.execute(&taken, []), Ok(1), "{taken}");
         }
