@@ -46,7 +46,7 @@ cordelia_pk1...   bob-laptop
 - **Its place:** `.cordelia/members`, at the root of the repository, on its default branch.
 - **Its form:** ASCII and line feeds only, at most 16 KiB. `#` lines and empty lines are skipped.
 - **One `channel` line:** `channel`, the channel's ID in hex, then the key of each of its relays, one or two (a card's relays, §8 there). It always ends with `without`, the number of keys that follow, and those keys: the keys a making anew left out (rule 5), or `without 0` for a new channel. A line whose number does not match its keys does not parse, so a line cut short does nothing. These keys do not count among the list's 64. A list without a `channel` line names members and no channel: followers wait, and say so.
-- **A list that names a key as a member, and after `without`, while that key is not in the channel, names no channel for now.** Followers hand over nothing and take nothing, and show rule 4.7's line, until that key's line is deleted, or until the key writes in the channel, as a device of a person who stays does when it is next on. So a key left out cannot stay listed. Bringing it back is a pull request that adds its line and takes it off `without`.
+- **A list that names a key as a member, and after `without`, while that key is not in the channel, names no channel for now.** Followers hand over nothing, and show rule 4.7's line, until that key's line is deleted, or until the key writes in the channel, as a device of a person who stays does when it is next on. So a key left out cannot stay listed. Bringing it back is a pull request that adds its line and takes it off `without`. A device that does not hold the channel cannot see who is in it, so the gate binds only those who hand over; a joiner still takes nothing while its own key is after `without`.
 - **Then one line for each device:** its key as `cordelia id` prints it, then a label of 1 to 32 characters of `a-z`, `0-9`, `.`, `_` and `-`.
 - **Keys are unique, and so are labels.**
 - **At most 64 keys.** A channel that would hold more says so where it is handed over (`channel_full`).
@@ -119,7 +119,7 @@ bob@laptop$ cordelia subscribe
 
 At each read, each device that follows the repository does the following, with no one asked.
 
-1. **It acts only for the channel the list names, and only where it holds that channel and writes there:** not paused, clean, and not moved from (§7 there). Where any of these fails, it hands over nothing and takes nothing, and says why (rule 6).
+1. **It hands over only the channel the list names, and only where it holds that channel and writes there:** not paused, clean, and not moved from (§7 there). Where any of these fails, it hands over nothing, and says why (rule 6). When it takes is rule 4.4.
    - **It hands over nothing in a channel in which it has read an offer that pauses this person:** one that seals to them and leaves out a key, whether the person then moved, stayed or is still paused (§7 there). That channel was made anew. An offer "without you", or one that is a fault, does not count.
 2. **Hands over.** Listed keys not in the channel, not named after `without`, not the person's own devices, and not keys the person removed, are handed the channel, as `share` does. The node's shares are counted apart from the person's own, so a person's `share` by hand keeps its places. They go **four at a time, in turns:**
    - each share lives for two reads, then is deleted, and its key waits out the read at which it goes;
@@ -129,7 +129,7 @@ At each read, each device that follows the repository does the following, with n
 3. **Deletes the shares to keys the list no longer names,** whether the node made them or a person did.
 4. **Takes.** A follower whose person does not hold the named channel looks for a share from each listed key, at each read.
    - It types each listed key again for that read, under a count of its own, so the person's own `accept --channel` keeps its eight places. It asks the relays once for each listed key at each read, not at every pass: 64 keys are 128 requests every ten minutes, well within what a relay allows (§8.4 there).
-   - It takes only the named channel, from a listed key, once the list names this device and its `channel` line does not name it after `without`.
+   - It takes only the named channel, from a listed key, once the list names this device's key as `cordelia id` prints it and its `channel` line does not name it after `without`. Rule 1's gate does not hold it back: it cannot see who is in the channel, and the members keep the gate.
    - It takes nothing while the person holds the channel the named one was made anew from: rule 6 says to move.
    - It takes only a share made within the hour of the latest read (`PAIR_KEY_TYPED_SECS`), so a share left at a relay long ago is not taken.
    - It files the channel on every device of the person's, as `accept --channel` does.
@@ -277,6 +277,7 @@ Five reviews, each checked in the code before its findings were taken. Each roun
 - **Every `channel` line ends with `without` and a count,** so a line cut short does not parse, and a following device's making anew carries the current `without` keys over (fifth review).
 - **Hand-overs go in turns, and takes come only within the hour of the latest read.** Eight places held by devices that were off, and a stale share, had each blocked or misled a join (first and second reviews).
 - **A channel follows one repository, and a key waits while any share of it does** (rules 2.5, 4.2 and 6). Two lists that named one channel, or one key, wrote over each other's shares (the review of slice 5a).
+- **Rule 1's gate binds only those who hand over** (rules 1, 4.1 and 4.4). A joiner holds no row of the channel, so every listed key after `without` looked out of it to the joiner, and kept it out for good, while the members saw that key write and handed the channel over (the review of slice 5b).
 
 ## 14. The person's answers (6 November)
 

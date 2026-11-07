@@ -2943,6 +2943,17 @@ pub const MEMBERS_READ_INTERVAL_SECS: u64 = 600;
 /// for days holds no place.
 pub const MEMBERS_HANDED_AT_ONCE: usize = MAX_TYPED_KEYS / 2;
 
+/// The most keys the node typed at reads of repositories' lists that one
+/// whole pass asks the relays for, across every repository the device
+/// follows (decision 2026-11-06 (joining), rule 4.4): the rest are asked
+/// for at the passes after, each within the hour of its read. Nothing
+/// bounds how many repositories a device follows, and each asking is a
+/// proof and a pull of a share pair channel, so six passes a minute ask
+/// 384 at most: with the shared pass's first pages and proofs and the
+/// person's own typings, 592 of `SHARED_REQUESTS_PER_MINUTE`. A list's 64
+/// keys are asked for in two passes.
+pub const MEMBERS_ASKED_PER_PASS: usize = 32;
+
 // Checked at compile time (decision 2026-10-10 §14). The largest card is
 // the seed and two relays behind their count: with the form, the time and
 // the key it is for, it fits a share; and it fits an anew record, whose
@@ -4268,13 +4279,17 @@ mod tests {
         let shared = passes * channels + channels + passes * 2 * typed;
         assert_eq!(shared, 208);
         assert!(shared <= u64::from(SHARED_REQUESTS_PER_MINUTE));
-        // And the keys the node types at a read of a repository's list
+        // And the keys the node types at reads of repositories' lists
         // (decision 2026-11-06 (joining), rule 4.4): a proof and a pull of
-        // the share pair channel of each of a list's 64, once after each
-        // read, all in one pass: 128 more, within the 600.
-        let listed = 2 * SHARED_MAX_KEYS as u64;
-        assert_eq!(shared + listed, 336);
+        // the share pair channel of each, at most MEMBERS_ASKED_PER_PASS at
+        // each whole pass across every follow, since nothing bounds how
+        // many a device has: 384 more, within the 600.
+        let listed = passes * 2 * MEMBERS_ASKED_PER_PASS as u64;
+        assert_eq!(listed, 384);
+        assert_eq!(shared + listed, 592);
         assert!(shared + listed <= u64::from(SHARED_REQUESTS_PER_MINUTE));
+        // A list's 64 keys are asked for in two passes.
+        assert_eq!(SHARED_MAX_KEYS.div_ceil(MEMBERS_ASKED_PER_PASS), 2);
         // The shows of a minute, as a device's side of a relay counts
         // them: one for each whole pass and each pass that sends, and as
         // many again.

@@ -285,11 +285,7 @@ pub fn set_last_read(
 /// last list read stands, and this is kept until a read counts. A `why`
 /// longer than the row keeps is cut, at a character.
 pub fn not_read(conn: &Connection, identity: &str, not: &NotRead) -> Result<(), CordeliaError> {
-    let mut end = not.why.len().min(NOT_READ_WHY_MAX_BYTES);
-    while !not.why.is_char_boundary(end) {
-        end -= 1;
-    }
-    let why = &not.why[..end];
+    let why = cut(&not.why, NOT_READ_WHY_MAX_BYTES);
     conn.execute(
         "UPDATE shared_follows SET not_read = ?2, not_read_why = ?3 WHERE identity = ?1",
         params![identity, not.word, why],
@@ -301,6 +297,19 @@ pub fn not_read(conn: &Connection, identity: &str, not: &NotRead) -> Result<(), 
 /// The most of why a read counted for nothing that a row keeps, as schema
 /// step 33 bounds it.
 const NOT_READ_WHY_MAX_BYTES: usize = 1024;
+
+/// The most of the line of what became of a typing that a row keeps, as
+/// schema step 33 bounds it.
+const TYPED_DETAIL_MAX_BYTES: usize = 1024;
+
+/// `text`, cut at a character so that it is at most `max` bytes.
+fn cut(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
 
 /// The last key the node handed the channel of `identity` to: its next
 /// turn starts after it.
@@ -345,7 +354,9 @@ pub fn type_key(
     Ok(())
 }
 
-/// What became of the node's typing of `key` for `identity`.
+/// What became of the node's typing of `key` for `identity`. A `detail`
+/// longer than the row keeps is cut, at a character, so that what became
+/// of it is always kept.
 pub fn typed_became(
     conn: &Connection,
     identity: &str,
@@ -353,6 +364,7 @@ pub fn typed_became(
     became: &str,
     detail: Option<&str>,
 ) -> Result<(), CordeliaError> {
+    let detail = detail.map(|detail| cut(detail, TYPED_DETAIL_MAX_BYTES));
     conn.execute(
         "UPDATE shared_follow_typed SET became = ?3, detail = ?4
              WHERE identity = ?1 AND key = ?2",

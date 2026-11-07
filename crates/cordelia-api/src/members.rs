@@ -312,6 +312,15 @@ impl Members {
         self.devices.iter().any(|device| same_key(&device.key, key))
     }
 
+    /// The line of `key` itself, where the list has one, and not of its
+    /// twin: a device follows and takes by its key as `cordelia id` prints
+    /// it, since the share pair channel a member hands it the channel in
+    /// is derived from the two keys as they are (decision 2026-11-06
+    /// (joining), rule 4.4).
+    pub fn line_of(&self, key: &[u8; 32]) -> Option<&Device> {
+        self.devices.iter().find(|device| device.key == *key)
+    }
+
     /// The label the list gives `key`, or its twin, where it lists it.
     pub fn label_of(&self, key: &[u8; 32]) -> Option<&str> {
         self.devices

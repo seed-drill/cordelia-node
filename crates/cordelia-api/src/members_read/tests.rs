@@ -1376,13 +1376,14 @@ fn a_share_older_than_the_hour_of_the_latest_read_is_not_taken() {
     );
 }
 
-/// Nothing is taken where the list names no channel, rule 1's gate holds,
-/// its channel line names this device after `without`, the list does not
-/// name this device, or a relay of its line is not one of this device's
-/// own: no key is typed, none is asked for, and each says why, in rule 6's
-/// line (rule 4.4). A list that clears them all has each key typed.
+/// Nothing is taken where the list names no channel, its channel line
+/// names this device after `without`, the list does not name this
+/// device's key, or names only its twin, or a relay of its line is not one
+/// of this device's own: no key is typed, none is asked for, and each says
+/// why, in rule 6's line (rule 4.4). A list that clears them all has each
+/// key typed.
 #[test]
-fn nothing_is_taken_where_the_gate_holds_this_device_is_left_out_or_not_listed() {
+fn nothing_is_taken_where_this_device_is_left_out_or_its_key_is_not_listed() {
     let s = bob(1);
     let now = s.now + 10;
     let channel = Shared::of(7);
@@ -1405,14 +1406,17 @@ fn nothing_is_taken_where_the_gate_holds_this_device_is_left_out_or_not_listed()
             format!("The list of {REPOSITORY} names no channel yet.")
         )
     );
-    let gated = bobs_list(&s, &channel, 1..=2, &[carol]);
+    let mut devices = listed(1..=2);
+    devices.push((twin(&bob_key), "bob-0".into()));
+    let twin_only = list_with(Some((&channel.id, &[])), &devices);
     assert_eq!(
-        not_typed(&gated, 'b'),
+        not_typed(&twin_only, 'b'),
         (
-            "left_out",
+            "twin_listed",
             format!(
-                "m2 is on the list of channel {words} but was left out of it: nothing is handed \
-                 over until its line goes, or it writes in the channel."
+                "The list of {REPOSITORY} names your key in another form: list it as cordelia id \
+                 prints it, {}.",
+                encode_public_key(&bob_key).unwrap()
             )
         )
     );
@@ -1469,6 +1473,97 @@ fn nothing_is_taken_where_the_gate_holds_this_device_is_left_out_or_not_listed()
     let both = sorted(&[member(1).public_key(), carol]);
     assert_eq!(typed_keys(&s), both);
     assert_eq!(asked_for(&s, read + 2), both);
+}
+
+/// Rule 1's gate does not keep a joiner out (rules 1 and 4.4): a device
+/// that does not hold the channel cannot see who is in it, so a listed key
+/// after `without` looks out of it, though the members see it write and
+/// hand the channel over. The joiner types every listed key, and takes
+/// the channel the list names from one.
+#[test]
+fn rule_1s_gate_does_not_keep_a_joiner_out() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = Shared::of(7);
+    let (alice, carol) = (member(1), member(2).public_key());
+    let gated = bobs_list(&s, &channel, 1..=2, &[carol]);
+    follows_at(&s, &gated, &commit('a'), now);
+    let read = now + READ;
+    reads(&s, &gated, &commit('a'), read);
+    assert_eq!(typed_keys(&s), sorted(&[alice.public_key(), carol]));
+    let typing = typing_of(&s, &alice, read + 1);
+    let share = share_of(&s, &alice, 7, read);
+    assert_eq!(
+        handed_to(&s, &typing, &[share], read + 1),
+        Became::Taken(channel.id)
+    );
+}
+
+/// The relays are asked for at most [`MEMBERS_ASKED_PER_PASS`] of the
+/// node's typings at a pass, across every follow (rule 4.4): the rest are
+/// asked for at the passes after, each within the hour of its read.
+#[test]
+fn a_pass_asks_for_at_most_32_typings_across_every_follow() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (review, design) = (Shared::of(7), Shared::of(8));
+    let first = bobs_list(&s, &review, 1..=20, &[]);
+    let second = bobs_list(&s, &design, 21..=40, &[]);
+    follows_as(&s, REPOSITORY, &first, &commit('a'), now);
+    follows_as(&s, OTHER, &second, &commit('a'), now);
+    let read = now + READ;
+    reads_as(&s, REPOSITORY, &first, &commit('a'), read);
+    reads_as(&s, OTHER, &second, &commit('a'), read);
+    let typed = |of: &str| follows::typed(&s[0].conn, of).unwrap().len();
+    assert_eq!((typed(REPOSITORY), typed(OTHER)), (20, 20));
+    let asked = to_ask(&s[0].conn, read + 1).unwrap();
+    assert_eq!(asked.len(), MEMBERS_ASKED_PER_PASS);
+    for typing in &asked {
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let became = take(conn, identity, typing, &[], &own_relays(), read + 1).unwrap();
+        assert_eq!(became, Became::Nothing);
+    }
+    assert_eq!(to_ask(&s[0].conn, read + 2).unwrap().len(), 40 - 32);
+}
+
+/// What became of a typing is kept, its line cut at a character to what
+/// the row keeps, so that a long one does not undo the take (the review
+/// of slice 5b, L4): here, the line that a clone with a long path is no
+/// mapped folder.
+#[test]
+fn a_long_line_of_what_became_of_a_typing_is_cut_and_the_take_stands() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = Shared::of(7);
+    let list = bobs_list(&s, &channel, 1..=1, &[]);
+    let clone = format!("/home/bob/{}", "\u{e9}".repeat(600));
+    let conn = &s[0].conn;
+    follows::follow(conn, REPOSITORY, "origin", &clone, now).unwrap();
+    let at = LastRead {
+        commit: commit('a'),
+        at: now,
+        from_clone: true,
+    };
+    follows::read_done(conn, REPOSITORY, &at, list.as_bytes(), None).unwrap();
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    let alice = member(1);
+    let typing = typing_of(&s, &alice, read + 1);
+    let share = share_of(&s, &alice, 7, read);
+    assert_eq!(
+        handed_to(&s, &typing, &[share], read + 1),
+        Became::Taken(channel.id)
+    );
+    assert_eq!(filings_of(&s, 0).len(), 1);
+    let (became, detail) = became_of(&s, &alice.public_key());
+    assert_eq!(became.as_deref(), Some(TAKEN));
+    let detail = detail.unwrap();
+    assert!(
+        detail.len() <= 1024 && detail.len() > 1000,
+        "{}",
+        detail.len()
+    );
+    assert!(detail.starts_with("/home/bob/\u{e9}"));
 }
 
 /// Where a key the node typed at a read is asked for, and the person has
@@ -1617,6 +1712,7 @@ fn nothing_is_taken_where_the_read_counted_for_nothing() {
     let typing = typing_of(&s, &alice, read + 1);
     let behind = done(&s, &read_of(&s, &list, &commit('b'), false), read + 1);
     assert!(matches!(behind, Done::NotRead(_)), "{behind:?}");
+    assert!(asked_for(&s, read + 1).is_empty(), "nothing is asked for");
     assert_eq!(
         handed_to(&s, &typing, &[share_of(&s, &alice, 7, read)], read + 2),
         Became::Refused("not_read")

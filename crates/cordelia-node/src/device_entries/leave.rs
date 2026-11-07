@@ -1676,7 +1676,9 @@ impl Leave {
     ///   from the start, each with `limit` and on from the place the last
     ///   reached, until a page holds nothing or leaves the place where it
     ///   was, the key reads nothing more, or RELAY_ENTRY_PULL_PAGES pages
-    ///   were read. Nothing is pushed.
+    ///   were read. Nothing is pushed. Where the counter holds back the
+    ///   proof, or the first pull after it, it is refused as `AskedEnough`:
+    ///   nothing was read, and a caller asks again at a later pass.
     /// - `counted` is given what the relay handed in each page, as it counts
     ///   it, before the page is read, as [`Leave::shared`] gives it: so the
     ///   caller counts it in the device's whole count and in the shared
@@ -1728,8 +1730,9 @@ impl Leave {
         }
         let mut read = Vec::new();
         let mut place = (NO_MARK, 0);
+        let mut pulled = false;
         for _ in 0..RELAY_ENTRY_PULL_PAGES {
-            if !lock(&self.inner).may_ask_shared(link.name()) {
+            if !pulls_on(lock(&self.inner).may_ask_shared(link.name()), pulled)? {
                 break;
             }
             let pull = WireMessage::EntryPull(EntryPull {
@@ -1747,6 +1750,7 @@ impl Leave {
                 Err(refused) if read.is_empty() => return Err(refused),
                 _ => break,
             };
+            pulled = true;
             // What the relay handed counts against the share, whatever is
             // then done with it.
             counted(
@@ -2222,6 +2226,19 @@ fn refusals_within(
     within
 }
 
+/// Whether a read of a share pair channel pulls one page more, where the
+/// shared counter says whether it `may` ask, and `pulled` says whether a
+/// page was pulled already ([`Leave::share_pair`]). A first pull held back
+/// read nothing: it is refused as `AskedEnough`, so the channel is read
+/// again at a later pass and not taken as empty.
+fn pulls_on(may: bool, pulled: bool) -> Result<bool, SharedRefused> {
+    match (may, pulled) {
+        (true, _) => Ok(true),
+        (false, true) => Ok(false),
+        (false, false) => Err(SharedRefused::AskedEnough),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2467,6 +2484,18 @@ mod tests {
             inner.may_ask("one");
         }
         assert!(inner.may_ask_shared("one"));
+    }
+
+    /// A read of a share pair channel whose first pull the shared counter
+    /// holds back is refused as `AskedEnough`, and not taken as a read that
+    /// found nothing: the caller asks again at a later pass. Once a page
+    /// was pulled, it stops with what it read.
+    #[test]
+    fn a_share_pair_read_held_back_before_its_first_pull_is_refused() {
+        assert_eq!(pulls_on(false, false), Err(SharedRefused::AskedEnough));
+        assert_eq!(pulls_on(false, true), Ok(false));
+        assert_eq!(pulls_on(true, false), Ok(true));
+        assert_eq!(pulls_on(true, true), Ok(true));
     }
 
     /// A node that reaches no relay is waking. Once it reaches one, it is

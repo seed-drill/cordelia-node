@@ -41,7 +41,9 @@ use std::path::Path;
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::{MEMBERS_HANDED_AT_ONCE, SHARED_MAX_CHANNELS, SHARED_MAX_KEYS};
+use cordelia_core::protocol::{
+    MEMBERS_ASKED_PER_PASS, MEMBERS_HANDED_AT_ONCE, SHARED_MAX_CHANNELS, SHARED_MAX_KEYS,
+};
 use cordelia_crypto::acts::{Filing, Subscription};
 use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::identity::NodeIdentity;
@@ -51,7 +53,7 @@ use cordelia_storage::shared_sharing as share_rows;
 
 use crate::following::{
     MOVED_FROM, channel_named, followed_elsewhere, followed_from_line, keys_in_channel,
-    made_anew_from, name_free, name_of, no_channel_line,
+    made_anew_from, name_free, name_of, no_channel_line, twin_line,
 };
 use crate::git_list::{ClonedList, Git, Identity, ListFailed};
 use crate::lists::Do;
@@ -678,12 +680,12 @@ pub struct Looks {
 /// and rule 6's line. It looks only where the latest read counted, the
 /// list names a channel, and the person holds none of these: that channel,
 /// one they dropped or moved from, or one it was made anew from (they move
-/// to it). And only where the list names this device, a twin counting as
-/// its key, its channel line does not name it after `without`, rule 1's
-/// gate is clear, every relay of the line is one of this device's own by
-/// key, and the channel has room and its name, as `accept --channel` would
-/// take it. Worked out at each read, and again at the take, under the
-/// lock.
+/// to it). And only where the list names this device's key as `cordelia
+/// id` prints it, its channel line does not name it after `without`, every
+/// relay of the line is one of this device's own by key, and the channel
+/// has room and its name, as `accept --channel` would take it. Rule 1's
+/// gate does not hold a take back (rule 1). Worked out at each read, and
+/// again at the take, under the lock.
 pub fn takes_in(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -732,11 +734,16 @@ pub fn takes_in(
         );
     }
     let own = identity.public_key();
-    if !list.lists(&own) {
-        return not(
-            "not_listed",
-            format!("Your key is not on the list of {repository} at {commit}."),
-        );
+    // A member's share to a twin of this device's key is in another share
+    // pair channel, which this device never reads.
+    if list.line_of(&own).is_none() {
+        return match list.lists(&own) {
+            true => not("twin_listed", twin_line(repository, &own)?),
+            false => not(
+                "not_listed",
+                format!("Your key is not on the list of {repository} at {commit}."),
+            ),
+        };
     }
     if line.leaves_out(&own) {
         return not(
@@ -747,21 +754,11 @@ pub fn takes_in(
             ),
         );
     }
-    let in_channel = keys_in_channel(conn, &own, &list)?;
-    let gated: Vec<String> = list
-        .gated(|key| in_channel.iter().any(|one| same_key(one, key)))
-        .into_iter()
-        .map(|device| {
-            format!(
-                "{} is on the list of channel {words} but was left out of it: nothing is handed \
-                 over until its line goes, or it writes in the channel.",
-                device.label
-            )
-        })
-        .collect();
-    if !gated.is_empty() {
-        return not("left_out", gated.join("\n"));
-    }
+    // Rule 1's gate binds only those who hand over. A device that does not
+    // hold the channel cannot see who is in it, so every key after
+    // `without` would look left out to it, for good. The members keep the
+    // gate, and this device takes nothing while its own key is after
+    // `without`, above.
     if let Some(relay) = line
         .relays
         .iter()
@@ -872,12 +869,18 @@ pub struct Typing {
 }
 
 /// The node's typings to ask the relays for at `now` (rule 4.4): each
-/// typed at a read, within the hour of that read (`PAIR_KEY_TYPED_SECS`),
-/// and not asked for since. So each listed key is asked for once at each
-/// read, at the pass after it, and not at every pass.
+/// typed at a read that counted, within the hour of that read
+/// (`PAIR_KEY_TYPED_SECS`), and not asked for since. So each listed key is
+/// asked for once at each read, at a pass after it, and not at every pass.
+/// No more than [`MEMBERS_ASKED_PER_PASS`] are given, across every follow,
+/// however many there are: the rest are asked for at the passes after.
 pub fn to_ask(conn: &Connection, now: i64) -> Result<Vec<Typing>, PersonError> {
     let mut asked = Vec::new();
     for follow in follows::follows(conn)? {
+        // A follow whose latest read counted for nothing takes nothing.
+        if follow.not_read.is_some() {
+            continue;
+        }
         for typed in follows::typed(conn, &follow.identity)? {
             if typed.became.is_none() && crate::adding::within_its_hour(typed.typed_at, now) {
                 asked.push(Typing {
@@ -888,6 +891,7 @@ pub fn to_ask(conn: &Connection, now: i64) -> Result<Vec<Typing>, PersonError> {
             }
         }
     }
+    asked.truncate(MEMBERS_ASKED_PER_PASS);
     Ok(asked)
 }
 
