@@ -145,7 +145,9 @@ fn at_the_relay_by(relay: &Node, channel: &[u8; 32], key: &[u8; 32]) -> usize {
 /// node types Alice's key, asks the relay for it, and takes the channel,
 /// filed under the repository's `owner/name` as taken from Alice's key,
 /// with the agent of his clone subscribed. Nobody runs `share` or
-/// `accept`.
+/// `accept`. Then Alice's status shows Bob's device joined, amber, by the
+/// list's label and the commit, until she runs `cordelia shared seen` at
+/// a terminal (rules 4.5 and 7); anywhere else it is refused.
 #[test]
 fn a_device_on_the_list_takes_the_channel_with_no_one_asked() {
     let relay = relay_started();
@@ -201,4 +203,75 @@ fn a_device_on_the_list_takes_the_channel_with_no_one_asked() {
         serde_json::json!([]),
         "nothing was typed by hand"
     );
+
+    // Bob's device writes in the channel as it takes it. Once Alice's
+    // device holds what it wrote, her next read says it joined.
+    wait_for("Alice's device holds Bob's entry", &all, 120, || {
+        (channel_of(&alice, NAME)?["keys"] == 1).then_some(())
+    });
+    subscribes_in(&alice, &alice_clone, &[], "which you hold");
+    let commit = git(&alice, &alice_clone, &["rev-parse", "HEAD"]);
+    let joined = format!("bob-desktop joined {NAME} from the list at {commit}");
+    let status = wait_for("Alice's status says Bob joined", &all, 120, || {
+        let status = status_json(&alice);
+        let says = status["shared"]["repositories"][0]["lines"]
+            .as_array()?
+            .iter()
+            .any(|line| line["says"] == joined.as_str() && line["amber"] == true);
+        says.then_some(status)
+    });
+    assert_eq!(status["level"], "amber", "{status}");
+    assert!(
+        holds_of(&status).contains(&"shared_repository".to_string()),
+        "{status}"
+    );
+    let plain = alice.cli(&["status"]);
+    assert!(
+        plain.contains(&format!("  Following: {REPOSITORY}, for {NAME}")),
+        "{plain}"
+    );
+    assert!(plain.contains(&format!("    To know: {joined}")), "{plain}");
+    assert!(
+        plain.contains("Members: alice-laptop (in), bob-desktop (in)."),
+        "{plain}"
+    );
+
+    // Not at a terminal, nothing is cleared.
+    let refused = alice.refused(&["shared", "seen", NAME]);
+    assert!(
+        refused.contains("Run cordelia shared seen in a terminal"),
+        "{refused}"
+    );
+    assert!(
+        status_json(&alice)["holds"]
+            .to_string()
+            .contains("shared_repository")
+    );
+    let said = alice.at_terminal(&["shared", "seen", NAME]).done();
+    assert!(
+        said.contains(&format!("Cleared 1 notice for {NAME} on this device.")),
+        "{said}"
+    );
+    let status = status_json(&alice);
+    assert!(
+        !holds_of(&status)
+            .iter()
+            .any(|what| what.starts_with("shared")),
+        "{status}"
+    );
+}
+
+/// `cordelia status --json` on `n`.
+fn status_json(n: &Node) -> serde_json::Value {
+    serde_json::from_str(&n.cli(&["status", "--json"])).unwrap()
+}
+
+/// What holds in a status, each by its word.
+fn holds_of(status: &serde_json::Value) -> Vec<String> {
+    status["holds"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|holds| holds["what"].as_str().map(String::from))
+        .collect()
 }

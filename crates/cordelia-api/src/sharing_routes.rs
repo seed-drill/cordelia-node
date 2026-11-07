@@ -358,10 +358,40 @@ pub async fn list(
     crate::commands::asked(&req, &state)?;
     let own = sharing::own_relays(&state);
     let now = state.sync_control.now();
-    let mut listed = sharing::list(&db(&state), &state.identity, &own, body.keys, now)
+    let conn = db(&state);
+    let mut listed = sharing::list(&conn, &state.identity, &own, body.keys, now)
         .map_err(crate::commands::refused)?;
+    // Each repository this device follows (decision 2026-11-06 (joining),
+    // rule 7), as the status says it.
+    listed["repositories"] = crate::repository_status::views(&conn, &state.identity, &own, now)
+        .map_err(crate::commands::refused)?
+        .into();
+    std::mem::drop(conn);
     listed["this_device"] = this_device(&state)?.into();
     Ok(HttpResponse::Ok().json(listed))
+}
+
+// ── POST /api/v1/shared/seen ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeenRequest {
+    pub name: String,
+}
+
+/// `cordelia shared seen <name>` (decision 2026-11-06 (joining), rules
+/// 4.5, 5 and 6): no yes, since it only clears notices on this device.
+pub async fn seen(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<SeenRequest>,
+) -> Result<HttpResponse, ApiError> {
+    crate::commands::asked(&req, &state)?;
+    let said = crate::repository_status::seen(&db(&state), &state.identity, &body.name);
+    match said {
+        Ok(said) => Ok(HttpResponse::Ok().json(json!({ "said": said }))),
+        Err(failed) => answer_of(failed),
+    }
 }
 
 // ── POST /api/v1/shared/anew ─────────────────────────────────────────

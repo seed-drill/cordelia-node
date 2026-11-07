@@ -3,10 +3,13 @@
 //! `messages` object of the messages record and apart from it.
 //!
 //! - **Nothing here sets a level.** The level is worked out in the command
-//!   (`cordelia-node/src/indicator.rs`), which reads of this object one
-//!   fact alone: `removed_device_holds`, each removed device that still
-//!   holds a shared channel the person has not made anew (property 16).
-//!   Everything else is for a person and a panel to read.
+//!   (`cordelia-node/src/indicator.rs`), which reads of this object two
+//!   facts alone: `removed_device_holds`, each removed device that still
+//!   holds a shared channel the person has not made anew (property 16);
+//!   and each line of `repositories` that is amber, the joining record's
+//!   ambers, by the person's ruling of 6 November (decision 2026-11-06
+//!   (joining), rule 6; [`crate::repository_status`]). Everything else is
+//!   for a person and a panel to read.
 //! - **Nothing in it is another person's text:** a relay is given by the
 //!   configuration's address for it and its key's words (§8.1), a key by
 //!   its whole key and its words, and a name is the person's own.
@@ -201,6 +204,10 @@ pub fn status_of(
             }));
         }
 
+        // Each repository this device follows (decision 2026-11-06
+        // (joining), rule 7).
+        let repositories = crate::repository_status::views(conn, identity, beside.own_relays, now)?;
+
         Ok(Some(json!({
             "channels": channels,
             "typed": typed,
@@ -209,6 +216,7 @@ pub fn status_of(
             "passed_over": passed_over,
             "past_a_bound": past_a_bound,
             "made_anew_past_a_bound": made_anew_past_a_bound,
+            "repositories": repositories,
         })))
     })
 }
@@ -272,22 +280,8 @@ fn channel_of(
     let mut offers = Vec::new();
     let mut not_moved_yet = 0;
     if let Some(row) = row.as_ref().filter(|row| row.state == State::Held) {
-        // For each folder that subscribes, the messages unread by its
-        // agent: a message unread by two counts twice, as the `messages`
-        // object counts a message to every name once for each folder.
-        for agent in &subscribed {
-            unread_by_an_agent += crate::shared_messages::unread(conn, identity, agent, now)?
-                .iter()
-                .filter(|seen| seen.row.channel == filing.channel)
-                .count();
-        }
-        let read_here = st(message_rows::read_by_a_person(conn, row.id))?;
-        for message in crate::shared::shown(conn, identity, &filing.channel, now)? {
-            let id = crate::shared_messages::id_of(&message.id)?;
-            if message.signer != own && !read_here.contains(&id) {
-                unread_by_a_person += 1;
-            }
-        }
+        (unread_by_an_agent, unread_by_a_person) =
+            unread_in(conn, identity, row, &subscribed, now)?;
         for key in &keys {
             held_back += st(kept::held_back(conn, row.id, &key.key, now))?;
         }
@@ -376,6 +370,37 @@ fn channel_of(
         "offers": offers,
         "also_a_name": names.contains(&filing.name),
     }))
+}
+
+/// The messages of the channel of `row`, which the person holds, that wait
+/// unread at `now`: by an agent, for each folder of `subscribed` that
+/// subscribes to it, a message unread by two counting twice, as the
+/// `messages` object counts a message to every name once for each folder;
+/// and by the person, on this device.
+pub(crate) fn unread_in(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    row: &kept::Channel,
+    subscribed: &[&str],
+    now: i64,
+) -> Result<(usize, usize), PersonError> {
+    let own = identity.public_key();
+    let mut by_an_agent = 0;
+    for agent in subscribed {
+        by_an_agent += crate::shared_messages::unread(conn, identity, agent, now)?
+            .iter()
+            .filter(|seen| seen.row.channel == row.channel)
+            .count();
+    }
+    let read_here = st(message_rows::read_by_a_person(conn, row.id))?;
+    let mut by_a_person = 0;
+    for message in crate::shared::shown(conn, identity, &row.channel, now)? {
+        let id = crate::shared_messages::id_of(&message.id)?;
+        if message.signer != own && !read_here.contains(&id) {
+            by_a_person += 1;
+        }
+    }
+    Ok((by_an_agent, by_a_person))
 }
 
 #[cfg(test)]

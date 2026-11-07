@@ -103,6 +103,10 @@ enum Commands {
         /// Omarchy bar
         #[arg(long, conflicts_with_all = ["line", "json"])]
         waybar: bool,
+        /// Also show the fingerprint words of each repository's channel and
+        /// of each key on its list
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Run the node on this device
     ///
@@ -684,11 +688,26 @@ enum SharedCommand {
         #[arg(long = "relay", value_name = "RELAY")]
         relays: Vec<String>,
     },
-    /// List the shared channels, their keys and their relays
+    /// List the shared channels, their keys and their relays, and the
+    /// repositories this device follows
     List {
         /// Also list each channel's keys, those refused for room among them
         #[arg(long)]
         keys: bool,
+        /// Also show the fingerprint words of each repository's channel and
+        /// of each key on its list
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
+    /// Clear the notices of a repository's channel on this device
+    ///
+    /// Run it in a terminal once you have read them in cordelia status:
+    /// who joined, a new channel line, and a key you left out that the
+    /// list does not name after without. A key no longer on the list stays
+    /// shown until you make the channel anew. It asks no yes.
+    Seen {
+        /// The channel's name, as cordelia status shows it
+        name: String,
     },
     /// File a shared channel under another name, on every device of yours
     Rename {
@@ -941,9 +960,12 @@ fn main() -> anyhow::Result<()> {
             show_secrets,
             new_key: false,
         }) => cmd_init(&cli.config, name, non_interactive, force, show_secrets),
-        Some(Commands::Status { line, json, waybar }) => {
-            cmd_status(&cli.config, line, json, waybar)
-        }
+        Some(Commands::Status {
+            line,
+            json,
+            waybar,
+            verbose,
+        }) => cmd_status(&cli.config, line, json, waybar, verbose),
         Some(Commands::Start) => cmd_start(&cli.config),
         Some(Commands::Stop) => {
             println!("cordelia stop: not yet implemented (requires PID file / signal)");
@@ -988,7 +1010,8 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Commands::Shared { what }) => match what {
             SharedCommand::New { name, relays } => shared_cmd::new(&cli.config, &name, &relays),
-            SharedCommand::List { keys } => shared_cmd::show(&cli.config, keys),
+            SharedCommand::List { keys, verbose } => shared_cmd::show(&cli.config, keys, verbose),
+            SharedCommand::Seen { name } => shared_cmd::seen(&cli.config, &name),
             SharedCommand::Rename {
                 name,
                 new_name,
@@ -1572,9 +1595,12 @@ fn messages_line(says: &str) -> String {
 }
 
 /// What the plain status says under `Memory:`, worked out from `facts`
-/// without the hold of a shared channel and without the hold of agents
-/// held for their person, and that hold of a shared channel, where it
-/// holds (decision 2026-10-10 §9). The other is [`messages_held`]'s.
+/// without the holds of shared channels and without the hold of agents
+/// held for their person, and the hold of a removed device that holds a
+/// shared channel, where it holds (decision 2026-10-10 §9). The ambers of
+/// the repositories this device follows are said under each repository
+/// (decision 2026-11-06 (joining), rule 7), and the hold of agents by
+/// [`messages_held`].
 fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indicator::Holds>) {
     let shared = indicator::shown(facts)
         .holds
@@ -1582,6 +1608,7 @@ fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indi
         .find(indicator::is_shared);
     let mut without = facts.clone();
     without.devices.removed_holds_shared = 0;
+    without.devices.repository_ambers.clear();
     without.held_pairs = 0;
     (indicator::shown(&without), shared)
 }
@@ -1596,7 +1623,13 @@ fn messages_held(facts: &indicator::Facts) -> Option<indicator::Holds> {
         .find(indicator::is_messages_held)
 }
 
-fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
+fn cmd_status(
+    config_path: &str,
+    line: bool,
+    json: bool,
+    waybar: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let status = gather_status(config_path);
     // The state, the level, and what the line says: the level is worked
     // out here, in the command, and nowhere else (decision 2026-10-04
@@ -1997,6 +2030,19 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 for line in msg_cmd::status_bound_lines(&live["messages"], now) {
                     println!("{line}");
                 }
+                // Last, each repository this device follows, with its
+                // lines, its ambers among them (decision 2026-11-06
+                // (joining), rule 7).
+                for repository in person_cmd::list(&live["shared"], "repositories") {
+                    let lines = shared_cmd::repository_lines(repository, verbose);
+                    for (n, line) in lines.iter().enumerate() {
+                        let line = history_cmd::printable(line);
+                        match n {
+                            0 => println!("  Following: {line}"),
+                            _ => println!("  {line}"),
+                        }
+                    }
+                }
             }
         }
         // A node whose address is refused is not asked, and is not known
@@ -2314,6 +2360,7 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         // ([`indicator::shared`]).
         removed_holds_shared_secs: None,
         removed_holds_shared: 0,
+        repository_ambers: Vec::new(),
     }
 }
 
@@ -7643,6 +7690,7 @@ mod tests {
                 carried_to_go_secs: Some(20),
                 removed_holds_shared_secs: None,
                 removed_holds_shared: 0,
+                repository_ambers: Vec::new(),
             }
         );
 

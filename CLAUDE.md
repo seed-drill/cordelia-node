@@ -108,6 +108,10 @@ cordelia-node/
                          #   a recovery, not clean, paused, and what a removal,
                          #   `devices` and `recover` name), shared_status (the
                          #   status's `shared` object, decision 2026-10-10 §9),
+                         #   repository_status (what the status and `shared list`
+                         #   say of each repository followed, its ambers, and
+                         #   `shared seen`, decision 2026-11-06 (joining), rules 6
+                         #   and 7),
                          #   at_relays (and
                          #   known: what a device knows of which relay holds which change),
                          #   local (the local
@@ -158,7 +162,9 @@ cordelia-node/
                          #   reach: whether
                          #   each relay can be reached, and its class), indicator (the
                          #   state and the level of a status; of a shared channel
-                         #   only a removed device that holds one)
+                         #   only a removed device that holds one, and the ambers of
+                         #   a repository followed, by the person's ruling of 6
+                         #   November)
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
     specs/               # Protocol and component specs + TLA+ model

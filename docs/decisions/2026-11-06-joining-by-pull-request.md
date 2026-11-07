@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Revised five times after its reviews (section 13). Amended on 7 November by the person's rulings: the node reads the clone only, and a channel follows one repository (section 14). To be built: a reviewed plan first. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
+**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Revised five times after its reviews (section 13). Amended on 7 November by the person's rulings: the node reads the clone only, and a channel follows one repository (section 14). Amended in building slice 7: when rule 5's "from then on" starts, the end of its amber at `shared seen`, and rule 6's line of a device that follows no list. To be built: a reviewed plan first. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -149,7 +149,9 @@ channel <new ID> <relay keys> without 2 <key> <key>
 
 **Once it is merged, the line itself says who was left out,** to every follower: one that was off, and one that joined later, included. No device has to have read the offer. While a key it names is still listed and not in the channel, the list names no channel (rule 1), so nobody is handed anything until that key's line goes. Then the key is not listed, and is never handed the channel. That holds where a member made it anew before the pull request that drops the key, and where a removal made it anew without a stolen device that is still listed.
 
-**The device that made it anew shows the line until the list names the new channel.** From then on, while a key it left out is still listed, it shows amber whenever the list's `channel` line does not name that key after `without`, at this making anew or any later one: `<label> was left out of <name>, and its channel line does not say so: add it after without, or delete its line`.
+**The device that made it anew shows the line until the list names the new channel,** amber: `<name> was made anew here: put its new channel line in .cordelia/members, in a pull request`, with the line. From then on, while a key it left out is still listed, it shows amber whenever the list's `channel` line does not name that key after `without`, at this making anew or any later one: `<label> was left out of <name>, and its channel line does not say so: add it after without, or delete its line`.
+- **"Then"** is the first read of a list that this device follows whose `channel` line names the new channel, or one made anew from it, as this device knows its moves. The device keeps when that was, with the making anew.
+- **That amber of a key also ends at `cordelia shared seen <name>` on that device,** as for a key brought back on purpose (rule 1): the making anew counts that key as left out no more. Otherwise it would never end.
 
 **Keys that cannot be named:** a key whose row the table let go, and anyone who wrote in a channel past a bound (§6.3 and §7 there). Where such a key is listed, it is handed the new channel. That errs toward the list, which decides.
 
@@ -175,7 +177,7 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 | The gate of rule 1 | `<label> is on the list of <name> but was left out of it: nothing is handed over until its line goes, or it writes in the channel.` |
 | The list, from the clone | rule 3's line, with how old it is |
 | A list naming a channel that another follow names | `The list of <identity> names <name>, which this device follows from <other identity>: run cordelia subscribe in a clone of the one it should follow.` |
-| Nobody of yours follows | `No device of yours reads the list of <name>: run cordelia subscribe in a clone of <identity>.` |
+| This device follows no list of the channel | `This device does not read the list of <name>: run cordelia subscribe in a clone of its repository.` Said by `cordelia shared seen <name>`. Only a device that follows a repository knows that a channel is its, and another device's follows are its own. |
 | The channel line changed | amber, as a join is: `The list of <identity> names a new channel for <name> at <commit>.` Cleared by `cordelia shared seen <name>`. |
 
 ## 7. What `cordelia status` shows
@@ -187,7 +189,9 @@ For each repository channel:
 - **what waits:** messages unread by the person and by an agent;
 - **any line of rules 4 to 6.**
 
-The notices of rules 4.5 to 4.7 show only on devices that follow the repository. The fingerprint words show only with `-v` (#228).
+The notices of rules 4.5 to 4.7 show only on devices that follow the repository. Rule 1's gate shows as rule 4.7's line, once, on a device that holds the channel: a joiner cannot see who is in it, and shows neither line. The fingerprint words show only with `-v` (#228).
+
+**The ambers set the status's level** (the person's ruling of 6 November): a join (4.5), a key dropped (4.6), rule 1's gate (4.7), a changed channel line and a device of yours left out (rule 6), and the three of rule 5. They overturn property 16 of the shared channels record, "nothing about a shared channel sets a level". Nothing else of a shared channel sets one.
 
 ## 8. An agent that is not in a clone
 
