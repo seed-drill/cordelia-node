@@ -451,6 +451,15 @@ pub struct ClonedList {
     pub fetched: Option<SystemTime>,
 }
 
+impl ClonedList {
+    /// [`ClonedList::fetched`], in seconds since the epoch, as a follow's
+    /// row keeps it.
+    pub fn fetched_at(&self) -> Option<i64> {
+        let since = self.fetched?.duration_since(SystemTime::UNIX_EPOCH).ok()?;
+        i64::try_from(since.as_secs()).ok()
+    }
+}
+
 /// Why the list was not read: each said plainly, for a status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListFailed {

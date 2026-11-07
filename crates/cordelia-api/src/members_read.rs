@@ -12,8 +12,10 @@
 //!   - first, a follow whose list names a channel the person dropped, on
 //!     this device or another, is stopped (rule 2.5);
 //!   - a read that failed, whose commit does not come after the last one,
-//!     or whose list does not parse counts for nothing: the last list
-//!     stands, and why is kept for the status;
+//!     whose list does not parse, or whose list names a channel that
+//!     another follow's list names counts for nothing: the last list
+//!     stands, and why is kept for the status. A channel follows one
+//!     repository;
 //!   - otherwise the list is kept, and rule 4 is done, with the list
 //!     compared with the one kept before by what it says, never by its
 //!     commit: the notices of rules 4.5, 4.6 and 6; the shares to keys the
@@ -31,17 +33,19 @@ use std::path::Path;
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{MEMBERS_HANDED_AT_ONCE, SHARED_MAX_KEYS};
-use cordelia_crypto::acts::{Came, Filing};
+use cordelia_crypto::acts::Filing;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_storage::follows::{self, Follow, LastRead, NotRead, Notice, NoticeOf};
 use cordelia_storage::shared::{self as kept, State};
 use cordelia_storage::shared_sharing as share_rows;
 
-use crate::following::keys_in_channel;
+use crate::following::{
+    channel_named, followed_elsewhere, followed_elsewhere_line, keys_in_channel,
+};
 use crate::git_list::{ClonedList, Git, Identity, ListFailed};
-use crate::lists::{self, AnyAct};
 use crate::members::{self, ChannelLine, Members, same_key};
 use crate::person::{Held, PersonError, in_one};
+use crate::shared_anew::{Gone, dropped_or_moved};
 use crate::sharing::{self, Failed, OwnRelay, ShareTo};
 use crate::state::AppState;
 
@@ -88,11 +92,12 @@ fn read_clone(git: &Git, follow: &Follow) -> Result<Read, ListFailed> {
     let clone = Path::new(&follow.clone);
     let list = git.read_clone(clone, &follow.remote, &identity)?;
     // Never back: the commit read is the last one read or comes after it.
-    // A follow with no last commit, as after following again, takes the
-    // commit as it is: the person's yes said whether it was behind.
+    // A follow has a last commit from its first read, and a yes to follow
+    // it again names one; a row with none would not know what is back, so
+    // its read counts for nothing.
     let comes_after = match &follow.last {
         Some(last) => git.comes_after(clone, &last.commit, &list.at.commit)?,
-        None => true,
+        None => false,
     };
     Ok(Read { list, comes_after })
 }
@@ -147,51 +152,78 @@ pub fn after_read(
             .and_then(|list| members::read(list).ok());
         let latest = latest_of(read);
         // First, rule 2.5: a drop of the channel the list names stops the
-        // follow, whether it was made on this device or another.
-        let dropped = dropped(conn)?;
-        let names_dropped = |members: &Members| {
-            members
-                .channel
-                .as_ref()
-                .is_some_and(|line| dropped.contains(&line.channel))
-        };
-        if kept_list.as_ref().is_some_and(names_dropped)
-            || latest
-                .as_ref()
-                .is_ok_and(|(_, _, list)| names_dropped(list))
-        {
-            follows::unfollow(conn, &follow.identity)?;
-            return Ok(Done::Stopped);
+        // follow, whether it was made on this device or another. A move is
+        // not a drop: rule 6 says to put the new line in the list.
+        let lists = kept_list
+            .iter()
+            .chain(latest.as_ref().ok().map(|latest| &latest.list));
+        for line in lists.filter_map(|list| list.channel.as_ref()) {
+            if dropped_or_moved(conn, &line.channel)? == Some(Gone::Dropped) {
+                follows::unfollow(conn, &follow.identity)?;
+                return Ok(Done::Stopped);
+            }
         }
-        let (commit, file, list) = match latest {
+        let latest = match latest {
             Ok(latest) => latest,
             Err(not) => {
                 follows::not_read(conn, &follow.identity, &not)?;
                 return Ok(Done::NotRead(not));
             }
         };
+        let (commit, list) = (&latest.commit, &latest.list);
+        // A channel follows one repository (rule 2.5): the follow whose
+        // list named it first keeps it.
+        if let Some(line) = &list.channel
+            && let Some(other) = followed_elsewhere(conn, &follow.identity, &line.channel)?
+        {
+            let not = NotRead {
+                word: "followed_elsewhere".into(),
+                why: followed_elsewhere_line(&other, &channel_named(conn, &line.channel)?),
+            };
+            follows::not_read(conn, &follow.identity, &not)?;
+            return Ok(Done::NotRead(not));
+        }
         let done = LastRead {
             commit: commit.clone(),
             at: now,
             from_clone: true,
         };
-        follows::read_done(conn, &follow.identity, &done, &file)?;
+        follows::read_done(
+            conn,
+            &follow.identity,
+            &done,
+            &latest.file,
+            latest.fetched_at,
+        )?;
+        // The keys a share waits for as the read begins, of any channel, by
+        // hand or the node's: the turn passes over each, and a key whose
+        // share goes at this read waits for it too (rule 4.2).
+        let waiting: Vec<[u8; 32]> = sharing::waiting(conn, now)?
+            .iter()
+            .map(|share| share.key)
+            .collect();
         noticed(
             conn,
             identity,
             &follow,
             kept_list.as_ref(),
-            &list,
-            &commit,
+            list,
+            commit,
             now,
         )?;
-        shares_go(conn, identity, &follow, kept_list.as_ref(), &list, now)?;
-        let (handed, not_handing) = match acts_in(conn, identity, own_relays, &list)? {
+        shares_go(conn, identity, &follow, kept_list.as_ref(), list, now)?;
+        let (handed, not_handing) = match acts_in(conn, identity, own_relays, list)? {
             Ok((line, filing)) => {
-                let handed = hand_over(
-                    conn, identity, &held, own_relays, &follow, &list, line, &filing, now,
-                )?;
-                (handed, None)
+                let turn = Turn {
+                    held: &held,
+                    own_relays,
+                    follow: &follow,
+                    list,
+                    line,
+                    filing: &filing,
+                    waiting: &waiting,
+                };
+                (hand_over(conn, identity, &turn, now)?, None)
             }
             Err(why) => (Vec::new(), Some(why)),
         };
@@ -211,11 +243,19 @@ fn same_follow(now: &Follow, then: &Follow) -> bool {
     now.clone == then.clone && now.remote == then.remote && commit(now) == commit(then)
 }
 
-/// The commit, the bytes and the list that `read` gives, or why it counts
-/// for nothing (rules 1 and 3): it failed, its commit does not come after
-/// the last one read, or its list does not parse. A clone with no list is a
-/// list with no members and no channel.
-fn latest_of(read: &CloneRead) -> Result<(String, Vec<u8>, Members), NotRead> {
+/// A list just read from a clone.
+struct Latest {
+    commit: String,
+    file: Vec<u8>,
+    list: Members,
+    fetched_at: Option<i64>,
+}
+
+/// The list that `read` gives, or why it counts for nothing (rules 1 and
+/// 3): it failed, its commit does not come after the last one read, or its
+/// list does not parse. A clone with no list is a list with no members and
+/// no channel.
+fn latest_of(read: &CloneRead) -> Result<Latest, NotRead> {
     let got = read.read.as_ref().map_err(|failed| NotRead {
         word: failed.code().into(),
         why: failed.says(),
@@ -241,37 +281,12 @@ fn latest_of(read: &CloneRead) -> Result<(String, Vec<u8>, Members), NotRead> {
         word: "not_a_list".into(),
         why: not.to_string(),
     })?;
-    Ok((commit.clone(), file, list))
-}
-
-/// The channels the person dropped, on this device or another, as the
-/// person's lists say (§3.4 there), those a bound leaves out among them:
-/// not those they moved from, which a move keeps as a drop (rule 6 says
-/// to put the new line in the list, and the follow goes on).
-fn dropped(conn: &Connection) -> Result<Vec<[u8; 32]>, PersonError> {
-    let holds = lists::holds(conn)?;
-    let mut filings: Vec<&Filing> = holds.filings.iter().map(|(act, _)| &act.item).collect();
-    let mut drops: Vec<[u8; 32]> = holds
-        .drops
-        .iter()
-        .map(|(act, _)| act.item.channel)
-        .collect();
-    for (act, _) in &holds.left_out {
-        match act {
-            AnyAct::Filing(filing) => filings.push(&filing.item),
-            AnyAct::Drop(drop) => drops.push(drop.item.channel),
-            _ => {}
-        }
-    }
-    let moved_from: Vec<[u8; 32]> = filings
-        .iter()
-        .filter_map(|filing| match filing.came {
-            Came::Moved(from) => Some(from),
-            _ => None,
-        })
-        .collect();
-    drops.retain(|channel| !moved_from.contains(channel));
-    Ok(drops)
+    Ok(Latest {
+        commit: commit.clone(),
+        file,
+        list,
+        fetched_at: got.list.fetched_at(),
+    })
 }
 
 // ── The notices (rules 4.5, 4.6 and 6) ───────────────────────────────
@@ -296,9 +311,11 @@ fn noticed(
         };
         follows::notice(conn, of, &notice)
     };
-    // Rule 6: the channel line names another channel than it did.
+    // Rule 6: the channel line names another channel than it did. A first
+    // line, as after `subscribe --new`, is no change.
     let channel = |members: &Members| members.channel.as_ref().map(|line| line.channel);
     if let Some(kept) = kept
+        && kept.channel.is_some()
         && list.channel.is_some()
         && channel(kept) != channel(list)
     {
@@ -334,9 +351,11 @@ fn noticed(
 
 /// Rule 4.5: each key the list names that this device first held an entry
 /// of in the channel the list names since the last read, and since the
-/// follow, gives a notice, once. The person's own devices give none. Nor
-/// does a read just after this device came to hold the channel: every key
-/// it then first holds was there before it, as far as it can tell.
+/// follow, gives a notice, once. The person's own devices give none, nor
+/// does a key that moved there with the person, sealed to by the offer
+/// that made the channel: it first writes there as it moves. Nor does a
+/// read just after this device came to hold the channel: every key it
+/// then first holds was there before it, as far as it can tell.
 fn joined(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -345,7 +364,7 @@ fn joined(
     commit: &str,
     now: i64,
 ) -> Result<(), PersonError> {
-    // With no last read, as after following again, nothing says since when.
+    // A follow has a last read: one with none would not know since when.
     let (Some(line), Some(last)) = (&list.channel, &follow.last) else {
         return Ok(());
     };
@@ -358,10 +377,13 @@ fn joined(
     }
     let own = identity.public_key();
     let own_devices = crate::person::who_counts(conn)?.keys();
+    let moved = crate::shared_anew::moved_with(conn, &own, &line.channel)?;
+    let among = |keys: &[[u8; 32]], key: &[u8; 32]| keys.iter().any(|one| same_key(one, key));
     for key in kept::keys(conn, row.id)? {
         if key.first_held.is_none_or(|first| first <= since)
             || same_key(&key.key, &own)
-            || own_devices.iter().any(|device| same_key(device, &key.key))
+            || among(&own_devices, &key.key)
+            || among(&moved, &key.key)
         {
             continue;
         }
@@ -383,12 +405,12 @@ fn joined(
 // ── The shares that go (rules 4.2 and 4.3) ───────────────────────────
 
 /// The shares that go at this read, in the channels the list kept and the
-/// list just read name: the node's, to a key the list no longer names, or
-/// made before the last read, so that each lives for two reads (rule
-/// 4.2); and a person's, to a key the list kept named and this one does
-/// not (rule 4.3). A share a person made to a key the list never named
-/// stays: a member may still hand the channel to such a key by hand
-/// (rule 10).
+/// list just read name: the node's, once it is not of the channel the
+/// list names, or to a key the list no longer names, or made before the
+/// last read, so that each lives for two reads (rule 4.2); and a person's,
+/// to a key the list kept named and this one does not (rule 4.3). A share
+/// a person made to a key the list never named stays: a member may still
+/// hand the channel to such a key by hand (rule 10).
 fn shares_go(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -407,6 +429,7 @@ fn shares_go(
             channels.push(line.channel);
         }
     }
+    let named = list.channel.as_ref().map(|line| line.channel);
     let last = follow.last.as_ref().map(|last| last.at);
     for row in share_rows::shares(conn)? {
         if row.gone || !channels.contains(&row.channel) {
@@ -414,7 +437,9 @@ fn shares_go(
         }
         let listed = list.lists(&row.key);
         let goes = match row.by_node {
-            true => !listed || last.is_none_or(|last| row.made < last),
+            true => {
+                named != Some(row.channel) || !listed || last.is_none_or(|last| row.made < last)
+            }
             false => !listed && kept.is_some_and(|kept| kept.lists(&row.key)),
         };
         if goes {
@@ -526,43 +551,48 @@ pub fn acts_in<'a>(
     Ok(Ok((line, filing)))
 }
 
-/// Rule 4.2: hand the channel of `filing` to the next
-/// [`MEMBERS_HANDED_AT_ONCE`] keys in `list`'s order, starting after the
+/// What a turn of rule 4.2 is taken from: what the person holds, the
+/// device's relays known by their keys, the follow, its list and channel
+/// line, the person's filing of that channel, and the keys a share waited
+/// for as the read began.
+struct Turn<'a> {
+    held: &'a Held,
+    own_relays: &'a [OwnRelay],
+    follow: &'a Follow,
+    list: &'a Members,
+    line: &'a ChannelLine,
+    filing: &'a Filing,
+    waiting: &'a [[u8; 32]],
+}
+
+/// Rule 4.2: hand the channel of the turn's filing to the next
+/// [`MEMBERS_HANDED_AT_ONCE`] keys in its list's order, starting after the
 /// last one handed, of those listed and not in the channel, not after
-/// `without` in `line`, not the person's own devices, not keys the person
-/// removed, and not keys a share of the person's own waits for, nor one of
-/// the node's made at the last read, which lives until the next. A twin
-/// counts as its key throughout. Each share is the node's, counted apart
-/// from the person's, through the checks `share` makes too. Returns the
-/// keys handed to.
-#[allow(clippy::too_many_arguments)]
+/// `without` in its line, not the person's own devices, and not keys the
+/// person removed; nor a key a share waited for as the read began, of any
+/// channel, by hand or the node's, as a share of one channel writes over
+/// another's for the same key. A twin counts as its key throughout. Each
+/// share is the node's, counted apart from the person's, through the
+/// checks `share` makes too. Returns the keys handed to.
 fn hand_over(
     conn: &Connection,
     identity: &NodeIdentity,
-    held: &Held,
-    own_relays: &[OwnRelay],
-    follow: &Follow,
-    list: &Members,
-    line: &ChannelLine,
-    filing: &Filing,
+    turn: &Turn<'_>,
     now: i64,
 ) -> Result<Vec<[u8; 32]>, PersonError> {
+    let Turn {
+        held,
+        own_relays,
+        follow,
+        list,
+        line,
+        filing,
+        waiting,
+    } = *turn;
     let own = identity.public_key();
     let in_channel = keys_in_channel(conn, &own, list)?;
     let own_devices = crate::person::who_counts(conn)?.keys();
     let removed = crate::person::removed_known(conn, &held.statement.statement)?;
-    // A share of one channel deletes another's for the same key, so a key
-    // that a person's own share waits for is left to it.
-    let by_hand: Vec<[u8; 32]> = sharing::waiting_by_hand(conn, now)?
-        .iter()
-        .map(|share| share.key)
-        .collect();
-    // What [`shares_go`] left of the node's: those of the last read.
-    let waiting: Vec<[u8; 32]> = follows::shares_by_node(conn)?
-        .into_iter()
-        .filter(|share| share.channel == filing.channel)
-        .map(|share| share.key)
-        .collect();
     let among = |keys: &[[u8; 32]], key: &[u8; 32]| keys.iter().any(|one| same_key(one, key));
     let to_hand = |key: &[u8; 32]| {
         !among(&in_channel, key)
@@ -570,8 +600,7 @@ fn hand_over(
             && !same_key(&own, key)
             && !among(&own_devices, key)
             && !among(&removed, key)
-            && !among(&by_hand, key)
-            && !among(&waiting, key)
+            && !among(waiting, key)
     };
     let devices = &list.devices;
     let start = follow

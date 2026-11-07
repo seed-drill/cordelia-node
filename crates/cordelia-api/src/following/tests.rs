@@ -7,6 +7,7 @@ use super::*;
 use crate::git_list::ListAt;
 use crate::several::Several;
 use crate::shared::tests::{Shared, bob, holds, member, message, stores};
+use cordelia_crypto::acts::Came;
 use cordelia_storage::meta;
 use serde_json::{Value, json};
 
@@ -406,6 +407,63 @@ fn a_dropped_channel_is_refused() {
     assert!(follow_row(&s).is_none());
 }
 
+/// A list that names a channel another follow's list names is not
+/// followed: a channel follows one repository (rule 2.5; the review of
+/// slice 5a, M2). The channel is said by its name where the person holds
+/// it, and else by its words; and a follow of the same repository again
+/// is not refused by its own list.
+#[test]
+fn a_channel_another_follow_names_is_refused() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let held = holds(&s, 0, 8, "review", now);
+    let not_held = Shared::of(9);
+    let other = "example.org/team/other";
+    let line_of = |channel: &Shared| {
+        format!(
+            "{}\n{} bob-laptop\n",
+            channel_line(channel, &[]),
+            id(&s.key(0))
+        )
+    };
+    for (channel, name) in [
+        (&held, "\"review\"".to_string()),
+        (
+            &not_held,
+            format!("channel {}", channel_words(&not_held.id)),
+        ),
+    ] {
+        follows::follow(conn, other, "origin", "/home/bob/Work/other", now).unwrap();
+        let read = LastRead {
+            commit: FIRST.into(),
+            at: now,
+            from_clone: true,
+        };
+        follows::read_done(conn, other, &read, line_of(channel).as_bytes(), None).unwrap();
+        assert_eq!(
+            refusal(planned(&s, Some(&line_of(channel)), FIRST, false)),
+            (
+                "followed_elsewhere",
+                format!(
+                    "This device follows {other}, whose list names {name} too: a channel follows \
+                     one repository."
+                )
+            )
+        );
+        assert!(follow_row(&s).is_none());
+        follows::unfollow(conn, other).unwrap();
+    }
+    // Its own list does not refuse a follow of the same repository again.
+    let list = line_of(&held);
+    yes(
+        &s,
+        &planned(&s, Some(&list), FIRST, false).unwrap(),
+        now + 1,
+    );
+    assert!(planned(&s, Some(&list), SECOND, false).is_ok());
+}
+
 /// The gate line of rule 6, for `label` on the list of `name`.
 fn gate_line(label: &str, name: &str) -> String {
     format!(
@@ -632,10 +690,11 @@ fn following_again_says_where_it_read_last_and_whether_the_clone_goes_back() {
 }
 
 /// Following again keeps what the node's reads need (rule 2.5): the list
-/// last read, the notices, the last key handed, and when it was first
-/// followed. The commit the yes named is where never-back starts now; the
-/// list read with it is not kept, so the next read is compared with the
-/// earlier one (rule 4.6).
+/// last read, and when it was read, the notices, the last key handed, and
+/// when it was first followed. The commit the yes named is where
+/// never-back starts now; the list read with it is not kept, so the next
+/// read is compared with the earlier one (rule 4.6), and notices each key
+/// first held since that one (rule 4.5).
 #[test]
 fn following_again_keeps_the_list_and_the_notices() {
     let s = devices(1);
@@ -662,7 +721,7 @@ fn following_again_keeps_the_list_and_the_notices() {
     let row = follow_row(&s).unwrap();
     let read = LastRead {
         commit: SECOND.into(),
-        at: now + 5,
+        at: now,
         from_clone: true,
     };
     assert_eq!(row.last, Some(read));

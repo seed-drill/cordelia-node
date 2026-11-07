@@ -259,7 +259,7 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
   - A pull request that adds a key's line and takes it off `without` lets it back in.
   - After a second making anew, a key left out at the first, whose line went, is not handed the newest channel.
 - **Turns.**
-  - Nine new keys, with eight of them off: the ninth is handed the channel at the next read.
+  - Nine new keys, with eight of them off: the ninth is handed the channel at the third read, twenty minutes after the first, as the shares of the first four go.
   - The taker's typings leave the person's eight places free.
   - The node's shares leave the person's own `share` its places.
 

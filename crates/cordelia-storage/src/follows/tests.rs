@@ -32,12 +32,17 @@ fn a_follow_is_kept_read_and_turned() {
         at: 9,
         from_clone: true,
     };
-    assert!(read_done(&conn, ID, &read, b"channel line").unwrap());
+    assert!(read_done(&conn, ID, &read, b"channel line", Some(8)).unwrap());
     set_last_handed(&conn, ID, &[5; 32]).unwrap();
     let kept = follow_of(&conn, ID).unwrap().unwrap();
     assert_eq!(kept.last, Some(read));
     assert_eq!(kept.list.as_deref(), Some(&b"channel line"[..]));
     assert_eq!(kept.last_handed, Some([5; 32]));
+    assert_eq!(
+        kept.fetched_at,
+        Some(8),
+        "when the clone said it was fetched"
+    );
     assert_eq!(follows(&conn).unwrap(), vec![kept]);
     // A list read for a repository not followed changes nothing.
     let other = LastRead {
@@ -45,7 +50,7 @@ fn a_follow_is_kept_read_and_turned() {
         at: 9,
         from_clone: false,
     };
-    assert!(!read_done(&conn, "example.org/o/other", &other, b"x").unwrap());
+    assert!(!read_done(&conn, "example.org/o/other", &other, b"x", None).unwrap());
 }
 
 /// A read that counted for nothing is kept with its word and why, the
@@ -60,7 +65,7 @@ fn a_read_that_counted_for_nothing_is_kept_until_one_counts() {
         at: 9,
         from_clone: true,
     };
-    read_done(&conn, ID, &read, b"list").unwrap();
+    read_done(&conn, ID, &read, b"list", None).unwrap();
     assert_eq!(follow_of(&conn, ID).unwrap().unwrap().not_read, None);
     let behind = NotRead {
         word: "behind".into(),
@@ -82,7 +87,7 @@ fn a_read_that_counted_for_nothing_is_kept_until_one_counts() {
     not_read(&conn, ID, &long).unwrap();
     let kept = follow_of(&conn, ID).unwrap().unwrap().not_read.unwrap();
     assert_eq!(kept.why, "w".repeat(1023));
-    read_done(&conn, ID, &read, b"list").unwrap();
+    read_done(&conn, ID, &read, b"list", None).unwrap();
     assert_eq!(follow_of(&conn, ID).unwrap().unwrap().not_read, None);
 }
 
@@ -103,7 +108,7 @@ fn following_again_starts_never_back_over_and_unfollowing_keeps_nothing() {
             at: 9,
             from_clone: false,
         };
-        read_done(conn, ID, &read, b"list").unwrap();
+        read_done(conn, ID, &read, b"list", None).unwrap();
         set_last_handed(conn, ID, &[2; 32]).unwrap();
         type_key(conn, ID, &key, 9).unwrap();
         notice(

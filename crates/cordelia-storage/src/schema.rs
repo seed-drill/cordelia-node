@@ -1874,7 +1874,8 @@ CREATE TABLE shared_anew_not_clean (
 /// - `shared_follows`: each repository this device follows, by its identity
 ///   (`host/owner/name`): the clone's remote and path, when it was
 ///   followed, the last commit read with when and from where (0 the host,
-///   1 the clone), the bytes of the last list read, the last key the
+///   1 the clone), when the person's git had last fetched it, as the clone
+///   said, the bytes of the last list read, the last key the
 ///   node handed the channel to, where its next turn starts after, and,
 ///   where the latest read counted for nothing, its word and why.
 /// - `shared_follow_typed`: the node's own typings of listed keys, for each
@@ -1904,6 +1905,7 @@ CREATE TABLE shared_follows (
                              OR (typeof(last_commit) = 'text' AND length(last_commit) IN (40, 64))),
     last_read_at  INTEGER CHECK(last_read_at IS NULL OR typeof(last_read_at) = 'integer'),
     read_from     INTEGER CHECK(read_from IS NULL OR read_from IN (0, 1)),
+    fetched_at    INTEGER CHECK(fetched_at IS NULL OR typeof(fetched_at) = 'integer'),
     list          BLOB CHECK(list IS NULL OR (typeof(list) = 'blob' AND length(list) <= 16384)),
     last_handed   BLOB CHECK(last_handed IS NULL
                              OR (typeof(last_handed) = 'blob' AND length(last_handed) = 32)),
@@ -7618,6 +7620,7 @@ mod tests {
             "INSERT INTO shared_follows (identity, remote, clone, followed_at, list) VALUES ('example.org/o/n', 'origin', '/r', 9, zeroblob(16385))".to_string(),
             "INSERT INTO shared_follows (identity, remote, clone, followed_at, last_handed) VALUES ('example.org/o/n', 'origin', '/r', 9, zeroblob(31))".to_string(),
             "INSERT INTO shared_follows (identity, remote, clone, followed_at, not_read) VALUES ('example.org/o/n', 'origin', '/r', 9, 'behind')".to_string(),
+            "INSERT INTO shared_follows (identity, remote, clone, followed_at, fetched_at) VALUES ('example.org/o/n', 'origin', '/r', 9, 'eight')".to_string(),
             "INSERT INTO shared_follows (identity, remote, clone, followed_at, not_read, not_read_why) VALUES ('example.org/o/n', 'origin', '/r', 9, '', 'why')".to_string(),
             format!("INSERT INTO shared_follows (identity, remote, clone, followed_at, not_read, not_read_why) VALUES ('example.org/o/n', 'origin', '/r', 9, 'git', '{}')", "w".repeat(1025)),
             "INSERT INTO shared_follow_typed (identity, key, typed_at) VALUES ('example.org/o/n', zeroblob(31), 9)".to_string(),
@@ -7637,7 +7640,7 @@ mod tests {
             assert!(conn.execute(&refused, []).is_err(), "{refused}");
         }
         for taken in [
-            format!("INSERT INTO shared_follows VALUES ('example.org/o/n', 'origin', '/r', 9, '{commit}', 9, 1, zeroblob(16384), zeroblob(32), 'git', '{}')", "w".repeat(1024)),
+            format!("INSERT INTO shared_follows VALUES ('example.org/o/n', 'origin', '/r', 9, '{commit}', 9, 1, 8, zeroblob(16384), zeroblob(32), 'git', '{}')", "w".repeat(1024)),
             "INSERT INTO shared_follow_typed VALUES ('example.org/o/n', zeroblob(32), 9, 'taken', NULL)".to_string(),
             format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 1, zeroblob(32), 'alice-laptop', '{commit}', 9)"),
             format!("INSERT INTO shared_follow_notices VALUES ('example.org/o/n', 2, zeroblob(0), NULL, '{}', 9)", "d".repeat(64)),

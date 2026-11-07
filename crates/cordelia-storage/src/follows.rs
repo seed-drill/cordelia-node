@@ -3,8 +3,9 @@
 //!
 //! - **The follows** (`shared_follows`): each repository this device
 //!   follows, by its identity (`host/owner/name`), with the clone's remote
-//!   and path, the last commit read with when and from where, the bytes of
-//!   the last list read, the last key the node handed the channel to,
+//!   and path, the last commit read with when and from where and when the
+//!   person's git had last fetched it, the bytes of the last list read, the
+//!   last key the node handed the channel to,
 //!   after which its next turn starts (rule 4.2), and why the latest read
 //!   counted for nothing, where it did (rules 1 and 3). Following again
 //!   starts never-back over, and keeps the rest (rule 2.5).
@@ -71,6 +72,10 @@ pub struct Follow {
     pub followed_at: i64,
     /// The last list read, where one was.
     pub last: Option<LastRead>,
+    /// When the person's git had last fetched the branch the last list was
+    /// read from, as the clone said then, where it said: for the status's
+    /// "fetched 2 hours ago" (rule 3).
+    pub fetched_at: Option<i64>,
     /// The bytes of the last list read.
     pub list: Option<Vec<u8>>,
     /// The last key the node handed the channel to: its next turn starts
@@ -99,7 +104,7 @@ pub struct LastRead {
 }
 
 const FOLLOW_COLUMNS: &str = "identity, remote, clone, followed_at, last_commit, last_read_at, \
-                              read_from, list, last_handed, not_read, not_read_why";
+                              read_from, list, last_handed, not_read, not_read_why, fetched_at";
 
 fn follow_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Follow> {
     let commit: Option<String> = row.get(4)?;
@@ -121,6 +126,7 @@ fn follow_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Follow> {
             }),
             _ => None,
         },
+        fetched_at: row.get(11)?,
         list: row.get(7)?,
         last_handed: last_handed.and_then(|key| key.try_into().ok()),
         not_read: match (word, why) {
@@ -135,11 +141,13 @@ fn follow_of_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Follow> {
 ///
 /// Following a repository again (rule 2.5) takes the remote and the clone
 /// given, and forgets only the last commit read, with when and from
-/// where, so that never-back starts over, for a history that was
-/// rewritten. It keeps the rest: the list last read, which the next read
-/// is compared with (rule 4.6); the notices, which go only as rules 4.5
-/// and 4.6 say; the last key handed and the node's typings; and when it
-/// was first followed, before which no key's join is noticed (rule 4.5).
+/// where: the caller sets them again in the same write
+/// ([`set_last_read`]), at the commit the person's yes named, where
+/// never-back starts over, for a history that was rewritten. It keeps the
+/// rest: the list last read, which the next read is compared with (rule
+/// 4.6); the notices, which go only as rules 4.5 and 4.6 say; the last key
+/// handed and the node's typings; and when it was first followed, before
+/// which no key's join is noticed (rule 4.5).
 pub fn follow(
     conn: &Connection,
     identity: &str,
@@ -224,21 +232,30 @@ pub fn follow_of(conn: &Connection, identity: &str) -> Result<Option<Follow>, Co
     .map_err(storage)
 }
 
-/// A list of `identity` was read: its commit, when, from where, and its
-/// bytes. Why an earlier read counted for nothing goes. Nothing is done for
+/// A list of `identity` was read: its commit, when, from where, its
+/// bytes, and when the person's git had last fetched it, where the clone
+/// said. Why an earlier read counted for nothing goes. Nothing is done for
 /// a repository this device does not follow.
 pub fn read_done(
     conn: &Connection,
     identity: &str,
     read: &LastRead,
     list: &[u8],
+    fetched_at: Option<i64>,
 ) -> Result<bool, CordeliaError> {
     let changed = conn
         .execute(
             "UPDATE shared_follows SET last_commit = ?2, last_read_at = ?3, read_from = ?4,
-                 list = ?5, not_read = NULL, not_read_why = NULL
+                 list = ?5, fetched_at = ?6, not_read = NULL, not_read_why = NULL
              WHERE identity = ?1",
-            params![identity, read.commit, read.at, read.from_clone as i64, list],
+            params![
+                identity,
+                read.commit,
+                read.at,
+                read.from_clone as i64,
+                list,
+                fetched_at
+            ],
         )
         .map_err(storage)?;
     Ok(changed == 1)

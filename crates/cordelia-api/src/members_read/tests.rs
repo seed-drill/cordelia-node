@@ -17,6 +17,9 @@ use cordelia_crypto::entry::CheckedEntry;
 use cordelia_crypto::shared::{Anew, Offer};
 
 const REPOSITORY: &str = "example.org/team/project";
+
+/// Another repository the device follows.
+const OTHER: &str = "example.org/team/other";
 const FOLDER: &str = "/home/bob/Work/project";
 
 /// A read's interval, as the node keeps it.
@@ -90,26 +93,47 @@ fn list_with(channel: Option<(&[u8; 32], &[[u8; 32]])>, devices: &[([u8; 32], St
 /// Device 0 follows the repository from `at`, with its list `list` at
 /// `commit` read then: as `subscribe` in a clone leaves it.
 fn follows_at(s: &Several, list: &str, commit: &str, at: i64) {
+    follows_as(s, REPOSITORY, list, commit, at);
+}
+
+/// [`follows_at`], of the repository `repository`.
+fn follows_as(s: &Several, repository: &str, list: &str, commit: &str, at: i64) {
     let conn = &s[0].conn;
-    follows::follow(conn, REPOSITORY, "origin", FOLDER, at).unwrap();
+    follows::follow(conn, repository, "origin", FOLDER, at).unwrap();
     let read = LastRead {
         commit: commit.into(),
         at,
         from_clone: true,
     };
-    follows::read_done(conn, REPOSITORY, &read, list.as_bytes()).unwrap();
+    follows::read_done(conn, repository, &read, list.as_bytes(), None).unwrap();
 }
 
 /// The follow on device 0.
 fn row(s: &Several) -> Option<Follow> {
-    follows::follow_of(&s[0].conn, REPOSITORY).unwrap()
+    row_of(s, REPOSITORY)
+}
+
+/// The follow of `repository` on device 0.
+fn row_of(s: &Several, repository: &str) -> Option<Follow> {
+    follows::follow_of(&s[0].conn, repository).unwrap()
 }
 
 /// What device 0 read of its clone: `list` at `commit`, for the follow as
 /// it is now, with never-back's answer `comes_after`.
 fn read_of(s: &Several, list: &str, commit: &str, comes_after: bool) -> CloneRead {
+    read_as(s, REPOSITORY, list, commit, comes_after)
+}
+
+/// [`read_of`], of the repository `repository`.
+fn read_as(
+    s: &Several,
+    repository: &str,
+    list: &str,
+    commit: &str,
+    comes_after: bool,
+) -> CloneRead {
     CloneRead {
-        follow: row(s).unwrap(),
+        follow: row_of(s, repository).unwrap(),
         read: Ok(Read {
             list: ClonedList {
                 at: ListAt {
@@ -132,6 +156,21 @@ fn done(s: &Several, read: &CloneRead, now: i64) -> Done {
 /// Device 0 reads `list` at `commit`, at `now`.
 fn reads(s: &Several, list: &str, commit: &str, now: i64) -> Done {
     done(s, &read_of(s, list, commit, true), now)
+}
+
+/// Device 0 reads `list` of the repository `repository` at `commit`, at
+/// `now`.
+fn reads_as(s: &Several, repository: &str, list: &str, commit: &str, now: i64) -> Done {
+    done(s, &read_as(s, repository, list, commit, true), now)
+}
+
+/// The node's shares waiting on device 0, each key with its channel.
+fn node_shares_in(s: &Several) -> Vec<([u8; 32], [u8; 32])> {
+    follows::shares_by_node(&s[0].conn)
+        .unwrap()
+        .into_iter()
+        .map(|share| (share.key, share.channel))
+        .collect()
 }
 
 /// The keys a read that was done handed the channel to.
@@ -248,8 +287,9 @@ fn notices(s: &Several) -> Vec<String> {
 /// hands the channel to the next four, in the list's order, starting after
 /// the last one handed, and each share lives for two reads, so at most
 /// eight of the node's wait at once: the ninth is handed it at the third
-/// read, twenty minutes on, and the fourth's share has gone. Once the
-/// ninth writes in the channel it is handed nothing more.
+/// read, twenty minutes on, as the first four's shares go, and those four
+/// wait for that read. Once the ninth writes in the channel it is handed
+/// nothing more.
 #[test]
 fn nine_new_keys_with_eight_off_the_ninth_is_handed_the_channel_in_turn() {
     let s = bob(1);
@@ -270,38 +310,27 @@ fn nine_new_keys_with_eight_off_the_ninth_is_handed_the_channel_in_turn() {
     let third = second + READ;
     assert_eq!(
         handed(reads(&s, &list, &commit('a'), third)),
-        [k[8], k[0], k[1], k[2]],
-        "the ninth, then the first again: their shares of two reads ago went"
+        [k[8]],
+        "the ninth; the first four's shares went, and they wait for this read"
     );
-    let shares = node_shares(&s);
-    assert_eq!(shares.len(), 8);
-    assert!(
-        !shares.iter().any(|(key, _)| *key == k[3]),
-        "the fourth's went"
-    );
-    for (key, made) in shares {
-        let at = match k[4..8].contains(&key) {
-            true => second,
-            false => third,
-        };
-        assert_eq!(made, at);
-    }
+    let mut waiting: Vec<([u8; 32], i64)> = k[4..8].iter().map(|key| (*key, second)).collect();
+    waiting.push((k[8], third));
+    waiting.sort();
+    assert_eq!(node_shares(&s), waiting);
 
     // The ninth wrote in the channel: it is in it, and handed nothing more.
     write_in(&s, &channel, &[&member(9)], third + 1);
     let fourth = third + READ;
     let turn = handed(reads(&s, &list, &commit('a'), fourth));
+    assert_eq!(turn, k[0..4], "after the ninth, the first four again");
+    let fifth = fourth + READ;
+    let turn = handed(reads(&s, &list, &commit('a'), fifth));
     assert!(!turn.contains(&k[8]), "{turn:?}");
-    assert_eq!(
-        turn,
-        k[3..7],
-        "after the third, whose shares of two reads ago went"
-    );
 }
 
 /// A share of the node's lives for two reads, then is deleted: it is not
-/// made again while it waits, and the read after next writes a delete over
-/// it before it is made again, so the key holds one share at a time.
+/// made again while it waits, the read after next writes a delete over it,
+/// and the key waits for that read before it is handed the channel again.
 #[test]
 fn a_nodes_share_lives_two_reads() {
     let s = bob(1);
@@ -310,7 +339,8 @@ fn a_nodes_share_lives_two_reads() {
     let alice = member(1).public_key();
     let list = list_of(Some((&channel.id, &[])), &[(alice, "alice")]);
     follows_at(&s, &list, &commit('a'), now);
-    let (first, second, third) = (now + READ, now + 2 * READ, now + 3 * READ);
+    let (first, second, third, fourth) =
+        (now + READ, now + 2 * READ, now + 3 * READ, now + 4 * READ);
     assert_eq!(handed(reads(&s, &list, &commit('a'), first)), [alice]);
     let rev = |s: &Several| {
         share_rows::shares(&s[0].conn)
@@ -324,8 +354,11 @@ fn a_nodes_share_lives_two_reads() {
     assert!(handed(reads(&s, &list, &commit('a'), second)).is_empty());
     assert_eq!(rev(&s), made_first, "the share waits as it was");
     assert_eq!(node_shares(&s), [(alice, first)]);
-    assert_eq!(handed(reads(&s, &list, &commit('a'), third)), [alice]);
-    assert_eq!(node_shares(&s), [(alice, third)]);
+    assert!(handed(reads(&s, &list, &commit('a'), third)).is_empty());
+    assert!(node_shares(&s).is_empty());
+    assert!(rev(&s).1, "written over");
+    assert_eq!(handed(reads(&s, &list, &commit('a'), fourth)), [alice]);
+    assert_eq!(node_shares(&s), [(alice, fourth)]);
     assert!(rev(&s).0 > made_first.0 + 1, "written over, then made anew");
 }
 
@@ -430,6 +463,64 @@ fn the_shares_to_keys_the_list_no_longer_names_go() {
     assert_eq!(hand_keys(&s), [stranger]);
 }
 
+/// Two repositories whose lists name one key, each with its own channel:
+/// a read passes over a key that a share of the other's waits for, so
+/// neither writes over the other's share, and each has its turn (rule
+/// 4.2; the review of slice 5a, M1).
+#[test]
+fn two_repositories_that_list_one_key_take_turns_with_it() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let review = holds(&s, 0, 7, "review", now);
+    let design = holds(&s, 0, 8, "design", now);
+    let alice = member(1).public_key();
+    let a = list_of(Some((&review.id, &[])), &[(alice, "alice")]);
+    let b = list_of(Some((&design.id, &[])), &[(alice, "alice")]);
+    follows_as(&s, REPOSITORY, &a, &commit('a'), now);
+    follows_as(&s, OTHER, &b, &commit('a'), now);
+    let (first, second, third) = (now + READ, now + 2 * READ, now + 3 * READ);
+    assert_eq!(
+        handed(reads_as(&s, REPOSITORY, &a, &commit('a'), first)),
+        [alice]
+    );
+    assert!(handed(reads_as(&s, OTHER, &b, &commit('a'), first + 1)).is_empty());
+    assert_eq!(node_shares_in(&s), [(alice, review.id)], "not written over");
+    assert!(handed(reads_as(&s, REPOSITORY, &a, &commit('a'), second)).is_empty());
+    assert!(handed(reads_as(&s, OTHER, &b, &commit('a'), second + 1)).is_empty());
+    assert_eq!(node_shares_in(&s), [(alice, review.id)]);
+    // The first's share goes after its two reads, and the other's turn
+    // comes.
+    assert!(handed(reads_as(&s, REPOSITORY, &a, &commit('a'), third)).is_empty());
+    assert_eq!(
+        handed(reads_as(&s, OTHER, &b, &commit('a'), third + 1)),
+        [alice]
+    );
+    assert_eq!(node_shares_in(&s), [(alice, design.id)]);
+}
+
+/// A share of the node's goes as soon as it is not of the channel the
+/// list names: a line that names another channel takes the old channel's
+/// shares at that read (the review of slice 5a, L3).
+#[test]
+fn a_nodes_share_of_a_channel_the_list_no_longer_names_goes_at_once() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let review = holds(&s, 0, 7, "review", now);
+    let design = holds(&s, 0, 8, "design", now);
+    let alice = member(1).public_key();
+    let first = list_of(Some((&review.id, &[])), &[(alice, "alice")]);
+    follows_at(&s, &first, &commit('a'), now);
+    assert_eq!(handed(reads(&s, &first, &commit('a'), now + READ)), [alice]);
+    let moved_on = list_of(Some((&design.id, &[])), &[(alice, "alice")]);
+    assert!(handed(reads(&s, &moved_on, &commit('b'), now + 2 * READ)).is_empty());
+    assert!(node_shares_in(&s).is_empty(), "{:?}", node_shares_in(&s));
+    assert_eq!(
+        handed(reads(&s, &moved_on, &commit('b'), now + 3 * READ)),
+        [alice]
+    );
+    assert_eq!(node_shares_in(&s), [(alice, design.id)]);
+}
+
 /// Behind rule 1's gate, the turn itself never hands the channel to a key
 /// the channel line names after `without`, or to its twin: a second guard,
 /// which no read reaches while the gate holds the list back.
@@ -452,18 +543,16 @@ fn the_turn_passes_over_a_key_after_without_behind_the_gate() {
     let filing = sharing::filed(conn).unwrap().remove(0);
     let line = list.channel.as_ref().unwrap();
     let follow = row(&s).unwrap();
-    let handed = hand_over(
-        conn,
-        identity,
-        &held,
-        &own_relays(),
-        &follow,
-        &list,
+    let turn = Turn {
+        held: &held,
+        own_relays: &own_relays(),
+        follow: &follow,
+        list: &list,
         line,
-        &filing,
-        now + 1,
-    )
-    .unwrap();
+        filing: &filing,
+        waiting: &[],
+    };
+    let handed = hand_over(conn, identity, &turn, now + 1).unwrap();
     assert_eq!(handed, [k[0]]);
 }
 
@@ -621,6 +710,68 @@ fn a_listed_key_that_first_writes_after_the_follow_joined_once() {
     assert!(notices(&s).is_empty(), "seen, it does not come back");
 }
 
+/// The keys that moved into a channel made anew, sealed to by the offer
+/// that made it, show no join as each first writes there: only a key the
+/// offer did not seal to does (rule 4.5; the review of slice 5a, M3).
+#[test]
+fn keys_that_moved_into_a_channel_made_anew_show_no_join() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let old = holds(&s, 0, 7, "review", now);
+    let (alice, carol, dave, eve) = (member(1), member(2), member(3), member(4));
+    write_in(&s, &old, &[&alice, &carol, &dave], now);
+    // Alice makes it anew without Dave, sealed to Carol and Bob; Bob moves.
+    let sealed = [alice.public_key(), carol.public_key(), s.key(0)];
+    stores(&s, 0, &offer_by(&alice, &old, 21, &sealed, now), now);
+    let plan =
+        crate::shared_anew::move_plan(conn, identity, &own_relays(), "review", None, None, now)
+            .unwrap();
+    crate::shared_anew::make_move(conn, identity, &plan.what, now).unwrap();
+    let new = Shared::of(21);
+    assert_eq!(plan.what.to.channel, new.id);
+    let list = list_of(
+        Some((&new.id, &[dave.public_key()])),
+        &[
+            (alice.public_key(), "alice"),
+            (carol.public_key(), "carol"),
+            (eve.public_key(), "eve"),
+        ],
+    );
+    follows_at(&s, &list, &commit('a'), now + 1);
+    write_in(&s, &new, &[&alice, &carol, &eve], now + 5);
+    reads(&s, &list, &commit('a'), now + READ);
+    assert_eq!(notices(&s), [format!("joined eve at {}", commit('a'))]);
+}
+
+/// Following again keeps when the list was last read (the review of slice
+/// 5a, L1): a key first held between that read and the yes shows as
+/// joined at the node's next read.
+#[test]
+fn following_again_notices_a_join_since_the_read_before_it() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let carol = member(2);
+    let list = list_of(Some((&channel.id, &[])), &[(carol.public_key(), "carol")]);
+    follows_at(&s, &list, &commit('a'), now);
+    write_in(&s, &channel, &[&carol], now + 5);
+    let again = crate::following::Following {
+        identity: REPOSITORY.into(),
+        remote: "origin".into(),
+        clone: FOLDER.into(),
+        commit: commit('b'),
+        list: list.as_bytes().to_vec(),
+        fetched_at: None,
+        agent: "project".into(),
+        then: crate::following::Then::Nothing,
+    };
+    crate::following::make(&s[0].conn, &s[0].identity, &again, now + 10).unwrap();
+    assert_eq!(row(&s).unwrap().last.unwrap().at, now);
+    reads(&s, &list, &commit('b'), now + READ);
+    assert_eq!(notices(&s), [format!("joined carol at {}", commit('b'))]);
+}
+
 /// A device that comes to hold the channel after it followed takes none of
 /// the keys it then first holds for a join: they were there before it, as
 /// far as it can tell. A key that first writes after that read is noticed.
@@ -650,9 +801,10 @@ fn a_device_that_comes_to_hold_the_channel_notices_no_join_of_those_there_before
 /// names it again, and comes back with the next drop. A key dropped that
 /// is not in the channel shows nothing. A list whose line names another
 /// channel shows that (rule 6), and the dropped key, not in that channel,
-/// goes; a line changed only in its `without` names the same channel, and
-/// a list with no line leaves the channel the one named before. A dropped
-/// key's notice stays through `shared seen`.
+/// goes; a line changed only in its `without` names the same channel, a
+/// list with no line leaves the channel the one named before, and a line
+/// after a list with none is no change, as after `subscribe --new`. A
+/// dropped key's notice stays through `shared seen`.
 #[test]
 fn a_key_dropped_from_the_list_and_a_changed_line_are_noticed() {
     let s = bob(1);
@@ -688,10 +840,13 @@ fn a_key_dropped_from_the_list_and_a_changed_line_are_noticed() {
     let no_line = list_of(None, &devices[..1]);
     reads(&s, &no_line, &commit('e'), now + 5);
     assert_eq!(notices(&s), [format!("dropped carol at {}", commit('c'))]);
+    // A line again, after none: no change is noticed.
+    reads(&s, &alice_only, &commit('f'), now + 6);
+    assert_eq!(notices(&s), [format!("dropped carol at {}", commit('c'))]);
     // Another channel: Carol is not in it, so her notice goes.
     let moved_on = list_of(Some((&other.id, &[][..])), &devices[..1]);
-    reads(&s, &moved_on, &commit('f'), now + 6);
-    assert_eq!(notices(&s), [format!("line changed at {}", commit('f'))]);
+    reads(&s, &moved_on, &commit('g'), now + 7);
+    assert_eq!(notices(&s), [format!("line changed at {}", commit('g'))]);
 }
 
 // ── The follow stopped (rule 2.5) ────────────────────────────────────
@@ -736,6 +891,51 @@ fn a_drop_on_this_device_or_another_stops_the_follow() {
         Done::Stopped
     );
     assert!(row(&s).is_none());
+}
+
+// ── One follow for each channel (rule 2.5) ───────────────────────────
+
+/// A list that names a channel another follow's list names counts for
+/// nothing: the follow that named it first keeps it, and why is kept for
+/// the status (the review of slice 5a, M2).
+#[test]
+fn a_list_that_names_a_channel_another_follow_names_counts_for_nothing() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let review = holds(&s, 0, 7, "review", now);
+    let design = holds(&s, 0, 8, "design", now);
+    let alice = member(1).public_key();
+    let a = list_of(Some((&review.id, &[])), &[(alice, "alice")]);
+    let b = list_of(Some((&design.id, &[])), &[(alice, "alice")]);
+    follows_as(&s, REPOSITORY, &a, &commit('a'), now);
+    follows_as(&s, OTHER, &b, &commit('a'), now);
+    let names_review = list_of(
+        Some((&review.id, &[])),
+        &[(alice, "alice"), (member(2).public_key(), "carol")],
+    );
+    let not = NotRead {
+        word: "followed_elsewhere".into(),
+        why: format!(
+            "This device follows {REPOSITORY}, whose list names \"review\" too: a channel \
+             follows one repository."
+        ),
+    };
+    let read = reads_as(&s, OTHER, &names_review, &commit('b'), now + READ);
+    assert_eq!(read, Done::NotRead(not.clone()));
+    let other = row_of(&s, OTHER).unwrap();
+    assert_eq!(
+        other.list.as_deref(),
+        Some(b.as_bytes()),
+        "the last list stands"
+    );
+    assert_eq!(other.last.unwrap().commit, commit('a'));
+    assert_eq!(other.not_read, Some(not));
+    assert!(node_shares_in(&s).is_empty());
+    // The follow that named it first keeps it.
+    assert_eq!(
+        handed(reads_as(&s, REPOSITORY, &a, &commit('a'), now + READ + 1)),
+        [alice]
+    );
 }
 
 // ── A read that counts for nothing (rules 1 and 3) ───────────────────
@@ -798,11 +998,17 @@ fn a_clone_behind_a_failed_read_and_a_list_that_does_not_parse_leave_the_last_li
         "line 6 of the list is not a key and a label"
     );
 
-    assert_eq!(handed(reads(&s, &later, &commit('b'), now + 4)).len(), 4);
+    // A read that counts keeps when the clone says it was fetched.
+    let mut read = read_of(&s, &later, &commit('b'), true);
+    let fetched = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_799_000_000);
+    if let Ok(got) = &mut read.read {
+        got.list.fetched = Some(fetched);
+    }
+    assert_eq!(handed(done(&s, &read, now + 4)).len(), 4);
     let row = row(&s).unwrap();
     assert_eq!(
-        (row.not_read, row.list.as_deref()),
-        (None, Some(later.as_bytes()))
+        (row.not_read, row.list.as_deref(), row.fetched_at),
+        (None, Some(later.as_bytes()), Some(1_799_000_000))
     );
 }
 
@@ -830,6 +1036,38 @@ fn a_follow_made_again_while_its_clone_was_read_is_read_again_later() {
     assert_eq!(done(&s, &read, now + 3), Done::Nothing);
 }
 
+/// A second follow of the same clone, at a commit of a history rewritten,
+/// made while a read of the clone ran, is not written over by that read:
+/// the read was checked against the commit before (the review of slice
+/// 5a, L2).
+#[test]
+fn a_follow_made_again_on_the_same_clone_is_not_written_over_by_a_stale_read() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let list = list_with(Some((&channel.id, &[])), &listed(1..=2));
+    follows_at(&s, &list, &commit('a'), now);
+    let stale = read_of(
+        &s,
+        &list_with(Some((&channel.id, &[])), &listed(1..=4)),
+        &commit('b'),
+        true,
+    );
+    let conn = &s[0].conn;
+    follows::follow(conn, REPOSITORY, "origin", FOLDER, now + 1).unwrap();
+    let rewritten = LastRead {
+        commit: commit('c'),
+        at: now,
+        from_clone: true,
+    };
+    follows::set_last_read(conn, REPOSITORY, &rewritten).unwrap();
+    assert_eq!(done(&s, &stale, now + 2), Done::Nothing);
+    let row = row(&s).unwrap();
+    assert_eq!(row.last, Some(rewritten));
+    assert_eq!(row.list.as_deref(), Some(list.as_bytes()));
+    assert!(node_keys(&s).is_empty());
+}
+
 // ── The clones, read with git ────────────────────────────────────────
 
 /// Over a real clone on the disk, and no server: each follow's clone is
@@ -854,7 +1092,7 @@ fn a_clone_on_the_disk_is_read_and_never_back() {
         at: now,
         from_clone: true,
     };
-    follows::read_done(conn, REPOSITORY, &read, first_list.as_bytes()).unwrap();
+    follows::read_done(conn, REPOSITORY, &read, first_list.as_bytes(), None).unwrap();
     let git = Git::under(&tmp.path().join("node")).unwrap();
     let read_now = || read_clones(&git, follows::follows(conn).unwrap()).remove(0);
 

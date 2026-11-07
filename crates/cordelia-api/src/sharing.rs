@@ -809,8 +809,8 @@ pub fn make_new(conn: &Connection, identity: &NodeIdentity, new: &New, now: i64)
 }
 
 /// The shares this device keeps waiting at `now`: each not written over,
-/// within its two hours (§3.1).
-fn waiting(conn: &Connection, now: i64) -> Result<Vec<ShareRow>, PersonError> {
+/// within its two hours (§3.1), the person's and the node's.
+pub(crate) fn waiting(conn: &Connection, now: i64) -> Result<Vec<ShareRow>, PersonError> {
     Ok(rows::shares(conn)?
         .into_iter()
         .filter(|share| !share.gone && (now - share.made).abs() < HAND_OVER_KEPT_SECS)
