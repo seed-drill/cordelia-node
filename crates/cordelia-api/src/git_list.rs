@@ -1313,6 +1313,31 @@ impl Git {
             .ok_or_else(no_head)?;
         Ok(branch.to_string())
     }
+
+    /// The top of the work tree that `folder` is in, as a real path: the
+    /// clone that `cordelia subscribe` follows, run in any folder of it
+    /// (decision 2026-11-06 (joining), rule 2). `NotARepository` where it
+    /// is in no repository, or in one with no work tree.
+    pub fn top_of(&self, folder: &Path) -> Result<PathBuf, ListFailed> {
+        let deadline = Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS);
+        let folder = folder
+            .canonicalize()
+            .map_err(|_| ListFailed::NotARepository)?;
+        let mut git = self.command(At::Clone(&folder));
+        git.args(["rev-parse", "--show-toplevel"]);
+        let ran = self
+            .run(git, deadline, STREAM_TIMEOUT_SECS, SHORT_OUTPUT_BYTES)
+            .map_err(Outcome::failed)?;
+        let said = String::from_utf8_lossy(&ran.stdout);
+        let top = said.strip_suffix('\n').unwrap_or(&said);
+        if !ran.success || top.is_empty() {
+            return Err(ListFailed::NotARepository);
+        }
+        // A path that is not text is not kept: it does not read back.
+        PathBuf::from(top)
+            .canonicalize()
+            .map_err(|_| ListFailed::NotARepository)
+    }
 }
 
 /// Why a run gave nothing to read: git wrote more than was asked for, or

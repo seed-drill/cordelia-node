@@ -1,7 +1,9 @@
 //! The commands that make, share and take a shared channel (decision
 //! 2026-10-10 §5.1 to §5.5): `cordelia shared new`, `shared list`, `shared
 //! rename`, `shared drop`, `cordelia share`, `cordelia accept <key>
-//! --channel <name>` and `cordelia label`; and `cordelia id --words`.
+//! --channel <name>` and `cordelia label`; `cordelia subscribe` in a clone,
+//! which follows its repository (decision 2026-11-06 (joining), rule 2);
+//! and `cordelia id --words`.
 //!
 //! **Each yes is asked here, at a terminal,** and a command that asks one
 //! refuses, before anything else, where its input is not one
@@ -238,6 +240,22 @@ pub fn subscribe(config_path: &str, name: &str, words: Option<&str>) -> anyhow::
     let (folder, _) = crate::msg_cmd::folder_of(config_path)?;
     let body = json!({ "folder": folder, "name": name, "words": words });
     if let Some(done) = with_a_yes(config_path, &at, "/api/v1/shared/subscribe", body)? {
+        print_said(&done);
+    }
+    Ok(())
+}
+
+/// `cordelia subscribe [--new] [--remote <remote>]` with no name (decision
+/// 2026-11-06 (joining), rules 2.3 and 2.4): this device follows the
+/// repository of the folder it runs in, at a terminal, with a yes. The
+/// node reads the clone; with `--new` it makes the repository's channel,
+/// and says the lines to add to the list.
+pub fn follow(config_path: &str, new: bool, remote: Option<&str>) -> anyhow::Result<()> {
+    let at = Terminal::at()?;
+    refuse_another_version(config_path)?;
+    let (folder, _) = crate::msg_cmd::folder_of(config_path)?;
+    let body = json!({ "folder": folder, "remote": remote, "new": new });
+    if let Some(done) = with_a_yes(config_path, &at, "/api/v1/shared/follow", body)? {
         print_said(&done);
     }
     Ok(())
@@ -650,6 +668,58 @@ mod tests {
         match parsed(&["cordelia", "id", "--words"]) {
             Ok(Some(Commands::Id { words: true })) => {}
             _ => panic!("id --words"),
+        }
+    }
+
+    /// `cordelia subscribe` takes a name, as before, or none, which follows
+    /// the repository it is run in (decision 2026-11-06 (joining), rule 2):
+    /// `--new` and `--remote` go only with no name, and `--words` only with
+    /// one.
+    #[test]
+    fn subscribe_with_a_name_or_none_is_parsed_apart() {
+        let parsed = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        match parsed(&["cordelia", "subscribe", "review", "--words", "a b c d"]) {
+            Ok(Some(Commands::Subscribe {
+                name: Some(name),
+                words: Some(words),
+                new: false,
+                remote: None,
+            })) => assert_eq!((name.as_str(), words.as_str()), ("review", "a b c d")),
+            _ => panic!("subscribe <name>"),
+        }
+        match parsed(&["cordelia", "subscribe"]) {
+            Ok(Some(Commands::Subscribe {
+                name: None,
+                words: None,
+                new: false,
+                remote: None,
+            })) => {}
+            _ => panic!("subscribe"),
+        }
+        match parsed(&["cordelia", "subscribe", "--new", "--remote", "upstream"]) {
+            Ok(Some(Commands::Subscribe {
+                name: None,
+                new: true,
+                remote: Some(remote),
+                ..
+            })) => assert_eq!(remote, "upstream"),
+            _ => panic!("subscribe --new --remote"),
+        }
+        for refused in [
+            &["cordelia", "subscribe", "review", "--new"][..],
+            &["cordelia", "subscribe", "review", "--remote", "upstream"],
+            &["cordelia", "subscribe", "--words", "a b c d"],
+            &["cordelia", "subscribe", "--new", "--words", "a b c d"],
+            &[
+                "cordelia",
+                "subscribe",
+                "--remote",
+                "upstream",
+                "--words",
+                "a b c d",
+            ],
+        ] {
+            assert!(parsed(refused).is_err(), "{refused:?}");
         }
     }
 
