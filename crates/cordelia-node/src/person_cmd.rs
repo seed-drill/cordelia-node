@@ -1688,6 +1688,9 @@ struct Handed {
     /// 2026-10-10 §3.5).
     shared_past_bound: Vec<String>,
     shared_acts: Vec<([u8; 32], String)>,
+    /// The repositories this device follows (decision 2026-10-24, rule
+    /// 24): a removal says to take the removed device's access away in each.
+    repositories: Vec<String>,
 }
 
 impl Handed {
@@ -1827,6 +1830,9 @@ impl Handed {
         let shared_past_bound: Vec<String> = list(handed, "shared_past_bound")
             .filter_map(|name| name.as_str().map(str::to_string))
             .collect();
+        let repositories: Vec<String> = list(handed, "repositories")
+            .filter_map(|identity| identity.as_str().map(str::to_string))
+            .collect();
         let shared_acts: Vec<([u8; 32], String)> = list(handed, "shared_acts")
             .filter_map(|act| {
                 let maker = decode_public_key(act["maker"].as_str()?).ok()?;
@@ -1838,6 +1844,7 @@ impl Handed {
             shared_unreached,
             shared_past_bound,
             shared_acts,
+            repositories,
             this_device: *own,
             applied,
             held,
@@ -1926,9 +1933,11 @@ impl Handed {
 
 /// What a removal says before its yes of the shared channels (decision
 /// 2026-10-10 §3.5; decision 2026-10-24, rule 24): each the person holds,
-/// that it is made anew without the device removed, and that the other
-/// people in it move with a yes of their own; and each act in force of a
-/// device it removes, with the command that undoes it. Nothing where the
+/// that it is made anew without the device removed, who stays in it, and
+/// that the other people in it move with a yes of their own; each act in
+/// force of a device it removes, with the command that undoes it; and each
+/// repository this device follows, where the removed device's access is
+/// for the person to take away, since no rule here can. Nothing where the
 /// change removes no device that the statement applied lists or that was
 /// added since.
 fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
@@ -1956,6 +1965,7 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
              nothing more in the old channel meanwhile.",
             names.join(", ")
         ));
+        lines.push(STAYS_AT_A_REMOVAL.into());
     }
     if !handed.shared_unreached.is_empty() {
         let names: Vec<String> = handed
@@ -1998,8 +2008,21 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
         );
         lines.extend(acts.into_iter().map(|line| format!("  {line}")));
     }
+    for repository in &handed.repositories {
+        lines.push(format!(
+            "\nThis device follows {repository}: take the removed device's access to it away \
+             there, and delete its line from .cordelia/members in a pull request."
+        ));
+    }
     lines
 }
+
+/// Who stays in a shared channel that a removal makes anew (decision
+/// 2026-10-24, rule 24), said before its yes.
+const STAYS_AT_A_REMOVAL: &str = "In each, your own devices stay, with the keys that the list of \
+                                  a repository you follow names, or, where you follow none for \
+                                  it, the keys a device of yours labelled. Anyone else is left \
+                                  out: share the new channel with them again.";
 
 /// What a removal says of the things that a device being removed lists
 /// as names and that are no names as this version would map one: how
@@ -3649,6 +3672,33 @@ mod tests {
         let mut no_entry = f.handed(&f.statement, &[]);
         no_entry["entry"] = "00".into();
         assert!(f.read(&no_entry).is_err());
+    }
+
+    /// A removal says before its yes who stays in each shared channel it
+    /// makes anew, and names each repository this device follows, to take
+    /// the removed device's access away there (decision 2026-10-24, rule
+    /// 24, condition 1 of the person's ruling of 7 November). A change
+    /// that removes no device says none of it.
+    #[test]
+    fn a_removal_names_each_repository_this_device_follows() {
+        let f = Fixture::new();
+        let mut handed = f.handed(&f.statement, &[]);
+        handed["shared_channels"] = json!(["review"]);
+        handed["repositories"] = json!(["example.org/team/project", "example.org/team/other"]);
+        let read = f.read(&handed).unwrap();
+        let mut removes = f.statement.statement.clone();
+        removes.devices.retain(|device| device.key != f.listed);
+        removes.removed.push(f.listed);
+        let said = shared_at_a_removal(&read, &removes);
+        assert!(said.contains(&STAYS_AT_A_REMOVAL.to_string()), "{said:?}");
+        for repository in ["example.org/team/project", "example.org/team/other"] {
+            let line = format!(
+                "\nThis device follows {repository}: take the removed device's access to it \
+                 away there, and delete its line from .cordelia/members in a pull request."
+            );
+            assert!(said.contains(&line), "{said:?}");
+        }
+        assert!(shared_at_a_removal(&read, &f.statement.statement).is_empty());
     }
 
     /// What a command shows as this device is its own reading of the key

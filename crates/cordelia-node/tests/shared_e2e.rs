@@ -2137,6 +2137,14 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
         ),
         "{before_yes}"
     );
+    // Who stays, before the yes (rule 24).
+    assert!(
+        before_yes.contains(
+            "In each, your own devices stay, with the keys that the list of a repository you \
+             follow names, or, where you follow none for it, the keys a device of yours labelled."
+        ),
+        "{before_yes}"
+    );
     at.says("The wait has ended.")
         .says("\"review\" is made anew without the device removed: it is channel ")
         .says(PUT_THE_LINE)

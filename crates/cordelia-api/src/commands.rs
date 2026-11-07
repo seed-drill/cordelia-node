@@ -1244,6 +1244,14 @@ pub async fn change_prepare(
     let own_relays = crate::sharing::own_relays(&state);
     let (shared_names, shared_unreached, shared_past_bound, shared_acts) =
         crate::shared_anew::at_a_removal(&conn, &own_relays).map_err(refused)?;
+    // Each repository this device follows: a removal says to take the
+    // removed device's access away there (decision 2026-10-24, rule 24).
+    // A device that can still push there can change the list.
+    let repositories: Vec<String> = cordelia_storage::follows::follows(&conn)
+        .map_err(|e| refused(PersonError::Storage(e)))?
+        .into_iter()
+        .map(|follow| follow.identity)
+        .collect();
     let mut acts_handed = Vec::new();
     for named in shared_acts {
         acts_handed.push(json!({
@@ -1273,6 +1281,7 @@ pub async fn change_prepare(
         "shared_unreached": shared_unreached,
         "shared_past_bound": shared_past_bound,
         "shared_acts": acts_handed,
+        "repositories": repositories,
         "look": seen,
     })))
 }
