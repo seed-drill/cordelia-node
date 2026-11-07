@@ -3594,6 +3594,59 @@ fn a_channel_shared_again_while_its_drop_is_written_shows_nothing_old_as_new() {
     assert_eq!(shown[0].first_held, t1, "shown as new");
 }
 
+/// Device `n` labels `member`'s key, as a device that counts: a channel
+/// shared by hand keeps it at a removal (decision 2026-10-24, rule 24).
+fn labels_member(s: &Several, n: usize, member: &NodeIdentity, now: i64) {
+    let label = Label {
+        key: member.public_key(),
+        label: Some("member".into()),
+    };
+    on(s, n, Do::Label(label), now);
+}
+
+/// A channel past its bound that no key stays in is not made anew at a
+/// removal (decision 2026-10-24, rule 24; decision 2026-10-10 §3.5): an
+/// offer seals to one key at least, and the offer of a channel past a
+/// bound seals to none of the person's devices. No label names the member
+/// the laptop holds there, so the removal says it is not made anew, and it
+/// stays not clean, as one whose making anew is refused; the other
+/// channels are made anew.
+#[test]
+fn a_channel_past_its_bound_that_no_key_stays_in_is_not_made_anew() {
+    let mut s = person(3, 3);
+    let (laptop, desktop, phone) = (0, 1, 2);
+    let PastABound { review, t2, .. } = past_a_bound(&s, &|_, _, _| {});
+    s.now = t2 + 10;
+    s.change(laptop, &[laptop, desktop], &[phone]);
+    let now = s.now + 1;
+    let conn = &s[laptop].conn;
+    let own_relays = vec![crate::sharing::OwnRelay {
+        name: "relay.example.org:9474".into(),
+        key: [3; 32],
+    }];
+    let said =
+        crate::shared_anew::anew_at_removal(conn, &s[laptop].identity, &own_relays, now).unwrap();
+    assert!(
+        said.contains(&crate::shared_anew::not_made_anew_past_a_bound_line(
+            "review"
+        )),
+        "{said:?}"
+    );
+    assert!(
+        cordelia_storage::shared_anew::made_of_channel(conn, &review.id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(crate::shared_anew::is_not_clean(conn, &review.id).unwrap());
+    assert_eq!(
+        said.iter()
+            .filter(|line| line.contains("is made anew without the device removed"))
+            .count(),
+        15,
+        "{said:?}"
+    );
+}
+
 /// A channel past its bound, as the tests below find it on the laptop.
 struct PastABound {
     review: crate::shared::tests::Shared,
@@ -3985,6 +4038,7 @@ fn a_removal_makes_a_channel_past_its_bound_anew() {
     );
     cordelia_storage::shared_pass::answered(&s[laptop].conn, id, &AT, &slot, 2, Answer::Holds)
         .unwrap();
+    labels_member(&s, laptop, &kept, t2 + 5);
     s.now = t2 + 10;
     s.change(laptop, &[laptop, desktop], &[phone]);
     let now = s.now + 1;
@@ -4232,6 +4286,7 @@ fn a_channel_past_its_bound_made_anew_at_a_removal_keeps_its_line() {
         dave,
         t2,
     } = past_a_bound_at(&s, relay, &|_, _, _| {});
+    labels_member(&s, laptop, &kept, t2 + 5);
     s.now = t2 + 10;
     s.change(laptop, &[laptop, desktop], &[phone]);
     let now = s.now + 1;

@@ -1398,9 +1398,9 @@ pub async fn change_make(
     }
     // A removal makes each shared channel anew in the same act, after the
     // transaction that applies it (decision 2026-10-24, rule 24; decision
-    // 2026-10-10 §3.5): every key of the device's table stays but the
-    // removed ones. A renewal or a settlement that removes nobody changes
-    // none.
+    // 2026-10-10 §3.5): the person's own devices stay, and the keys a list
+    // or a label of the person's keeps, never a removed one. A renewal or a
+    // settlement that removes nobody changes none.
     let made_anew = {
         let conn = db(&state);
         let removed =

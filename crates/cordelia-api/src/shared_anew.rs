@@ -605,12 +605,26 @@ pub struct LeftOut {
 }
 
 /// The keys that stay at a removal or at a recovery, with no question
-/// (decision 2026-10-24, rule 24): the person's own devices where
-/// `own_devices` says so, and then every key of the table of the channel
-/// of `row` but the removed keys and the person's own devices, in the
-/// order of the listing, 64 at most; what it left out besides; and who its
-/// new channel line names as left out (decision 2026-11-06 (joining), rule
-/// 5). A key not moved yet is not kept: rule 24 keeps the table alone.
+/// (decision 2026-10-24, rule 24, as the person ruled on 7 November): only
+/// what the removed device could not write, never who wrote in the
+/// channel. A thief with a stolen device can write there under any key it
+/// makes, until the removal is known, so the table of keys keeps no one.
+///
+/// - **The person's own devices that count,** where `own_devices` says so.
+/// - **A channel that follows a repository,** where this device follows
+///   one whose list names the channel, or one it was made anew or moved
+///   from ([`followed`]): each key the list names, but those its channel
+///   line or this device's own makings anew left out before.
+/// - **Any other channel,** shared by hand or of a repository this device
+///   does not follow: each key of the listing that a label in force names,
+///   where the label's maker, which every act records, is a device that
+///   counts. A label made by a removed device keeps nothing. Every other
+///   key is left out, and is shared the new channel again.
+///
+/// Never a removed key or its twin, nor this device or another of the
+/// person's but as its own device; 64 at most, in the order of the list or
+/// of the listing. Returns them, what it left out besides, and who its new
+/// channel line names as left out (decision 2026-11-06 (joining), rule 5).
 ///
 /// A channel past its bound that a removal makes anew is sealed to none of
 /// the person's own devices (§3.5): none of them holds the new channel, so
@@ -626,29 +640,64 @@ fn staying_with_no_question(
     own_devices: bool,
 ) -> Result<(Vec<[u8; 32]>, LeftOut, NewLine), PersonError> {
     let listed = listing_of(conn, held, own, row)?;
-    let mut stay: Vec<[u8; 32]> = match own_devices {
-        true => listed.own_devices.keys().copied().collect(),
-        false => Vec::new(),
-    };
-    let mut past_64 = 0;
-    for key in &listed.asked {
-        // A removal keeps the table's keys alone (rule 24).
-        if listed.not_moved.contains(key) {
-            continue;
-        }
-        if stay.len() >= SHARED_MAX_KEYS {
-            past_64 += 1;
-            continue;
-        }
-        stay.push(*key);
-    }
+    let followed = followed(conn, row)?;
     // The keys of the removal or recovery that left the channel not clean
     // are named whatever a list says (rule 5).
     let removing = match st(rows::not_clean_of(conn, &row.channel))? {
         Some(mark) => removed_at(conn, mark.since)?.unwrap_or_default(),
         None => Vec::new(),
     };
-    let line = new_line_of(conn, held, row, &removing, &[], &stay)?;
+    let mut never: Holders = removing.iter().collect();
+    for key in crate::person::removed_known(conn, &held.statement.statement)?.keys() {
+        never.add(key);
+    }
+    let staying: Vec<[u8; 32]> = match &followed.list {
+        Some(list) => {
+            let carried: Holders = followed.carried.iter().collect();
+            list.devices
+                .iter()
+                .map(|device| device.key)
+                .filter(|key| !carried.holds(key))
+                .collect()
+        }
+        None => {
+            let labelled: Holders = lists::holds(conn)?
+                .labels
+                .iter()
+                .filter(|(act, maker)| *maker == Maker::Counts && act.item.label.is_some())
+                .map(|(act, _)| act.item.key)
+                .collect();
+            listed
+                .asked
+                .iter()
+                .filter(|key| labelled.holds(key))
+                .copied()
+                .collect()
+        }
+    };
+    let mut stay = Holders::new();
+    if own_devices {
+        for key in listed.own_devices.keys() {
+            stay.add(key);
+        }
+    }
+    let mut past_64 = 0;
+    for key in &staying {
+        if never.holds(key)
+            || listed.own_devices.holds(key)
+            || Holder::of(key) == Holder::of(own)
+            || stay.holds(key)
+        {
+            continue;
+        }
+        if stay.len() >= SHARED_MAX_KEYS {
+            past_64 += 1;
+            continue;
+        }
+        stay.add(key);
+    }
+    let stay: Vec<[u8; 32]> = stay.keys().copied().collect();
+    let line = new_line_of(conn, held, &followed, &removing, &[], &stay)?;
     Ok((
         stay,
         LeftOut {
@@ -700,7 +749,8 @@ pub fn unreached_line(name: &str) -> String {
 }
 
 /// Make each shared channel the person holds anew, as `shared anew` does,
-/// with no key asked about (decision 2026-10-24, rule 24): on the device
+/// with no key asked about and only the keys that stay by rule 24
+/// ([`staying_with_no_question`]; decision 2026-10-24): on the device
 /// that makes a removal, after the transaction that applies it; and on the
 /// machine of a recovery, each once it has read it ([`make_owed`]). Each
 /// keeps its relays. A channel none of whose relays is one of `own_relays`
@@ -747,6 +797,14 @@ pub fn anew_at_removal(
             };
             let (stay, left, line) =
                 staying_with_no_question(conn, &held, &identity.public_key(), &row, false)?;
+            // An offer seals to one key at least, and none of the person's
+            // devices stays in a channel past a bound: where no other key
+            // stays either, it is not made anew, and stays not clean and
+            // named, as one whose making anew is refused (§3.5).
+            if stay.is_empty() {
+                said.push(not_made_anew_past_a_bound_line(&row.name));
+                continue;
+            }
             past.push((row, stay, left, line));
         } else {
             held_rows.push(row);
@@ -1154,46 +1212,22 @@ pub struct NewLine {
     pub without: Vec<[u8; 32]>,
 }
 
-/// Who the making anew of the channel of `row` leaves out, with the keys of
-/// `stay` staying, at a removal of the keys of `removing`, where a person
-/// left out each key of `chosen` that does not stay (decision 2026-11-06
-/// (joining), rule 5). It decides nothing of who stays.
-///
-/// - **The list** is that of the repository this device follows whose
-///   channel line names the channel, or a channel it was made anew or moved
-///   from, back along the moves this device keeps: a line not merged yet
-///   leaves the list naming an earlier channel.
-/// - **Left out,** and named after `without`: first each key of `removing`,
-///   whatever the list says, so that a removal names the device it removes
-///   and a line that later lists it again does not let it in. Then each
-///   other key the person removed, as this device knows them
-///   (`removed_known`), that the list names, or each, where no list does; a
-///   removed device held every seed of the person's, whether or not it
-///   wrote there. Then each key of `chosen` that the list names, or each,
-///   where no list does.
-/// - **Carried over,** and named after `without` too: the `without` keys of
-///   the list's channel line, and the keys this device's own makings anew
-///   left out back along the moves, that the list still names, or each,
-///   where no list does, so that a later making anew never frees a key
-///   left out before. What another device's making anew left out cannot be
-///   known here (§10, the known limit).
-/// - **A twin counts as its key.** A key that stays is neither named nor
-///   kept, but a key the person removed is named though its twin stays.
-///   The rows the table let go, and anyone who wrote there past a bound,
-///   are in no listing and cannot be named: where one is listed, it is
-///   handed the new channel, which errs toward the list.
-///
-/// A removal and a recovery pass no `chosen`: the keys they leave out only
-/// for room or because they had not moved are not named, and the list
-/// decides for them.
-fn new_line_of(
-    conn: &Connection,
-    held: &Held,
-    row: &Channel,
-    removing: &[[u8; 32]],
-    chosen: &[[u8; 32]],
-    stay: &[[u8; 32]],
-) -> Result<NewLine, PersonError> {
+/// The list that the channel of `row` follows, as this device holds it
+/// (decision 2026-11-06 (joining), rules 2.5 and 5): that of the repository
+/// this device follows whose channel line names the channel, or a channel
+/// it was made anew or moved from, back along the moves this device keeps,
+/// since a line not merged yet leaves the list naming an earlier channel.
+/// `None` where it follows none here.
+struct Followed {
+    list: Option<crate::members::Members>,
+    /// The keys left out before, which a later making anew never frees:
+    /// the `without` keys of the list's channel line, then those this
+    /// device's own makings anew left out back along the moves.
+    carried: Vec<[u8; 32]>,
+}
+
+/// The list the channel of `row` follows ([`Followed`]).
+fn followed(conn: &Connection, row: &Channel) -> Result<Followed, PersonError> {
     // Back along the moves, to the channel the list names: what this
     // device's makings anew left out on the way is carried over.
     let made = st(follows::made_lines(conn))?;
@@ -1225,7 +1259,50 @@ fn new_line_of(
         let current = list.channel.iter().flat_map(|line| &line.without);
         carried.splice(0..0, current.copied());
     }
-    let named = |key: &[u8; 32]| list.is_none_or(|list| list.lists(key));
+    Ok(Followed {
+        list: list.cloned(),
+        carried,
+    })
+}
+
+/// Who the making anew of a channel leaves out, with the keys of `stay`
+/// staying, at a removal of the keys of `removing`, where a person left out
+/// each key of `chosen` that does not stay, and the channel follows the
+/// list of `followed` (decision 2026-11-06 (joining), rule 5). It decides
+/// nothing of who stays.
+///
+/// - **Left out,** and named after `without`: first each key of `removing`,
+///   whatever the list says, so that a removal names the device it removes
+///   and a line that later lists it again does not let it in. Then each
+///   other key the person removed, as this device knows them
+///   (`removed_known`), that the list names, or each, where no list does; a
+///   removed device held every seed of the person's, whether or not it
+///   wrote there. Then each key of `chosen` that the list names, or each,
+///   where no list does.
+/// - **Carried over,** and named after `without` too: the keys of
+///   [`Followed::carried`] that the list still names, or each, where no
+///   list does, so that a later making anew never frees a key left out
+///   before. What another device's making anew left out cannot be known
+///   here (§10, the known limit).
+/// - **A twin counts as its key.** A key that stays is neither named nor
+///   kept, but a key the person removed is named though its twin stays.
+///   The rows the table let go, and anyone who wrote there past a bound,
+///   are in no listing and cannot be named: where one is listed, it is
+///   handed the new channel, which errs toward the list.
+///
+/// A removal and a recovery pass no `chosen`: the keys they leave out only
+/// for room, or because no list or label of the person's keeps them, are
+/// not named, and the list decides for them.
+fn new_line_of(
+    conn: &Connection,
+    held: &Held,
+    followed: &Followed,
+    removing: &[[u8; 32]],
+    chosen: &[[u8; 32]],
+    stay: &[[u8; 32]],
+) -> Result<NewLine, PersonError> {
+    let (list, carried) = (&followed.list, &followed.carried);
+    let named = |key: &[u8; 32]| list.as_ref().is_none_or(|list| list.lists(key));
     let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     let stay: Holders = stay.iter().collect();
     let mut left_out = Holders::new();
@@ -1324,8 +1401,7 @@ pub struct Listing {
     pub own_devices: Holders,
     /// The keys asked about, in the order listed.
     pub asked: Vec<[u8; 32]>,
-    /// Of `asked`, the keys not moved yet: asked about at `shared anew`,
-    /// and not kept at a removal, which keeps the table alone (rule 24).
+    /// Of `asked`, the keys not moved yet, asked about like any other.
     pub not_moved: Vec<[u8; 32]>,
     /// The keys listed as left out because the person removed them.
     pub removed: usize,
@@ -1616,7 +1692,14 @@ pub fn anew_plan(
         return refused("", STAY_PAST_64.into());
     }
     let left_out = listing.asked.len() - (stay.len() - listing.own_devices.len());
-    let line = new_line_of(conn, &held, &row, &[], &listing.asked, &stay)?;
+    let line = new_line_of(
+        conn,
+        &held,
+        &followed(conn, &row)?,
+        &[],
+        &listing.asked,
+        &stay,
+    )?;
     let at: Vec<String> = relays
         .iter()
         .map(|key| relay_shown(own_relays, key))

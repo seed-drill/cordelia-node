@@ -2119,6 +2119,9 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
     });
     let bob_dir = maps_folder(&bob, "repo", AGENT);
     subscribes(&bob, &bob_dir, "review");
+    // The desktop labels Bob: at a removal, a channel shared by hand keeps
+    // the keys a device that counts labelled (rule 24).
+    labels_key(&desktop, &key_of(&bob), "bob");
     let old = id_filed(&laptop, "review").unwrap();
     let old_card = card_of_node(&laptop, &old);
     let before_laptop = at_the_relay_by(&relay, &old, &key_of(&laptop));
@@ -2545,7 +2548,8 @@ fn recovers(new: &Node, words: &str, answers: &[&str]) -> AtTerminal {
 /// back with the device that made it, the laptop's acts with what undoes
 /// each, and the desktop's as passed over until it is added again; the end
 /// of the look prints them again; the new machine then holds the channel,
-/// and makes it anew once it has read it.
+/// and makes it anew once it has read it, sealed to itself alone (decision
+/// 2026-10-24, rule 24).
 #[test]
 fn a_recovery_brings_the_shared_channels_back_and_names_each() {
     let relay = relay_started();
@@ -2620,8 +2624,11 @@ fn a_recovery_brings_the_shared_channels_back_and_names_each() {
         .iter()
         .map(|seal| cordelia_crypto::bech32::encode_public_key(&seal.key).unwrap())
         .collect();
-    assert!(sealed.contains(&key_of(&bob)), "{sealed:?}");
     assert!(!sealed.contains(&key_of(&laptop)), "{sealed:?}");
+    // Nor to Bob (rule 24): the laptop, removed, labelled him, and the new
+    // machine counts no label made before it until the device that made it
+    // is added again. The person shares the new channel with him again.
+    assert_eq!(sealed, [key_of(&new)], "{sealed:?}");
 }
 
 /// An honest node writes nothing in a shared channel but messages,

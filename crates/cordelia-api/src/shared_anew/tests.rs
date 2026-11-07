@@ -7,7 +7,7 @@ use crate::lists::tests::filing;
 use crate::several::{Several, Twin};
 use crate::shared::Read;
 use crate::shared::tests::{
-    FULL, Shared, acts, anew, anew_of, bob, fill_to, holds, member, out, row, stores,
+    FULL, Shared, acts, anew, anew_of, bob, fill_to, holds, labels, member, out, row, stores,
 };
 use cordelia_crypto::acts::{Label, Subscription};
 use cordelia_crypto::shared::{Anew, Offer, Seal};
@@ -538,9 +538,9 @@ fn out_for_the_rest_comes_only_after_the_whole_list() {
 
 /// A removal makes each shared channel anew without the removed key
 /// (decision 2026-10-24, rules 23 and 24; decision 2026-10-10 §3.5, §7):
-/// on the device that makes it, with no question, sealed to every key of
-/// its table but the removed one, and its subscription moved with its
-/// start; the old channel's entries stay until its offer is at each relay
+/// on the device that makes it, with no question, sealed to its own
+/// devices and to Alice, whom the laptop labelled, and its subscription
+/// moved with its start; the old channel's entries stay until its offer is at each relay
 /// of its card, and then go. The other device follows the filing, and its
 /// old channel is moved from: neither is left not clean.
 #[test]
@@ -554,6 +554,7 @@ fn a_removal_makes_each_shared_channel_anew_without_the_removed_key() {
         subscribed: true,
     };
     acts(&s, 0, Do::Subscribe(subscription), now);
+    labels(&s, 0, &member(1).public_key(), Some("alice"), now);
     s.meet(&[0, 1, 2]);
     for n in 0..3 {
         crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
@@ -1023,12 +1024,14 @@ fn shared_anew_asks_about_a_key_not_moved_yet() {
     let what = plan.unwrap().what;
     assert!(what.stay.contains(&dave.public_key()), "{:?}", what.stay);
     assert_eq!(what.left_out, 0);
-    // A removal keeps the table's keys alone.
+    // A removal keeps a key labelled by a device that counts, Dave, though
+    // he has not moved, and not Alice, whom no label names, though she
+    // wrote there (rule 24).
+    labels(&s, 0, &dave.public_key(), Some("dave"), now);
     let held = crate::person::held(conn).unwrap().unwrap();
     let (stay, ..) =
         staying_with_no_question(conn, &held, &s.key(0), &row(&s, 0, &new), true).unwrap();
-    assert!(stay.contains(&alice.public_key()), "{stay:?}");
-    assert!(!stay.contains(&dave.public_key()), "{stay:?}");
+    assert_eq!(stay, vec![s.key(0), dave.public_key()]);
 }
 
 /// An offer whose maker has not written in the channel it names counts for
@@ -1583,9 +1586,11 @@ fn moved_subscriptions_leave_room_for_a_new_one() {
 
 /// The line of a removal says how many keys the cap and the rows let go
 /// left out (the review of slice 8, medium 5; decision 2026-10-10,
-/// property 7): with a member's 100 keys and 3 rows let go, the laptop's
-/// removal of the tablet leaves out 38 keys past the 64 that stay, and 3
-/// no longer known; `remove-device` says so at its end.
+/// property 7): with 100 keys of members, 63 of them labelled, and 3 rows
+/// let go, the laptop's removal of the tablet keeps its two devices and 62
+/// labelled keys, and leaves out the other labelled one past the 64 that
+/// stay, and 3 no longer known; `remove-device` says so at its end. (With
+/// 64 labelled, the laptop would show none of its own devices there.)
 #[test]
 fn a_removal_says_how_many_keys_the_cap_and_the_rows_let_go_left_out() {
     let mut s = bob(3);
@@ -1594,6 +1599,9 @@ fn a_removal_says_how_many_keys_the_cap_and_the_rows_let_go_left_out() {
     let members: Vec<NodeIdentity> = (0..99).map(|k| member(1_000 + k)).collect();
     let refs: Vec<&NodeIdentity> = members.iter().collect();
     written_by(&s, 0, &channel, &refs, now);
+    for member in &members[..SHARED_MAX_KEYS - 1] {
+        labels(&s, 0, &member.public_key(), Some("a member"), now);
+    }
     let conn = &s[0].conn;
     conn.execute(
         "UPDATE shared_channels SET let_go = 3 WHERE channel = ?1",
@@ -1601,7 +1609,7 @@ fn a_removal_says_how_many_keys_the_cap_and_the_rows_let_go_left_out() {
     )
     .unwrap();
     let said = anew_at_removal(conn, &s[0].identity, &relays(), now).unwrap();
-    let besides = "Left out besides: 38 keys past the 64 that stay, and up to 3 keys no longer \
+    let besides = "Left out besides: 1 key past the 64 that stay, and up to 3 keys no longer \
                    known on this device.";
     assert!(said[0].ends_with(besides), "{said:?}");
     let at_the_end = made_at_the_last_removal(conn, Some(0)).unwrap();
@@ -3159,13 +3167,14 @@ fn a_channel_made_anew_after_a_recovery_keeps_its_line() {
 // ── The fix round of slice 6 ─────────────────────────────────────────
 
 /// Bob's three devices hold `review` at [`line_at`], each following the
-/// others' lists, with Alice's key shown on the laptop, and the laptop
-/// removes the tablet and makes `review` anew (decision 2026-10-24, rule
-/// 24). Returns the channel made anew, C1, and Alice; the laptop then holds
-/// C2 as `review`.
+/// others' lists, with Alice's key shown and labelled on the laptop, and
+/// the laptop removes the tablet and makes `review` anew (decision
+/// 2026-10-24, rule 24). Returns the channel made anew, C1, and Alice; the
+/// laptop then holds C2 as `review`.
 fn removed_at_line_at(s: &mut Several) -> (Shared, NodeIdentity) {
     let now = s.now + 10;
     let c1 = holds_at_line_at(s, 0, 7, "review", now);
+    labels(s, 0, &member(1).public_key(), Some("alice"), now);
     s.meet(&[0, 1, 2]);
     for n in 0..3 {
         crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
@@ -3252,11 +3261,12 @@ fn a_later_making_anew_names_an_earlier_removed_key_only_where_listed() {
     assert!(read.without.is_empty(), "{line}");
 }
 
-/// A key a removal leaves out only because it had not moved is not named,
-/// and the list decides for it (the review of slice 6, medium 1): Bob keeps
-/// Carol when he makes C0 into C1, and removes the tablet before Carol
-/// moves. Rule 24 leaves Carol out of C2, and the line names the tablet
-/// alone, so the list, which lists Carol, is not held back by her.
+/// A key the list names stays at a removal though it has not moved, and is
+/// not named (the review of slice 6, medium 1; decision 2026-10-24, rule
+/// 24, as the person ruled on 7 November): Bob keeps Carol when he makes C0
+/// into C1, and removes the tablet before Carol moves. The list, which
+/// lists Carol, keeps her in C2, and the line names the tablet alone, so
+/// the list is not held back by her.
 #[test]
 fn a_key_a_removal_leaves_out_only_as_not_moved_is_not_named() {
     let mut s = bob(3);
@@ -3288,8 +3298,8 @@ fn a_key_a_removal_leaves_out_only_as_not_moved_is_not_named() {
         .unwrap()
         .unwrap();
     assert!(
-        !offer.sealed_to.contains(&carol),
-        "rule 24 keeps the table alone"
+        offer.sealed_to.contains(&carol),
+        "rule 24 keeps the keys the list names"
     );
     let (line, read) = line_in(&said);
     assert_eq!(read.without, [tablet], "{line}");
@@ -3411,12 +3421,13 @@ fn twin_says(twin: &Twin, channel: &Shared, number: u64, body: &str, sent: i64) 
 }
 
 /// Bob's three devices hold "review", each following the others' lists,
-/// and Alice and the tablet wrote there; then a thief with the tablet
-/// writes there `wrote`, which device 0, the laptop, stores, before it
-/// knows of any removal. Returns the channel and Alice.
+/// and Alice, whom the laptop labelled, and the tablet wrote there; then a
+/// thief with the tablet writes there `wrote`, which device 0, the laptop,
+/// stores, before it knows of any removal. Returns the channel.
 fn a_thief_wrote(s: &mut Several, wrote: &dyn Fn(&Shared, i64) -> CheckedEntry) -> Shared {
     let now = s.now + 10;
     let channel = holds(s, 0, 7, "review", now);
+    labels(s, 0, &member(1).public_key(), Some("alice"), now);
     s.meet(&[0, 1, 2]);
     for n in 0..3 {
         crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
@@ -3526,15 +3537,14 @@ fn an_offer_by_or_to_a_removed_keys_twin_is_a_fault() {
 }
 
 /// A key that a thief made with the stolen device's seed, before the
-/// removal, stays at the removal's making anew (decision 2026-10-24, rule
-/// 24, as built): the thief writes in "review" under a key of its own,
-/// which is in the laptop's table, is no removed key and is not the
-/// person's; the laptop removes the tablet, and its making anew seals the
-/// new seed to that key, so the thief opens it and reads the new channel.
-/// Nothing in the code or either record leaves such a key out: this test
-/// shows the gap, and fails until it is closed (the person decides how).
+/// removal, does not stay at the removal's making anew (decision
+/// 2026-10-24, rule 24, as the person ruled on 7 November): the thief
+/// writes in "review" under a key of its own, which is in the laptop's
+/// table, is no removed key and is not the person's. Who stays comes only
+/// from what the removed device could not write, never from who wrote, so
+/// the laptop's making anew seals nothing that key opens; Alice, whom the
+/// laptop labelled, stays.
 #[test]
-#[ignore = "shows a gap: a key a thief made before the removal stays at its making anew"]
 fn a_removal_leaves_out_a_key_the_thief_made() {
     let mut s = bob(3);
     let made = NodeIdentity::from_seed([0x7e; 32]).unwrap();
@@ -3547,5 +3557,171 @@ fn a_removal_leaves_out_a_key_the_thief_made() {
     assert!(
         a_seal_opens_for(&s, 0, &channel, &made).is_none(),
         "the thief opens the new seed with the key it made"
+    );
+    assert!(a_seal_opens_for(&s, 0, &channel, &member(1)).is_some());
+}
+
+/// The keys that device `n`'s making anew of `channel` sealed to, in order.
+fn sealed_to(s: &Several, n: usize, channel: &Shared) -> Vec<[u8; 32]> {
+    st(rows::offer_from(&s[n].conn, &channel.id, &s.key(n)))
+        .unwrap()
+        .unwrap()
+        .sealed_to
+}
+
+/// A channel shared by hand keeps, at a removal, the person's own devices
+/// and the keys labelled by a device that counts, and no other key
+/// (decision 2026-10-24, rule 24, as the person ruled on 7 November): Bob's
+/// laptop labelled Alice and Erin, and his tablet labelled Dave, before the
+/// laptop removes the tablet. Alice, Carol and Dave wrote in "review". The
+/// making anew seals to the laptop, the desktop and Alice: not to Carol,
+/// whom no label names; not to Dave, whose label the removed tablet made,
+/// though it is in force; and not to Erin, labelled but never in the
+/// channel as far as the laptop knows.
+#[test]
+fn a_removal_keeps_own_devices_and_keys_labelled_by_a_device_that_counts() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol, dave, erin) = (member(1), member(2), member(3), member(4));
+    labels(&s, 0, &alice.public_key(), Some("alice"), now);
+    labels(&s, 0, &erin.public_key(), Some("erin"), now);
+    labels(&s, 2, &dave.public_key(), Some("dave"), now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    written_by(&s, 0, &channel, &[&alice, &carol, &dave], now);
+    let dave_label = crate::lists::holds(&s[0].conn)
+        .unwrap()
+        .labels
+        .into_iter()
+        .find(|(act, _)| act.item.key == dave.public_key())
+        .unwrap();
+    assert_eq!(dave_label.0.maker, s.key(2), "the tablet labelled Dave");
+
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    anew_at_removal(&s[0].conn, &s[0].identity, &relays(), now).unwrap();
+    assert_eq!(
+        sealed_to(&s, 0, &channel),
+        vec![s.key(0), s.key(1), alice.public_key()]
+    );
+}
+
+/// A channel that follows a repository keeps, at a removal, the person's
+/// own devices and the keys its list names, and no other key (decision
+/// 2026-10-24, rule 24, as the person ruled on 7 November): the laptop
+/// follows a list that names "review", Alice and Dave, Erin, whom the
+/// channel line names after `without`, and the tablet's twin, whose line is
+/// not deleted yet. Alice and Carol wrote there, and a thief with
+/// the tablet wrote under a key it made. Once the laptop removes the
+/// tablet, its making anew seals to the laptop, the desktop, Alice and
+/// Dave, who never wrote there: not to Carol, whom the list does not name,
+/// though she wrote; not to Erin, left out before; and not to the tablet,
+/// its twin or the thief's key.
+#[test]
+fn a_removal_keeps_the_keys_a_repositorys_list_names() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let channel = holds_at_line_at(&s, 0, 7, "review", now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    let (alice, carol, dave, erin) = (member(1), member(2), member(3), member(4));
+    let made = NodeIdentity::from_seed([0x7e; 32]).unwrap();
+    written_by(&s, 0, &channel, &[&alice, &carol, &made], now);
+    let tablet = s.key(2);
+    let listed = [
+        s.key(0),
+        s.key(1),
+        twin(tablet),
+        alice.public_key(),
+        dave.public_key(),
+        erin.public_key(),
+    ];
+    follows_a_list(
+        &s,
+        0,
+        "example.org/team/project",
+        &channel.id,
+        &[erin.public_key()],
+        &listed,
+        now,
+    );
+
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    anew_at_removal(&s[0].conn, &s[0].identity, &line_relays(), now).unwrap();
+    assert_eq!(
+        sealed_to(&s, 0, &channel),
+        vec![s.key(0), s.key(1), alice.public_key(), dave.public_key()]
+    );
+}
+
+/// A device that does not follow the repository a channel follows keeps,
+/// at a removal, what a channel shared by hand keeps, and never the table
+/// (decision 2026-10-24, rule 24, condition 2 of the person's ruling of 7
+/// November): the desktop follows a list that names "review", Alice and
+/// Carol, and the laptop does not. Both wrote there, and the laptop labelled
+/// Alice. The laptop removes the tablet: its making anew seals to its own
+/// devices and Alice, and not to Carol, whom only a list it does not
+/// follow names.
+#[test]
+fn a_device_that_does_not_follow_keeps_what_a_channel_shared_by_hand_keeps() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    let channel = holds_at_line_at(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    labels(&s, 0, &alice.public_key(), Some("alice"), now);
+    s.meet(&[0, 1, 2]);
+    for n in 0..3 {
+        crate::lists::follow(&s[n].conn, &s[n].identity, now).unwrap();
+        out(&s, n, now);
+    }
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    let listed = [s.key(0), s.key(1), alice.public_key(), carol.public_key()];
+    follows_a_list(
+        &s,
+        1,
+        "example.org/team/project",
+        &channel.id,
+        &[],
+        &listed,
+        now,
+    );
+
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 20;
+    anew_at_removal(&s[0].conn, &s[0].identity, &line_relays(), now).unwrap();
+    assert_eq!(
+        sealed_to(&s, 0, &channel),
+        vec![s.key(0), s.key(1), alice.public_key()]
+    );
+}
+
+/// The machine of a recovery makes a channel anew with what a removal
+/// keeps (decision 2026-10-24, rule 24): its own devices, and a key a
+/// device that counts labelled, Alice; not Carol, who wrote there and whom
+/// no label names.
+#[test]
+fn a_recovery_makes_a_channel_anew_with_what_a_removal_keeps() {
+    let mut s = bob(2);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    labels(&s, 0, &alice.public_key(), Some("alice"), now);
+    written_by(&s, 0, &channel, &[&alice, &carol], now);
+    s.change(0, &[0], &[1]);
+    let now = s.now + 20;
+    let conn = &s[0].conn;
+    recovered(conn, &[s.key(1)], now).unwrap();
+    assert_eq!(make_owed(conn, &s[0].identity, now, &|_| true).unwrap(), 1);
+    assert_eq!(
+        sealed_to(&s, 0, &channel),
+        vec![s.key(0), alice.public_key()]
     );
 }
