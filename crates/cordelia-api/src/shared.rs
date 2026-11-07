@@ -1098,7 +1098,6 @@ pub fn accept_typed(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Option<Judged>, PersonError> {
-    use cordelia_crypto::share::{Share, share_name};
     use cordelia_storage::shared_sharing as typed_rows;
     // Rule 1.
     let reads = typed_rows::typed_key(conn, key)?.is_some_and(|row| {
@@ -1109,7 +1108,23 @@ pub fn accept_typed(
     if !reads {
         return Ok(None);
     }
-    let not = |why: NotAShare| Ok(Some(Judged::Not(why)));
+    judge_share(identity, key, typed_at, entry).map(Some)
+}
+
+/// Judge `entry`, handed from the share pair channel of `key`, typed at
+/// `typed_at` and reading now, by rules 2 to 8 of §3.2: for a key a person
+/// typed ([`accept_typed`]), and for one the node typed at a read of a
+/// repository's list (decision 2026-11-06 (joining), rule 4.4), whose rule
+/// 1 is its own. A share made an hour or more from `typed_at` is not one to
+/// take (rule 5).
+pub fn judge_share(
+    identity: &NodeIdentity,
+    key: &[u8; 32],
+    typed_at: i64,
+    entry: &CheckedEntry,
+) -> Result<Judged, PersonError> {
+    use cordelia_crypto::share::{Share, share_name};
+    let not = |why: NotAShare| Ok(Judged::Not(why));
     // Rule 2: the share pair channel of the typed key and this device.
     let Some((pair, secret)) = crate::shared_pass::share_pair(identity, key) else {
         return not(NotAShare::NotThePairChannel);
@@ -1154,7 +1169,7 @@ pub fn accept_typed(
     if share.card.channel_id()? != named {
         return not(NotAShare::AnotherChannel);
     }
-    Ok(Some(Judged::Share(Box::new(entry.clone()))))
+    Ok(Judged::Share(Box::new(entry.clone())))
 }
 
 #[cfg(test)]

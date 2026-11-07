@@ -108,7 +108,7 @@ fn read_on(s: &Several, list: Option<&str>, commit: &str, comes_after: bool) -> 
 
 /// The plan of device 0 in [`FOLDER`], of what was read.
 fn plan_of(s: &Several, read: &ClonedRead, new: bool) -> Out<Plan<Following>> {
-    plan(&s[0].conn, &s[0].identity, &own_relays(), FOLDER, read, new)
+    plan(&s[0].conn, &s[0].identity, &own_relays(), read, new)
 }
 
 /// The plan of device 0 in [`FOLDER`], with `list` at `commit`, which
@@ -259,13 +259,34 @@ fn a_device_not_on_the_list_is_refused_and_nothing_is_done() {
     assert!(follows::follows(&s[0].conn).unwrap().is_empty());
 }
 
-/// A twin of this device's key is this device's key (rule 1).
+/// A list that names a twin of this device's key, and not the key as
+/// `cordelia id` prints it, does not name this device: a member's share
+/// to the twin is in a share pair channel this device never reads (rule
+/// 4.4). It is refused plainly, with the key to list.
 #[test]
-fn a_twin_of_this_devices_key_is_on_the_list() {
+fn a_twin_of_this_devices_key_on_the_list_is_refused_plainly() {
     let s = devices(1);
     let mut twin = s.key(0);
     twin[31] ^= 0x80;
+    let line = format!(
+        "The list of {REPOSITORY} names your key in another form: list it as cordelia id prints \
+         it, {}.",
+        id(&s.key(0))
+    );
     let list = format!("{} bob-laptop\n", id(&twin));
+    let refused = refusal(planned(&s, Some(&list), FIRST, false));
+    assert_eq!(refused, ("twin_listed", line.clone()));
+    let channel = Shared::of(7);
+    let list = format!(
+        "{}\n{} bob-laptop\n",
+        channel_line(&channel, &[]),
+        id(&twin)
+    );
+    let refused = refusal(planned(&s, Some(&list), FIRST, false));
+    assert_eq!(refused, ("twin_listed", line));
+    assert!(follow_row(&s).is_none());
+    // The key itself is on the list.
+    let list = format!("{} bob-laptop\n", id(&s.key(0)));
     let planned = planned(&s, Some(&list), FIRST, false).unwrap();
     assert!(
         planned
@@ -693,6 +714,15 @@ fn following_again_says_where_it_read_last_and_whether_the_clone_goes_back() {
     assert_ne!(plan_of(&s, &upstream, false).unwrap().asks, on.asks);
     let mut elsewhere = read_on(&s, Some(&list), FIRST, true);
     elsewhere.top = PathBuf::from("/home/bob/Work/project-2");
+    assert_eq!(refusal(plan_of(&s, &elsewhere, false)).0, "not_mapped");
+    map(
+        &s,
+        0,
+        &[
+            (FOLDER, "project"),
+            ("/home/bob/Work/project-2", "project-2"),
+        ],
+    );
     assert_ne!(plan_of(&s, &elsewhere, false).unwrap().asks, on.asks);
     // A read that checked another last commit than the follow now has.
     let mut stale = read_on(&s, Some(&list), FIRST, true);
@@ -1304,6 +1334,12 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
     }
     let (_, looked) = asked(&state, json!({ "folder": docs, "look": true })).await;
     let asks = looked["asks"].as_str().unwrap().to_string();
+    // The agent the yes names is the one mapped at the top, which a take
+    // subscribes, and not that of the folder given (rule 4.4).
+    assert!(
+        asks.contains("The agent of this folder, project, is subscribed"),
+        "{asks}"
+    );
     let (status, done) = asked(&state, json!({ "folder": docs, "said_yes_to": asks })).await;
     assert_eq!(status, 200, "{done}");
     assert_eq!(row(&state).unwrap().clone, top);

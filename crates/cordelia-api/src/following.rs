@@ -33,7 +33,7 @@ use std::time::Instant;
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{MEMBERS_LABEL_MAX_CHARS, SHARED_MAX_KEYS};
-use cordelia_crypto::acts::Subscription;
+use cordelia_crypto::acts::{Filing, Subscription};
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_storage::follows::{self, LastRead};
@@ -234,24 +234,29 @@ pub enum Then {
 }
 
 /// The line of rule 6 for a list that names no channel.
-fn no_channel_line(repository: &str) -> String {
+pub(crate) fn no_channel_line(repository: &str) -> String {
     format!("The list of {repository} names no channel yet.")
 }
 
-/// What `cordelia subscribe` with no name would do in `folder`, given what
-/// was read of its clone (rule 2.3), and its yes; or, with `new`, what
-/// `--new` would make (rule 2.4). `own_relays` are the device's relays
-/// known by their keys.
+/// What `cordelia subscribe` with no name would do, given what was read
+/// of the clone (rule 2.3), and its yes; or, with `new`, what `--new`
+/// would make (rule 2.4). `own_relays` are the device's relays known by
+/// their keys.
 pub fn plan(
     conn: &Connection,
     identity: &NodeIdentity,
     own_relays: &[OwnRelay],
-    folder: &str,
     read: &ClonedRead,
     new: bool,
 ) -> Out<Plan<Following>> {
     sharing::standing(conn)?;
-    let agent = crate::shared_routes::agent_here(conn, folder)?;
+    // The agent is the one mapped at the clone's top, the folder the
+    // follow keeps: so the agent the yes names is the one the node
+    // subscribes when it takes the channel (decision 2026-11-06 (joining),
+    // rule 4.4). The command sends the folder whose memory the session
+    // keeps, which is that top.
+    let clone = read.top.display().to_string();
+    let agent = crate::shared_routes::agent_here(conn, &clone)?;
     let repository = read.identity.to_string();
     let commit = &read.list.at.commit;
     // A clone with no list is a list with no members and no channel.
@@ -275,22 +280,24 @@ pub fn plan(
         None => None,
     };
     let own = identity.public_key();
-    // A twin of this device's key is its key (rule 1).
-    let label = members.label_of(&own).map(str::to_string);
+    // Only this device's key as `cordelia id` prints it counts: a member's
+    // share to its twin is in another share pair channel, which this
+    // device never reads (rule 4.4).
+    let label = members.line_of(&own).map(|device| device.label.clone());
     let key_line = match &label {
         Some(label) => format!("Your key is on the list, as {label}."),
         None => "Your key is not on the list.".to_string(),
     };
-    let not_listed = || {
-        sharing::refused(
+    let not_listed = || match members.lists(&own) {
+        true => sharing::refused("twin_listed", twin_line(&repository, &own)?),
+        false => sharing::refused(
             "not_listed",
             format!(
                 "Your key is not on the list of {repository} at {commit}. Add it with a pull \
                  request, then run this again."
             ),
-        )
+        ),
     };
-    let clone = read.top.display().to_string();
     // The yes names this clone and its remote, so that it is a yes to no
     // other clone or remote of the repository at this commit.
     let mut asks = vec![format!(
@@ -352,30 +359,8 @@ pub fn plan(
                 ),
             );
         }
-        // Filed under the repository's `owner/name` (§14, answer 2).
-        let name = format!("{}/{}", read.identity.owner(), read.identity.name());
-        if sharing::filed(conn)?
-            .iter()
-            .any(|filing| filing.name == name)
-        {
-            return sharing::refused(
-                "name_taken",
-                format!(
-                    "You file another channel as {name}: rename it with cordelia shared rename."
-                ),
-            );
-        }
-        let mappings = crate::sync::mappings(conn).map_err(|e| PersonError::Held(e.to_string()))?;
-        if let Some(mapped) = mappings.iter().find(|mapping| mapping.name == name) {
-            return sharing::refused(
-                "name_taken",
-                format!(
-                    "You sync a folder as {name}: to free the name, unmap it with cordelia sync \
-                     unmap {}, then map it under another name.",
-                    crate::shared_routes::shell_word(&mapped.folder)
-                ),
-            );
-        }
+        let name = name_of(&read.identity);
+        name_free(conn, &name)?;
         // The lines it says to add must leave a list of at most 64 (rule 1).
         let would = members.devices.len() + to_add(conn, &members)?.len();
         if would > SHARED_MAX_KEYS {
@@ -461,7 +446,7 @@ pub fn plan(
         let subscribing = crate::shared_routes::subscribe_plan(
             conn,
             identity,
-            folder,
+            &clone,
             &filing.name,
             Some(&words),
         )?;
@@ -495,30 +480,8 @@ pub fn plan(
         None => {}
     }
     // The person holds the channel the named one was made anew from: they
-    // move to it, and nobody hands it to them (rule 6). Only an offer that
-    // counts says so, judged as `shared move` judges it: one for this
-    // device, or sealed to another of the person's. An offer "without
-    // you", or one that is a fault, does not (rule 4.1).
-    let mut made_anew_from = None;
-    for filing in &filings {
-        let Some(row) = kept::channel(conn, &filing.channel)? else {
-            continue;
-        };
-        let counts = crate::shared_anew::judged(conn, identity, &row, None)?
-            .iter()
-            .any(|one| {
-                one.offer.new_channel == line.channel
-                    && matches!(
-                        one.is,
-                        OfferIs::ForThisDevice(_) | OfferIs::SealedElsewhere(_)
-                    )
-            });
-        if counts {
-            made_anew_from = Some(filing);
-            break;
-        }
-    }
-    if let Some(from) = made_anew_from {
+    // move to it, and nobody hands it to them (rule 6).
+    if let Some(from) = made_anew_from(conn, identity, &filings, &line.channel)? {
         asks.push(format!("It names channel {words}, which you do not hold."));
         asks.push(key_line);
         asks.push(format!(
@@ -547,6 +510,82 @@ pub fn plan(
     }
     asks.push(once_taken);
     planned(asks, Then::Nothing)
+}
+
+/// What is said where the list of `repository` names a twin of this
+/// device's key `own`, and not the key as `cordelia id` prints it (rule
+/// 4.4).
+pub(crate) fn twin_line(repository: &str, own: &[u8; 32]) -> Result<String, PersonError> {
+    Ok(format!(
+        "The list of {repository} names your key in another form: list it as cordelia id prints \
+         it, {}.",
+        encode_public_key(own)?
+    ))
+}
+
+/// The name a repository's channel is filed under, made or taken: the
+/// repository's `owner/name` (§14, answer 2).
+pub(crate) fn name_of(identity: &Identity) -> String {
+    format!("{}/{}", identity.owner(), identity.name())
+}
+
+/// `name`, a repository's `owner/name`, is free to file its channel under
+/// (rule 6): no other channel is filed as it, and no folder is synced as
+/// it. Refused, as `name_taken`, with what frees it.
+pub(crate) fn name_free(conn: &Connection, name: &str) -> Out<()> {
+    if sharing::filed(conn)?
+        .iter()
+        .any(|filing| filing.name == name)
+    {
+        return sharing::refused(
+            "name_taken",
+            format!("You file another channel as {name}: rename it with cordelia shared rename."),
+        );
+    }
+    let mappings = crate::sync::mappings(conn).map_err(|e| PersonError::Held(e.to_string()))?;
+    if let Some(mapped) = mappings.iter().find(|mapping| mapping.name == name) {
+        return sharing::refused(
+            "name_taken",
+            format!(
+                "You sync a folder as {name}: to free the name, unmap it with cordelia sync unmap \
+                 {}, then map it under another name.",
+                crate::shared_routes::shell_word(&mapped.folder)
+            ),
+        );
+    }
+    Ok(())
+}
+
+/// The filing of the channel the person holds that `channel` was made
+/// anew from, among `filings`, where one is: they move to it, and nobody
+/// hands it to them (rule 6). Only an offer that counts says so, judged as
+/// `shared move` judges it: one for this device, or sealed to another of
+/// the person's. An offer "without you", or one that is a fault, does not
+/// (rule 4.1).
+pub(crate) fn made_anew_from<'a>(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    filings: &'a [Filing],
+    channel: &[u8; 32],
+) -> Result<Option<&'a Filing>, PersonError> {
+    for filing in filings {
+        let Some(row) = kept::channel(conn, &filing.channel)? else {
+            continue;
+        };
+        let counts = crate::shared_anew::judged(conn, identity, &row, None)?
+            .iter()
+            .any(|one| {
+                one.offer.new_channel == *channel
+                    && matches!(
+                        one.is,
+                        OfferIs::ForThisDevice(_) | OfferIs::SealedElsewhere(_)
+                    )
+            });
+        if counts {
+            return Ok(Some(filing));
+        }
+    }
+    Ok(None)
 }
 
 /// The other repository this device follows whose list kept names the
