@@ -1509,7 +1509,7 @@ fn has_read_from(all: &[&Node], n: &Node, name: &str, keys: &[String]) {
 /// removal of the device that made them (decision 2026-10-10 §3.4, §4.1,
 /// T16): Alice's tablet subscribes her `notes` folder to a channel shared
 /// with Bob, and unsubscribes her `work` folder, which her laptop had
-/// subscribed. Her laptop then makes a change, and then removes the
+/// subscribed. Her laptop labels Bob, makes a change, and then removes the
 /// tablet. On the laptop and the phone, `notes` still subscribes with the
 /// start each took, `work` does not, and a message Bob sends after is
 /// unread for `notes` alone.
@@ -1554,6 +1554,9 @@ fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_t
         .collect();
     has_read_from(&all, &bob, "review", &alices);
     subscribes(&bob, &bob_dir, "review");
+    // At the removal, a channel shared by hand keeps the keys a device that
+    // counts labelled (decision 2026-10-24, rule 24).
+    labels_key(&laptop, &key_of(&bob), "bob");
 
     // The laptop subscribes `work`; the tablet takes it, subscribes
     // `notes`, and unsubscribes `work`.
