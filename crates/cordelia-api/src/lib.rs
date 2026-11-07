@@ -35,7 +35,8 @@
 //! git through [`git_list`] (decision 2026-11-06 (joining)): which
 //! repository a clone is, a read of the clone's copy of its list, and
 //! never back, each with nothing of the person's reaching git. Following a
-//! repository, `cordelia subscribe` in a clone, is [`following`].
+//! repository, `cordelia subscribe` in a clone, is [`following`]; the node's read of each list it follows, and
+//! what it then does, is [`members_read`].
 //!
 //! A personal node serves [`configure_device_routes`]: it carries no
 //! channel of the older kind (decision 2026-10-04 §10). A node of any
@@ -68,6 +69,7 @@ pub mod local;
 pub mod look;
 pub mod marks;
 pub mod members;
+pub mod members_read;
 pub mod messages;
 pub mod names;
 pub mod own_read;

@@ -33,7 +33,7 @@ use std::time::Instant;
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{MEMBERS_LABEL_MAX_CHARS, SHARED_MAX_KEYS};
-use cordelia_crypto::acts::{Came, Subscription};
+use cordelia_crypto::acts::Subscription;
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_storage::follows::{self, LastRead};
@@ -44,7 +44,7 @@ use crate::lists::Do;
 use crate::members::{self, ChannelLine, Members, same_key};
 use crate::messages::cleaned;
 use crate::person::{Held, PersonError, in_one};
-use crate::shared_anew::OfferIs;
+use crate::shared_anew::{Gone, OfferIs};
 use crate::sharing::{self, Failed, New, Out, OwnRelay, Plan, Refusal, channel_words};
 
 // ── The clone, read outside the lock ─────────────────────────────────
@@ -206,6 +206,11 @@ pub struct Following {
     pub commit: String,
     /// The list's bytes, as the clone has them: none where it has no list.
     pub list: Vec<u8>,
+    /// When the person's git had last fetched it, where the clone says.
+    pub fetched_at: Option<i64>,
+    /// The other repository this device follows whose list names the same
+    /// channel, where one does: this follow takes its place (rule 2.5).
+    pub replaces: Option<String>,
     /// The agent of the folder it was run in.
     pub agent: String,
     pub then: Then,
@@ -262,6 +267,12 @@ pub fn plan(
                 ),
             );
         }
+    };
+    // A channel follows one repository (rule 2.5): a follow of another
+    // whose list names this list's channel is replaced by this one.
+    let replaces = match &members.channel {
+        Some(line) => followed_elsewhere(conn, &repository, &line.channel)?,
+        None => None,
     };
     let own = identity.public_key();
     // A twin of this device's key is its key (rule 1).
@@ -323,6 +334,8 @@ pub fn plan(
                 clone: clone.clone(),
                 commit: commit.clone(),
                 list: file.clone(),
+                fetched_at: read.list.fetched_at(),
+                replaces: replaces.clone(),
                 agent: agent.clone(),
                 then,
             },
@@ -426,6 +439,14 @@ pub fn plan(
             .collect()
     };
     let filings = sharing::filed(conn)?;
+    // A channel follows one repository, so that no two lists hand it over,
+    // or delete its shares (rule 2.5): the yes says which follow stops.
+    if let Some(other) = &replaces {
+        asks.push(stops_following_line(
+            other,
+            &channel_named(conn, &line.channel)?,
+        ));
+    }
     if let Some(filing) = filings.iter().find(|filing| filing.channel == line.channel) {
         let name = cleaned(&filing.name);
         asks.push(format!(
@@ -463,17 +484,15 @@ pub fn plan(
     // --channel` refuses it (§3.4 there). A move is kept as a drop: each
     // is said as rules 2.3 and 6 say it. The drop keeps no name, so the
     // channel is said by its words.
-    if crate::shared_anew::held_or_dropped(conn, None)?.contains(&line.channel) {
-        let moved = filings
-            .iter()
-            .any(|filing| filing.came == Came::Moved(line.channel));
-        return match moved {
-            true => sharing::refused("moved", MOVED_FROM.into()),
-            false => sharing::refused(
+    match crate::shared_anew::dropped_or_moved(conn, &line.channel)? {
+        Some(Gone::Moved) => return sharing::refused("moved", MOVED_FROM.into()),
+        Some(Gone::Dropped) => {
+            return sharing::refused(
                 "dropped",
                 format!("You dropped channel {words}, and a dropped channel is not taken again."),
-            ),
-        };
+            );
+        }
+        None => {}
     }
     // The person holds the channel the named one was made anew from: they
     // move to it, and nobody hands it to them (rule 6). Only an offer that
@@ -530,6 +549,63 @@ pub fn plan(
     planned(asks, Then::Nothing)
 }
 
+/// The other repository this device follows whose list kept names the
+/// channel `channel`, where one does (rule 2.5). A channel follows one
+/// repository: two lists that named one channel would each hand it over,
+/// write over the other's shares, and delete a share to a key one of them
+/// no longer names while the other names it still.
+pub(crate) fn followed_elsewhere(
+    conn: &Connection,
+    repository: &str,
+    channel: &[u8; 32],
+) -> Result<Option<String>, PersonError> {
+    for follow in follows::follows(conn)? {
+        let names = follow
+            .list
+            .as_deref()
+            .and_then(|list| members::read(list).ok())
+            .and_then(|members| members.channel)
+            .is_some_and(|line| line.channel == *channel);
+        if names && follow.identity != repository {
+            return Ok(Some(follow.identity));
+        }
+    }
+    Ok(None)
+}
+
+/// What the yes of `subscribe` in a clone says where it replaces the
+/// follow of `other`, whose list names `name` too (rule 2.5).
+pub(crate) fn stops_following_line(other: &str, name: &str) -> String {
+    format!(
+        "This stops following {other}, whose list names {name} too: a channel follows one \
+         repository."
+    )
+}
+
+/// What is said of a read of the list of `repository` that names `name`,
+/// which this device follows from `other`: the read counts for nothing
+/// (rules 2.5 and 6).
+pub(crate) fn followed_from_line(repository: &str, name: &str, other: &str) -> String {
+    format!(
+        "The list of {repository} names {name}, which this device follows from {other}: run \
+         cordelia subscribe in a clone of the one it should follow."
+    )
+}
+
+/// The channel `channel` as a line says it: by the person's name for it,
+/// where they hold it, or else by its words.
+pub(crate) fn channel_named(conn: &Connection, channel: &[u8; 32]) -> Result<String, PersonError> {
+    Ok(
+        match sharing::filed(conn)?
+            .into_iter()
+            .find(|filing| filing.channel == *channel)
+        {
+            Some(filing) => format!("\"{}\"", cleaned(&filing.name)),
+            None => format!("channel {}", channel_words(channel)),
+        },
+    )
+}
+
 /// The keys of the person's devices that count and that `members` does not
 /// name, a twin counting as its key: those `--new` says to add (rule 2.4).
 fn to_add(conn: &Connection, members: &Members) -> Result<Vec<[u8; 32]>, PersonError> {
@@ -544,7 +620,7 @@ fn to_add(conn: &Connection, members: &Members) -> Result<Vec<[u8; 32]>, PersonE
 /// device holds it ("in the channel", the record's words): in its table of
 /// the channel's keys, or not moved yet (#291). None where the list has no
 /// channel line, or the device holds no row of the channel.
-fn keys_in_channel(
+pub(crate) fn keys_in_channel(
     conn: &Connection,
     own: &[u8; 32],
     members: &Members,
@@ -603,9 +679,15 @@ pub fn make(
         // said whether this clone goes back from the last commit read, and
         // the commit it named is where never-back starts now. The list
         // last read is kept, and not this one: the node's next read, woken
-        // now, compares the list it reads with it (rule 4.6). A first
-        // follow keeps this read whole.
-        let again = follows::follow_of(conn, &following.identity)?.is_some();
+        // now, compares the list it reads with it (rule 4.6). So is when
+        // it was read, since when that read notices a key's join (rule
+        // 4.5). A first follow keeps this read whole.
+        // The follow this one replaces stops first, in the same write: a
+        // channel follows one repository (rule 2.5).
+        if let Some(other) = &following.replaces {
+            follows::unfollow(conn, other)?;
+        }
+        let earlier = follows::follow_of(conn, &following.identity)?;
         follows::follow(
             conn,
             &following.identity,
@@ -613,14 +695,23 @@ pub fn make(
             &following.clone,
             now,
         )?;
-        let read = LastRead {
+        let mut read = LastRead {
             commit: following.commit.clone(),
             at: now,
             from_clone: true,
         };
-        match again {
-            true => follows::set_last_read(conn, &following.identity, &read)?,
-            false => follows::read_done(conn, &following.identity, &read, &following.list)?,
+        match earlier {
+            Some(earlier) => {
+                read.at = earlier.last.map_or(now, |last| last.at);
+                follows::set_last_read(conn, &following.identity, &read)?
+            }
+            None => follows::read_done(
+                conn,
+                &following.identity,
+                &read,
+                &following.list,
+                following.fetched_at,
+            )?,
         };
         said.push(format!(
             "Following {}, from its list at commit {}. cordelia status shows how it goes.",
@@ -769,4 +860,4 @@ pub fn list_labels(labels: &[String], taken: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

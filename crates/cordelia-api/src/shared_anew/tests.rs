@@ -2252,7 +2252,7 @@ fn share_hands_out_no_channel_that_is_not_clean() {
     let alice = encode_public_key(&member(1).public_key()).unwrap();
     let (conn, identity) = (&s[1].conn, &s[1].identity);
     let to = sharing::share_plan(conn, identity, &relays(), "review", &alice, None, now).unwrap();
-    sharing::make_share(conn, identity, &relays(), &to.what, now).unwrap();
+    sharing::make_share(conn, identity, &relays(), &to.what, false, now).unwrap();
     assert_eq!(
         sharing::shares_to_push(conn, identity, &AT).unwrap().len(),
         1
@@ -2272,6 +2272,7 @@ fn share_hands_out_no_channel_that_is_not_clean() {
             identity,
             &relays(),
             &later.what,
+            false,
             now
         )),
         "not_clean"
@@ -2536,7 +2537,7 @@ fn shares_review(s: &Several, n: usize, to: &NodeIdentity, now: i64) {
     let to = encode_public_key(&to.public_key()).unwrap();
     let (conn, identity) = (&s[n].conn, &s[n].identity);
     let plan = sharing::share_plan(conn, identity, &relays(), "review", &to, None, now).unwrap();
-    sharing::make_share(conn, identity, &relays(), &plan.what, now).unwrap();
+    sharing::make_share(conn, identity, &relays(), &plan.what, false, now).unwrap();
 }
 
 /// Device `n`'s pass writes over the shares it does not send, and then

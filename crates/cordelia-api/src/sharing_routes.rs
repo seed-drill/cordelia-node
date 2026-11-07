@@ -165,7 +165,7 @@ pub async fn share(
             )
         },
         |conn, own, to, now| {
-            let said = sharing::make_share(conn, identity, own, to, now)?;
+            let said = sharing::make_share(conn, identity, own, to, false, now)?;
             Ok(json!({ "said": said }))
         },
     )

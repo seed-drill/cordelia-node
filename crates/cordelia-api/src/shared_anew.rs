@@ -182,15 +182,22 @@ pub struct Judged {
 }
 
 impl Judged {
-    /// Whether it pauses this device's sending in the old channel
-    /// (decision 2026-10-24, rule 26): it seals to this person and leaves
-    /// out a key, is no fault, and no person here stayed after it.
-    pub fn pauses(&self) -> bool {
+    /// Whether it made the old channel anew for this person: it seals to
+    /// them and leaves out a key, and is no fault, whether they then moved,
+    /// stayed or are still paused. The node hands nothing over in such a
+    /// channel (decision 2026-11-06 (joining), rule 4.1).
+    pub fn made_anew_for_you(&self) -> bool {
         matches!(
             self.is,
             OfferIs::ForThisDevice(_) | OfferIs::SealedElsewhere(_)
         ) && !self.left_out.is_empty()
-            && !self.offer.stayed
+    }
+
+    /// Whether it pauses this device's sending in the old channel
+    /// (decision 2026-10-24, rule 26): it made it anew for this person,
+    /// and no person here stayed after it.
+    pub fn pauses(&self) -> bool {
+        self.made_anew_for_you() && !self.offer.stayed
     }
 }
 
@@ -219,6 +226,43 @@ pub(crate) fn held_or_dropped(
         }
     }
     Ok(channels)
+}
+
+/// What became of a channel the person holds no more, as the list this
+/// device last wrote says (§3.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// Dropped, while its drop is kept.
+    Dropped,
+    /// Moved from, to a channel made anew: a move is kept as a drop.
+    Moved,
+}
+
+/// Whether the person dropped the channel `channel`, or moved from it,
+/// while its drop is kept: what `subscribe` in a clone refuses, and what
+/// stops the node's follow of a list that names it, but for a move
+/// (decision 2026-11-06 (joining), rules 2.3, 2.5 and 6). None where its
+/// drop is not kept.
+pub(crate) fn dropped_or_moved(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Option<Gone>, PersonError> {
+    let holds = lists::holds(conn)?;
+    if !holds
+        .drops
+        .iter()
+        .any(|(act, _)| act.item.channel == *channel)
+    {
+        return Ok(None);
+    }
+    let moved = holds
+        .filings
+        .iter()
+        .any(|(act, _)| act.item.came == Came::Moved(*channel));
+    Ok(Some(match moved {
+        true => Gone::Moved,
+        false => Gone::Dropped,
+    }))
 }
 
 /// Judge `offer`, read in the channel of `row`, on the device of
@@ -1732,15 +1776,15 @@ pub fn make_move(
     Ok(lines)
 }
 
-/// The keys that the offer which made the channel `channel` sealed to and
-/// that have not written there yet, but this device: "not moved yet" (§7).
-/// An offer counts only where this device made it, or its maker has
-/// written in this channel and is not a key the person removed: only a
-/// holder of this channel's seed can write there. A key left out still
-/// holds the old channel, and can write an offer there that names this
-/// one, even with a seal of this device's copied from another; its keys
-/// are not taken (#291's reviews).
-pub fn not_moved_yet(
+/// The keys that the offer which made the channel `channel` sealed to,
+/// but this device: those that move there with it (§7), whether or not
+/// they have written there yet. An offer counts only where this device
+/// made it, or its maker has written in this channel and is not a key the
+/// person removed: only a holder of this channel's seed can write there. A
+/// key left out still holds the old channel, and can write an offer there
+/// that names this one, even with a seal of this device's copied from
+/// another; its keys are not taken (#291's reviews).
+pub fn moved_with(
     conn: &Connection,
     own: &[u8; 32],
     channel: &[u8; 32],
@@ -1754,11 +1798,7 @@ pub fn not_moved_yet(
     }) else {
         return Ok(Vec::new());
     };
-    let wrote: Vec<[u8; 32]> = st(kept::keys(conn, row.id))?
-        .into_iter()
-        .filter(|key| key.first_held.is_some())
-        .map(|key| key.key)
-        .collect();
+    let wrote = wrote_in(conn, &row)?;
     // A maker the person removed counts for nothing, though it wrote here.
     let removed = match held(conn)? {
         Some(held) => crate::person::removed_known(conn, &held.statement.statement)?,
@@ -1774,12 +1814,38 @@ pub fn not_moved_yet(
             continue;
         }
         for key in offer.sealed_to {
-            if key != *own && !wrote.contains(&key) && !keys.contains(&key) {
+            if key != *own && !keys.contains(&key) {
                 keys.push(key);
             }
         }
     }
     Ok(keys)
+}
+
+/// The keys of [`moved_with`] that have not written in the channel
+/// `channel` yet: "not moved yet" (§7).
+pub fn not_moved_yet(
+    conn: &Connection,
+    own: &[u8; 32],
+    channel: &[u8; 32],
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    let Some(row) = st(kept::channel(conn, channel))? else {
+        return Ok(Vec::new());
+    };
+    let wrote = wrote_in(conn, &row)?;
+    Ok(moved_with(conn, own, channel)?
+        .into_iter()
+        .filter(|key| !wrote.contains(key))
+        .collect())
+}
+
+/// The keys that wrote in the channel of `row`, as this device holds it.
+fn wrote_in(conn: &Connection, row: &Channel) -> Result<Vec<[u8; 32]>, PersonError> {
+    Ok(st(kept::keys(conn, row.id))?
+        .into_iter()
+        .filter(|key| key.first_held.is_some())
+        .map(|key| key.key)
+        .collect())
 }
 
 // ── What a command that writes says (§5.4) ───────────────────────────

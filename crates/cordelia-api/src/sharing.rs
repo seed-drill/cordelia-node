@@ -14,7 +14,9 @@
 //!   and the four words of its key. A card holds no text another chose.
 //! - **A share** (§3.1) is one entry in the share pair channel of this
 //!   device and the taker's key, kept for two hours ([`drop_old_shares`]),
-//!   one waiting for a key at a time, eight at most.
+//!   one waiting for a key at a time, eight at most. The node's own, made
+//!   from a repository's list, are counted apart (`may_share`; decision
+//!   2026-11-06 (joining), rule 4.2).
 //! - **A key typed for a channel** (§3.2) is kept an hour with the name it
 //!   files under; the pass reads its share pair channel at each of the
 //!   device's own relays, gives each entry to the judge
@@ -807,11 +809,21 @@ pub fn make_new(conn: &Connection, identity: &NodeIdentity, new: &New, now: i64)
 }
 
 /// The shares this device keeps waiting at `now`: each not written over,
-/// within its two hours (§3.1).
-fn waiting(conn: &Connection, now: i64) -> Result<Vec<ShareRow>, PersonError> {
+/// within its two hours (§3.1), the person's and the node's.
+pub(crate) fn waiting(conn: &Connection, now: i64) -> Result<Vec<ShareRow>, PersonError> {
     Ok(rows::shares(conn)?
         .into_iter()
         .filter(|share| !share.gone && (now - share.made).abs() < HAND_OVER_KEPT_SECS)
+        .collect())
+}
+
+/// The shares a person made by hand that this device keeps waiting at
+/// `now`: the node's are counted apart (decision 2026-11-06 (joining),
+/// rule 4.2), so that a person's `share` keeps its eight places.
+pub(crate) fn waiting_by_hand(conn: &Connection, now: i64) -> Result<Vec<ShareRow>, PersonError> {
+    Ok(waiting(conn, now)?
+        .into_iter()
+        .filter(|share| !share.by_node)
         .collect())
 }
 
@@ -834,7 +846,6 @@ pub fn share_plan(
     now: i64,
 ) -> Out<Plan<ShareTo>> {
     let held = standing(conn)?;
-    let own = identity.public_key();
     let filing = match find(conn, name, words, None) {
         Err(Failed::Refused(refusal)) if refusal.word == "no_such_channel" && words.is_none() => {
             let own_name = crate::names::listed(conn)?
@@ -855,31 +866,11 @@ pub fn share_plan(
         found => found?,
     };
     let key = key_typed(typed)?;
-    another_persons(conn, &held, &own, &key, "share")?;
-    if !any_own(own_relays, &filing.card) {
-        return refused(
-            "not_reached",
-            format!(
-                "\"{name}\" is held on this device but not reached from it: write there from a \
-                 device of yours that reaches its relays."
-            ),
-        );
-    }
-    if let Some(refusal) = not_written_there(conn, identity, &filing.channel, name)? {
-        return Err(Failed::Refused(refusal));
-    }
-    let shown = crate::shared::shown_keys(conn, &filing.channel)?;
-    if shown.len() >= SHARED_MAX_KEYS && !shown.contains(&key) {
-        return refused(
-            "channel_full",
-            format!(
-                "\"{name}\" shows 64 keys on this device, which is the most: make it anew without \
-                 some (cordelia shared anew)."
-            ),
-        );
-    }
-    let mut keys_waiting: Vec<[u8; 32]> =
-        waiting(conn, now)?.iter().map(|share| share.key).collect();
+    may_share(conn, &held, identity, own_relays, &filing, &key)?;
+    let mut keys_waiting: Vec<[u8; 32]> = waiting_by_hand(conn, now)?
+        .iter()
+        .map(|share| share.key)
+        .collect();
     keys_waiting.dedup();
     keys_waiting.sort();
     keys_waiting.dedup();
@@ -908,6 +899,48 @@ pub fn share_plan(
         asks,
         what: ShareTo { filing, key },
     })
+}
+
+/// Whether this device may hand the channel of `filing` to `key`, as
+/// `share` checks it and the node's hand-overs do (§5.5; decision
+/// 2026-11-06 (joining), rule 4.2): the key is another person's device,
+/// the channel is reached from here, this device writes there now, and it
+/// shows fewer than 64 keys or shows this one. The person's eight places
+/// (`too_many_shares`) are not among these: the node's shares are counted
+/// apart.
+pub(crate) fn may_share(
+    conn: &Connection,
+    held: &Held,
+    identity: &NodeIdentity,
+    own_relays: &[OwnRelay],
+    filing: &Filing,
+    key: &[u8; 32],
+) -> Out<()> {
+    let name = &filing.name;
+    another_persons(conn, held, &identity.public_key(), key, "share")?;
+    if !any_own(own_relays, &filing.card) {
+        return refused(
+            "not_reached",
+            format!(
+                "\"{name}\" is held on this device but not reached from it: write there from a \
+                 device of yours that reaches its relays."
+            ),
+        );
+    }
+    if let Some(refusal) = not_written_there(conn, identity, &filing.channel, name)? {
+        return Err(Failed::Refused(refusal));
+    }
+    let shown = crate::shared::shown_keys(conn, &filing.channel)?;
+    if shown.len() >= SHARED_MAX_KEYS && !shown.contains(key) {
+        return refused(
+            "channel_full",
+            format!(
+                "\"{name}\" shows 64 keys on this device, which is the most: make it anew without \
+                 some (cordelia shared anew)."
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Why `share` hands nothing of the channel `channel`, named `name`: this
@@ -972,7 +1005,7 @@ fn share_rev(
 /// Write a delete over the share of `row`, one revision above it, in its
 /// share pair channel (§3.1): it waits in the store to be sent to each
 /// relay of the card it handed.
-fn write_over(
+pub(crate) fn write_over(
     conn: &Connection,
     identity: &NodeIdentity,
     row: &ShareRow,
@@ -1005,13 +1038,16 @@ fn write_over(
 /// Hand the channel of `to` (§3.1): a delete over every other share this
 /// device has waiting for that key, and one entry in the share pair channel
 /// of this device and the key, `share/<the channel's ID>`, holding the
-/// form, the time, the key and the card. Returns the lines said after the
-/// yes.
+/// form, the time, the key and the card. `by_node` where the node hands it
+/// from a repository's list, not a person (decision 2026-11-06 (joining),
+/// rule 4.2): the share is kept as the node's, and nothing is said.
+/// Returns the lines said after the yes.
 pub fn make_share(
     conn: &Connection,
     identity: &NodeIdentity,
     own_relays: &[OwnRelay],
     to: &ShareTo,
+    by_node: bool,
     now: i64,
 ) -> Out<Vec<String>> {
     let held = standing(conn)?;
@@ -1059,13 +1095,16 @@ pub fn make_share(
                 rev,
                 made: now,
                 gone: false,
-                by_node: false,
+                by_node,
             },
         )?;
         Ok(None)
     })?;
     if let Some(refusal) = refusal {
         return Err(Failed::Refused(refusal));
+    }
+    if by_node {
+        return Ok(Vec::new());
     }
     let at: Vec<String> = to
         .filing

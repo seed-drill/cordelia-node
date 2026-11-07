@@ -90,7 +90,7 @@ bob@laptop$ cordelia subscribe
    ```
 
    It is refused where the list names a channel already.
-5. **What the device keeps** is a row of its own: the identity, the clone's path, the last commit read, and the keys that read named. It is keyed by the identity, not by a channel's name. Running `subscribe` again, with a yes that names the commit, starts the row afresh, for a history that was rewritten. The list says which channel the repository's is, so a rename, a making anew or a move changes nothing in the row. `shared drop` of the channel the list names stops the follow. A device that leaves its person deletes every row.
+5. **What the device keeps** is a row of its own: the identity, the clone's path, the last commit read, and the keys that read named. It is keyed by the identity, not by a channel's name. Running `subscribe` again, with a yes that names the commit, starts the row afresh, for a history that was rewritten. The list says which channel the repository's is, so a rename, a making anew or a move changes nothing in the row. `shared drop` of the channel the list names stops the follow. A device that leaves its person deletes every row. **A channel follows one repository.** Subscribing in a clone of another repository whose list names that channel replaces the follow, with a yes that says so: `This stops following <identity>, whose list names <name> too: a channel follows one repository.` A read of a list that names another follow's channel counts for nothing, and the last list stands.
 6. **One device of the person's that follows is enough.** Every follower, of every person, does the work of rule 4 for the team. Each device of yours that should read the list for you runs `subscribe` in a clone once.
 
 ## 3. Reading the list
@@ -122,10 +122,10 @@ At each read, each device that follows the repository does the following, with n
 1. **It acts only for the channel the list names, and only where it holds that channel and writes there:** not paused, clean, and not moved from (§7 there). Where any of these fails, it hands over nothing and takes nothing, and says why (rule 6).
    - **It hands over nothing in a channel in which it has read an offer that pauses this person:** one that seals to them and leaves out a key, whether the person then moved, stayed or is still paused (§7 there). That channel was made anew. An offer "without you", or one that is a fault, does not count.
 2. **Hands over.** Listed keys not in the channel, not named after `without`, not the person's own devices, and not keys the person removed, are handed the channel, as `share` does. The node's shares are counted apart from the person's own, so a person's `share` by hand keeps its places. They go **four at a time, in turns:**
-   - each share lives for two reads, then is deleted;
+   - each share lives for two reads, then is deleted, and its key waits out the read at which it goes;
    - each read hands over to the next four such keys, in the list's order, starting after the last one handed;
    - so at most eight wait at once (`MAX_TYPED_KEYS`), and a device that is off for days holds no place;
-   - a key that a share of the person's own waits for, made by hand, is skipped: a share of one channel deletes another's for the same key (`make_share`).
+   - a key that a share of any channel waits for, the person's or the node's, is passed over: a share of one channel deletes another's for the same key (`make_share`).
 3. **Deletes the shares to keys the list no longer names,** whether the node made them or a person did.
 4. **Takes.** A follower whose person does not hold the named channel looks for a share from each listed key, at each read.
    - It types each listed key again for that read, under a count of its own, so the person's own `accept --channel` keeps its eight places. It asks the relays once for each listed key at each read, not at every pass: 64 keys are 128 requests every ten minutes, well within what a relay allows (§8.4 there).
@@ -174,6 +174,7 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 | An offer read in the named channel | `<name> was made anew by <label>: nothing is handed over until the list names the new channel.` |
 | The gate of rule 1 | `<label> is on the list of <name> but was left out of it: nothing is handed over until its line goes, or it writes in the channel.` |
 | The list, from the clone | rule 3's line, with how old it is |
+| A list naming a channel that another follow names | `The list of <identity> names <name>, which this device follows from <other identity>: run cordelia subscribe in a clone of the one it should follow.` |
 | Nobody of yours follows | `No device of yours reads the list of <name>: run cordelia subscribe in a clone of <identity>.` |
 | The channel line changed | amber, as a join is: `The list of <identity> names a new channel for <name> at <commit>.` Cleared by `cordelia shared seen <name>`. |
 
@@ -259,7 +260,7 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
   - A pull request that adds a key's line and takes it off `without` lets it back in.
   - After a second making anew, a key left out at the first, whose line went, is not handed the newest channel.
 - **Turns.**
-  - Nine new keys, with eight of them off: the ninth is handed the channel at the next read.
+  - Nine new keys, with eight of them off: the ninth is handed the channel at the third read, twenty minutes after the first, as the shares of the first four go.
   - The taker's typings leave the person's eight places free.
   - The node's shares leave the person's own `share` its places.
 
@@ -275,6 +276,7 @@ Five reviews, each checked in the code before its findings were taken. Each roun
 - **A left-out key is named in the `channel` line (`without`),** and a list that still lists it names no channel. An earlier rule needed every device to have read the offer itself, which a device that was off, or one that joined later, had not (second to fourth reviews).
 - **Every `channel` line ends with `without` and a count,** so a line cut short does not parse, and a following device's making anew carries the current `without` keys over (fifth review).
 - **Hand-overs go in turns, and takes come only within the hour of the latest read.** Eight places held by devices that were off, and a stale share, had each blocked or misled a join (first and second reviews).
+- **A channel follows one repository, and a key waits while any share of it does** (rules 2.5, 4.2 and 6). Two lists that named one channel, or one key, wrote over each other's shares (the review of slice 5a).
 
 ## 14. The person's answers (6 November)
 

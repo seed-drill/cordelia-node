@@ -626,6 +626,9 @@ pub struct DeviceEntries {
     /// Whether the lists that the store held from before step 20 are known
     /// to have been read: once they are, a pass asks no more.
     held_lists_read: AtomicBool,
+    /// One read at a time of the repositories' lists the device follows
+    /// (decision 2026-11-06 (joining), rules 3 and 4).
+    members_reading: Mutex<()>,
 }
 
 impl DeviceEntries {
@@ -670,6 +673,7 @@ impl DeviceEntries {
             started: AtomicBool::new(false),
             lists_seen: Mutex::default(),
             held_lists_read: AtomicBool::new(false),
+            members_reading: Mutex::default(),
         })
     }
 
@@ -1738,6 +1742,62 @@ impl DeviceEntries {
     /// ahead ([`Clock::run_ahead`]) runs its time of day ahead with them.
     pub fn unix(&self) -> i64 {
         self.clock.unix_from(self.state.sync_control.now())
+    }
+
+    // ── The lists of the repositories followed ──────────────────────
+
+    /// The read of each repository's list the device follows (decision
+    /// 2026-11-06 (joining), rules 3 and 4;
+    /// [`cordelia_api::members_read::read_each`]): every
+    /// MEMBERS_READ_INTERVAL_SECS, at the node's start, and when a person
+    /// follows a repository. Each clone is read with git outside the lock,
+    /// and each read is then done under a hold of the lock of its own.
+    /// One read at a time: one asked while another runs waits for it, and
+    /// then reads, so a follow made meanwhile is read at once. A node that
+    /// is held up does nothing.
+    pub fn read_members(&self) {
+        if self.state.held.why().is_some() {
+            return;
+        }
+        let _one = lock(&self.members_reading);
+        let read = cordelia_api::members_read::read_each(&self.state, || self.unix());
+        let done = match read {
+            Ok(done) => done,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the lists of the repositories followed");
+                return;
+            }
+        };
+        use cordelia_api::members_read::Done;
+        for (repository, done) in done {
+            match done {
+                Ok(Done::Read {
+                    handed,
+                    not_handing,
+                }) => tracing::debug!(
+                    %repository,
+                    handed = handed.len(),
+                    not_handing = not_handing.as_ref().map(|why| why.word()),
+                    "a repository's list was read"
+                ),
+                Ok(Done::NotRead(not)) => tracing::info!(
+                    %repository,
+                    word = %not.word,
+                    why = %not.why,
+                    "a repository's list was not read: the last list read stands"
+                ),
+                Ok(Done::Stopped) => tracing::info!(
+                    %repository,
+                    "a repository is followed no more: its list names a channel that was dropped"
+                ),
+                Ok(Done::Nothing) => {}
+                Err(e) => tracing::warn!(
+                    %repository,
+                    error = %e,
+                    "could not do what a repository's list says"
+                ),
+            }
+        }
     }
 
     // ── The hourly task of messages ─────────────────────────────────

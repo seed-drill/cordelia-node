@@ -7,6 +7,7 @@ use super::*;
 use crate::git_list::ListAt;
 use crate::several::Several;
 use crate::shared::tests::{Shared, bob, holds, member, message, stores};
+use cordelia_crypto::acts::Came;
 use cordelia_storage::meta;
 use serde_json::{Value, json};
 
@@ -406,6 +407,74 @@ fn a_dropped_channel_is_refused() {
     assert!(follow_row(&s).is_none());
 }
 
+/// A list that names a channel another follow's list names replaces that
+/// follow: a channel follows one repository (rule 2.5), and a repository
+/// renamed, or a fork left for upstream, is followed anew this way. The
+/// yes says which follow stops, naming the channel by the person's name
+/// where they hold it, and else by its words; the plan stops nothing, and
+/// the yes stops the other follow as this one begins. A follow of the same
+/// repository again replaces nothing.
+#[test]
+fn a_channel_another_follow_names_replaces_that_follow() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let held = holds(&s, 0, 8, "review", now);
+    let not_held = Shared::of(9);
+    let other = "example.org/team/other";
+    let line_of = |channel: &Shared| {
+        format!(
+            "{}\n{} bob-laptop\n",
+            channel_line(channel, &[]),
+            id(&s.key(0))
+        )
+    };
+    for (channel, name) in [
+        (&held, "\"review\"".to_string()),
+        (
+            &not_held,
+            format!("channel {}", channel_words(&not_held.id)),
+        ),
+    ] {
+        follows::follow(conn, other, "origin", "/home/bob/Work/other", now).unwrap();
+        let read = LastRead {
+            commit: FIRST.into(),
+            at: now,
+            from_clone: true,
+        };
+        follows::read_done(conn, other, &read, line_of(channel).as_bytes(), None).unwrap();
+        let planned = planned(&s, Some(&line_of(channel)), FIRST, false).unwrap();
+        let stops = format!(
+            "This stops following {other}, whose list names {name} too: a channel follows one \
+             repository."
+        );
+        assert!(planned.asks.contains(&stops), "{}", planned.asks);
+        assert!(
+            follows::follow_of(conn, other).unwrap().is_some(),
+            "a plan stops nothing"
+        );
+        yes(&s, &planned, now + 1);
+        assert!(follows::follow_of(conn, other).unwrap().is_none());
+        assert!(follow_row(&s).is_some());
+        follows::unfollow(conn, REPOSITORY).unwrap();
+    }
+    // Its own list replaces nothing where the same repository is followed
+    // again.
+    let list = line_of(&held);
+    yes(
+        &s,
+        &planned(&s, Some(&list), FIRST, false).unwrap(),
+        now + 2,
+    );
+    let again = planned(&s, Some(&list), SECOND, false).unwrap();
+    assert!(
+        !again.asks.contains("This stops following"),
+        "{}",
+        again.asks
+    );
+    assert_eq!(again.what.replaces, None);
+}
+
 /// The gate line of rule 6, for `label` on the list of `name`.
 fn gate_line(label: &str, name: &str) -> String {
     format!(
@@ -632,10 +701,11 @@ fn following_again_says_where_it_read_last_and_whether_the_clone_goes_back() {
 }
 
 /// Following again keeps what the node's reads need (rule 2.5): the list
-/// last read, the notices, the last key handed, and when it was first
-/// followed. The commit the yes named is where never-back starts now; the
-/// list read with it is not kept, so the next read is compared with the
-/// earlier one (rule 4.6).
+/// last read, and when it was read, the notices, the last key handed, and
+/// when it was first followed. The commit the yes named is where
+/// never-back starts now; the list read with it is not kept, so the next
+/// read is compared with the earlier one (rule 4.6), and notices each key
+/// first held since that one (rule 4.5).
 #[test]
 fn following_again_keeps_the_list_and_the_notices() {
     let s = devices(1);
@@ -662,7 +732,7 @@ fn following_again_keeps_the_list_and_the_notices() {
     let row = follow_row(&s).unwrap();
     let read = LastRead {
         commit: SECOND.into(),
-        at: now + 5,
+        at: now,
         from_clone: true,
     };
     assert_eq!(row.last, Some(read));
@@ -1027,13 +1097,13 @@ fn git(home: &Path, dir: &Path, args: &[&str]) -> String {
 /// A clone of `https://example.org/team/project` with no network: a
 /// repository whose `origin` names it, and whose copy of the remote's
 /// default branch, `refs/remotes/origin/main`, is the commit of the list.
-struct OnDisk {
+pub(crate) struct OnDisk {
     home: PathBuf,
-    top: PathBuf,
+    pub(crate) top: PathBuf,
 }
 
 impl OnDisk {
-    fn new(under: &Path) -> Self {
+    pub(crate) fn new(under: &Path) -> Self {
         let home = under.join("home");
         let top = under.join("project");
         std::fs::create_dir_all(&home).unwrap();
@@ -1056,7 +1126,7 @@ impl OnDisk {
 
     /// Commit `list`, and make it the remote's default branch as a fetch
     /// would. Returns the commit.
-    fn fetched(&self, list: &str) -> String {
+    pub(crate) fn fetched(&self, list: &str) -> String {
         std::fs::write(self.top.join(".cordelia/members"), list).unwrap();
         git(&self.home, &self.top, &["add", "-A"]);
         git(&self.home, &self.top, &["commit", "--quiet", "-m", "list"]);
@@ -1080,7 +1150,7 @@ impl OnDisk {
 
     /// Commit `list` on a branch with no history, and make it the remote's
     /// default branch: a commit that comes after no other. Returns it.
-    fn rewritten(&self, list: &str) -> String {
+    pub(crate) fn rewritten(&self, list: &str) -> String {
         git(
             &self.home,
             &self.top,
