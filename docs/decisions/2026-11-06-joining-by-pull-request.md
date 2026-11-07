@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Revised five times after its reviews (section 13). To be built: a reviewed plan first. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
+**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Revised five times after its reviews (section 13). Amended on 7 November by the person's rulings: the node reads the clone only, and a channel follows one repository (section 14). To be built: a reviewed plan first. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -95,25 +95,25 @@ bob@laptop$ cordelia subscribe
 
 ## 3. Reading the list
 
-**The node reads the clone's own copy of the default branch, and fetches a public repository itself.**
+**The node reads the clone's own copy of the default branch, and nothing else.** No git command of the node's reaches the network (the person, 7 November).
 
 - **From the clone, read only.** It reads `refs/remotes/<remote>/<branch>`, the default branch as the person's own git last fetched it. `<branch>` is the one that `refs/remotes/<remote>/HEAD` names, and the remote must still have an address that names the identity. Where that ref is missing, as after a default branch is renamed, the status says to run `git remote set-head <remote> --auto`. It reads the file with `git cat-file blob`, and never touches the working tree, a local branch, the clone's refs or its files.
-- **Fetching, for a repository anyone can read.** Every ten minutes (`MEMBERS_READ_INTERVAL_SECS`), and at the node's start, the node fetches `HEAD` of `https://<host>/<owner>/<name>` into a repository of its own, `~/.cordelia/repos/<host>/<owner>/<name>.git`. It fetches with `--depth 1` into a ref of its own, `refs/cordelia/list`, then reads the one file. A new commit brings only what changed.
+- **When.** Every ten minutes (`MEMBERS_READ_INTERVAL_SECS`), at the node's start, and when a person follows, the node reads each clone it follows.
+- **The list is as fresh as the clone,** for a public repository as for a private one. It comes from the person's own `git fetch` or `git pull`. The status says how old it is: `list of <identity> read from your clone, fetched 2 hours ago`, or that the age is not known. So a join waits until a member's clone has the merged list: a member runs `git pull` there.
 - **Nothing of the person's reaches git, so nothing can ask.** Every git command the node runs, reads of the clone included, runs in a cleared environment:
   - only `PATH` is kept, and the variables of a proxy and of a company's own certificate authority (`HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `GIT_SSL_CAINFO`), which never ask;
   - `HOME` and `XDG_CONFIG_HOME` are an empty folder of the node's, so no global setting is read, on any version of git;
   - `GIT_CONFIG_NOSYSTEM=1`, and `-c credential.helper=`, which empties the list a clone's own configuration may set;
   - `GIT_ALLOW_PROTOCOL=https`, so nothing goes over SSH and no agent is asked;
-  - `GIT_NO_LAZY_FETCH=1`, so a read of a partial clone never fetches;
+  - `GIT_NO_LAZY_FETCH=1`, so a read of a partial clone never fetches, and a partial clone is not read with a git older than 2.44, which ignores it;
+  - `GIT_NO_REPLACE_OBJECTS=1` and `GIT_GRAFT_FILE=/dev/null`, so a replace ref or a graft in the clone cannot swap the list or fake never-back;
   - `GIT_TERMINAL_PROMPT=0` and an empty `GIT_ASKPASS`, with `SSH_ASKPASS` gone with the rest;
   - `http.followRedirects=false`;
   - hooks, `gc` and maintenance are off;
   - `-c safe.directory=<clone>` for a read of the clone;
-  - git is stopped after sixty seconds (`MEMBERS_FETCH_MAX_SECS`), by TERM, and the node clears its own repository's locks.
-- **A private repository is not fetched by the node.** It needs credentials, and every way to give them can ask. Its list comes from the clone, as the person's own `git fetch` or `git pull` brings it. The status says how old it is: `list of <identity> read from your clone, fetched 2 hours ago`.
-- **A redirect** (a repository renamed or moved) ends the fetch. The status says `<identity> has moved: run cordelia subscribe in a clone of it again`.
-- **The host's answer stands.** What the node fetches is the branch as the host has it now (rule 10).
-- **A read of the clone never goes back.** It counts only where the clone's commit is the last commit read (from either source), or comes after it: `git merge-base --is-ancestor`, run in the clone. A clone left behind gives no new list, and the status says so. The last commit read is kept in the row, so a restart does not forget it.
+  - git is stopped by TERM at its deadline (`STREAM_TIMEOUT_SECS` for a read, twice that for all of `subscribe`'s), and killed `MEMBERS_GIT_TERM_SECS` later.
+- **What the clone holds stands.** A program that runs as the person can change it (rule 10).
+- **A read of the clone never goes back.** It counts only where the clone's commit is the last commit read, or comes after it: `git merge-base --is-ancestor`, run in the clone. A clone left behind gives no new list, and the status says so. The last commit read is kept in the row, so a restart does not forget it.
 
 ## 4. What a node does with the list
 
@@ -209,9 +209,9 @@ The notices of rules 4.5 to 4.7 show only on devices that follow the repository.
 ## 10. Who can do what
 
 - **Whoever can merge to the default branch** admits any key, at once, and names the channel. That is the person's rule: the repository decides. Each join shows on every follower's status (rule 4.5), and a stolen account with merge rights is the same as its owner.
-- **The host** decides what the branch is. A public repository is reached over TLS. A private one is reached by the person's own git.
-- **A program that runs as a member** can change the clone or the node's own repository, and so the list. It can already run `share` with a yes (the README's security section). Each join's notice names the commit, for the person to check.
-- **A list in a public repository** shows the channel's ID, its relays, its keys and their labels. None of it lets anyone read the channel: that needs a member to hand it over.
+- **The host** decides what the branch is, as the person's own git fetches it. The node itself reaches no host.
+- **A program that runs as a member** can change the clone, and so the list, for example with `git update-ref`. It can already run `share` with a yes (the README's security section). Each join's notice names the commit, for the person to check.
+- **A list in a public repository** shows the channel's ID, its relays, its keys and their labels. None of it lets anyone read the channel: that needs a member to hand it over. Nor can a stranger with the channel's ID and relays write there, or fill its room at a relay. A relay hands a channel only on a proof made with its secret, and takes an entry only where it is signed by the channel's own key, which comes from the seed (§2.1 and §10 there; decision 2026-10-04 §2.4).
 - **A member can still hand the channel to a key that is not listed,** by hand: a channel stays flat. `log` shows that key, with no label of the person's.
 - **A known limit:** a device that does not follow the repository, making its channel anew, cannot carry the current line's `without` keys. Where one of those keys is still listed and the person does not carry it over, it is let back in once the new line is merged. The device that left it out shows amber until the line names it again (rule 5).
 - **The reader shows listed keys as it shows any other key** (§2.4 there). They are not labelled for the person, and share the hour and the room of keys the person does not know (§6.3 there), until the person labels them.
@@ -221,8 +221,10 @@ The notices of rules 4.5 to 4.7 show only on devices that follow the repository.
 | Name | Value | Why |
 |---|---|---|
 | `MEMBERS_READ_INTERVAL_SECS` | 600 | As `RELAY_ASK_AGAIN_SECS`: a join waits about ten minutes on each side once the list is read |
-| `MEMBERS_FETCH_MAX_SECS` | 60 | A fetch that has not ended by then is stopped |
+| `MEMBERS_HANDED_AT_ONCE` | 4 | Derived: half of `MAX_TYPED_KEYS`, as a share lives for two reads (rule 4.2) |
 | `MEMBERS_FILE_MAX_BYTES` | 16,384 | The members record, rule 1 |
+| `MEMBERS_LABEL_MAX_CHARS` | 32 | Rule 1 |
+| `MEMBERS_GIT_TERM_SECS` | 2 | After TERM, before git is killed (rule 3) |
 
 ## 12. Tests
 
@@ -236,10 +238,10 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
   - Bob's status shows `alice-laptop joined ...` until `shared seen`.
   - Nobody runs `share` or `accept`.
 - **Order does not matter.** Alice subscribes before the merge, and waits, saying so. Then the merge comes, and she joins.
-- **A private repository.** No fetch is made: the list comes from the clone, and the status says how old it is.
+- **From the clone only.** No git of the node's reaches the network: the list comes from the clone, and the status says how old it is.
 
 **Never asked, and never back**
-- **Nothing asks.** The person's git configuration and environment are set to ask in each way: a credential helper, globally and in the clone's own configuration, that would ask; an `insteadOf` to SSH; `SSH_ASKPASS`; a redirect; and a partial clone whose read would fetch. Each git command either goes over HTTPS without asking or fails, and no prompt opens.
+- **Nothing asks.** The person's git configuration and environment are set to ask in each way: a credential helper, globally and in the clone's own configuration, that would ask; an `insteadOf` to SSH; `SSH_ASKPASS`; and a partial clone whose read would fetch. Each git command either goes over HTTPS without asking or fails, and no prompt opens.
 - **Identity.**
   - A remote changed to a fork is not read.
   - With two remotes, `--remote` is needed.
@@ -276,11 +278,14 @@ Five reviews, each checked in the code before its findings were taken. Each roun
 - **A left-out key is named in the `channel` line (`without`),** and a list that still lists it names no channel. An earlier rule needed every device to have read the offer itself, which a device that was off, or one that joined later, had not (second to fourth reviews).
 - **Every `channel` line ends with `without` and a count,** so a line cut short does not parse, and a following device's making anew carries the current `without` keys over (fifth review).
 - **Hand-overs go in turns, and takes come only within the hour of the latest read.** Eight places held by devices that were off, and a stale share, had each blocked or misled a join (first and second reviews).
+- **The node reads the clone only** (the person, 7 November). Its own fetch of a public repository drew findings in three rounds of slice 2's review: it fetched a whole tree; a git older than 2.44 fetches lazily; and a host sends a blob asked for by its ID whatever the filter says, so a size bound needed a watch on the fetch.
 - **A channel follows one repository, and a key waits while any share of it does** (rules 2.5, 4.2 and 6). Two lists that named one channel, or one key, wrote over each other's shares (the review of slice 5a).
 - **Rule 1's gate binds only those who hand over** (rules 1, 4.1 and 4.4). A joiner holds no row of the channel, so every listed key after `without` looked out of it to the joiner, and kept it out for good, while the members saw that key write and handed the channel over (the review of slice 5b).
 
-## 14. The person's answers (6 November)
+## 14. The person's answers (6 and 7 November)
 
 1. **`cordelia shared seen <name>`** clears the notice of a join (rule 4.5) and of a changed channel line (rule 6), on each device: yes.
 2. **The default name is the repository's `owner/name`:** yes.
 3. **A private repository's list comes only from the person's own fetches.** A read-only token in the node's configuration is left for later: yes.
+4. **The node reads the clone only,** with no git of its own that reaches the network (7 November): yes. Its own fetch of a public repository was built and taken out (section 13).
+5. **A channel follows one repository** (7 November): kept.
