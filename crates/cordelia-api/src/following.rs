@@ -526,7 +526,7 @@ pub fn plan(
 pub(crate) fn too_many_follows_line() -> String {
     format!(
         "This device follows {SHARED_MAX_CHANNELS} repositories, the most it can. To follow \
-         another, first drop the channel of one with cordelia shared drop. Nothing was done."
+         another, first run cordelia unsubscribe in a clone of one it follows. Nothing was done."
     )
 }
 
@@ -740,6 +740,75 @@ pub(crate) fn back_along_moves(
         }
     }
     Ok(chain)
+}
+
+// ── Following no more: `unsubscribe` in a clone ─────────────────────
+
+/// What `unsubscribe` with no name read of the clone a folder is in: the
+/// top of its work tree, and the repository its remote names, where one
+/// remote names one.
+#[derive(Debug, Clone)]
+pub struct CloneOf {
+    pub top: PathBuf,
+    pub identity: Option<String>,
+}
+
+/// What `unsubscribe` with no name says in a folder of no repository.
+pub const NOT_IN_A_CLONE_TO_STOP: &str = "This folder is not in a git repository, so this device \
+                                          follows no repository from it, and nothing was done. \
+                                          To unsubscribe its agent from a shared channel, give \
+                                          the channel's name: cordelia unsubscribe <name>";
+
+/// Read the clone that `folder` is in, with the node's git under
+/// `data_dir`, until `deadline`, outside the node's lock: its top, and the
+/// repository its remote names (decision 2026-11-06 (joining), rule 2.5).
+pub fn clone_of(data_dir: &Path, folder: &Path, deadline: Instant) -> Out<CloneOf> {
+    let git =
+        Git::under(data_dir).map_err(|e| PersonError::Held(format!("the node's git: {e}")))?;
+    let top = match git.top_of(folder, deadline) {
+        Ok(top) => top,
+        Err(ListFailed::NotARepository) => {
+            return sharing::refused("not_a_repository", NOT_IN_A_CLONE_TO_STOP.into());
+        }
+        Err(failed) => return not_read(None, &failed),
+    };
+    let identity = git
+        .identity_of_clone_by(&top, None, deadline)
+        .ok()
+        .map(|(_, identity)| identity.to_string());
+    Ok(CloneOf { top, identity })
+}
+
+/// `cordelia unsubscribe` with no name, in a clone (rule 2.5), in one
+/// write: this device follows no more the repository it follows from that
+/// clone, or whose identity the clone's remote names. No yes, as
+/// `unsubscribe` asks none: it drops no channel and unsubscribes no agent,
+/// and `subscribe` there follows again. Returns what it says.
+pub fn unfollow(conn: &Connection, read: &CloneOf) -> Out<Vec<String>> {
+    let top = read.top.display().to_string();
+    let stopped = in_one(conn, || {
+        let mut stopped = Vec::new();
+        for follow in follows::follows(conn)? {
+            if follow.clone == top || read.identity.as_deref() == Some(follow.identity.as_str()) {
+                follows::unfollow(conn, &follow.identity)?;
+                stopped.push(follow.identity);
+            }
+        }
+        Ok(stopped)
+    })?;
+    if stopped.is_empty() {
+        return sharing::refused(
+            "not_followed",
+            format!(
+                "This device follows no repository from your clone at {}.",
+                cleaned(&top)
+            ),
+        );
+    }
+    Ok(stopped
+        .iter()
+        .map(|identity| format!("This device follows {identity} no more."))
+        .collect())
 }
 
 // ── On the yes ───────────────────────────────────────────────────────

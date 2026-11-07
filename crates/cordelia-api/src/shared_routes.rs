@@ -335,6 +335,44 @@ pub async fn follow(
     }
 }
 
+// ── POST /api/v1/shared/unfollow ─────────────────────────────────────
+
+/// What `cordelia unsubscribe` with no name asks: the folder it ran in.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnfollowRequest {
+    pub folder: String,
+}
+
+/// `cordelia unsubscribe` in a clone (decision 2026-11-06 (joining), rule
+/// 2.5): no yes. The clone is read with git outside the node's lock, within
+/// `STREAM_TIMEOUT_SECS`, and the follow stopped under it.
+pub async fn unfollow(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<UnfollowRequest>,
+) -> Result<HttpResponse, ApiError> {
+    crate::commands::asked(&req, &state)?;
+    let deadline = Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS);
+    let data_dir = state.home_dir.clone();
+    let folder = std::path::PathBuf::from(&body.folder);
+    let reading = tokio::task::spawn_blocking(move || {
+        crate::following::clone_of(&data_dir, &folder, deadline)
+    });
+    let read = match tokio::time::timeout_at(deadline.into(), reading).await {
+        Ok(read) => read.map_err(|e| ApiError::Internal(format!("the read of the clone: {e}")))?,
+        Err(_) => Err(Failed::Refused(Refusal {
+            word: "late",
+            line: crate::following::late_line(STREAM_TIMEOUT_SECS),
+        })),
+    };
+    let said = read.and_then(|read| crate::following::unfollow(&db(&state), &read));
+    match said {
+        Ok(said) => Ok(HttpResponse::Ok().json(json!({ "said": said }))),
+        Err(failed) => answer_of(failed),
+    }
+}
+
 /// [`follow`], once the clone was read: the plan, its yes, and what is
 /// done on it, under the node's lock.
 pub(crate) fn follow_read(

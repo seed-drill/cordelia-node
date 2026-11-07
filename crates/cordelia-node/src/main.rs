@@ -313,16 +313,22 @@ enum Commands {
     /// Stop showing an agent a shared channel, on every device of yours
     ///
     /// In the folder, or from anywhere with --agent.
+    ///
+    /// With no name, in a clone of a repository this device follows, it
+    /// stops this device following it: its list is read no more here. It
+    /// unsubscribes no agent and drops no channel, and `cordelia subscribe`
+    /// in the clone follows it again.
     Unsubscribe {
-        /// The name you file the shared channel under
-        name: String,
+        /// The name you file the shared channel under; none in a clone, to
+        /// stop following its repository
+        name: Option<String>,
         /// The agent, as `cordelia sync status` names it, in place of this
         /// folder's
-        #[arg(long)]
+        #[arg(long, requires = "name")]
         agent: Option<String>,
         /// The channel's four words, where two shared channels of yours
         /// have one name
-        #[arg(long, value_name = "FOUR WORDS")]
+        #[arg(long, value_name = "FOUR WORDS", requires = "name")]
         words: Option<String>,
     },
     /// Channels shared between people: messages between your agents and
@@ -1010,9 +1016,12 @@ fn main() -> anyhow::Result<()> {
             remote,
             ..
         }) => shared_cmd::follow(&cli.config, new, remote.as_deref()),
-        Some(Commands::Unsubscribe { name, agent, words }) => {
-            shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
-        }
+        Some(Commands::Unsubscribe { name, agent, words }) => match name {
+            Some(name) => {
+                shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
+            }
+            None => shared_cmd::unfollow(&cli.config),
+        },
         Some(Commands::Shared { what }) => match what {
             SharedCommand::New { name, relays } => shared_cmd::new(&cli.config, &name, &relays),
             SharedCommand::List { keys, verbose } => shared_cmd::show(&cli.config, keys, verbose),

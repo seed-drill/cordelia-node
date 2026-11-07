@@ -1048,7 +1048,10 @@ fn seen_clears_a_changed_line_and_never_a_key_left_out_which_its_label_clears() 
             still_shown_line("carol-laptop", "review"),
         ]
     );
-    assert_eq!(ambers(&view_now(&s, now + 4)), std::slice::from_ref(&not_said));
+    assert_eq!(
+        ambers(&view_now(&s, now + 4)),
+        std::slice::from_ref(&not_said)
+    );
     assert_eq!(
         seen_key(&s, "review", "carol-laptop"),
         [format!("Cleared: {not_said}")]
@@ -1144,6 +1147,24 @@ fn a_removals_drop_past_a_bound_keeps_the_follow_on_its_device() {
         amber_words(&view_now(&s, now + 2)),
         ["made_anew_at_removal"]
     );
+    // An ordinary removal's making anew, not past a bound, with nothing
+    // filed after it: a drop.
+    anew_rows::made(
+        &s[0].conn,
+        &MadeRow {
+            channel: old.id,
+            new_channel: new.id,
+            rev: 2,
+            made_at: now,
+            at_removal: true,
+            delivering: true,
+            past_64: 0,
+            let_go: 0,
+            past_bound: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(gone(), Some(crate::shared_anew::Gone::Dropped));
     // Where the making anew is not kept, as on the person's other devices,
     // the drop stops the follow.
     anew_rows::forget_made(&s[0].conn, &old.id).unwrap();

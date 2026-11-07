@@ -280,6 +280,17 @@ pub fn unsubscribe(
     Ok(())
 }
 
+/// `cordelia unsubscribe` with no name, in a clone (decision 2026-11-06
+/// (joining), rule 2.5): no yes; this device follows the clone's
+/// repository no more.
+pub fn unfollow(config_path: &str) -> anyhow::Result<()> {
+    refuse_another_version(config_path)?;
+    let (folder, _) = crate::msg_cmd::folder_of(config_path)?;
+    let body = json!({ "folder": folder });
+    print_said(&asked(config_path, "/api/v1/shared/unfollow", &body)?);
+    Ok(())
+}
+
 // ── cordelia shared anew, move and stay ──────────────────────────────
 
 /// What `shared anew` asks of each key (decision 2026-10-10 §7).
@@ -441,10 +452,10 @@ pub fn show(config_path: &str, keys: bool, verbose: bool) -> anyhow::Result<()> 
 /// name its channel is filed under; then, each indented, when and from
 /// where its list was read, the members by the list's labels, each in or
 /// not yet where this device can see it, what waits unread, and each line
-/// of rules 4 to 6, with any channel line it says to put in the list under
-/// it. The members are each said with `every`, and else the first
-/// [`MEMBERS_LABELS_SHOWN`] and how many more. The fingerprint words show
-/// only with `verbose` (#228).
+/// of rules 4 to 6, an amber one after the line's amber mark, with any
+/// channel line it says to put in the list under it. The members are each
+/// said with `every`, and else the first [`MEMBERS_LABELS_SHOWN`] and how
+/// many more. The fingerprint words show only with `verbose` (#228).
 pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<String> {
     let mut head = format!(
         "{}, for {}",
@@ -493,7 +504,11 @@ pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<S
         ));
     }
     for line in list(repository, "lines") {
-        lines.push(format!("  {}", text(line, "says")));
+        let says = text(line, "says");
+        lines.push(match line["amber"] == true {
+            true => format!("  {} {says}", crate::indicator::AMBER_MARK),
+            false => format!("  {says}"),
+        });
         if let Some(put) = line["line"].as_str() {
             lines.push(format!("    {put}"));
         }
@@ -971,7 +986,7 @@ mod tests {
                 "  Members: alice-laptop (in), bob-desktop (not yet).",
                 "  Unread: 2 by you, 1 by an agent.",
                 "  Handing team/project to bob-desktop: waiting for that device to take it.",
-                "  team/project was made anew here: put its new channel line in \
+                "  ◆ team/project was made anew here: put its new channel line in \
                  .cordelia/members, in a pull request",
                 "    channel 00 cordelia_pk1x without 0",
             ]
@@ -1015,6 +1030,36 @@ mod tests {
             repository_lines(&many, false, true)[2],
             "  Members: m1, m2, m3, m4, m5, m6, m7, m8, m9."
         );
+    }
+
+    /// `cordelia unsubscribe` takes a name, as before, or none, in a clone,
+    /// to stop following its repository (decision 2026-11-06 (joining),
+    /// rule 2.5): `--agent` and `--words` go only with a name.
+    #[test]
+    fn unsubscribe_with_a_name_or_none_is_parsed_apart() {
+        let parsed = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        match parsed(&["cordelia", "unsubscribe"]) {
+            Ok(Some(Commands::Unsubscribe {
+                name: None,
+                agent: None,
+                words: None,
+            })) => {}
+            _ => panic!("unsubscribe"),
+        }
+        match parsed(&["cordelia", "unsubscribe", "review", "--agent", "notes"]) {
+            Ok(Some(Commands::Unsubscribe {
+                name: Some(name),
+                agent: Some(agent),
+                ..
+            })) => assert_eq!((name.as_str(), agent.as_str()), ("review", "notes")),
+            _ => panic!("unsubscribe <name> --agent"),
+        }
+        for refused in [
+            &["cordelia", "unsubscribe", "--agent", "notes"][..],
+            &["cordelia", "unsubscribe", "--words", "a b c d"],
+        ] {
+            assert!(parsed(refused).is_err(), "{refused:?}");
+        }
     }
 
     /// `cordelia shared seen <name>` takes a name, and `shared list` and

@@ -205,6 +205,7 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
             // Following a repository: `subscribe` in a clone (decision
             // 2026-11-06 (joining), rule 2).
             .route("/follow", web::post().to(crate::shared_routes::follow))
+            .route("/unfollow", web::post().to(crate::shared_routes::unfollow))
             .route(
                 "/unsubscribe",
                 web::post().to(crate::shared_routes::unsubscribe),

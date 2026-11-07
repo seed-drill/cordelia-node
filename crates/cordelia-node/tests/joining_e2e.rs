@@ -233,7 +233,7 @@ fn a_device_on_the_list_takes_the_channel_with_no_one_asked() {
         plain.contains(&format!("  Following: {REPOSITORY}, for {NAME}")),
         "{plain}"
     );
-    assert!(plain.contains(&format!("    {joined}")), "{plain}");
+    assert!(plain.contains(&format!("    ◆ {joined}")), "{plain}");
     assert!(
         plain.contains("Members: alice-laptop (in), bob-desktop (in)."),
         "{plain}"
@@ -258,6 +258,28 @@ fn a_device_on_the_list_takes_the_channel_with_no_one_asked() {
             .iter()
             .any(|what| what.starts_with("shared")),
         "{status}"
+    );
+
+    // `cordelia unsubscribe` with no name, in Bob's clone, stops his device
+    // following the repository: its channel and its agent's subscription
+    // stay (rule 2.5).
+    let out = bob.command_in(&bob_clone, &["unsubscribe"]);
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "{said}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(said, format!("This device follows {REPOSITORY} no more.\n"));
+    assert_eq!(
+        status_json(&bob)["shared"]["repositories"],
+        serde_json::json!([])
+    );
+    assert!(channel_of(&bob, NAME).is_some());
+    let listed = bob.post("/api/v1/shared/list", serde_json::json!({}));
+    assert_eq!(
+        listed["subscriptions"],
+        serde_json::json!([{ "agent": AGENT, "channel": NAME }])
     );
 }
 

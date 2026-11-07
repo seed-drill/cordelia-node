@@ -1138,6 +1138,10 @@ fn of_its_folders(f: &Facts) -> (State, String) {
     (Synced, "memory synced".into())
 }
 
+/// The mark of amber: the line's, and that of each amber line the plain
+/// status says of a repository followed.
+pub const AMBER_MARK: &str = "◆";
+
 /// One line for a status bar: a mark and the summary, coloured unless
 /// `color` is false. Empty when there is nothing to show.
 ///
@@ -1148,11 +1152,11 @@ fn of_its_folders(f: &Facts) -> (State, String) {
 pub fn line(state: State, level: Option<Level>, summary: &str, color: bool) -> String {
     let (mark, code) = match (level, state) {
         (_, State::Uninitialised) => return String::new(),
-        (Some(Level::Red), _) => ("▲", "31"),    // red
-        (Some(Level::Amber), _) => ("◆", "33"),  // yellow, and its own mark
-        (None, State::Synced) => ("●", "32"),    // green
-        (None, State::Syncing) => ("◐", "33"),   // yellow
-        (None, State::Attention) => ("▲", "31"), // red
+        (Some(Level::Red), _) => ("▲", "31"),          // red
+        (Some(Level::Amber), _) => (AMBER_MARK, "33"), // yellow, and its own mark
+        (None, State::Synced) => ("●", "32"),          // green
+        (None, State::Syncing) => ("◐", "33"),         // yellow
+        (None, State::Attention) => ("▲", "31"),       // red
         (None, State::Offline | State::Off | State::Stopped) => ("○", "2"), // dim
     };
     if color {
