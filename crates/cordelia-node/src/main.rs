@@ -538,6 +538,11 @@ enum MsgCommand {
         /// give the folder you gave `msg summary --folder`
         #[arg(long, value_name = "DIR")]
         folder: Option<String>,
+        /// For a message from your own agents, also show the four words
+        /// of the device that sent it, its thread, and how many messages
+        /// the two agents have here
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Send a message, as this folder's agent: its text on standard input
     ///
@@ -592,6 +597,10 @@ enum MsgCommand {
         /// shared channel's are all shown
         #[arg(long)]
         since: Option<String>,
+        /// At a terminal too, show the lines an agent sees around each
+        /// message
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// For a person at a terminal: how many messages may wait unread
     /// between two agents
@@ -1000,9 +1009,12 @@ fn main() -> anyhow::Result<()> {
                 id,
                 next_shared,
                 folder,
+                verbose,
             } => match (id, next_shared) {
+                // A shared message's header says its thread and counts,
+                // with `-v` or without it.
                 (_, true) => msg_cmd::read_next_shared(&cli.config, folder.as_deref()),
-                (Some(id), false) => msg_cmd::read(&cli.config, &id, folder.as_deref()),
+                (Some(id), false) => msg_cmd::read(&cli.config, &id, folder.as_deref(), verbose),
                 (None, false) => unreachable!("the parser asks for an id or --next-shared"),
             },
             MsgCommand::Send {
@@ -1027,7 +1039,9 @@ fn main() -> anyhow::Result<()> {
                     folder,
                 },
             ),
-            MsgCommand::Log { since } => msg_cmd::log(&cli.config, since.as_deref()),
+            MsgCommand::Log { since, verbose } => {
+                msg_cmd::log(&cli.config, since.as_deref(), verbose)
+            }
             MsgCommand::Allow {
                 words,
                 all,
