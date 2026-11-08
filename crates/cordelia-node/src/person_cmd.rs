@@ -2216,10 +2216,16 @@ fn removed_with_it(with_it: &[&SignedAddition]) -> String {
     format!(
         "\nRemoved with it, as the device being removed added them since the last change: {}. \
          One of them that is yours comes back under a new key: run cordelia init --new-key on \
-         it, then add it from a device of yours.",
+         it, then add it from a device of yours.\n{REPLACING}",
         names.join(", ")
     )
 }
+
+/// What a removal says of a device replaced, beside the keys it removes
+/// with the device (decision 2026-10-24 (removal), rule 6): every removal
+/// removes them, not only one of a stolen device.
+const REPLACING: &str = "This is so at every removal, not only of a stolen device: to replace a \
+                         device, make the removal on the new one, which it then keeps.";
 
 /// The devices of the last change that stay with nothing asked: each but
 /// the one that goes, but those that a person is asked about, and but
@@ -2383,6 +2389,13 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
         Which::Remove(key) => Some(*key),
         _ => None,
     };
+    // The keys the one that goes added, swept with it at any depth: no
+    // question asks of one, in a removal or in a settlement that joins a
+    // head that lists one.
+    let swept: Vec<[u8; 32]> = added_by_the_one_that_goes(handed, goes)
+        .iter()
+        .map(|record| record.addition.device.key)
+        .collect();
     if let Some(goes) = goes {
         if goes == own {
             anyhow::bail!(
@@ -2494,6 +2507,7 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
     );
     let gone = |key: &[u8; 32]| {
         Some(*key) == goes
+            || swept.contains(key)
             || handed.knows_removed(key)
             || heads.iter().any(|statement| statement.removes(key))
     };
@@ -3951,6 +3965,59 @@ mod tests {
         for key in [f.listed, id(5).public_key(), id(6).public_key()] {
             assert!(signs.removes(&key));
         }
+    }
+
+    /// A settlement that removes a device asks nothing of a key that
+    /// device added, though a head it joins lists that key, as a device of
+    /// the version before keeps a key it asked of (decision 2026-10-24
+    /// (removal), rule 6): the phone goes, and it added the desktop, which
+    /// a change made apart lists. The settlement removes the desktop, and
+    /// lists it nowhere.
+    #[test]
+    fn a_settlement_asks_nothing_of_a_key_the_removed_device_added() {
+        let f = Fixture::new();
+        let phrase = Phrase::parse(WORDS).unwrap();
+        let desktop = NodeIdentity::from_seed([5; 32]).unwrap();
+        let read = |entry: &CheckedEntry| {
+            open_statement(
+                entry,
+                &phrase.public_key().unwrap(),
+                &entry.channel,
+                &phrase.statement_key().unwrap(),
+            )
+            .unwrap()
+        };
+        // A change made apart that lists the desktop.
+        let (apart, apart_entry) = f.apart(2);
+        let mut stay = apart.statement.devices.clone();
+        stay.push(Device::new(desktop.public_key(), "desktop").unwrap());
+        let head_entry = prepare_change(&apart, &f.own.public_key(), stay, &[])
+            .unwrap()
+            .sign(&phrase, &apart_entry, &[])
+            .unwrap();
+        let head = read(&head_entry);
+        assert!(head.statement.lists(&desktop.public_key()));
+        let records = [f.added_by(
+            &NodeIdentity::from_seed([3; 32]).unwrap(),
+            desktop.public_key(),
+            "desktop",
+        )];
+        let mut handed = f.handed(&f.statement, &records);
+        handed["heads"] = json!([{
+            "statement": hex::encode(head.to_bytes().unwrap()),
+            "entry": hex::encode(head_entry.to_wire()),
+        }]);
+        let handed = f.read(&handed).unwrap();
+        let typed = Typed::of(&[]);
+        let prepared = asked(&typed, &handed, &Which::Remove(f.listed)).unwrap();
+        assert!(
+            typed.asked.borrow().is_empty(),
+            "{:?}",
+            typed.asked.borrow()
+        );
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        assert!(signs.removes(&desktop.public_key()) && signs.removes(&f.listed));
+        assert!(!signs.lists(&desktop.public_key()));
     }
 
     /// A device that has said that it left is asked about at a change
