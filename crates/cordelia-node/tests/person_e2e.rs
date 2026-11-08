@@ -950,15 +950,16 @@ fn words_of(key: &str) -> String {
 }
 
 /// A removal, as a person makes it: `remove-device` shows the device to
-/// be removed and asks of each device added since whether it stays, with
-/// no answer suggested for one that the device being removed added; it
-/// shows the lists that the phrase will sign, asks its yes and then the
-/// phrase, and stays until the relay holds the change. A mistyped phrase
-/// is told from a wrong one, and neither makes anything: and no word of
-/// either is told from another before the twelfth is typed. The removed
-/// device stops and says why, the others apply, `devices` shows who has
-/// applied, and the removed key is refused when it is added again. A
-/// device that was added by a device added since may not add.
+/// be removed, and removes with it, with no question and in one line, each
+/// device it added since the last change (decision 2026-10-24 (removal),
+/// rule 6, as the person ruled on 8 November); it shows the lists that the
+/// phrase will sign, asks its yes and then the phrase, and stays until the
+/// relay holds the change. A mistyped phrase is told from a wrong one, and
+/// neither makes anything: and no word of either is told from another
+/// before the twelfth is typed. The removed devices stop, the removed
+/// device says why, `devices` lists the removed keys, and the removed key
+/// is refused when it is added again. A device that was added by a device
+/// added since may not add.
 #[test]
 fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     let relay = relay_started();
@@ -1016,28 +1017,22 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
             "To be removed: ({}) \"desktop\".",
             words_of(&desktop_key)
         ));
-        // The tablet was added by the device that is being removed: it
-        // is shown as that. No answer is suggested for it, or for any
-        // device added since: pressing Enter answers nothing.
+        // The tablet was added by the device that is being removed: it is
+        // removed with it, with no question, in one line.
         at.says(&format!(
-            "({}) \"tablet\", added since the last change, from ({}) \"desktop\"",
-            words_of(&tablet_key),
-            words_of(&desktop_key)
+            "Removed with it, as the device being removed added them since the last change: \
+             ({}) \"tablet\".",
+            words_of(&tablet_key)
         ));
-        at.says("It was added by the device that is being removed");
-        at.says("Type `stays` or `removed`").types("");
-        at.says("That is none of the answers. No answer is suggested: type one.");
-        at.says("Type `stays` or `removed`").types("stays");
         // The lists, from the bytes that will be signed.
         at.says("The change that the recovery phrase will sign (change 2):");
         at.says(&format!("made on ({}) \"laptop\"", words_of(&laptop_key)));
-        at.says("devices (2):");
+        at.says("devices (1):");
         at.says(&format!(
             "({}) \"laptop\"  (this device)",
             words_of(&laptop_key)
         ));
-        at.says(&format!("({}) \"tablet\"", words_of(&tablet_key)));
-        at.says("removed keys (1):");
+        at.says("removed keys (2):");
         at.says(&format!(
             "({}), known here as \"desktop\"",
             words_of(&desktop_key)
@@ -1052,7 +1047,6 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     };
     // Without its yes nothing is made, and the phrase is not asked for.
     let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
-    at.says("Type `stays` or `removed`").types("stays");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("no");
@@ -1136,32 +1130,22 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         "the phrase is not shown as it is typed"
     );
 
-    // The laptop has applied its own change, and the tablet applies it.
+    // The laptop has applied its own change, and the tablet, removed with
+    // the desktop, learns that it was removed.
     assert_eq!(look(&laptop)["change"], 2);
-    applies(&tablet, 2, &all);
-    wait_for(
-        "the laptop hears that the tablet applied",
-        &all,
-        120,
-        || {
-            let seen = look(&laptop);
-            let tablet = seen["devices"]
-                .as_array()?
-                .iter()
-                .find(|device| device["label"] == "tablet")?;
-            (tablet["applied"] == 2).then_some(())
-        },
-    );
+    wait_for("the tablet learns that it was removed", &all, 120, || {
+        (text(&look(&tablet), "state") == "removed").then_some(())
+    });
     let listed = laptop.cli(&["devices"]);
     println!("{listed}");
+    assert!(listed.contains("Removed keys:"), "{listed}");
+    // The tablet is among them, by its words: its record, which gave its
+    // label, was under the change before.
+    let removed_keys = listed.split("Removed keys:").nth(1).unwrap_or_default();
     assert!(
-        listed.contains(&format!(
-            "({}) \"tablet\": has applied change 2",
-            words_of(&tablet_key)
-        )),
+        removed_keys.contains(&tablet_key) && removed_keys.contains(&words_of(&tablet_key)),
         "{listed}"
     );
-    assert!(listed.contains("Removed keys:"), "{listed}");
     // A statement lists a removed key bare: it is shown by the label
     // that this device knew it by.
     assert!(
@@ -3800,20 +3784,19 @@ fn every_way_out_of_the_prompt_drops_what_was_typed_ahead() {
 
 // ── A chain of two, at a removal ─────────────────────────────────────
 
-/// A chain of two at a removal (decision 2026-10-04 §6, §16). The desktop
-/// makes the phrase, and adds the laptop and the tablet; the tablet adds
-/// the phone. On the laptop, which the last change does not list, the
-/// desktop is removed.
+/// A chain of two at a removal (decision 2026-10-04 §6, §16; decision
+/// 2026-10-24 (removal), rule 6, as the person ruled on 8 November). The
+/// desktop makes the phrase, and adds the laptop and the tablet; the
+/// tablet adds the phone. On the laptop, which the last change does not
+/// list, the desktop is removed.
 ///
 /// - The laptop is shown its own addition, and its listing is confirmed
-///   by a typed answer.
-/// - The tablet, which the device being removed added, is asked about
-///   before the phone, which the tablet added.
-/// - No answer is suggested for either: pressing Enter answers nothing,
-///   and where the input ends at a question the command is refused, with
-///   nothing made.
+///   by a typed answer; where the input ends there, nothing is made.
+/// - The tablet, which the device being removed added, and the phone,
+///   which the tablet added, are asked about by no question: both are
+///   removed with it, named in one line.
 #[test]
-fn a_chain_of_two_is_asked_about_in_its_order_and_no_answer_is_suggested() {
+fn a_chain_of_two_is_removed_with_the_device_that_added_it() {
     let relay = relay_started();
     let desktop = device_started("desktop", &relay);
     let laptop = device_started("laptop", &relay);
@@ -3836,42 +3819,23 @@ fn a_chain_of_two_is_asked_about_in_its_order_and_no_answer_is_suggested() {
     });
     let desktop_key = key_of(&desktop);
 
-    // The input ends at the first question: nothing is made.
+    // The input ends at the confirmation of this machine: nothing is made.
     let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
     at.says("Type `list` to list this machine and go on.")
-        .types("list");
-    at.says("No answer is suggested for any of them: each is typed.");
-    at.says("Type `stays` or `removed`").ends_the_input();
+        .ends_the_input();
     let said = at.refused_within(std::time::Duration::from_secs(60));
-    assert!(
-        said.contains("the input ended before an answer was typed. Nothing was made."),
-        "{said}"
-    );
     assert!(!said.contains("Make this change?"), "{said}");
     assert_eq!(look(&laptop)["change"], 1);
 
     let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
     at.says("To be removed:");
+    // The tablet and the phone go with it, in one line, with no question.
+    at.says("Removed with it, as the device being removed added them since the last change:")
+        .says("tablet")
+        .says("phone");
     at.says("was signed before this machine was added, so it does not list this machine.")
         .says("Type `list` to list this machine and go on.")
         .types("list");
-    at.says("No answer is suggested for any of them: each is typed.");
-    // The tablet first: the device that is being removed added it.
-    at.says("tablet")
-        .says("added since the last change, from")
-        .says("desktop")
-        .says("It was added by the device that is being removed");
-    at.says("Type `stays` or `removed`").types("");
-    at.says("That is none of the answers. No answer is suggested: type one.");
-    at.says("Type `stays` or `removed`").types("removed");
-    // Then the phone, which the tablet added: Enter keeps it no more
-    // than it keeps the tablet.
-    at.says("phone")
-        .says("added since the last change, from")
-        .says("tablet");
-    at.says("Type `stays` or `removed`").types("");
-    at.says("That is none of the answers. No answer is suggested: type one.");
-    at.says("Type `stays` or `removed`").types("removed");
     at.says("The change that the recovery phrase will sign (change 2):");
     at.says("devices (1):");
     at.says("(this device)");
@@ -3883,9 +3847,8 @@ fn a_chain_of_two_is_asked_about_in_its_order_and_no_answer_is_suggested() {
         .types(&words);
     at.says("The change is made (change 2).");
     let said = at.done();
-    // Each of the two was asked about, and asked again where Enter was
-    // pressed: no third device was.
-    assert_eq!(said.matches("added since the last change, from").count(), 4);
+    // Neither was asked about.
+    assert!(!said.contains("Type `stays` or `removed`"), "{said}");
     let seen = look(&laptop);
     assert_eq!(seen["change"], 2, "{seen}");
     assert_eq!(seen["devices"].as_array().unwrap().len(), 1, "{seen}");

@@ -233,10 +233,11 @@ pub enum PersonError {
     TwinOfADevice,
 
     #[error(
-        "the change lists a device and removes its twin, which is the same device: nothing was \
-         made. A device whose twin is removed is removed too."
+        "the change lists the device {0} and removes its twin, which is the same device: \
+         nothing was made. Remove that device too; then run `cordelia init --new-key` on it, and \
+         add it again from a device of yours."
     )]
-    TwinInBothLists,
+    TwinInBothLists(String),
 
     #[error(
         "this device may not add: it was added, since the last change, by a device added since"
@@ -634,14 +635,15 @@ pub(crate) fn know_removed(
 
 /// Judge again, by each removed key's cut (decision 2026-10-24 (removal),
 /// rules 2 and 6), the records of additions that this device keeps under
-/// the change it follows: one that a removed key signed counts for nothing
-/// where the device took it at or after that key's cut time, or in a
-/// generation made apart from its removal, and the key it adds is removed,
-/// with that key as its adder. So in turn is each key that such a key
-/// added. A record taken before the cut time stays: a device added honestly
-/// before the removal stays the person's. Done from the moment the device
-/// knows, and again whenever what it knows grows. Says whether anything
-/// changed.
+/// the change it follows: one that a removed key signed counts for nothing,
+/// whenever the device took it, under a change the removal was made after
+/// or made apart from it ([`crate::cut::Cuts::cuts_an_addition`]), and the
+/// key it adds is removed, with that key as its adder. So in turn is each
+/// key that such a key added, at any depth (the person's ruling of 8
+/// November: a removal removes every key the removed device added since
+/// the last change). Its cost: a device the removed one added honestly
+/// comes back under a new key. Done from the moment the device knows, and
+/// again whenever what it knows grows. Says whether anything changed.
 pub(crate) fn judge_records_by_their_cut(
     conn: &Connection,
     own: &[u8; 32],
@@ -675,7 +677,7 @@ pub(crate) fn judge_records_by_their_cut(
         .devices_held();
         let mut again = false;
         for record in held_rows::additions(conn)? {
-            if !cuts.cuts_key(&record.adder, &generation, record.seen_at) {
+            if !cuts.cuts_an_addition(&record.adder, &generation) {
                 continue;
             }
             // A key that a removal of the adder lists as a device is the
@@ -9138,14 +9140,23 @@ mod tests {
             s.listed(&[laptop, desktop]),
             &[s.key(tablet), Twin::of_key(&s.key(desktop))],
         );
-        assert!(matches!(
-            removes_its_twin,
-            Err(PersonError::TwinInBothLists)
-        ));
+        // The refusal names the device, and says how to go on.
+        let Err(refused @ PersonError::TwinInBothLists(_)) = removes_its_twin else {
+            panic!("{removes_its_twin:?}");
+        };
+        let said = refused.to_string();
+        assert!(
+            said.contains(&encode_public_key(&s.key(desktop)).unwrap()),
+            "{said}"
+        );
+        assert!(said.contains("cordelia init --new-key"), "{said}");
         let mut stay = s.listed(&[laptop, desktop]);
         stay.push(Device::new(Twin::of_key(&s.key(tablet)), "its twin").unwrap());
         let lists_its_twin = made(stay, &[s.key(tablet)]);
-        assert!(matches!(lists_its_twin, Err(PersonError::TwinInBothLists)));
+        assert!(matches!(
+            lists_its_twin,
+            Err(PersonError::TwinInBothLists(_))
+        ));
         assert!(made(s.listed(&[laptop, desktop]), &[s.key(tablet)]).is_ok());
     }
 
@@ -9168,7 +9179,7 @@ mod tests {
     /// The device about to be removed cannot make a device of its own twin
     /// (one holder): its record of the twin counts already, and once the
     /// laptop removes it, more than ten minutes later, its twin is removed
-    /// with it, though rule 6 cuts no record taken so long before.
+    /// with it, as one key.
     #[test]
     fn a_record_of_a_keys_own_twin_never_counts() {
         use crate::several::{Several, Twin};
@@ -9397,15 +9408,14 @@ mod tests {
         assert!(follows_a_clear_change(&conn).unwrap());
     }
 
-    /// Rule 6, its records (decision 2026-10-24 (removal), unit test 12): a
-    /// counted record that a removed key signed, taken at or after that
-    /// key's cut time, counts for nothing from the moment the device knows;
-    /// the key it added is removed, and so is each key that key added in
-    /// its turn. A record taken a second before the cut time stays: a
-    /// device added honestly before the removal stays the person's. And the
-    /// next change made here lists each as removed (rule 20).
+    /// Rule 6, its records (decision 2026-10-24 (removal), unit test 12, as
+    /// the person ruled on 8 November): a counted record that a removed key
+    /// signed counts for nothing from the moment the device knows, whenever
+    /// it was taken, a second before the cut time as after it; the key it
+    /// added is removed, and so is each key that key added in its turn. And
+    /// the next change made here lists each as removed (rule 20).
     #[test]
-    fn test_records_a_removed_key_signed_after_its_cut_time_count_for_nothing() {
+    fn test_every_record_a_removed_key_signed_counts_for_nothing() {
         use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
         let phrase = phrase();
         let [_, two, three, _] = statements(&phrase);
@@ -9431,12 +9441,12 @@ mod tests {
         // apply waits for the cycle.
         let entry = change_made_at(&phrase, &three, secret(3), made);
         assert!(know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap());
-        assert_eq!(counted(&conn), [true, false, false]);
+        assert_eq!(counted(&conn), [false, false, false]);
         let counting = who_counts(&conn).unwrap();
-        assert!(counting.counts(&key(5)));
+        assert!(!counting.counts(&key(5)));
         assert!(!counting.counts(&key(6)) && !counting.counts(&key(7)));
         assert_eq!(removed(&conn), {
-            let mut keys = vec![key(2), key(6), key(7)];
+            let mut keys = vec![key(2), key(5), key(6), key(7)];
             keys.sort();
             keys
         });
@@ -9450,7 +9460,7 @@ mod tests {
             Shown::Applied(_)
         ));
         assert!(removed(&conn).contains(&key(6)) && removed(&conn).contains(&key(7)));
-        assert!(!removed(&conn).contains(&key(5)));
+        assert!(removed(&conn).contains(&key(5)));
 
         // A key that the removal itself lists as a device, or a change on
         // its chain, is the person's by the phrase, and is not removed,
@@ -9516,15 +9526,14 @@ mod tests {
         assert!(!judge_records_by_their_cut(&conn, &key(0), made).unwrap());
     }
 
-    /// Records are judged again when a change is first noted with its
-    /// lists, and not only when a new key is removed (the review of slice
-    /// 8, its third finding). Two removals of device 2 are made apart: the
-    /// one at `made` is seen first, and the record that device 2 signed
-    /// before its cut stays; then the one made earlier is seen, which
-    /// removes no new key, and moves the cut before the record. The key it
-    /// added is removed.
+    /// A record does not turn on the cut time (the review of slice 8, its
+    /// third finding, and the person's ruling of 8 November). Two removals
+    /// of device 2 are made apart: the one at `made` is seen first, and the
+    /// record that device 2 signed before its cut counts for nothing at
+    /// once; then the one made earlier is seen, which removes no new key,
+    /// and moves the cut: nothing more changes. The key it added is removed.
     #[test]
-    fn test_records_are_judged_again_where_a_removal_seen_later_moves_the_cut_earlier() {
+    fn test_records_do_not_turn_on_a_removal_seen_later_moving_the_cut_earlier() {
         use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
         let margin = REMOVAL_TAKEN_MARGIN_SECS as i64;
         let phrase = phrase();
@@ -9551,8 +9560,12 @@ mod tests {
             made + 1,
         )
         .unwrap();
-        assert_eq!(counted(&conn), [true]);
-        assert_eq!(removed(&conn), vec![key(2)]);
+        assert_eq!(counted(&conn), [false]);
+        assert_eq!(removed(&conn), {
+            let mut keys = vec![key(2), key(6)];
+            keys.sort();
+            keys
+        });
         // The removal made apart, and earlier.
         let apart = two
             .next(key(1), &secret(33), listed(&[0, 1]), &[key(2)])
@@ -9651,29 +9664,26 @@ mod tests {
     /// The change followed is noted with its lists when a change is shown
     /// (the review of slice 8, its sixth finding): on a device stepped to
     /// this version, which noted none, rule 6 would otherwise find no time
-    /// for the removal's cut, and cut everything, so that a record device 2
-    /// signed before its removal stopped counting. The lists are taken out
-    /// by hand, as a device stepped to this version has them.
+    /// for the removal's cut, and cut everything. A record device 2 signed
+    /// counts for nothing either way now (the person's ruling of 8
+    /// November), so this asks of the cut that rule 7 reads: device 2's has
+    /// the removal's time. The lists are taken out by hand, as a device
+    /// stepped to this version has them.
     #[test]
     fn test_the_change_followed_is_noted_with_its_lists_when_a_change_is_shown() {
         use cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS;
         let phrase = phrase();
-        let [_, two, three, _] = statements(&phrase);
+        let [_, _, three, _] = statements(&phrase);
         let conn = device_at(0, 2);
         conn.execute("DELETE FROM person_change_times_lists", [])
             .unwrap();
         let made = NOW + 50_000;
         let cut = made - REMOVAL_TAKEN_MARGIN_SECS as i64;
-        see_addition(&conn, &added(&two, 2, 5), cut - 1).unwrap();
         let entry = change_made_at(&phrase, &three, secret(3), made);
         know_what_is_shown(&conn, &device(0), &entry, made + 1).unwrap();
-        assert!(
-            held_rows::additions(&conn)
-                .unwrap()
-                .iter()
-                .all(|record| record.counted)
-        );
         assert_eq!(removed(&conn), vec![key(2)]);
+        let cuts = crate::cut::Cuts::read(&conn).unwrap();
+        assert_eq!(cuts.of_key(&key(2)).unwrap().at, Some(cut));
     }
 
     /// The gate of rule 4 in `come_to` holds where rule 6, run there at the

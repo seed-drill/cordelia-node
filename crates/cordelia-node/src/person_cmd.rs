@@ -2117,9 +2117,15 @@ const SAID_IT_LEFT: &str = "It has said that it left, and started again under an
 /// is two long at most, so those that a device of the statement added
 /// come first, and those that such a device added after them, each in
 /// the order the node handed them. This device and the one that goes
-/// are asked about by neither.
+/// are asked about by neither, nor is a key the one that goes added, at
+/// any depth: the removal removes each with no question
+/// ([`added_by_the_one_that_goes`]).
 fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
     let own = handed.this_device;
+    let with_it: Vec<[u8; 32]> = added_by_the_one_that_goes(handed, goes)
+        .iter()
+        .map(|record| record.addition.device.key)
+        .collect();
     let added_since = |key: &[u8; 32]| handed.added.iter().any(|r| r.addition.device.key == *key);
     let (first, after): (Vec<&SignedAddition>, Vec<&SignedAddition>) = handed
         .added
@@ -2146,18 +2152,14 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
     for record in first.into_iter().chain(after) {
         let added = &record.addition;
         let key = added.device.key;
-        if key == own || Some(key) == goes || handed.knows_removed(&key) {
+        if key == own || Some(key) == goes || handed.knows_removed(&key) || with_it.contains(&key) {
             continue;
         }
         let says = format!(
-            "\n{}, added since the last change, from {} at {}{}{}:",
+            "\n{}, added since the last change, from {} at {}{}:",
             named(&added.device.label, &key),
             named(&handed.label(&added.adder), &added.adder),
             time_of(added.at),
-            match Some(added.adder) == goes {
-                true => ". It was added by the device that is being removed",
-                false => "",
-            },
             match handed.left.contains(&key) {
                 true => format!(". {SAID_IT_LEFT}"),
                 false => String::new(),
@@ -2169,6 +2171,54 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
         });
     }
     asked
+}
+
+/// The records of the keys that `goes`, the device a removal removes,
+/// added since the last change, and of each key one of them added in turn,
+/// at any depth (decision 2026-10-24 (removal), rule 6, as the person
+/// ruled on 8 November): the removal removes each, with no question, as
+/// every device rule 6 there removes it. Never this device, which makes
+/// the change, nor what it added.
+fn added_by_the_one_that_goes(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<&SignedAddition> {
+    let Some(goes) = goes else {
+        return Vec::new();
+    };
+    let mut adders = vec![goes];
+    let mut with_it: Vec<&SignedAddition> = Vec::new();
+    loop {
+        let more: Vec<&SignedAddition> = handed
+            .added
+            .iter()
+            .filter(|record| {
+                let key = record.addition.device.key;
+                adders.contains(&record.addition.adder)
+                    && key != handed.this_device
+                    && !adders.contains(&key)
+            })
+            .collect();
+        if more.is_empty() {
+            return with_it;
+        }
+        for record in more {
+            adders.push(record.addition.device.key);
+            with_it.push(record);
+        }
+    }
+}
+
+/// What a removal says of the keys it removes with the device, as that
+/// device added them ([`added_by_the_one_that_goes`]), in one line.
+fn removed_with_it(with_it: &[&SignedAddition]) -> String {
+    let names: Vec<String> = with_it
+        .iter()
+        .map(|record| named(&record.addition.device.label, &record.addition.device.key))
+        .collect();
+    format!(
+        "\nRemoved with it, as the device being removed added them since the last change: {}. \
+         One of them that is yours comes back under a new key: run cordelia init --new-key on \
+         it, then add it from a device of yours.",
+        names.join(", ")
+    )
 }
 
 /// The devices of the last change that stay with nothing asked: each but
@@ -2361,6 +2411,12 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
             false => refuses_a_key_it_does_not_know(at, &goes)?,
         }
         removed.push(goes);
+        // Each key it added since the last change goes with it.
+        let with_it = added_by_the_one_that_goes(handed, Some(goes));
+        if !with_it.is_empty() {
+            println!("{}", removed_with_it(&with_it));
+            removed.extend(with_it.iter().map(|record| record.addition.device.key));
+        }
     }
     // The keys removed on another branch, which this change lists too.
     let elsewhere: Vec<&[u8; 32]> = handed
@@ -3833,25 +3889,11 @@ mod tests {
                 time_of(7)
             )
         );
-        // Where the device that added one is the one that goes, that is
-        // said, and the one that goes is not asked about.
+        // The one that goes is not asked about, nor what it added: the
+        // removal removes those with it.
         let asked = questions(&handed, Some(key(5)));
         let keys: Vec<[u8; 32]> = asked.iter().map(|asked| asked.device.key).collect();
-        assert_eq!(keys, [key(8), key(6), key(7)]);
-        assert!(
-            !asked[0].says.contains("being removed"),
-            "{}",
-            asked[0].says
-        );
-        for by_the_one_that_goes in &asked[1..] {
-            assert!(
-                by_the_one_that_goes
-                    .says
-                    .ends_with(". It was added by the device that is being removed:"),
-                "{}",
-                by_the_one_that_goes.says
-            );
-        }
+        assert_eq!(keys, [key(8)]);
         // This device is asked about by nobody: its listing is confirmed
         // apart.
         let mut handed = f.handed(&f.statement, &records);
@@ -3862,6 +3904,53 @@ mod tests {
             .map(|asked| asked.device.key)
             .collect();
         assert_eq!(keys, [key(5), key(6), key(7)]);
+    }
+
+    /// A removal removes every key the device it removes added since the
+    /// last change, at any depth, with no question, and says so in one line
+    /// (decision 2026-10-24 (removal), rule 6, as the person ruled on 8
+    /// November): the phone goes; it added the desktop, which added a
+    /// second laptop. Neither is asked about; both are removed with it, and
+    /// the line names both.
+    #[test]
+    fn a_key_added_by_one_the_removed_device_added_is_said_so() {
+        let f = Fixture::new();
+        let id = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap();
+        // f.listed ("phone", seed 3) is a device of the statement, and goes.
+        let records = [
+            f.added_by(&id(3), id(5).public_key(), "desktop"),
+            f.added_by(&id(5), id(6).public_key(), "laptop two"),
+            f.adds(id(8).public_key(), "watch"),
+        ];
+        let handed = f.read(&f.handed(&f.statement, &records)).unwrap();
+        let questioned = questions(&handed, Some(f.listed));
+        let keys: Vec<[u8; 32]> = questioned.iter().map(|one| one.device.key).collect();
+        assert_eq!(keys, [id(8).public_key()], "only the watch is asked about");
+        let with_it = added_by_the_one_that_goes(&handed, Some(f.listed));
+        let keys: Vec<[u8; 32]> = with_it.iter().map(|r| r.addition.device.key).collect();
+        assert_eq!(keys, [id(5).public_key(), id(6).public_key()]);
+        let line = removed_with_it(&with_it);
+        assert!(
+            line.contains(&named("desktop", &id(5).public_key())),
+            "{line}"
+        );
+        assert!(
+            line.contains(&named("laptop two", &id(6).public_key())),
+            "{line}"
+        );
+        assert!(line.contains("cordelia init --new-key"), "{line}");
+        // A change that removes nobody removes nothing with it.
+        assert!(added_by_the_one_that_goes(&handed, None).is_empty());
+        // The change asks of the watch alone, and removes the two with the
+        // phone.
+        let typed = Typed::of(&["stays"]);
+        let prepared = asked(&typed, &handed, &Which::Remove(f.listed)).unwrap();
+        let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+        assert_eq!(typed.asked.borrow().len(), 1);
+        assert!(signs.lists(&id(8).public_key()));
+        for key in [f.listed, id(5).public_key(), id(6).public_key()] {
+            assert!(signs.removes(&key));
+        }
     }
 
     /// A device that has said that it left is asked about at a change

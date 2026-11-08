@@ -178,9 +178,11 @@ fn one_key_in_one_list(statement: &Statement) -> Result<(), PersonError> {
             .iter()
             .any(|one| Holder::of(one) == Holder::of(key))
     };
-    match statement.devices.iter().any(|device| removed(&device.key)) {
-        true => Err(PersonError::TwinInBothLists),
-        false => Ok(()),
+    match statement.devices.iter().find(|device| removed(&device.key)) {
+        Some(device) => Err(PersonError::TwinInBothLists(
+            cordelia_crypto::bech32::encode_public_key(&device.key)?,
+        )),
+        None => Ok(()),
     }
 }
 
