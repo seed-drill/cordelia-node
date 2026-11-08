@@ -12611,13 +12611,20 @@ async fn at_a_wake_a_relay_is_heard_once_its_answer_is_judged() {
 /// desktop's change that removes the tablet, waits for the sync cycle's
 /// turn to be applied, the device is closed from the commit that keeps the
 /// keys it removes. Relay B, which still holds the change followed and has
-/// given leave, is pushed nothing sealed under it. Once the turn ends the
-/// change is applied.
+/// given leave, is pushed nothing sealed under it by the pass that sends.
+/// Once the turn ends the change is applied.
+///
+/// Relay B's turn in the whole pass ends at its show, which fails: each
+/// relay has its turn and none waits for another, and a turn at B that went
+/// on before relay A's answer was judged could push what waits, as a device
+/// that knows of no removal may. The pass that sends goes on once the
+/// device is closed.
 ///
 /// Taken out: the keys and the close committed before the apply waits (the
-/// device stands applied while it waits: the check that it is closed
-/// fails, and without that check relay B is pushed what waits under the
-/// change that the tablet holds, and the check of B fails).
+/// device stands applied while it waits: the wait for it to be closed
+/// fails, and where the pass that sends goes on half a second after the
+/// whole show at relay A, as it did before, relay B is pushed what waits
+/// under the change that the tablet holds, and the check of B fails).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_change_after_the_one_followed_that_removes_a_key_is_known_at_once() {
     let (a, b) = (StandIn::started().await, StandIn::started().await);
@@ -12639,24 +12646,36 @@ async fn a_change_after_the_one_followed_that_removes_a_key_is_known_at_once() {
     a.requests();
     b.requests();
 
-    // Relay A comes to hold the desktop's change; relay B does not.
+    // Relay A comes to hold the desktop's change; relay B does not, and
+    // resets the next show, which gives no leave and ends none: the leave
+    // it gave stands.
     a.says(
         Say::Answer(ShowAnswer::Whole),
         Say::Answer(ShowAnswer::Another(change.to_wire())),
     );
+    let mut first = true;
+    b.hook(move |request| match request {
+        WireMessage::EntryShow(_) | WireMessage::EntryShowShort(_) if first => {
+            first = false;
+            Some(Say::Reset)
+        }
+        _ => None,
+    });
     laptop.writes("notes", "a.md", "waits to be sent");
     let turn = laptop.state.history.turn();
     let handle = tokio::runtime::Handle::current();
     std::thread::scope(|scope| {
         let passing = scope.spawn(|| handle.block_on(laptop.passes()));
+        // The apply waits for the cycle's turn, with the device closed.
         let waited = std::time::Instant::now();
-        while !a.seen().contains(&Seen::Whole) {
-            assert!(waited.elapsed() < Duration::from_secs(30), "no whole show");
+        while laptop.stands() != Stands::Stopped(State::Fork) {
+            assert!(
+                waited.elapsed() < Duration::from_secs(30),
+                "the device is not closed while the apply waits: {:?}",
+                laptop.stands()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
-        std::thread::sleep(Duration::from_millis(500));
-        // The apply waits for the cycle's turn, with the device closed.
-        assert_eq!(laptop.stands(), Stands::Stopped(State::Fork));
         let sends = scope
             .spawn(|| {
                 handle.block_on(async {
@@ -12666,7 +12685,6 @@ async fn a_change_after_the_one_followed_that_removes_a_key_is_known_at_once() {
             .join()
             .unwrap();
         assert!(sends.is_ok(), "the pass that sends waited");
-        std::thread::sleep(Duration::from_millis(500));
         assert!(
             !b.seen().contains(&Seen::Push),
             "relay B was pushed what waits while relay A's answer waited for the turn"

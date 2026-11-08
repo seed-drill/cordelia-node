@@ -1940,13 +1940,14 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
 // ── Two changes made apart, and cordelia settle ──────────────────────
 
 /// Two devices each make a change while neither can hear the other: the
-/// relay comes to hold one, and the device that made the other sees both.
-/// Both are clear, so it sets the other aside and goes on (decision
-/// 2026-10-24 (removal), rules 8 and 11): it says so, with both lists, and
-/// is amber. Any change made there joins the two (rule 21): `cordelia
-/// renew`, there, shows both statements, asks of the other device whether
-/// it stays, and makes the settlement with the phrase, as `cordelia
-/// settle` does. Both devices apply it.
+/// relay keeps both, as heads made apart (decision 2026-10-24 (removal),
+/// rule 14), and hands each device the head it lacks at its next show
+/// (rule 16), so each sees both. Both are clear, so each sets the other's
+/// aside and goes on (rules 8 and 11): it says so, with both lists, and is
+/// amber. Any change made there joins the two (rule 21): `cordelia renew`,
+/// on one of them, shows both statements, asks of the other device whether
+/// it stays, and makes the settlement with the phrase, as `cordelia settle`
+/// does. Both devices apply it.
 #[test]
 fn two_changes_made_apart_are_settled_with_the_phrase() {
     let mut relay = relay_started();
@@ -1982,22 +1983,21 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
     let all = [&relay, &laptop, &desktop];
 
-    // One of the two sees both, and sets the other aside.
+    // Each sees both, and sets the other's aside: the one that showed its
+    // change first is handed the other's at its next pass.
     let sets_aside = |device: &Node| {
         look(device)["set_aside"]
             .as_array()
             .is_some_and(|heads| !heads.is_empty())
     };
-    wait_for("one device sees both changes", &all, 180, || {
-        (sets_aside(&laptop) || sets_aside(&desktop)).then_some(())
+    wait_for("each device sees both changes", &all, 180, || {
+        (sets_aside(&laptop) && sets_aside(&desktop)).then_some(())
     });
-    let (forked, other) = match sets_aside(&laptop) {
-        true => (&laptop, &desktop),
-        false => (&desktop, &laptop),
-    };
-    assert!(!sets_aside(other), "the relay holds one of the two");
-    // It goes on: it is not stopped.
-    assert_eq!(text(&look(forked), "state"), "applied");
+    let (forked, other) = (&laptop, &desktop);
+    // Each goes on: neither is stopped.
+    for device in [forked, other] {
+        assert_eq!(text(&look(device), "state"), "applied", "{}", device.name);
+    }
     let set_aside = "is set aside: settle it with the phrase (`cordelia settle`)";
     let status = forked.cli(&["status"]);
     assert!(
