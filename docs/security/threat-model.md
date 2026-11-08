@@ -265,7 +265,7 @@ belongs to something that is not built or designed in public yet.
 - `crates/cordelia-api/src/change.rs`: `test_a_change_is_made_only_over_what_the_prompt_showed`
 - `crates/cordelia-api/src/change.rs`: `test_a_change_brings_no_removed_key_back`
 - `crates/cordelia-node/tests/person_e2e.rs`: `a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleared`
-- `crates/cordelia-node/tests/person_e2e.rs`: `a_chain_of_two_is_asked_about_in_its_order_and_no_answer_is_suggested`
+- `crates/cordelia-node/tests/person_e2e.rs`: `a_chain_of_two_is_removed_with_the_device_that_added_it`
 - `crates/cordelia-node/tests/person_e2e.rs`: `two_changes_made_apart_are_settled_with_the_phrase`
 - `crates/cordelia-node/tests/removal_e2e.rs`: `two_removals_made_apart_close_both_sides_until_settle`
 - `crates/cordelia-node/tests/removal_e2e.rs`: `a_removed_device_that_shows_old_changes_pushes_no_head_out`
