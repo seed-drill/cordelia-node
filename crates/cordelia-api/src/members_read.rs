@@ -61,7 +61,7 @@ use crate::members::{self, ChannelLine, Members, same_key};
 use crate::messages::cleaned;
 use crate::person::{Held, PersonError, in_one};
 use crate::shared::Judged;
-use crate::shared_anew::{Gone, dropped_or_moved};
+use crate::shared_anew::{Gone, OfferIs, dropped_or_moved};
 use crate::sharing::{
     self, Became, Failed, OwnRelay, Refusal, ShareTo, Taker, Took, channel_words, relay_shown,
 };
@@ -513,7 +513,8 @@ pub enum NotHanding {
     MovedFrom,
     /// A removal came, and it was not made anew: it is not clean here.
     NotClean,
-    /// An offer read there made it anew for this person, by `maker`.
+    /// An offer read there, by `maker`, made it anew: one that seals to
+    /// this person, or one "without you". Only a fault does not count.
     MadeAnew { maker: [u8; 32] },
     /// None of its relays is one of this device's.
     NotReached,
@@ -541,10 +542,10 @@ impl NotHanding {
 /// where this device hands that channel over (rule 4.1); or why it does
 /// not. Only the channel the list names, once rule 1's gate lets it; only
 /// where this device holds it and writes there: held, clean, and not moved
-/// from; and never where it read an offer there that made it anew for
-/// this person, whether they then moved, stayed or are still paused.
-/// Where it is not reached from here or is full, nothing would be handed
-/// either, and that is said.
+/// from; and never where it read an offer there that is no fault, whether
+/// it seals to this person, who then moved, stayed or is still paused, or
+/// leaves them out ("without you"). Where it is not reached from here or
+/// is full, nothing would be handed either, and that is said.
 pub fn acts_in<'a>(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -601,9 +602,13 @@ pub(crate) fn acts_in_with<'a>(
     if crate::shared_anew::is_not_clean(conn, &line.channel)? {
         return Ok(Err(NotHanding::NotClean));
     }
+    // Any offer read there that is no fault made the channel anew, an
+    // offer "without you" too: a device left out hands a newcomer nothing
+    // that its members are leaving (rule 4.1, as the person ruled on 8
+    // November).
     let made_anew = crate::shared_anew::judged(conn, identity, &row, None)?
         .into_iter()
-        .find(|judged| judged.made_anew_for_you());
+        .find(|judged| !matches!(judged.is, OfferIs::Fault(_)));
     if let Some(judged) = made_anew {
         return Ok(Err(NotHanding::MadeAnew {
             maker: judged.offer.maker,

@@ -657,10 +657,10 @@ fn a_holder_of_the_channel_it_was_made_anew_from_is_told_to_move() {
     assert!(matches!(planned.what.then, Then::Nothing));
 }
 
-/// An offer "without you" does not count (rule 4.1): a holder of the old
-/// channel that the list names only after `without`, and not as a device,
-/// is refused as any device not on the list is, and nothing is done (rule
-/// 2.3).
+/// An offer "without you" leaves nothing to move to (rule 6): a holder of
+/// the old channel that the list names only after `without`, and not as a
+/// device, is refused as any device not on the list is, and nothing is
+/// done (rule 2.3).
 #[test]
 fn an_offer_without_you_does_not_say_to_move() {
     let s = devices(1);

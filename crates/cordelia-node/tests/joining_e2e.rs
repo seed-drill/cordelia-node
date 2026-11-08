@@ -1152,10 +1152,10 @@ fn nine_new_keys_with_eight_off_the_ninth_is_handed_the_channel_at_the_third_rea
 /// channel by the list. Bob makes it anew and leaves Carol out: it prints
 /// the new channel line, Carol's key after `without`.
 ///
-/// - **Before that line is merged, nobody hands the new channel over,**
-///   and neither Bob's device nor Alice's hands anything: Alice's has read
-///   Bob's offer, and Bob's has moved from the channel the list names, so
-///   Dave's key, merged meanwhile, is handed nothing by either.
+/// - **Before that line is merged, nobody hands anything over:** Alice's
+///   device and Carol's have read Bob's offer, which leaves Carol out, and
+///   Bob's has moved from the channel the list names, so Dave's key, merged
+///   meanwhile, is handed nothing, by Carol's device either.
 /// - **A key dropped by a merge shows amber** on each follower.
 /// - **Once the new line is merged,** Alice moves, Bob's device hands the
 ///   new channel to Dave's key, and never to Carol's.
@@ -1226,19 +1226,25 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
     assert_eq!(shown[0]["line"], new_line.as_str());
 
     // Before the new line is merged: once Alice's device has read Bob's
-    // offer, a merge adds Dave's line, and neither her device nor Bob's
-    // hands Dave anything, or anyone the new channel.
+    // offer, and Carol's has read it "without you", a merge adds Dave's
+    // line, and nobody hands Dave anything, or anyone the new channel.
     let offer_read = format!(
         "{NAME} was made anew by bob-desktop: nothing is handed over until the list names the \
          new channel."
     );
-    shows(&all, &alice, "offer_read", &offer_read, false);
+    for n in [&alice, &carol] {
+        shows(&all, n, "offer_read", &offer_read, false);
+    }
     let with_dave = host.merges(&format!("{old_line}\n{bobs}{alices}{carols}{daves}"));
-    host.fetches(&bob, &bob_clone);
-    host.fetches(&alice, &alice_clone);
-    has_read(&all, &bob, &with_dave);
-    has_read(&all, &alice, &with_dave);
-    for n in [&bob, &alice] {
+    for (n, clone) in [
+        (&bob, &bob_clone),
+        (&alice, &alice_clone),
+        (&carol, &carol_clone),
+    ] {
+        host.fetches(n, clone);
+        has_read(&all, n, &with_dave);
+    }
+    for n in [&bob, &alice, &carol] {
         let shares = shares_of(n);
         assert!(
             !shares

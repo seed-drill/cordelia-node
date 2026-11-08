@@ -194,7 +194,9 @@ impl Judged {
     /// Whether it made the old channel anew for this person: it seals to
     /// them and leaves out a key, and is no fault, whether they then moved,
     /// stayed or are still paused. The node hands nothing over in such a
-    /// channel (decision 2026-11-06 (joining), rule 4.1).
+    /// channel, nor in one where it read any other offer that is no fault,
+    /// one "without you" among them (decision 2026-11-06 (joining), rule
+    /// 4.1).
     pub fn made_anew_for_you(&self) -> bool {
         matches!(
             self.is,
