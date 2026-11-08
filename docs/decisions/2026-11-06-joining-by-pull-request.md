@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Revised five times after its reviews (section 13). Amended on 7 November by the person's rulings: the node reads the clone only, and a channel follows one repository (section 14). Amended in building slice 7 and after its review: when rule 5's "from then on" starts, the end of its amber at `shared seen <name> <label>`, rule 6's line of a device that follows no list, the bound of 16 follows (rule 2.7), and a removal's drop past a bound (rule 5). Section 11 names every constant, each with its reason (slice 9). To be built: a reviewed plan first. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
+**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Amended on 7 November by the person's rulings: the node reads the clone only, and a channel follows one repository (section 14). Revised five times after its reviews (section 13), and amended in building slice 7 and after its review (rules 2.7, 5 and 6). Built in slices 1 to 7 by the plan on issue #293, with the docs in slice 9; slice 8's real-process tests are in progress. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1.
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -28,7 +28,7 @@ cordelia_pk1...   bob-laptop
 
 **What a person does:**
 - **To start a team's channel, once:** `cordelia subscribe --new` in a clone. It makes the channel and prints the `channel` line. A pull request adds that line and the maker's devices.
-- **To join:** a pull request that adds a line for each of your devices. Once it is merged, run `cordelia subscribe` in your clone, once, and type yes.
+- **To join:** a pull request that adds a line for each of your devices. Once it is merged, run `git pull` (or `git fetch`) in your clone, then `cordelia subscribe` there, once, and type yes.
 
 **What the nodes then do, with no one asked.** Each device that follows the repository reads the list every ten minutes.
 - A member's node hands the named channel to each listed key that is not in it.
@@ -57,10 +57,11 @@ cordelia_pk1...   bob-laptop
 
 ```
 bob@laptop$ cd ~/Work/project
+bob@laptop$ git pull
 bob@laptop$ cordelia subscribe
 ```
 
-**With no name, in a folder of a git repository, `subscribe` follows that repository.** It needs a terminal and one yes. The folder must be mapped, as for any agent: otherwise it says to run `cordelia sync map .`, and does nothing.
+**With no name, in a folder of a git repository, `subscribe` follows that repository.** It needs a terminal and one yes. The folder must be mapped, as for any agent: otherwise it says to run `cordelia sync map .`, and does nothing. It reads the list from the clone's own copy of the default branch, as the person's git last fetched it (rule 3). So a joiner runs `git pull`, or `git fetch`, in the clone once the pull request is merged, and then `subscribe`: before that fetch, the list it reads does not name the joiner's key, and it is refused (rule 2.3).
 
 1. **The repository's identity** is `host/owner/name`, in lower case, from a remote of the clone. The remote's address must have one of four forms:
    - `https://<host>/<owner>/<name>`
@@ -80,7 +81,7 @@ bob@laptop$ cordelia subscribe
    - **The person holds the channel the list names:** it follows the repository and subscribes this folder's agent.
    - **They do not, and the list names this device:** it follows the repository and waits to be handed the channel (rule 4). The yes says: `This follows <identity>. A member's device hands you its channel once it reads the list. cordelia status shows how it goes.`
    - **The list does not name this device:** `Your key is not on the list of <identity> at <commit>. Add it with a pull request, then run this again.` Nothing is done.
-   - **The person dropped that channel:** it says so and does nothing, as `accept --channel` refuses today (§3.4 there): `You dropped <name>, and a dropped channel is not taken again.`
+   - **The person dropped that channel:** it says so and does nothing, as `accept --channel` refuses today (§3.4 there): `You dropped channel <words>, and a dropped channel is not taken again.` A drop keeps no name, so the channel is said by its four words.
 4. **`cordelia subscribe --new`** makes the channel for the team, once, at the person's relays, as `shared new` does. It is filed under the repository's `owner/name`. It prints the line to add, and the person's own keys and labels:
 
    ```
@@ -102,7 +103,7 @@ bob@laptop$ cordelia subscribe
 - **When.** Every ten minutes (`MEMBERS_READ_INTERVAL_SECS`), at the node's start, and when a person follows, the node reads each clone it follows.
 - **The list is as fresh as the clone,** for a public repository as for a private one. It comes from the person's own `git fetch` or `git pull`. The status says how old it is: `list of <identity> read from your clone, fetched 2 hours ago`, or that the age is not known. So a join waits until a member's clone has the merged list: a member runs `git pull` there.
 - **Nothing of the person's reaches git, so nothing can ask.** Every git command the node runs, reads of the clone included, runs in a cleared environment:
-  - only `PATH` is kept, and the variables of a proxy and of a company's own certificate authority (`HTTPS_PROXY`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `GIT_SSL_CAINFO`), which never ask;
+  - only `PATH` is kept, and the variables of a proxy and of a company's own certificate authority (`HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `GIT_SSL_CAINFO`), which never ask;
   - `HOME` and `XDG_CONFIG_HOME` are an empty folder of the node's, so no global setting is read, on any version of git;
   - `GIT_CONFIG_NOSYSTEM=1`, and `-c credential.helper=`, which empties the list a clone's own configuration may set;
   - `GIT_ALLOW_PROTOCOL=https`, so nothing goes over SSH and no agent is asked;
@@ -247,7 +248,7 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
   - Within two reads, Alice holds the channel and sends a message that Bob reads.
   - Bob's status shows `alice-laptop joined ...` until `shared seen`.
   - Nobody runs `share` or `accept`.
-- **Order does not matter.** Alice subscribes before the merge, and waits, saying so. Then the merge comes, and she joins.
+- **Order does not matter.** Alice's line is merged, and she runs `subscribe` before any member's clone has the merged list: she follows and waits, and her status says what for (rule 6). Then a member runs `git pull`, and she joins. A key that is not listed yet is refused, and follows nothing (rule 2.3).
 - **From the clone only.** No git of the node's reaches the network: the list comes from the clone, and the status says how old it is.
 
 **Never asked, and never back**
