@@ -221,6 +221,9 @@ you to type yes, then asks for the phrase.
   and a device of yours that still counts labelled it. Share it again with
   anyone else. Take the removed device's access away in each repository
   your devices follow, or that it could push to.
+- A removal removes too every device the removed one added since the last
+  change. To replace a device, add the new one from the old, then make the
+  removal on the new one: it keeps the device that makes it.
 - A device removed by mistake comes back only as a new device: run
   `cordelia init --new-key` on it, then add it.
 
