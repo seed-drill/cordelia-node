@@ -32,7 +32,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::CryptoError;
 use crate::ecies::{hkdf_sha256, hkdf_sha256_of};
-use crate::identity::{NodeIdentity, x25519_pub_from_ed25519_pub};
+use crate::identity::{Holder, NodeIdentity, x25519_pub_from_ed25519_pub};
 use crate::share::Relays;
 
 /// Why a channel's secret was not derived.
@@ -126,11 +126,11 @@ pub fn share_pair_secret(device: &NodeIdentity, other: &[u8; 32]) -> Result<[u8;
 }
 
 /// The secret of a channel between this device and the device whose key is
-/// `other`, under `label`: one's own key and a key with no X25519 form are
-/// refused.
+/// `other`, under `label`: one's own key, or its twin, which is the same
+/// holder ([`Holder`]), and a key with no X25519 form are refused.
 fn between(label: &[u8], device: &NodeIdentity, other: &[u8; 32]) -> Result<[u8; 32], DeriveError> {
     let own = device.public_key();
-    if own == *other {
+    if Holder::of(&own) == Holder::of(other) {
         return Err(DeriveError::OwnKey);
     }
     let other_x25519 = x25519_pub_from_ed25519_pub(other).ok_or(DeriveError::KeyNotUsable)?;
@@ -485,6 +485,9 @@ mod tests {
             pair_secret(&a, &a.public_key()),
             Err(DeriveError::OwnKey)
         ));
+        let mut twin = a.public_key();
+        twin[31] ^= 0x80;
+        assert!(matches!(pair_secret(&a, &twin), Err(DeriveError::OwnKey)));
 
         let mut bad: Vec<[u8; 32]> = EIGHT_TORSION
             .iter()
@@ -592,6 +595,12 @@ mod tests {
 
         assert!(matches!(
             share_pair_secret(&a, &a.public_key()),
+            Err(DeriveError::OwnKey)
+        ));
+        let mut twin = a.public_key();
+        twin[31] ^= 0x80;
+        assert!(matches!(
+            share_pair_secret(&a, &twin),
             Err(DeriveError::OwnKey)
         ));
         assert!(matches!(

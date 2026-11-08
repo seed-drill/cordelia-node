@@ -172,7 +172,9 @@ impl ByTheCuts {
     ) -> Result<Self, PersonError> {
         let noted = crate::cut::Cuts::read(conn)?;
         let mut cuts = Vec::new();
-        for key in crate::person::removed_known(conn, statement)? {
+        // An act's maker is a signer, and is matched byte for byte: a
+        // removed key's twin is no maker at all ([`Makers::maker`]).
+        for &key in crate::person::removed_known(conn, statement)?.keys() {
             let times = match noted.act_generations(&key) {
                 Some((at, generations)) => generations.into_iter().map(|g| (g, at)).collect(),
                 None => Vec::new(),
@@ -223,15 +225,19 @@ impl Makers {
     fn named(conn: &Connection, standing: &Standing) -> Result<Self, PersonError> {
         Ok(Self::new(
             standing.counting.clone(),
-            ByTheStatement::of(&crate::person::removed_known(
-                conn,
-                &standing.held.statement.statement,
-            )?),
+            ByTheStatement::of(
+                &crate::person::removed_known(conn, &standing.held.statement.statement)?
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
         ))
     }
 
     /// What `key` is as a maker: `None` where it is neither a device that
-    /// counts nor a removed key, and its acts are passed over.
+    /// counts nor a removed key, and its acts are passed over. A maker is
+    /// the key an act is signed under, so it is asked byte for byte: the
+    /// twin of either is none, and its acts are passed over.
     pub fn maker(&self, key: &[u8; 32]) -> Option<Maker> {
         if self.removals.removal(key).is_some() {
             Some(Maker::Removed)

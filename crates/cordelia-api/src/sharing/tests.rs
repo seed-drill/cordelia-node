@@ -816,7 +816,8 @@ async fn the_routes_ask_their_yes_and_refuse_a_field_they_do_not_know() {
 
 /// A key the person's statement lists as removed is handed nothing, taken
 /// from in nothing and labelled nothing (decision 2026-10-10 §5.5,
-/// `removed_key`).
+/// `removed_key`), and nor is its twin, its top bit flipped, which opens
+/// what is sealed to it (decision 2026-10-24, property 4).
 #[test]
 fn a_removed_key_is_handed_nothing_taken_from_or_labelled() {
     let mut s = bob(2);
@@ -838,6 +839,45 @@ fn a_removed_key_is_handed_nothing_taken_from_or_labelled() {
     assert_eq!(word(accepted.err().unwrap()), "removed_key");
     let labelled = label_plan(conn, identity, &removed, Some("old"), now);
     assert_eq!(word(labelled.err().unwrap()), "removed_key");
+    let mut twin = s.key(1);
+    twin[31] ^= 0x80;
+    let twin = encode_public_key(&twin).unwrap();
+    let shared = share_plan(conn, identity, &relays(), "review", &twin, None, now);
+    assert_eq!(word(shared.err().unwrap()), "removed_key");
+    let accepted = accept_plan(conn, identity, &relays(), &twin, "taken", now);
+    assert_eq!(word(accepted.err().unwrap()), "removed_key");
+    let labelled = label_plan(conn, identity, &twin, Some("old"), now);
+    assert_eq!(word(labelled.err().unwrap()), "removed_key");
+}
+
+/// A twin is never another person's key (decision 2026-10-10 §5.5): the
+/// twin of this device's key, and of another device of the person's, is
+/// that device, so `share`, `accept --channel` and `label` refuse each as
+/// `own_device`, as they refuse the key itself.
+#[test]
+fn a_twin_of_an_own_device_is_that_device() {
+    let s = bob(2);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let identity = &s[0].identity;
+    meta::set(conn, meta::SYNC_CLAUDE_DIR, "/home/bob/.claude").unwrap();
+    let plan = new_plan(conn, &relays(), "review", &[]).unwrap();
+    make_new(conn, identity, &plan.what, now).unwrap();
+    let word = |failed: Failed| match failed {
+        Failed::Refused(refusal) => refusal.word,
+        Failed::Error(e) => panic!("{e}"),
+    };
+    for n in [0, 1] {
+        for key in [s.key(n), crate::several::Twin::of_key(&s.key(n))] {
+            let key = encode_public_key(&key).unwrap();
+            let shared = share_plan(conn, identity, &relays(), "review", &key, None, now);
+            assert_eq!(word(shared.err().unwrap()), "own_device", "{n}");
+            let accepted = accept_plan(conn, identity, &relays(), &key, "taken", now);
+            assert_eq!(word(accepted.err().unwrap()), "own_device", "{n}");
+            let labelled = label_plan(conn, identity, &key, Some("mine"), now);
+            assert_eq!(word(labelled.err().unwrap()), "own_device", "{n}");
+        }
+    }
 }
 
 /// A device that leaves its person keeps no share it wrote, whose card

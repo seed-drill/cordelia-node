@@ -19,9 +19,10 @@
 //!
 //! What it does not know fails safe: a generation whose chain it did not
 //! note is taken as made apart, and a key that no noted change removes has
-//! everything cut. A record taken before the cut time stays, and so does
-//! what came in a generation made after the removal: the key was known to
-//! be removed there.
+//! everything cut. What came in a generation made after the removal stays:
+//! the key was known to be removed there. A record of an addition that the
+//! key signed is cut whenever it was taken ([`Cuts::cuts_an_addition`]): a
+//! removal removes every key the removed key added since the last change.
 
 use std::collections::BTreeMap;
 
@@ -235,9 +236,10 @@ impl Cuts {
     /// lists it: a key that `adder` added after one of its removals is
     /// spared nowhere that removal is noted, whatever another removal made
     /// apart lists. One removal alone spares only a key that existed when
-    /// it was made, and that the person kept there: `cordelia
-    /// remove-device` asks of each key the device removed added, and says
-    /// that the device being removed added it.
+    /// it was made, and that the person kept there, by a version of
+    /// `cordelia remove-device` that asked of it: this one asks of no key
+    /// the device it removes added, and lists each as removed (rule 6, as
+    /// the person ruled on 8 November).
     pub(crate) fn listed_toward_a_removal(&self, adder: &[u8; 32], key: &[u8; 32]) -> bool {
         let Some(cut) = self.of_key(adder) else {
             return false;
@@ -338,6 +340,17 @@ impl Cuts {
     pub(crate) fn cuts_key(&self, key: &[u8; 32], generation: &Change, at: i64) -> bool {
         self.of_key(key)
             .is_some_and(|cut| self.cuts(cut, generation, at))
+    }
+
+    /// Whether a record of an addition that `key` signed, under
+    /// `generation`, is cut (rule 6, as the person ruled on 8 November): as
+    /// [`Cuts::cuts_key`] says, but whenever this device took it. A removal
+    /// removes every key the removed key added since the last change, with
+    /// no question: a device that never took the record before the cut
+    /// time, or never took it at all, could not tell an honest addition
+    /// from a thief's.
+    pub(crate) fn cuts_an_addition(&self, key: &[u8; 32], generation: &Change) -> bool {
+        self.cuts_key(key, generation, i64::MAX)
     }
 }
 

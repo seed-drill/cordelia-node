@@ -45,6 +45,10 @@ rustls = { workspace = true }
 rcgen = { workspace = true }
 # Another spelling of a key, which a repository's list refuses (members.rs).
 bech32 = { workspace = true }
+# A key's twin, and a signature under it, as a thief would make them. The
+# crypto crate already brings both: this adds no crate to the build.
+curve25519-dalek = { workspace = true }
+sha2 = { workspace = true }
 
 [target.'cfg(unix)'.dev-dependencies]
 # A terminal of a test's own, at which nothing that git runs may ask. The

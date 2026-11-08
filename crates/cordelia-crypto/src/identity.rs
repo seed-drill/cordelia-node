@@ -264,6 +264,128 @@ pub fn is_usable_public_key(ed_pk: &[u8; 32]) -> bool {
     x25519_pub_from_ed25519_pub(ed_pk).is_some()
 }
 
+/// A key as the one who holds its secret: **a key and its twin are one
+/// holder.** A key's twin is the key with its top bit flipped (bit 7 of
+/// byte 31, the sign of x): the key's point negated. To Ed25519 it is
+/// another key, and whoever holds the key's secret signs under the twin
+/// with that secret negated. To X25519 it is the same key
+/// ([`x25519_pub_from_ed25519_pub`] reads y alone), so what is sealed to
+/// the one opens with the other's secret.
+///
+/// So a holder's equality, order and hash read the key without that bit,
+/// and no comparison of two holders can tell a key from its twin. Who a
+/// device must not reach or take from, its own devices, and who holds a
+/// channel are compared as holders, never byte for byte. The key as it was
+/// given is kept ([`Holder::key`]) for what needs its bytes: a signature
+/// checked under it, a slot named by it, the key written or shown.
+#[derive(Debug, Clone, Copy)]
+pub struct Holder([u8; 32]);
+
+impl Holder {
+    pub fn of(key: &[u8; 32]) -> Self {
+        Self(*key)
+    }
+
+    /// The key as it was given.
+    pub fn key(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// What a holder is compared by: the key without its top bit.
+    fn one(&self) -> [u8; 32] {
+        let mut key = self.0;
+        key[31] &= 0x7f;
+        key
+    }
+}
+
+impl PartialEq for Holder {
+    fn eq(&self, other: &Self) -> bool {
+        self.one() == other.one()
+    }
+}
+
+impl Eq for Holder {}
+
+impl std::hash::Hash for Holder {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.one().hash(state);
+    }
+}
+
+impl PartialOrd for Holder {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Holder {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.one().cmp(&other.one())
+    }
+}
+
+/// Keys as their holders ([`Holder`]), each holder once, in the order
+/// they were first added: asked with [`Holders::holds`], which finds a key
+/// by its twin too. It has no other way to ask, so a set of removed keys
+/// or of a person's devices cannot be asked byte for byte.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Holders(Vec<Holder>);
+
+impl Holders {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `key`, or its twin, is one of these.
+    pub fn holds(&self, key: &[u8; 32]) -> bool {
+        self.0.contains(&Holder::of(key))
+    }
+
+    /// Add `key`, where neither it nor its twin is here yet; whether it was
+    /// added.
+    pub fn add(&mut self, key: &[u8; 32]) -> bool {
+        let added = !self.holds(key);
+        if added {
+            self.0.push(Holder::of(key));
+        }
+        added
+    }
+
+    /// The keys, as each was first added, in that order.
+    pub fn keys(&self) -> impl Iterator<Item = &[u8; 32]> + '_ {
+        self.0.iter().map(Holder::key)
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'a> FromIterator<&'a [u8; 32]> for Holders {
+    fn from_iter<I: IntoIterator<Item = &'a [u8; 32]>>(keys: I) -> Self {
+        let mut holders = Self::new();
+        for key in keys {
+            holders.add(key);
+        }
+        holders
+    }
+}
+
+impl FromIterator<[u8; 32]> for Holders {
+    fn from_iter<I: IntoIterator<Item = [u8; 32]>>(keys: I) -> Self {
+        let mut holders = Self::new();
+        for key in keys {
+            holders.add(&key);
+        }
+        holders
+    }
+}
+
 /// Wrap a raw 32-byte Ed25519 seed in PKCS#8 v1 DER for ring.
 ///
 /// ring doesn't accept raw seeds directly -- it requires PKCS#8 DER.
@@ -624,6 +746,42 @@ mod tests {
         assert!(verify_signature(&child.public_key(), msg, &sig));
         // Lead cannot verify child's signature with its own key
         assert!(!verify_signature(&lead.public_key(), msg, &sig));
+    }
+
+    /// A key's twin, its top bit flipped, is a usable key with the key's
+    /// own X25519 key. As holders the two are one, by equality, order and
+    /// hash, and no key that differs in any other bit is; `Holders` finds a
+    /// key by its twin, keeps one of the two, and keeps the key as given.
+    #[test]
+    fn a_key_and_its_twin_are_one_holder() {
+        use std::collections::HashSet;
+        let id = NodeIdentity::from_seed([0x42u8; 32]).unwrap();
+        let key = id.public_key();
+        let mut twin = key;
+        twin[31] ^= 0x80;
+        assert!(is_usable_public_key(&twin));
+        let x25519 = Some(id.x25519_public_key());
+        assert_eq!(x25519_pub_from_ed25519_pub(&key), x25519);
+        assert_eq!(x25519_pub_from_ed25519_pub(&twin), x25519);
+        let (one, other) = (Holder::of(&key), Holder::of(&twin));
+        assert!(one == other && other == one);
+        assert_eq!(one.cmp(&other), std::cmp::Ordering::Equal);
+        assert_eq!(HashSet::from([one, other]).len(), 1);
+        assert_eq!(other.key(), &twin);
+        for bit in 0..255 {
+            let mut near = key;
+            near[bit / 8] ^= 1 << (bit % 8);
+            assert!(
+                Holder::of(&near) != one && Holder::of(&near) != other,
+                "{bit}"
+            );
+        }
+        let mut holders = Holders::new();
+        assert!(holders.add(&twin) && !holders.add(&key));
+        assert!(holders.holds(&key) && holders.holds(&twin));
+        assert_eq!(holders.keys().collect::<Vec<_>>(), vec![&twin]);
+        let both: Holders = [key, twin, [9; 32]].into_iter().collect();
+        assert_eq!(both.len(), 2);
     }
 
     // T8-3 (LOW): generate_psk produces unique 32-byte values

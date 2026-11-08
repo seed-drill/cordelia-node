@@ -27,7 +27,7 @@ use cordelia_core::protocol::{
     MEMBERS_FILE_MAX_BYTES, MEMBERS_LABEL_MAX_CHARS, SHARED_MAX_KEYS, SHARED_MAX_RELAYS,
 };
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
-use cordelia_crypto::identity::is_usable_public_key;
+use cordelia_crypto::identity::{Holder, is_usable_public_key};
 
 /// The channel a list names, its relays, and the keys a making anew left
 /// out of it.
@@ -212,12 +212,12 @@ fn key_of(word: &str) -> Option<[u8; 32]> {
     (encode_public_key(&key).ok()? == word && is_usable_public_key(&key)).then_some(key)
 }
 
-/// Whether two keys are one, or each other's twin: a key with its top bit
-/// flipped is another key to Ed25519, but the same key to X25519, from
-/// which a share's pair is derived. So a twin counts as the key itself,
-/// for a key twice and for the gate.
+/// Whether two keys are one holder ([`Holder`]): one key, or each other's
+/// twin. A key with its top bit flipped is another key to Ed25519, but the
+/// same key to X25519, from which a share's pair is derived. So a twin
+/// counts as the key itself, for a key twice and for the gate.
 pub fn same_key(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    a[..31] == b[..31] && (a[31] & 0x7f) == (b[31] & 0x7f)
+    Holder::of(a) == Holder::of(b)
 }
 
 /// A channel's ID: 64 lower-case hex characters.

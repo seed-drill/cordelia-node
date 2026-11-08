@@ -217,6 +217,9 @@ fn says(e: &PersonError) -> String {
                                     `cordelia init --new-key` on that device gives it a new \
                                     one."
             .into(),
+        PersonError::TwinOfADevice => "that key is a twin of the key of one of your devices: \
+                                       the two are one device, so it is not added."
+            .into(),
         PersonError::MayNotAdd => "this device may not add another yet: it was itself added, \
                                    since the last change, by a device added since. Add from \
                                    another device, or make a change first (`cordelia renew`)."
@@ -1241,6 +1244,14 @@ pub async fn change_prepare(
     let own_relays = crate::sharing::own_relays(&state);
     let (shared_names, shared_unreached, shared_past_bound, shared_acts) =
         crate::shared_anew::at_a_removal(&conn, &own_relays).map_err(refused)?;
+    // Each repository this device follows: a removal says to take the
+    // removed device's access away there (decision 2026-10-24, rule 24).
+    // A device that can still push there can change the list.
+    let repositories: Vec<String> = cordelia_storage::follows::follows(&conn)
+        .map_err(|e| refused(PersonError::Storage(e)))?
+        .into_iter()
+        .map(|follow| follow.identity)
+        .collect();
     let mut acts_handed = Vec::new();
     for named in shared_acts {
         acts_handed.push(json!({
@@ -1270,6 +1281,7 @@ pub async fn change_prepare(
         "shared_unreached": shared_unreached,
         "shared_past_bound": shared_past_bound,
         "shared_acts": acts_handed,
+        "repositories": repositories,
         "look": seen,
     })))
 }
@@ -1395,9 +1407,9 @@ pub async fn change_make(
     }
     // A removal makes each shared channel anew in the same act, after the
     // transaction that applies it (decision 2026-10-24, rule 24; decision
-    // 2026-10-10 §3.5): every key of the device's table stays but the
-    // removed ones. A renewal or a settlement that removes nobody changes
-    // none.
+    // 2026-10-10 §3.5): the person's own devices stay, and the keys a list
+    // or a label of the person's keeps, never a removed one. A renewal or a
+    // settlement that removes nobody changes none.
     let made_anew = {
         let conn = db(&state);
         let removed =

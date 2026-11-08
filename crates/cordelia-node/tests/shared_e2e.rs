@@ -1509,7 +1509,7 @@ fn has_read_from(all: &[&Node], n: &Node, name: &str, keys: &[String]) {
 /// removal of the device that made them (decision 2026-10-10 §3.4, §4.1,
 /// T16): Alice's tablet subscribes her `notes` folder to a channel shared
 /// with Bob, and unsubscribes her `work` folder, which her laptop had
-/// subscribed. Her laptop then makes a change, and then removes the
+/// subscribed. Her laptop labels Bob, makes a change, and then removes the
 /// tablet. On the laptop and the phone, `notes` still subscribes with the
 /// start each took, `work` does not, and a message Bob sends after is
 /// unread for `notes` alone.
@@ -1554,6 +1554,9 @@ fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_t
         .collect();
     has_read_from(&all, &bob, "review", &alices);
     subscribes(&bob, &bob_dir, "review");
+    // At the removal, a channel shared by hand keeps the keys a device that
+    // counts labelled (decision 2026-10-24, rule 24).
+    labels_key(&laptop, &key_of(&bob), "bob");
 
     // The laptop subscribes `work`; the tablet takes it, subscribes
     // `notes`, and unsubscribes `work`.
@@ -2119,6 +2122,9 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
     });
     let bob_dir = maps_folder(&bob, "repo", AGENT);
     subscribes(&bob, &bob_dir, "review");
+    // The desktop labels Bob: at a removal, a channel shared by hand keeps
+    // the keys a device that counts labelled (rule 24).
+    labels_key(&desktop, &key_of(&bob), "bob");
     let old = id_filed(&laptop, "review").unwrap();
     let old_card = card_of_node(&laptop, &old);
     let before_laptop = at_the_relay_by(&relay, &old, &key_of(&laptop));
@@ -2131,6 +2137,15 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
         before_yes.contains(
             "These shared channels are made anew without the device removed, in this change: \
              \"review\". The other people in each move with a yes of their own"
+        ),
+        "{before_yes}"
+    );
+    // Who stays, before the yes (rule 24).
+    assert!(
+        before_yes.contains(
+            "In each, your own devices stay. A channel that follows a repository this device \
+             follows keeps the keys its list names. Any other keeps a key only where this device \
+             saw it in the channel and a device of yours that still counts labelled it."
         ),
         "{before_yes}"
     );
@@ -2545,7 +2560,8 @@ fn recovers(new: &Node, words: &str, answers: &[&str]) -> AtTerminal {
 /// back with the device that made it, the laptop's acts with what undoes
 /// each, and the desktop's as passed over until it is added again; the end
 /// of the look prints them again; the new machine then holds the channel,
-/// and makes it anew once it has read it.
+/// and makes it anew once it has read it, sealed to itself alone (decision
+/// 2026-10-24, rule 24).
 #[test]
 fn a_recovery_brings_the_shared_channels_back_and_names_each() {
     let relay = relay_started();
@@ -2620,8 +2636,11 @@ fn a_recovery_brings_the_shared_channels_back_and_names_each() {
         .iter()
         .map(|seal| cordelia_crypto::bech32::encode_public_key(&seal.key).unwrap())
         .collect();
-    assert!(sealed.contains(&key_of(&bob)), "{sealed:?}");
     assert!(!sealed.contains(&key_of(&laptop)), "{sealed:?}");
+    // Nor to Bob (rule 24): the laptop, removed, labelled him, and the new
+    // machine counts no label made before it until the device that made it
+    // is added again. The person shares the new channel with him again.
+    assert_eq!(sealed, [key_of(&new)], "{sealed:?}");
 }
 
 /// An honest node writes nothing in a shared channel but messages,

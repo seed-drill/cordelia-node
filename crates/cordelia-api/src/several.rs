@@ -1049,6 +1049,90 @@ pub(crate) fn entry_by(
         .unwrap()
 }
 
+/// The twin of a device's key: the key with its top bit (bit 7 of byte
+/// 31, the sign of x) flipped, which is the key's point negated. To
+/// Ed25519 it is another key, and whoever holds the device's secret signs
+/// under it with that secret negated; to X25519 it is the same key. A
+/// test makes one as a thief with a stolen device would.
+pub(crate) struct Twin {
+    pub(crate) key: [u8; 32],
+    secret: curve25519_dalek::Scalar,
+    nonce: [u8; 32],
+}
+
+impl Twin {
+    /// The twin of `key`: the key with its top bit flipped.
+    pub(crate) fn of_key(key: &[u8; 32]) -> [u8; 32] {
+        let mut twin = *key;
+        twin[31] ^= 0x80;
+        twin
+    }
+
+    /// The twin of `device`'s key, with what signs under it.
+    pub(crate) fn of(device: &NodeIdentity) -> Self {
+        use sha2::{Digest, Sha512};
+        let hash = Sha512::digest(device.seed());
+        let mut scalar = [0u8; 32];
+        scalar.copy_from_slice(&hash[..32]);
+        scalar[0] &= 0xf8;
+        scalar[31] &= 0x7f;
+        scalar[31] |= 0x40;
+        let secret = -curve25519_dalek::Scalar::from_bytes_mod_order(scalar);
+        let key = curve25519_dalek::EdwardsPoint::mul_base(&secret)
+            .compress()
+            .to_bytes();
+        let mut flipped = device.public_key();
+        flipped[31] ^= 0x80;
+        assert_eq!(key, flipped, "the twin is the key with its top bit flipped");
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&hash[32..]);
+        Self { key, secret, nonce }
+    }
+
+    /// An Ed25519 signature of `message` under the twin (RFC 8032, 5.1.6,
+    /// with the secret negated).
+    pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
+        use curve25519_dalek::{EdwardsPoint, Scalar};
+        use sha2::{Digest, Sha512};
+        let wide = |parts: &[&[u8]]| {
+            let mut hash = Sha512::new();
+            for part in parts {
+                hash.update(part);
+            }
+            let mut wide = [0u8; 64];
+            wide.copy_from_slice(&hash.finalize());
+            Scalar::from_bytes_mod_order_wide(&wide)
+        };
+        let r = wide(&[&self.nonce, message]);
+        let big_r = EdwardsPoint::mul_base(&r).compress().to_bytes();
+        let k = wide(&[&big_r, &self.key, message]);
+        let s = r + k * self.secret;
+        let mut signature = [0u8; 64];
+        signature[..32].copy_from_slice(&big_r);
+        signature[32..].copy_from_slice(&s.to_bytes());
+        signature
+    }
+
+    /// The entry the twin writes of `value` under `name` at `rev`, with no
+    /// chain, in the channel whose secret is `channel`, as [`entry_by`]
+    /// makes one. It passes the check that a relay and a device make.
+    pub(crate) fn entry(&self, channel: &[u8; 32], rev: u64, name: &str, value: Value) -> Entry {
+        let inside = Inside {
+            name: name.to_string(),
+            value,
+            chain: Some(Vec::new()),
+        };
+        // Sealed by any key: what is sealed reads no author.
+        let mut entry = Entry::seal(channel, &identity_of(0xfff0), rev, &inside).unwrap();
+        entry.author = self.key;
+        let form = entry.signed_bytes();
+        entry.author_signature = self.sign(&[LABEL_ENTRY_AUTHOR, &form[..]].concat());
+        let channel_key = derive::signing_key(channel).unwrap();
+        entry.channel_signature = channel_key.sign(&[LABEL_ENTRY_CHANNEL, &form[..]].concat());
+        entry
+    }
+}
+
 /// An entry of the channel whose secret is `channel`, with these clear
 /// fields, signed by `author` and by the channel: whatever its content
 /// says. It passes the check, which reads no content.
@@ -2699,5 +2783,86 @@ mod tests {
         let alone = Machine::new(7);
         let signer = Link::signer_of(&s.key(0));
         assert_eq!(key_signed_as(&alone.conn, &signer).unwrap(), None);
+    }
+
+    /// A removal removes every key the removed device added since the last
+    /// change, whether or not the device that makes it saw the record
+    /// (decision 2026-10-24 (removal), rule 6, as the person ruled on 8
+    /// November). The stolen tablet (2) adds a key of the thief's (4)
+    /// before its removal is known; the desktop (1) takes the record, and
+    /// the laptop (0), which makes the removal more than ten minutes later,
+    /// never sees it. Both the tablet and key 4 write late in the old
+    /// generation, and the desktop takes both before it is shown the
+    /// removal. Once it applies it, key 4 is removed there with its adder,
+    /// is no device left out, and what it wrote late is cut, as the
+    /// tablet's is: none of it reaches the laptop.
+    #[test]
+    fn a_key_the_removed_device_added_that_the_remover_never_saw() {
+        let mut s = Several::new(5);
+        s.make_phrase(0);
+        for n in 1..4 {
+            assert!(matches!(s.add(0, n), Accepted::Joined(_)));
+        }
+        s.meet(&[0, 1, 2, 3]);
+        // Change 2 lists all four, so the tablet is a device of the statement.
+        s.change(0, &[0, 1, 2, 3], &[]);
+        s.meet(&[0, 1, 2, 3]);
+        assert!((0..4).all(|n| s[n].number() == 2));
+        s.hold(&[0, 1, 2, 3], "notes");
+        s.write(0, "notes", "a.md", "a one");
+        s.write(2, "notes", "c.md", "c one");
+        s.meet(&[0, 1, 2, 3]);
+
+        // The thief, on the tablet, adds key 4. The record reaches the
+        // desktop alone.
+        assert!(matches!(s.add(2, 4), Accepted::Joined(_)));
+        s.hold(&[4], "notes");
+        s.pass(2, 1);
+        assert!(s[1].counts(&s.key(4)));
+        assert!(!s[0].counts(&s.key(4)));
+
+        // More than ten minutes on, the laptop removes the tablet.
+        s.now += REMOVAL_TAKEN_MARGIN_SECS as i64 + 1;
+        s.change(0, &[0, 1, 3], &[2]);
+        assert_eq!(s[0].number(), 3);
+
+        // Both write late in the old generation; the desktop takes both
+        // before it is shown the removal.
+        s.write(4, "notes", "d.md", "d, by the key the tablet added, late");
+        s.write(2, "notes", "c.md", "c two, by the tablet, late");
+        s.pass(4, 1);
+        s.pass(2, 1);
+        assert_eq!(
+            s[1].text("notes", "d.md").as_deref(),
+            Some("d, by the key the tablet added, late")
+        );
+
+        // The desktop is shown the removal, and applies it.
+        let taken = s.pass(0, 1);
+        assert!(
+            matches!(taken[0], Taken::Shown(Shown::Applied(_))),
+            "{:?}",
+            taken[0]
+        );
+        let statement = s[1].held().statement.statement;
+        assert_eq!(statement.number, 3);
+
+        // Key 4 is removed with its adder, though the record came long
+        // before the cut time, and counts nowhere.
+        assert!(!s[1].counts(&s.key(4)));
+        let removed = held_rows::removed_keys(&s[1].conn).unwrap();
+        assert!(removed.contains(&s.key(2)) && removed.contains(&s.key(4)));
+        let shown_to_4 = s.pass(0, 4);
+        assert_eq!(shown_to_4[0], Taken::Shown(Shown::NotListed));
+        assert_ne!(s[4].secret(), s[0].secret());
+        // It is not shown as a device left out.
+        let left_out = cordelia_storage::acts::left_out(&s[1].conn).unwrap();
+        assert!(!left_out.iter().any(|row| row.key == s.key(4)));
+
+        // What each wrote late is cut (rule 7), and reaches no other device.
+        assert_eq!(s[1].text("notes", "c.md").as_deref(), Some("c one"));
+        assert_eq!(s[1].text("notes", "d.md"), None);
+        s.pass(1, 0);
+        assert_eq!(s[0].text("notes", "d.md"), None);
     }
 }

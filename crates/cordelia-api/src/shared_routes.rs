@@ -28,7 +28,7 @@ use cordelia_core::protocol::{
 };
 use cordelia_crypto::acts::Subscription;
 use cordelia_crypto::bech32::encode_public_key;
-use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::identity::{Holder, NodeIdentity};
 use cordelia_crypto::message::{is_a_link, shared_read_mark};
 use cordelia_crypto::share::Card;
 use cordelia_storage::shared::{self as kept, Channel, Shown, State};
@@ -198,13 +198,13 @@ fn keys_that_wrote(
         .filter(|(act, _)| act.item.label.is_some())
         .map(|(act, _)| act.item.key)
         .collect();
-    let counting = crate::person::who_counts(conn)?;
+    let own_devices = crate::person::who_counts(conn)?.devices_held();
     let removed = crate::person::removed_known(conn, &held.statement.statement)?;
     let wrote: Vec<[u8; 32]> = kept::keys(conn, row.id)?
         .into_iter()
-        .filter(|key| key.first_held.is_some() && key.key != *own)
+        .filter(|key| key.first_held.is_some() && Holder::of(&key.key) != Holder::of(own))
         .map(|key| key.key)
-        .filter(|key| !counting.counts(key) && !removed.contains(key))
+        .filter(|key| !own_devices.holds(key) && !removed.holds(key))
         .collect();
     let labelled = wrote.iter().filter(|key| labels.contains(key)).count();
     Ok((wrote.len(), labelled))

@@ -46,7 +46,7 @@ use cordelia_core::protocol::{
 };
 use cordelia_crypto::acts::{Filing, Subscription};
 use cordelia_crypto::entry::CheckedEntry;
-use cordelia_crypto::identity::NodeIdentity;
+use cordelia_crypto::identity::{Holder, Holders, NodeIdentity};
 use cordelia_storage::follows::{self, Follow, LastRead, NotRead, Notice, NoticeOf};
 use cordelia_storage::shared::{self as kept, State};
 use cordelia_storage::shared_sharing as share_rows;
@@ -402,14 +402,15 @@ fn joined(
         return Ok(());
     }
     let own = identity.public_key();
-    let own_devices = crate::person::who_counts(conn)?.keys();
-    let moved = crate::shared_anew::moved_with(conn, &own, &line.channel)?;
-    let among = |keys: &[[u8; 32]], key: &[u8; 32]| keys.iter().any(|one| same_key(one, key));
+    let own_devices = crate::person::who_counts(conn)?.devices_held();
+    let moved: Holders = crate::shared_anew::moved_with(conn, &own, &line.channel)?
+        .into_iter()
+        .collect();
     for key in kept::keys(conn, row.id)? {
         if key.first_held.is_none_or(|first| first <= since)
-            || same_key(&key.key, &own)
-            || among(&own_devices, &key.key)
-            || among(&moved, &key.key)
+            || Holder::of(&key.key) == Holder::of(&own)
+            || own_devices.holds(&key.key)
+            || moved.holds(&key.key)
         {
             continue;
         }
@@ -662,17 +663,17 @@ fn hand_over(
         waiting,
     } = *turn;
     let own = identity.public_key();
-    let in_channel = keys_in_channel(conn, &own, list)?;
-    let own_devices = crate::person::who_counts(conn)?.keys();
+    let in_channel: Holders = keys_in_channel(conn, &own, list)?.into_iter().collect();
+    let own_devices = crate::person::who_counts(conn)?.devices_held();
     let removed = crate::person::removed_known(conn, &held.statement.statement)?;
-    let among = |keys: &[[u8; 32]], key: &[u8; 32]| keys.iter().any(|one| same_key(one, key));
+    let waiting: Holders = waiting.iter().collect();
     let to_hand = |key: &[u8; 32]| {
-        !among(&in_channel, key)
+        !in_channel.holds(key)
             && !line.leaves_out(key)
-            && !same_key(&own, key)
-            && !among(&own_devices, key)
-            && !among(&removed, key)
-            && !among(waiting, key)
+            && Holder::of(&own) != Holder::of(key)
+            && !own_devices.holds(key)
+            && !removed.holds(key)
+            && !waiting.holds(key)
     };
     let devices = &list.devices;
     let start = follow
@@ -899,17 +900,17 @@ fn type_listed(
     let keys: Vec<[u8; 32]> = match takes_in(conn, identity, own_relays, &follow)? {
         Ok(looks) => {
             let own = identity.public_key();
-            let own_devices = crate::person::who_counts(conn)?.keys();
+            let own_devices = crate::person::who_counts(conn)?.devices_held();
             let removed = crate::person::removed_known(conn, &held.statement.statement)?;
-            let among =
-                |keys: &[[u8; 32]], key: &[u8; 32]| keys.iter().any(|one| same_key(one, key));
             looks
                 .list
                 .devices
                 .iter()
                 .map(|device| device.key)
                 .filter(|key| {
-                    !same_key(&own, key) && !among(&own_devices, key) && !among(&removed, key)
+                    Holder::of(&own) != Holder::of(key)
+                        && !own_devices.holds(key)
+                        && !removed.holds(key)
                 })
                 .collect()
         }
