@@ -50,8 +50,9 @@ cordelia-node/
                          #   the share), shared (forms 6 and 5, and the anew seal),
                          #   acts (a device's list, each act signed by its maker).
                          #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 32: the removal's 21 to 26, the shared
-                         #   channels' 27 to 32). entries; arrivals (the arrivals of
+    cordelia-storage/    # SQLite (schema.rs: steps 1 to 33: the removal's 21 to 26, the shared
+                         #   channels' 27 to 32, and 33, the repositories followed).
+                         #   entries; arrivals (the arrivals of
                          #   each file, decision 2026-10-24 rule 7); person and acts (what a
                          #   device holds of its person, and what a person did at a terminal);
                          #   relay (a relay's channels and room, and its sweeps); at_relays
@@ -76,7 +77,11 @@ cordelia-node/
                          #   shared messages, the channel's hour, the kept values);
                          #   shared_anew (step 32: the offers read in each
                          #   channel, the channels made anew here, those not
-                         #   yet clean); db
+                         #   yet clean); follows (step 33: the repositories
+                         #   a device follows, the node's own typings of
+                         #   listed keys, the notices until `shared seen`;
+                         #   the node's shares, and what each making anew
+                         #   left out and the channel line it printed); db
                          #   (secure_delete, set
                          #   before the steps run,
                          #   and the truncating checkpoint of a personal node); the older
@@ -108,6 +113,16 @@ cordelia-node/
                          #   a recovery, not clean, paused, and what a removal,
                          #   `devices` and `recover` name), shared_status (the
                          #   status's `shared` object, decision 2026-10-10 §9),
+                         #   members (a repository's `.cordelia/members`
+                         #   read: its channel line, its devices, rule 1's gate;
+                         #   decision 2026-11-06 (joining)), git_list (a
+                         #   clone read with git, in an environment cleared so
+                         #   that nothing asks: which repository it is, its
+                         #   list at the remote's default branch, never back),
+                         #   following (`subscribe` and `unsubscribe` in a
+                         #   clone, and `subscribe --new`), members_read (the
+                         #   node's read of each list it follows: the hand-overs
+                         #   in turns, the take, the notices),
                          #   repository_status (what the status and `shared list`
                          #   say of each repository followed, its ambers, and
                          #   `shared seen`, decision 2026-11-06 (joining), rules 6
@@ -154,16 +169,23 @@ cordelia-node/
                          #   log's question), shared_cmd (the commands that make,
                          #   share and take a shared channel, `subscribe`,
                          #   `unsubscribe`, `shared anew`, `move` and `stay`,
-                         #   and `id --words`),
-                         #   recover_cmd (`recover`), daemon lifecycle, p2p.rs,
+                         #   `id --words`; `subscribe` and `unsubscribe` in a
+                         #   clone, `shared seen`, and the lines of each
+                         #   repository followed),
+                         #   recover_cmd (`recover`), daemon lifecycle, p2p.rs
+                         #   (with the read of each repository's list a device
+                         #   follows: at the start, every ten minutes, and when
+                         #   a person follows one),
                          #   relay_entries (a relay's side of the streams of entries),
                          #   device_entries (a device's passes, the pass of shared
-                         #   channels, and leave with the doors of shared channels;
+                         #   channels, the node's asking for a share after a
+                         #   list's read, and leave with the doors of shared channels;
                          #   reach: whether
                          #   each relay can be reached, and its class), indicator (the
                          #   state and the level of a status; of a shared channel
                          #   only a removed device that holds one, and the ambers of
-                         #   a repository followed, by the person's ruling of 6
+                         #   a repository followed, each a hold `shared_repository`
+                         #   after every other, by the person's ruling of 6
                          #   November)
     cordelia-test/       # Test harness: TestNode, TestMesh
   docs/
@@ -196,11 +218,13 @@ Start here when working on a module:
 | Encryption | `docs/specs/ecies-envelope-encryption.md` |
 | Data/storage | `docs/specs/data-formats.md` |
 | Local history (what sync replaced, and restore) | `docs/decisions/2026-09-30-agent-memory-sync.md` §4.5b |
+| Shared channels between people | `docs/decisions/2026-10-10-a-shared-channel-for-messages.md` |
+| A repository's shared channel, joined by pull request (`.cordelia/members`, `subscribe` in a clone, the node's read of each list) | `docs/decisions/2026-11-06-joining-by-pull-request.md` |
 | Parameters | `docs/specs/parameter-rationale.md` (every value explained) |
 | Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
 | Identity | `docs/specs/identity.md` |
 | Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `removal_e2e.rs` (a removal fails safe, decision 2026-10-24 (removal), section 7; the window's test is ignored for its length), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it; making anew, moving, a removal and a recovery; the status's `shared` object), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
+| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `removal_e2e.rs` (a removal fails safe, decision 2026-10-24 (removal), section 7; the window's test is ignored for its length), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it; making anew, moving, a removal and a recovery; the status's `shared` object), `joining_e2e.rs` (joining a repository's shared channel by pull request: a device on the list takes the channel with no one asked, read from a clone on its disk; the git of the list's reads has its own tests in `cordelia-api/tests/git_list.rs`, against a server of git over HTTPS on loopback), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
 | Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
 | TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
 
@@ -395,6 +419,21 @@ parameter-rationale.md §12.13:
 | `SHARED_ANEW_CONTENT_BYTES`, `SHARED_ANEW_VALUE_BYTES` | 16,384, 16,274 (derived) | parameter-rationale.md §12.13 |
 | `SHARE_VALUE_BYTES` | 407 (derived: a share seals at 512) | parameter-rationale.md §12.13 |
 | `SHARE_PREFIX`, `SHARED_ANEW_PREFIX`, `SHARED_READ_PREFIX`, `PERSONAL_SHARED_PREFIX` | `share/`, `anew/`, `sread/`, `shared/` | parameter-rationale.md §12.13 |
+
+The constants of a repository's list, for joining its shared channel by
+pull request (decision 2026-11-06 (joining)), each with its reason in
+parameter-rationale.md §12.14:
+
+| Parameter | Value | Spec Section |
+|-----------|-------|-------------|
+| `MEMBERS_FILE_MAX_BYTES` | 16,384 (the most of `.cordelia/members` a device reads; a larger file is not read, and the last list read stands) | parameter-rationale.md §12.14 |
+| `MEMBERS_LABEL_MAX_CHARS` | 32 (a device's label in the list, of `a-z`, `0-9`, `.`, `_` and `-`) | parameter-rationale.md §12.14 |
+| `MEMBERS_GIT_TERM_SECS` | 2s (after TERM, before git is killed, where a read of a clone has not ended within `STREAM_TIMEOUT_SECS`) | parameter-rationale.md §12.14 |
+| `MEMBERS_READ_INTERVAL_SECS` | 600s (how often the node reads each list it follows; also at its start, and when a person follows a repository) | parameter-rationale.md §12.14 |
+| `MEMBERS_HANDED_AT_ONCE` | 4 (derived: `MAX_TYPED_KEYS` / 2; the listed keys handed the channel at each read, each share kept for two reads) | parameter-rationale.md §12.14 |
+| `MEMBERS_ASKED_PER_PASS` | 32 (the node's typings asked of the relays in one whole pass, across every follow: 384 requests a minute, 592 of `SHARED_REQUESTS_PER_MINUTE` with the rest of the shared pass) | parameter-rationale.md §12.14 |
+| `MEMBERS_COMMIT_SHOWN_CHARS` | 12 (a commit's characters that the status, `shared list` and the line show; `--json` gives it whole) | parameter-rationale.md §12.14 |
+| `MEMBERS_LABELS_SHOWN` | 6 (the members the plain status names of each repository, then "and <n> more") | parameter-rationale.md §12.14 |
 
 ## Running Tests
 

@@ -167,6 +167,23 @@
 > made, at 21 to 26 with `shared_lists`, is refused, and nothing in it is
 > changed. A database at alpha.17's step 20 steps through 21 to 32.
 >
+> Step 33, per the decision record of 2026-11-06 (joining a repository's
+> shared channel by pull request):
+>
+> - **v33:** the repositories a device follows: `shared_follows` (each by
+>   its identity, `host/owner/name`, with the clone's remote and path, the
+>   last commit read, the last list read, and where the node's next turn
+>   of hand-overs starts), `shared_follow_typed` (the node's own typings
+>   of listed keys, apart from the person's) and `shared_follow_notices`
+>   (a join and a changed channel line until `cordelia shared seen`, and a
+>   key the list dropped until it leaves the channel). Columns are added
+>   to `shared_shares` (`by_node`: the node made the share) and to
+>   `shared_anew_made` (`left_out`, `line`, `cut` and `named_at`: what a
+>   making anew left out, the channel line it printed, and when a list
+>   first named the new channel). The tables are empty at the step, and
+>   each new column is empty or 0; no older row changes otherwise. A relay
+>   keeps nothing in them.
+>
 > No step from 11 on changes a row of the older kind. A database at a later
 > version than the program's own is refused, and nothing in it is changed
 > (§5.2).

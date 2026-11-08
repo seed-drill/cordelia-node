@@ -89,8 +89,8 @@ enum Commands {
     /// Show this device and the state of its memory sync
     ///
     /// With no flag it prints this device's key and settings, whether the
-    /// node is running, its peers, and the state of memory sync and of
-    /// your devices.
+    /// node is running, its peers, the state of memory sync and of your
+    /// devices, and each repository this device follows.
     Status {
         /// Print one short line for a status bar, such as Claude Code's
         /// status line
@@ -734,6 +734,10 @@ enum SharedCommand {
     /// Run it in a terminal. It lists every key this device has held or
     /// refused in the channel, and asks of each whether it stays. Those
     /// who stay move with `cordelia shared move` on one of their devices.
+    ///
+    /// It prints the new channel line, which names the keys it left out.
+    /// If the channel is a repository's, put that line in place of the
+    /// old one in `.cordelia/members`, in a pull request.
     Anew {
         name: String,
         /// A relay of yours for the new channel, as your configuration

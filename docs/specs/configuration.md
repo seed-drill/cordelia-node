@@ -38,6 +38,22 @@
 >   start on this version, a folder `before-<version>`: a copy of the
 >   database and of the key files of the older channels, as they were
 >   (operations.md §10.5).
+>
+> Per the [decision record of 2026-11-06 (joining)](../decisions/2026-11-06-joining-by-pull-request.md):
+>
+> - **Joining a repository's shared channel adds no setting for a
+>   deployment.** The repositories a device follows are in the node's
+>   database (schema step 33), kept by `cordelia subscribe` in a clone.
+>   How often the node reads each list is `MEMBERS_READ_INTERVAL_SECS`
+>   (600 seconds), a constant of `protocol.rs`.
+> - **The node runs the `git` that its `PATH` finds,** in an environment of
+>   its own (rule 3): of its own environment it keeps only `PATH` and the
+>   variables of a proxy and of a certificate authority, and `HOME` is
+>   `git-home`, an empty folder in its data directory, so no setting of the
+>   person's reaches git.
+
+<!-- Slice 8 of issue #293 may add a setting that only tests set, for the
+read interval: it is documented here with that slice. -->
 
 ---
 

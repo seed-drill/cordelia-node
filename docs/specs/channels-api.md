@@ -1389,8 +1389,10 @@ never held, comes in only under **a word that the phrase signed:**
     `stopped`, `held`, `no_phrase`, `errors`, `stalled`, `stopped_syncing`,
     `conflicts` and `too_large` (red), and `no_relay`, `refused`,
     `other_version`, `removal_not_applied`, `added`, `left`,
-    `relay_without_latest`, `relay_no_room`, `names` and, last of all,
-    `messages_held` (amber).
+    `relay_without_latest`, `relay_no_room`, `names`, `messages_held` and,
+    last of all, `shared_repository`, one for each amber line of a
+    repository this device follows (amber; decision 2026-11-06 (joining),
+    rule 7).
   - Of the node: `running` (null where the command did not ask it, with why
     under `not_asked`); `version`, the command's own, and `node_version`;
     `held` and `key_files_in_place`, where they are set; `uptime_secs`;
@@ -1403,6 +1405,18 @@ never held, comes in only under **a word that the phrase signed:**
     `Messages:`, not under `Memory:`. Nothing else of messages
     changes them; plain `cordelia status` also says each bound in force
     (decision 2026-10-25, rule 4).
+  - **`shared`,** at the top level, as the node gave it, where it gave it:
+    its fields are in decision 2026-10-10 §9. Its `repositories` is each
+    repository this device follows (decision 2026-11-06 (joining), rule
+    7): `identity`, `name`, `held`, `channel` and `words`; `read`, when the
+    list was read, at which commit, from the clone, and when the clone was
+    fetched; `members`, each with `label`, `key`, `words` and `in` (null
+    where this device does not hold the channel); the unread counts; and
+    `lines`, each with a `word`, what it `says`, whether it is `amber`,
+    and a channel `line` to put in the list, where it says to. Each amber
+    line is a hold `shared_repository`; nothing else of `shared` but the
+    hold of a removed device that holds a shared channel changes the
+    level.
   - Under `sync`: the settings; `projects`, one for each folder that syncs;
     `unmapped`, the found entries; `available`; `stands` and `moved_on`;
     `publishes_nothing`, why nothing is published from this device where

@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Revised five times after its reviews (section 13). Amended on 7 November by the person's rulings: the node reads the clone only, and a channel follows one repository (section 14). Amended in building slice 7 and after its review: when rule 5's "from then on" starts, the end of its amber at `shared seen <name> <label>`, rule 6's line of a device that follows no list, the bound of 16 follows (rule 2.7), and a removal's drop past a bound (rule 5). To be built: a reviewed plan first. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
+**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Revised five times after its reviews (section 13). Amended on 7 November by the person's rulings: the node reads the clone only, and a channel follows one repository (section 14). Amended in building slice 7 and after its review: when rule 5's "from then on" starts, the end of its amber at `shared seen <name> <label>`, rule 6's line of a device that follows no list, the bound of 16 follows (rule 2.7), and a removal's drop past a bound (rule 5). Section 11 names every constant, each with its reason (slice 9). To be built: a reviewed plan first. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1 (issue #293). It needs #291 (#296) first.
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -223,14 +223,18 @@ The notices of rules 4.5 to 4.7 show only on devices that follow the repository.
 
 ## 11. Constants
 
+Each is in `protocol.rs`, and explained at length in parameter-rationale.md §12.14.
+
 | Name | Value | Why |
 |---|---|---|
-| `MEMBERS_READ_INTERVAL_SECS` | 600 | As `RELAY_ASK_AGAIN_SECS`: a join waits about ten minutes on each side once the list is read |
-| `MEMBERS_HANDED_AT_ONCE` | 4 | Derived: half of `MAX_TYPED_KEYS`, as a share lives for two reads (rule 4.2) |
-| `MEMBERS_ASKED_PER_PASS` | 32 | The node's typings asked of the relays in one pass, across every follow, so the shared pass stays within its requests (rule 4.4) |
-| `MEMBERS_FILE_MAX_BYTES` | 16,384 | The members record, rule 1 |
-| `MEMBERS_LABEL_MAX_CHARS` | 32 | Rule 1 |
-| `MEMBERS_GIT_TERM_SECS` | 2 | After TERM, before git is killed (rule 3) |
+| `MEMBERS_FILE_MAX_BYTES` | 16,384 | Room for a channel line with two relays and 64 keys after `without`, and 64 devices' lines with labels of 32: 11.1 KiB together (rule 1) |
+| `MEMBERS_LABEL_MAX_CHARS` | 32 | Long enough to tell devices apart, short enough to sit beside a key on one line; its characters need no escaping where it is shown (rule 1) |
+| `MEMBERS_GIT_TERM_SECS` | 2 | Git ends on TERM in milliseconds; two seconds is room for a loaded machine before it is killed (rule 3) |
+| `MEMBERS_READ_INTERVAL_SECS` | 600 | As `RELAY_ASK_AGAIN_SECS`: a join waits about ten minutes on each side once the list is read, and the list changes only with a merge and a fetch (rules 3 and 4) |
+| `MEMBERS_HANDED_AT_ONCE` | 4 | Derived: half of `MAX_TYPED_KEYS`, as a share lives for two reads, so a device that is off holds no place for long (rule 4.2) |
+| `MEMBERS_ASKED_PER_PASS` | 32 | The node's typings asked of the relays in one pass, across every follow: 384 requests a minute, 592 with the rest of the shared pass, within the 600 of `SHARED_REQUESTS_PER_MINUTE` (rule 4.4) |
+| `MEMBERS_COMMIT_SHOWN_CHARS` | 12 | As git's short form: twelve tell commits apart in any repository a team shares, and keep a join's line short; `--json` gives the whole commit (rule 7) |
+| `MEMBERS_LABELS_SHOWN` | 6 | Six labels fit on one line of a terminal; `--json` and `shared list` give every member (rule 7) |
 
 ## 12. Tests
 
