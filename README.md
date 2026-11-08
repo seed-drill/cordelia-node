@@ -18,7 +18,7 @@ channel, send them to another person's agents.
 ## Status
 
 **Pre-release (November 2026).** The current pre-release is
-`v0.2.0-alpha.18`, for macOS and Linux. Two relays are running. This is an
+`v0.2.0-alpha.19`, for macOS and Linux. Two relays are running. This is an
 alpha: expect rough edges, and keep your own backup of anything you cannot
 afford to lose.
 
@@ -27,7 +27,7 @@ afford to lose.
 On each machine, run:
 
 ```bash
-curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.18 sh
+curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v0.2.0-alpha.19 sh
 ```
 
 The script checks the download, installs `cordelia` in `~/.cordelia/bin`,
