@@ -1385,14 +1385,48 @@ never held, comes in only under **a word that the phrase signed:**
   - **`summary`** is the first thing of that level, and with no level what
     the state says.
   - **`holds`** is everything that holds, red first, each with its `level`,
-    `what` it is in a word, and what the line `says` of it. `what` is one of
-    `stopped`, `held`, `no_phrase`, `errors`, `stalled`, `stopped_syncing`,
-    `conflicts` and `too_large` (red), and `no_relay`, `refused`,
-    `other_version`, `removal_not_applied`, `added`, `left`,
-    `relay_without_latest`, `relay_no_room`, `names`, `messages_held` and,
-    last of all, `shared_repository`, one for each amber line of a
-    repository this device follows (amber; decision 2026-11-06 (joining),
-    rule 7).
+    `what` it is in a word, and what the line `says` of it. They come in
+    this order (`indicator::holds`, `cordelia-node/src/indicator.rs`).
+    Red:
+    - `stopped`: this device has stopped syncing, and the line says why,
+      such as that it was removed.
+    - `held`: the node is held up: its first start on this version is not
+      done, or its database is from a later version.
+    - `no_phrase`: a folder is mapped, and this device has no recovery
+      phrase yet, or is not added yet.
+    - `errors`: memory sync has an error.
+    - `stalled`: memory sync has stopped reporting.
+    - `stopped_syncing`: the notice of what stopped at the first start.
+    - `conflicts`: a memory folder holds conflict copies.
+    - `too_large`: a memory file is too large to sync.
+
+    Amber:
+    - `channel_nearly_full`: the personal channel is past its warning size
+      (`PERSONAL_CHANNEL_WARN_BYTES`; decision 2026-10-19 §2).
+    - `no_relay`: no relay has been reached for five minutes.
+    - `refused`: a relay did not take what this device sent.
+    - `other_version`: the node runs another version than the command.
+    - `removal_not_applied`: a removal is not yet applied by every device,
+      for seven days.
+    - `set_aside`: a change made apart is set aside, for seven days.
+    - `shared_removed_device_holds`: a removed device still holds shared
+      channels not made anew, for seven days (decision 2026-10-10 §9).
+    - `added`: a device was added and is not yet cleared with `cordelia
+      devices --clear`.
+    - `left`: a device has left.
+    - `carried`: names that a recovery or a carry brought in are not yet
+      sent, after five minutes.
+    - `relay_without_latest`: a relay is not known to hold the latest
+      change (decision 2026-10-19, rule 11).
+    - `relay_no_room`: a relay has no room.
+    - `names`: names are not yet listed by a device, or not yet sent.
+    - `relay_out_of_reach`: a relay is out of reach while another is
+      reached (decision 2026-10-19, rule 11).
+    - `messages_held`: agents are held for their person (decision
+      2026-10-25, rule 4).
+    - `shared_repository`: last of all, one for each amber line of a
+      repository this device follows (decision 2026-11-06 (joining), rule
+      7).
   - Of the node: `running` (null where the command did not ask it, with why
     under `not_asked`); `version`, the command's own, and `node_version`;
     `held` and `key_files_in_place`, where they are set; `uptime_secs`;
@@ -1400,10 +1434,10 @@ never held, comes in only under **a word that the phrase signed:**
   - **`messages`,** at the top level, as the node gave it, where it gave
     it (decision 2026-10-09 §8). Only its `held_pairs` changes the
     `level`, `summary` and `holds`: above 0 it is the amber hold
-    `messages_held`, last of every hold, which `--line` and `--waybar`
-    show as any amber, and plain `cordelia status` on a line of its own,
-    `Messages:`, not under `Memory:`. Nothing else of messages
-    changes them; plain `cordelia status` also says each bound in force
+    `messages_held`, after every other hold but `shared_repository`,
+    which `--line` and `--waybar` show as any amber, and plain `cordelia
+    status` on a line of its own, `Messages:`, not under `Memory:`.
+    Nothing else of messages changes them; plain `cordelia status` also says each bound in force
     (decision 2026-10-25, rule 4).
   - **`shared`,** at the top level, as the node gave it, where it gave it:
     its fields are in decision 2026-10-10 §9. Its `repositories` is each
