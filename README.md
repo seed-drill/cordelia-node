@@ -351,16 +351,20 @@ subscribe` there follows again.
 
 **To leave, or to take someone out:**
 
-1. A pull request deletes their lines. Each member's device that follows
-   then shows each one in amber, until the list names the channel made
-   anew without it.
-2. A member runs `cordelia shared anew <name>`. It makes the channel anew
-   without them, and prints its new `channel` line, which names who it
-   left out.
-3. A pull request puts that line in place of the old one. Until it is
-   merged, no device hands the new channel to anyone. Then everyone who
-   stays moves to it with `cordelia shared move <name>`, as their status
-   says.
+1. A member runs `cordelia shared anew <name>`. It makes the channel anew
+   without them, and prints its new `channel` line. The line names each
+   device it left out whose line is still in the list, so run it before
+   their lines are deleted. If a line is gone already, the new line does
+   not name that device. That is safe: a device that is not on the list
+   is never handed the channel.
+2. A pull request deletes their lines and puts the new line in place of
+   the old one. Until it is merged, no device hands anything over. Then
+   everyone who stays moves to it with `cordelia shared move <name>`, as
+   their status says.
+
+If a pull request deletes someone's lines first, each member's device
+that follows shows each one in amber, until the list names the channel
+made anew without them.
 
 Merge new `channel` lines in the order they were made. When you remove
 one of your devices, `cordelia remove-device` makes each channel anew

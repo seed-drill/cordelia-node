@@ -580,8 +580,10 @@ pub(crate) fn name_free_in(conn: &Connection, filings: &[Filing], name: &str) ->
 /// anew from, among `filings`, where one is: they move to it, and nobody
 /// hands it to them (rule 6). Only an offer that counts says so, judged as
 /// `shared move` judges it: one for this device, or sealed to another of
-/// the person's. An offer "without you", or one that is a fault, does not
-/// (rule 4.1).
+/// the person's. An offer "without you" leaves the person nothing to move
+/// to, and one that is a fault does not count. (Either way a device that
+/// read it hands that channel over no more, rule 4.1, unless it is a
+/// fault.)
 pub(crate) fn made_anew_from<'a>(
     conn: &Connection,
     identity: &NodeIdentity,

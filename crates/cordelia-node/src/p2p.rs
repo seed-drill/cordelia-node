@@ -2659,6 +2659,7 @@ pub async fn p2p_loop(
     relay_ask_again: std::time::Duration,
     most_proved: usize,
     reach: Option<std::sync::Arc<cordelia_node::device_entries::Reach>>,
+    members_read: std::time::Duration,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -2907,10 +2908,9 @@ pub async fn p2p_loop(
     messages_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // The read of each repository's list the device follows (decision
     // 2026-11-06 (joining), rules 3 and 4), on a personal node: when it
-    // starts, and every MEMBERS_READ_INTERVAL_SECS after.
-    let mut members_interval = tokio::time::interval(std::time::Duration::from_secs(
-        cordelia_core::protocol::MEMBERS_READ_INTERVAL_SECS,
-    ));
+    // starts, and every MEMBERS_READ_INTERVAL_SECS after: a test sets it
+    // lower (`[members] read_interval_secs`).
+    let mut members_interval = tokio::time::interval(members_read);
     members_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Entries between relays that work together (§2.4 item 6): what a
     // relay took is passed on, and what it lacks is pulled.

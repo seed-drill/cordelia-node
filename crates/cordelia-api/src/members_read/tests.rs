@@ -631,8 +631,7 @@ fn nothing_is_handed_over_in_a_channel_not_clean() {
 /// Nothing is handed over in a channel in which this device read an offer
 /// that seals to the person and leaves out a key, whether the person is
 /// paused, stayed or moved (rule 4.1); a channel moved from is not one
-/// dropped, so the follow goes on (rule 6). An offer "without you" does
-/// not count.
+/// dropped, so the follow goes on (rule 6).
 #[test]
 fn nothing_is_handed_over_in_a_channel_made_anew_for_the_person_paused_stayed_or_moved() {
     let s = bob(1);
@@ -644,17 +643,8 @@ fn nothing_is_handed_over_in_a_channel_made_anew_for_the_person_paused_stayed_or
     write_in(&s, &channel, &[&alice, &carol, &dave], now);
     let list = list_with(Some((&channel.id, &[])), &listed(4..=5));
     follows_at(&s, &list, &commit('a'), now);
-    // Without you: sealed to Carol and Dave, and not to Bob.
-    let without_you = offer_by(
-        &carol,
-        &channel,
-        20,
-        &[carol.public_key(), dave.public_key()],
-        now,
-    );
-    stores(&s, 0, &without_you, now);
     let turn = handed(reads(&s, &list, &commit('a'), now + 1));
-    assert_eq!(turn.len(), 2, "an offer without you does not count");
+    assert_eq!(turn.len(), 2);
     // Sealed to Bob and Alice, without Carol and Dave: Bob is paused.
     stores(
         &s,
@@ -694,6 +684,36 @@ fn nothing_is_handed_over_in_a_channel_made_anew_for_the_person_paused_stayed_or
         NotHanding::MovedFrom
     );
     assert!(row(&s).is_some());
+}
+
+/// Nothing is handed over either in a channel in which this device read an
+/// offer "without you", which leaves the person out (rule 4.1, as the
+/// person ruled on 8 November): a device left out hands a newcomer nothing
+/// that the channel's members are leaving. Only an offer that is a fault
+/// does not count, as one into a channel the person holds.
+#[test]
+fn nothing_is_handed_over_in_a_channel_made_anew_without_the_person_and_a_fault_does_not_count() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    holds(&s, 0, 8, "design", now);
+    let (alice, carol, dave) = (member(1), member(2), member(3));
+    write_in(&s, &channel, &[&alice, &carol, &dave], now);
+    let list = list_with(Some((&channel.id, &[])), &listed(4..=5));
+    follows_at(&s, &list, &commit('a'), now);
+    // A fault: an offer into "design", which the person holds.
+    let sealed = [carol.public_key(), dave.public_key()];
+    stores(&s, 0, &offer_by(&dave, &channel, 8, &sealed, now), now);
+    let turn = handed(reads(&s, &list, &commit('a'), now + 1));
+    assert_eq!(turn.len(), 2, "an offer that is a fault does not count");
+    // Without you: sealed to Carol and Dave, and not to Bob.
+    stores(&s, 0, &offer_by(&carol, &channel, 20, &sealed, now), now);
+    assert_eq!(
+        not_handing(reads(&s, &list, &commit('a'), now + 2)),
+        NotHanding::MadeAnew {
+            maker: carol.public_key()
+        }
+    );
 }
 
 // ── The notices (rules 4.5, 4.6 and 6) ───────────────────────────────
@@ -1745,7 +1765,8 @@ fn nothing_is_taken_of_a_channel_dropped_or_moved_from() {
 
 /// Nothing is taken where the person holds a channel the named one was
 /// made anew from, by an offer that counts: they move to it (rules 4.4 and
-/// 6). An offer "without you" does not count.
+/// 6). An offer "without you" leaves nothing to move to, and does not
+/// count here.
 #[test]
 fn nothing_is_taken_where_a_channel_it_was_made_anew_from_is_held() {
     let s = bob(1);
