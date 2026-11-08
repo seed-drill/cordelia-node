@@ -21,9 +21,8 @@
 //!   the last commit read or comes after it.
 //!
 //! **The node reads only the clone,** as the person's own git last
-//! fetched it, and its git reaches no network. Whether the node should
-//! also fetch a public repository's list itself, as rule 3 has it, is
-//! open: the person who owns the project rules on it.
+//! fetched it, and its git reaches no network (rule 3, and the person's
+//! ruling of 7 November in section 14 of that record).
 //!
 //! **Nothing of the person's reaches git, so nothing can ask.** Every git
 //! command here runs in a cleared environment ([`Git`]): only `PATH` and
