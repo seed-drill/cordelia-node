@@ -1486,6 +1486,25 @@ fn acts_taken_long_ago(devices: &[&Node]) {
     }
 }
 
+/// Wait until `n`'s table of the channel `name` holds each of `keys` as a
+/// key that wrote there. A subscribe's question counts the keys of other
+/// people that wrote in the channel, and its yes is refused where that
+/// changed while it was asked: so a device subscribes only once it has read
+/// the record that each wrote when it came to hold the channel.
+fn has_read_from(all: &[&Node], n: &Node, name: &str, keys: &[String]) {
+    wait_for("the keys that wrote are held", all, 300, || {
+        let channel = channel_of(n, name)?;
+        let table = channel["table"].as_array()?;
+        keys.iter()
+            .all(|key| {
+                table
+                    .iter()
+                    .any(|row| row["key"] == key.as_str() && !row["first_held"].is_null())
+            })
+            .then_some(())
+    });
+}
+
 /// A subscription and an unsubscription survive a statement and the
 /// removal of the device that made them (decision 2026-10-10 §3.4, §4.1,
 /// T16): Alice's tablet subscribes her `notes` folder to a channel shared
@@ -1526,15 +1545,26 @@ fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_t
         .iter()
         .map(|n| maps_folder(n, "work", WORK))
         .collect();
+    // Each subscribes once it has read what each device of the other
+    // person wrote when it came to hold the channel: the count of keys
+    // that its question names then stays.
+    let alices: Vec<String> = [&laptop, &phone, &tablet]
+        .iter()
+        .map(|n| key_of(n))
+        .collect();
+    has_read_from(&all, &bob, "review", &alices);
     subscribes(&bob, &bob_dir, "review");
 
     // The laptop subscribes `work`; the tablet takes it, subscribes
     // `notes`, and unsubscribes `work`.
+    let bobs = [key_of(&bob)];
+    has_read_from(&all, &laptop, "review", &bobs);
     subscribes(&laptop, &work[0], "review");
     let only_work = vec![(WORK.to_string(), "review".to_string())];
     wait_for("the tablet holds work's subscription", &all, 300, || {
         (subscriptions_on(&tablet) == only_work).then_some(())
     });
+    has_read_from(&all, &tablet, "review", &bobs);
     subscribes(&tablet, &notes[2], "review");
     let said = tablet.cli(&["unsubscribe", "review", "--agent", WORK]);
     assert!(said.starts_with("Unsubscribed: "), "{said}");
