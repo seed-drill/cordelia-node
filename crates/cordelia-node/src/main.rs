@@ -89,8 +89,8 @@ enum Commands {
     /// Show this device and the state of its memory sync
     ///
     /// With no flag it prints this device's key and settings, whether the
-    /// node is running, its peers, and the state of memory sync and of
-    /// your devices.
+    /// node is running, its peers, the state of memory sync and of your
+    /// devices, and each repository this device follows.
     Status {
         /// Print one short line for a status bar, such as Claude Code's
         /// status line
@@ -103,6 +103,10 @@ enum Commands {
         /// Omarchy bar
         #[arg(long, conflicts_with_all = ["line", "json"])]
         waybar: bool,
+        /// Also show the fingerprint words of each repository's channel and
+        /// of each key on its list
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Run the node on this device
     ///
@@ -256,33 +260,75 @@ enum Commands {
         none: bool,
     },
     /// Show the agent of this folder the messages of a shared channel, on
-    /// every device of yours
+    /// every device of yours, or follow the repository you are in
     ///
-    /// Run it in a terminal, in the folder. It is shown a count of what
-    /// waits there, can read it, and can write there with
+    /// Run it in a terminal, in the folder. It says what it will do and
+    /// asks you to type yes.
+    ///
+    /// With a name, the agent of this folder is shown a count of what
+    /// waits in that shared channel, can read it, and can write there with
     /// `cordelia msg send --channel <name>`. What was written there before
     /// is in `cordelia msg log` only.
+    ///
+    /// With no name, in a clone of a git repository, this device follows
+    /// the repository. It reads the list in `.cordelia/members`, as your
+    /// own git last fetched it.
+    ///
+    /// - If you hold the channel the list names, the agent of this folder
+    ///   is subscribed to it.
+    ///
+    /// - If you do not, and your key is on the list, a member's device
+    ///   hands you the channel once it reads the list. `cordelia status`
+    ///   shows how it goes.
+    ///
+    /// - If your key is not on the list, add it with a pull request, then
+    ///   run this again.
+    ///
+    /// With `--new`, it makes the repository's channel, for a list that
+    /// names none yet. It prints the lines to add to `.cordelia/members` in
+    /// a pull request.
     Subscribe {
-        /// The name you file the shared channel under
-        name: String,
+        /// The name you file the shared channel under. Leave it out to
+        /// follow the repository you are in
+        name: Option<String>,
         /// The channel's four words, where two shared channels of yours
         /// have one name
-        #[arg(long, value_name = "FOUR WORDS")]
+        // A conflict lifts a `requires` in clap: `--new` conflicts with the
+        // name, so `--words` is refused beside it in its own right.
+        #[arg(
+            long,
+            value_name = "FOUR WORDS",
+            requires = "name",
+            conflicts_with_all = ["new", "remote"]
+        )]
         words: Option<String>,
+        /// Make the repository's channel, where its list names none yet
+        #[arg(long, conflicts_with = "name")]
+        new: bool,
+        /// The remote of your clone that names the repository, where its
+        /// remotes name more than one
+        #[arg(long, value_name = "REMOTE", conflicts_with = "name")]
+        remote: Option<String>,
     },
     /// Stop showing an agent a shared channel, on every device of yours
     ///
     /// In the folder, or from anywhere with --agent.
+    ///
+    /// With no name, in a clone of a repository this device follows, it
+    /// stops this device following it: its list is read no more here. It
+    /// unsubscribes no agent and drops no channel, and `cordelia subscribe`
+    /// in the clone follows it again.
     Unsubscribe {
-        /// The name you file the shared channel under
-        name: String,
+        /// The name you file the shared channel under; none in a clone, to
+        /// stop following its repository
+        name: Option<String>,
         /// The agent, as `cordelia sync status` names it, in place of this
         /// folder's
-        #[arg(long)]
+        #[arg(long, requires = "name")]
         agent: Option<String>,
         /// The channel's four words, where two shared channels of yours
         /// have one name
-        #[arg(long, value_name = "FOUR WORDS")]
+        #[arg(long, value_name = "FOUR WORDS", requires = "name")]
         words: Option<String>,
     },
     /// Channels shared between people: messages between your agents and
@@ -648,11 +694,31 @@ enum SharedCommand {
         #[arg(long = "relay", value_name = "RELAY")]
         relays: Vec<String>,
     },
-    /// List the shared channels, their keys and their relays
+    /// List the shared channels, their keys and their relays, and the
+    /// repositories this device follows
     List {
         /// Also list each channel's keys, those refused for room among them
         #[arg(long)]
         keys: bool,
+        /// Also show the fingerprint words of each repository's channel and
+        /// of each key on its list
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
+    /// Clear the notices of a repository's channel on this device
+    ///
+    /// Run it in a terminal once you have read them in cordelia status. It
+    /// clears who joined and a new channel line, and says each one. A key
+    /// you left out that the list names again stays shown: if you brought
+    /// it back on purpose, clear it with its label. A key no longer on the
+    /// list stays shown until the list names the channel made anew without
+    /// it. It asks no yes.
+    Seen {
+        /// The channel's name, as cordelia status shows it
+        name: String,
+        /// The label of a key you left out and brought back on purpose: its
+        /// notice alone is cleared
+        label: Option<String>,
     },
     /// File a shared channel under another name, on every device of yours
     Rename {
@@ -668,6 +734,10 @@ enum SharedCommand {
     /// Run it in a terminal. It lists every key this device has held or
     /// refused in the channel, and asks of each whether it stays. Those
     /// who stay move with `cordelia shared move` on one of their devices.
+    ///
+    /// It prints the new channel line, which names the keys it left out.
+    /// If the channel is a repository's, put that line in place of the
+    /// old one in `.cordelia/members`, in a pull request.
     Anew {
         name: String,
         /// A relay of yours for the new channel, as your configuration
@@ -905,9 +975,12 @@ fn main() -> anyhow::Result<()> {
             show_secrets,
             new_key: false,
         }) => cmd_init(&cli.config, name, non_interactive, force, show_secrets),
-        Some(Commands::Status { line, json, waybar }) => {
-            cmd_status(&cli.config, line, json, waybar)
-        }
+        Some(Commands::Status {
+            line,
+            json,
+            waybar,
+            verbose,
+        }) => cmd_status(&cli.config, line, json, waybar, verbose),
         Some(Commands::Start) => cmd_start(&cli.config),
         Some(Commands::Stop) => {
             println!("cordelia stop: not yet implemented (requires PID file / signal)");
@@ -934,15 +1007,31 @@ fn main() -> anyhow::Result<()> {
             let label = if none { None } else { label };
             shared_cmd::label(&cli.config, &key, label.as_deref())
         }
-        Some(Commands::Subscribe { name, words }) => {
-            shared_cmd::subscribe(&cli.config, &name, words.as_deref())
-        }
-        Some(Commands::Unsubscribe { name, agent, words }) => {
-            shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
-        }
+        Some(Commands::Subscribe {
+            name: Some(name),
+            words,
+            ..
+        }) => shared_cmd::subscribe(&cli.config, &name, words.as_deref()),
+        // With no name, it follows the repository it is run in (decision
+        // 2026-11-06 (joining), rule 2).
+        Some(Commands::Subscribe {
+            name: None,
+            new,
+            remote,
+            ..
+        }) => shared_cmd::follow(&cli.config, new, remote.as_deref()),
+        Some(Commands::Unsubscribe { name, agent, words }) => match name {
+            Some(name) => {
+                shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
+            }
+            None => shared_cmd::unfollow(&cli.config),
+        },
         Some(Commands::Shared { what }) => match what {
             SharedCommand::New { name, relays } => shared_cmd::new(&cli.config, &name, &relays),
-            SharedCommand::List { keys } => shared_cmd::show(&cli.config, keys),
+            SharedCommand::List { keys, verbose } => shared_cmd::show(&cli.config, keys, verbose),
+            SharedCommand::Seen { name, label } => {
+                shared_cmd::seen(&cli.config, &name, label.as_deref())
+            }
             SharedCommand::Rename {
                 name,
                 new_name,
@@ -1526,9 +1615,12 @@ fn messages_line(says: &str) -> String {
 }
 
 /// What the plain status says under `Memory:`, worked out from `facts`
-/// without the hold of a shared channel and without the hold of agents
-/// held for their person, and that hold of a shared channel, where it
-/// holds (decision 2026-10-10 §9). The other is [`messages_held`]'s.
+/// without the holds of shared channels and without the hold of agents
+/// held for their person, and the hold of a removed device that holds a
+/// shared channel, where it holds (decision 2026-10-10 §9). The ambers of
+/// the repositories this device follows are said under each repository
+/// (decision 2026-11-06 (joining), rule 7), and the hold of agents by
+/// [`messages_held`].
 fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indicator::Holds>) {
     let shared = indicator::shown(facts)
         .holds
@@ -1536,6 +1628,7 @@ fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indi
         .find(indicator::is_shared);
     let mut without = facts.clone();
     without.devices.removed_holds_shared = 0;
+    without.devices.repository_ambers.clear();
     without.held_pairs = 0;
     (indicator::shown(&without), shared)
 }
@@ -1550,7 +1643,13 @@ fn messages_held(facts: &indicator::Facts) -> Option<indicator::Holds> {
         .find(indicator::is_messages_held)
 }
 
-fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
+fn cmd_status(
+    config_path: &str,
+    line: bool,
+    json: bool,
+    waybar: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let status = gather_status(config_path);
     // The state, the level, and what the line says: the level is worked
     // out here, in the command, and nowhere else (decision 2026-10-04
@@ -1706,8 +1805,10 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             }
             // What the node says of the shared channels, as it gave it,
             // where it gives it (decision 2026-10-10 §9): apart from
-            // `messages`, never mixed in one count. The level reads one
-            // fact of it alone ([`indicator::shared`]).
+            // `messages`, never mixed in one count. The level reads two
+            // facts of it alone: a removed device that holds a channel, and
+            // each amber line of a repository followed (decision 2026-11-06
+            // (joining), rule 7; [`indicator::shared`]).
             if live["shared"].is_object() {
                 out["shared"] = live["shared"].clone();
             }
@@ -1950,6 +2051,19 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 let now = chrono::Utc::now().timestamp();
                 for line in msg_cmd::status_bound_lines(&live["messages"], now) {
                     println!("{line}");
+                }
+                // Last, each repository this device follows, with its
+                // lines, its ambers among them (decision 2026-11-06
+                // (joining), rule 7).
+                for repository in person_cmd::list(&live["shared"], "repositories") {
+                    let lines = shared_cmd::repository_lines(repository, verbose, false);
+                    for (n, line) in lines.iter().enumerate() {
+                        let line = history_cmd::printable(line);
+                        match n {
+                            0 => println!("  Following: {line}"),
+                            _ => println!("  {line}"),
+                        }
+                    }
                 }
             }
         }
@@ -2268,6 +2382,7 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         // ([`indicator::shared`]).
         removed_holds_shared_secs: None,
         removed_holds_shared: 0,
+        repository_ambers: Vec::new(),
     }
 }
 
@@ -2744,7 +2859,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400)), config.limits.most_proved_on_a_connection(), reach).await;
+            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400)), config.limits.most_proved_on_a_connection(), reach, config.members.read_interval()).await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
@@ -7597,6 +7712,7 @@ mod tests {
                 carried_to_go_secs: Some(20),
                 removed_holds_shared_secs: None,
                 removed_holds_shared: 0,
+                repository_ambers: Vec::new(),
             }
         );
 

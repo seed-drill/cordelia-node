@@ -273,7 +273,121 @@ cordelia msg log                 # for you, at a terminal: read what your agents
 
 A shared channel carries the same short messages between your agents and
 another person's. It holds nothing of your own: no memory and no other
-channel. Everyone you hand it to reads and writes every message in it.
+channel. Everyone in it reads and writes every message in it.
+
+A team can keep its channel in its repository, and join it by pull
+request. You can also hand a channel to someone yourself.
+
+### A team's channel, in its repository
+
+A file named `.cordelia/members`, on the repository's default branch,
+names the channel and each device in it:
+
+```
+channel 9f2c...e41a cordelia_pk1... without 0
+cordelia_pk1...   alice-laptop
+cordelia_pk1...   bob-desktop
+```
+
+**A merged pull request is the whole join.** You run no `share` and no
+`accept`. Whoever can merge to the default branch decides who is in, so
+the repository's own rules guard the channel. There is no six-word check:
+the list is the check.
+
+**To start the team's channel, once.** In your clone of the repository,
+once you have mapped it with `cordelia sync map`:
+
+```bash
+cordelia subscribe --new
+```
+
+It makes the channel, files it under the repository's `owner/name`, and
+subscribes your clone's agent. It prints the lines to add: the `channel`
+line, and a line for each of your devices. Add them to
+`.cordelia/members` in a pull request, and merge it.
+
+**To join.**
+
+1. Run `cordelia id` on each of your devices. In a pull request, add a
+   line to `.cordelia/members` for each: the key, then a label you choose,
+   of up to 32 lower-case letters, digits, `.`, `_` and `-`. List every
+   device you have: each one holds the channel and writes in it.
+2. Once it is merged, run `git pull` in your clone. Then run `cordelia
+   subscribe` there, and type yes. You need to do this on one device
+   only.
+
+**Then the nodes do the rest.** Each device that follows the repository
+reads the list from its own clone, every ten minutes.
+
+- A member's device hands the channel to each device on the list that
+  does not have it yet. It reads only that member's clone, so once the
+  pull request is merged, a member runs `git pull` there.
+- Your device takes the channel, keeps it on all your devices, and
+  subscribes your clone's agent.
+- So a join can take twenty minutes once a member's clone has the list.
+
+Your clone's agent then sends to the channel with `cordelia msg send
+--channel <name>`, where `<name>` is the repository's `owner/name`. To let
+the agent of another folder you mapped in too, run `cordelia subscribe
+<name>` in that folder.
+
+**What you see.** `cordelia status` shows each repository you follow:
+when your node read the list, at which commit, and how old your clone's
+copy is; each member by label, in or not yet; and how many messages you
+and your agents have not read. If a join waits on something, the status
+says what.
+
+- When a device joins, each member's device that follows the repository
+  shows it in amber, with its label and the commit that added it. Check
+  that you expect that commit. Then run `cordelia shared seen <name>` to
+  clear it.
+- `cordelia shared list` shows the same, with every member.
+  `cordelia status --json` gives each repository under
+  `shared.repositories`.
+
+**To stop following** on this device, run `cordelia unsubscribe` in the
+clone. You keep the channel, and your agent stays subscribed. `cordelia
+subscribe` there follows again.
+
+**To leave, or to take someone out:**
+
+1. A member runs `cordelia shared anew <name>`. It makes the channel anew
+   without them, and prints its new `channel` line. The line names each
+   device it left out whose line is still in the list, so run it before
+   their lines are deleted. If a line is gone already, the new line does
+   not name that device. That is safe: a device that is not on the list
+   is never handed the channel.
+2. A pull request deletes their lines and puts the new line in place of
+   the old one. Until it is merged, no device hands anything over. Then
+   everyone who stays moves to it with `cordelia shared move <name>`, as
+   their status says.
+
+If a pull request deletes someone's lines first, each member's device
+that follows shows each one in amber, until the list names the channel
+made anew without them.
+
+Merge new `channel` lines in the order they were made. When you remove
+one of your devices, `cordelia remove-device` makes each channel anew
+too, and prints each new `channel` line: put it in the list the same way.
+
+**Limits:**
+
+- Whoever can merge to the default branch can add any device, at once.
+  Each join shows in amber on each member's device that follows, with its
+  commit.
+- Your node reads only your clone, with git, and never the network. The
+  list is as fresh as your last `git pull` or `git fetch`.
+- A program that runs as you can change your clone, and so the list your
+  node reads.
+- Anyone who can read the repository can read the list: the channel's ID,
+  its relays, the keys and the labels. None of that lets them read or
+  write in the channel.
+- A member can still hand the channel to a device that is not on the
+  list, with `cordelia share`.
+- A list names at most 64 devices. A device follows at most 16
+  repositories, and a channel follows one repository.
+
+### A channel you share by hand
 
 ```bash
 cordelia shared new <name>                # make one
@@ -288,27 +402,6 @@ cordelia shared list                      # the channels you hold
 Before you hand a channel to someone's key, have them read you their six
 words by another way, a call or in person. `cordelia shared --help` has the
 rest: renaming, dropping, and making a channel anew without someone.
-
-**A team can keep its channel's keys in a repository.** Put a file named
-`.cordelia/members` in the repository:
-
-```
-cordelia_pk1...   alice-laptop
-cordelia_pk1...   bob-desktop
-```
-
-- **To join,** run `cordelia id` on each device you have, and raise a pull
-  request that adds a line for each: the key, then a label.
-- **Merging it is the yes.** Whoever can merge to that branch decides who
-  is in, so the repository's own rules guard the channel. There is no
-  six-word check: the list is the check.
-- **For now, a member then hands the channel over by hand,** with `cordelia
-  share <name> <key>` for each new key. The new member takes it with
-  `cordelia accept <key> --channel <name>`, using that member's key from
-  the file.
-- **A command that reads the list and does this for you** is designed
-  ([#290](https://github.com/seed-drill/cordelia-node/pull/290)), and comes
-  after the first release. This section will change when it lands.
 
 ## Relays
 

@@ -1,6 +1,8 @@
 //! The routes of subscribing and of messages in a shared channel (decision
 //! 2026-10-10 §4, §5.1 to §5.6, §6): `/api/v1/shared/subscribe`,
-//! `unsubscribe`, `read`, `send`, `summary` and `log`.
+//! `unsubscribe`, `read`, `send`, `summary` and `log`; and `follow`, which
+//! is `subscribe` in a clone with no name (decision 2026-11-06 (joining),
+//! rule 2), whose work is in [`crate::following`].
 //!
 //! - **Each is a POST with a JSON body that refuses a field it does not
 //!   know** (`deny_unknown_fields`), behind the node's token, refused while
@@ -22,6 +24,7 @@ use serde_json::{Value, json};
 
 use cordelia_core::protocol::{
     AGENT_MESSAGE_BODY_MAX_BYTES, AGENT_MESSAGE_ID_BYTES, AGENT_MESSAGE_SUMMARY_WAIT_MS,
+    STREAM_TIMEOUT_SECS,
 };
 use cordelia_crypto::acts::Subscription;
 use cordelia_crypto::bech32::encode_public_key;
@@ -112,7 +115,7 @@ fn card_of(row: &Channel) -> Result<Card, PersonError> {
 }
 
 /// The folder's agent, or the refusal of a folder that is not mapped.
-fn agent_here(conn: &Connection, folder: &str) -> Result<String, Failed> {
+pub(crate) fn agent_here(conn: &Connection, folder: &str) -> Result<String, Failed> {
     match agent_of(conn, folder).map_err(|e| Failed::Error(PersonError::Held(e.to_string())))? {
         Some(agent) => Ok(agent),
         None => refusal("not_mapped", not_mapped_line(folder)),
@@ -257,6 +260,137 @@ pub async fn subscribe(
                  in cordelia msg log only.",
                 cleaned(&subscription.agent)
             )] }))
+        },
+    )
+}
+
+// ── POST /api/v1/shared/follow ───────────────────────────────────────
+
+/// What `cordelia subscribe` with no name asks: the folder it ran in, the
+/// remote `--remote` chose, and whether `--new` was given.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FollowRequest {
+    pub folder: String,
+    #[serde(default)]
+    pub remote: Option<String>,
+    #[serde(default)]
+    pub new: bool,
+    #[serde(default)]
+    pub look: bool,
+    #[serde(default)]
+    pub said_yes_to: Option<String>,
+}
+
+/// `cordelia subscribe` in a clone, and `--new` (decision 2026-11-06
+/// (joining), rules 2.3 and 2.4): at a terminal, with a yes. A route of
+/// its own beside `subscribe`, as its body names no channel and its work
+/// reads git, outside the node's lock.
+///
+/// The folder must be mapped before git is run. The clone is read at the
+/// look and again at the yes, so a yes to a list at another commit is
+/// refused as `changed`. All of git's work is given 20 seconds, so the
+/// command, which waits 30, is always answered. On the yes, the node is
+/// asked to read the lists it follows now.
+pub async fn follow(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<FollowRequest>,
+) -> Result<HttpResponse, ApiError> {
+    crate::commands::asked(&req, &state)?;
+    let lasts = {
+        let conn = db(&state);
+        if let Err(failed) = sharing::standing(&conn).and_then(|_| agent_here(&conn, &body.folder))
+        {
+            return answer_of(failed);
+        }
+        crate::following::last_reads(&conn).map_err(crate::commands::refused)?
+    };
+    // One deadline for every step of git, made before any of them.
+    let secs = 2 * STREAM_TIMEOUT_SECS;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let data_dir = state.home_dir.clone();
+    let folder = std::path::PathBuf::from(&body.folder);
+    let remote = body.remote.clone();
+    let reading = tokio::task::spawn_blocking(move || {
+        crate::following::read_of(
+            &data_dir,
+            &folder,
+            remote.as_deref(),
+            &lasts,
+            deadline,
+            secs,
+        )
+    });
+    let read = match tokio::time::timeout_at(deadline.into(), reading).await {
+        Ok(read) => read.map_err(|e| ApiError::Internal(format!("the read of the clone: {e}")))?,
+        Err(_) => Err(Failed::Refused(Refusal {
+            word: "late",
+            line: crate::following::late_line(secs),
+        })),
+    };
+    match read {
+        Ok(read) => follow_read(&state, &body, &read),
+        Err(failed) => answer_of(failed),
+    }
+}
+
+// ── POST /api/v1/shared/unfollow ─────────────────────────────────────
+
+/// What `cordelia unsubscribe` with no name asks: the folder it ran in.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UnfollowRequest {
+    pub folder: String,
+}
+
+/// `cordelia unsubscribe` in a clone (decision 2026-11-06 (joining), rule
+/// 2.5): no yes. The clone is read with git outside the node's lock, within
+/// `STREAM_TIMEOUT_SECS`, and the follow stopped under it.
+pub async fn unfollow(
+    req: HttpRequest,
+    state: web::Data<AppState>,
+    body: web::Json<UnfollowRequest>,
+) -> Result<HttpResponse, ApiError> {
+    crate::commands::asked(&req, &state)?;
+    let deadline = Instant::now() + Duration::from_secs(STREAM_TIMEOUT_SECS);
+    let data_dir = state.home_dir.clone();
+    let folder = std::path::PathBuf::from(&body.folder);
+    let reading = tokio::task::spawn_blocking(move || {
+        crate::following::clone_of(&data_dir, &folder, deadline)
+    });
+    let read = match tokio::time::timeout_at(deadline.into(), reading).await {
+        Ok(read) => read.map_err(|e| ApiError::Internal(format!("the read of the clone: {e}")))?,
+        Err(_) => Err(Failed::Refused(Refusal {
+            word: "late",
+            line: crate::following::late_line(STREAM_TIMEOUT_SECS),
+        })),
+    };
+    let said = read.and_then(|read| crate::following::unfollow(&db(&state), &read));
+    match said {
+        Ok(said) => Ok(HttpResponse::Ok().json(json!({ "said": said }))),
+        Err(failed) => answer_of(failed),
+    }
+}
+
+/// [`follow`], once the clone was read: the plan, its yes, and what is
+/// done on it, under the node's lock.
+pub(crate) fn follow_read(
+    state: &AppState,
+    body: &FollowRequest,
+    read: &crate::following::ClonedRead,
+) -> Result<HttpResponse, ApiError> {
+    let identity = &state.identity;
+    asked_then(
+        state,
+        body.look,
+        body.said_yes_to.as_deref(),
+        |conn, own, _| crate::following::plan(conn, identity, own, read, body.new),
+        |conn, _, following, now| {
+            let said = crate::following::make(conn, identity, following, now)?;
+            // The node reads the list now, not at its next turn (rule 3).
+            state.own_channels.ask_members_read();
+            Ok(json!({ "said": said }))
         },
     )
 }

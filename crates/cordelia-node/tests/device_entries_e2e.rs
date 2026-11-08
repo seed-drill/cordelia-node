@@ -11930,6 +11930,7 @@ async fn the_share_pair_door_pushes_a_share_and_hands_the_typed_keys_entries_to_
             rev: again.rev,
             made: alice.now(),
             gone: false,
+            by_node: false,
         },
     )
     .unwrap();

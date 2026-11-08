@@ -3371,6 +3371,24 @@ reason there:
 
 ---
 
+### 12.14 A Repository's List (decision 2026-11-06 (joining))
+
+**`MEMBERS_FILE_MAX_BYTES` = 16,384.** The most bytes of `.cordelia/members` a device reads. A channel line with two relays and a `without` of 64 keys is 4,769 bytes, and 64 devices' lines with labels of 32 characters are 6,656 bytes: 11.1 KiB together. 16 KiB holds both, with room for comments. A larger file is not read, and the last list read stands.
+
+**`MEMBERS_LABEL_MAX_CHARS` = 32.** A label is for people reading the file: short enough to stay on one line beside a key, long enough for `alice-laptop-2026` and the like. The characters are `a-z`, `0-9`, `.`, `_` and `-`, so a label needs no escaping anywhere it is shown.
+
+**`MEMBERS_GIT_TERM_SECS` = 2.** How long git is given after TERM, where a read of a clone has not ended within `STREAM_TIMEOUT_SECS`, before its process group is killed (rule 3). A read of a clone is a few local commands of git, each of which ends in milliseconds; one that has not ended in ten seconds is stuck, on a disk or a lock. Git ends on TERM in milliseconds, removing whatever it was writing for itself; two seconds is room for a loaded machine, and KILL ends the rest. The node's reads of a clone write nothing in it.
+
+**`MEMBERS_READ_INTERVAL_SECS` = 600.** How often the node reads each list it follows (rules 3 and 4), from the clone as the person's own git last fetched it; also at the node's start, and at once when a person follows a repository. The same ten minutes as `RELAY_ASK_AGAIN_SECS`, for the same reason: what one side wrote reaches the other within about one interval. A join then waits about ten minutes on each side once the list is read, one for a member's device to hand the channel over and one for the new member's to take it, with no one asked. A read of a clone is a few git commands that read files on the disk, so reading more often would cost little; but the list changes only with a merged pull request and the person's next fetch, so a shorter wait would hasten nothing that matters, and each read hands the channel to four more keys, which a shorter interval would push to the relays more often. A test lowers it with `[members] read_interval_secs` (configuration.md §2.13), so that a test of a join need not wait ten minutes for each read; no deployment sets it.
+
+**`MEMBERS_HANDED_AT_ONCE` = 4 (derived: `MAX_TYPED_KEYS` / 2).** How many listed keys the node hands a repository's channel to at each read (rule 4.2): the next four in the list's order, starting after the last one handed, each share deleted after two reads. So at most eight of the node's shares wait at once, the same bound as the shares a person makes by hand, and counted apart from those, so that a person's `share` keeps its eight places. A device that is off for days holds a place for two reads, then gives it to the next key, and waits out the read at which its share goes: with nine new keys and eight devices off, the ninth is handed the channel at the third read, twenty minutes on, not after the two hours a share is kept.
+
+**`MEMBERS_ASKED_PER_PASS` = 32.** The most keys the node typed at reads of repositories' lists that one whole pass asks the relays for, across every repository the device follows (rule 4.4); the rest are asked for at the passes after, each within the hour of its read. Each asking is a proof and a pull of a share pair channel, counted in the shared pass's own counter, and a device follows up to 16 repositories (`SHARED_MAX_CHANNELS`), of 64 keys each. Six whole passes a minute at 32 are 384 requests, and with the shared pass's first pages and proofs and the person's own typings (208), 592 of the 600 `SHARED_REQUESTS_PER_MINUTE` allows: so the shared pass, a person's `accept --channel` and the node's takes all keep their room, however many lists there are. A list's 64 keys are asked for in two passes, twenty seconds, which a join that waits ten minutes for a read does not feel.
+
+**`MEMBERS_COMMIT_SHOWN_CHARS` = 12.** The characters of a commit that `cordelia status`, `shared list` and the status line show (rule 7): the start of its hex, as git's own short form. Seven, git's least, can name two commits of a large repository; twelve tell them apart in any repository a team shares, and keep a join's line short enough for a status bar. `--json` gives the whole commit, for a person or a program to check.
+
+**`MEMBERS_LABELS_SHOWN` = 6.** The labels of a list's members that the plain status shows of each repository, then "and <n> more" (rule 7). A list names up to 64 devices; six fit on one line of a terminal, and are enough to see who is in and who not yet. `--json` and `shared list` give every member.
+
 ## 13. Memory Across Connections (Change F)
 
 These bound what one connection of an unlisted peer can make a relay hold,

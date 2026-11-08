@@ -1626,6 +1626,11 @@ fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_t
 /// 2026-10-10 §7).
 const LABEL_FIRST: &str = "A key you label is listed first, before keys you have not labelled";
 
+/// What every making anew says before its new channel line (decision
+/// 2026-11-06 (joining), rule 5).
+const PUT_THE_LINE: &str = "If this channel follows a repository's list, put this line in place \
+                            of its channel line, in a pull request:";
+
 /// `cordelia shared anew <name>` on `n`, at a terminal: it lists every key
 /// first; each key it asks about is answered as `answers` says of the key
 /// the question names, after typing each of `again` first, which must each
@@ -1652,12 +1657,12 @@ fn makes_anew(n: &Node, name: &str, answers: &[(String, &str)], again: &[&str]) 
     at.says("own devices among them. Left out: ")
         .says("Type yes to go on")
         .types("yes");
-    let said = at.done();
-    assert!(
-        said.contains(&format!("Made \"{name}\" anew: it is channel ")),
-        "{said}"
-    );
-    said
+    // The new channel line follows what it made (decision 2026-11-06
+    // (joining), rule 5).
+    at.says(&format!("Made \"{name}\" anew: it is channel "))
+        .says(PUT_THE_LINE)
+        .says("channel ");
+    at.done()
 }
 
 /// What `shared move <name>` on `n` would do, once `n` has read an offer
@@ -2130,7 +2135,9 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
         "{before_yes}"
     );
     at.says("The wait has ended.")
-        .says("\"review\" is made anew without the device removed: it is channel ");
+        .says("\"review\" is made anew without the device removed: it is channel ")
+        .says(PUT_THE_LINE)
+        .says(&format!(" without 1 {}", key_of(&tablet)));
     drop(at);
     let new = id_filed(&desktop, "review").unwrap();
     assert_ne!(new, old);

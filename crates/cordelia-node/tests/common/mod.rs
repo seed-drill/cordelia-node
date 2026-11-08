@@ -621,6 +621,16 @@ impl Node {
         std::fs::write(self.config(), config).unwrap();
     }
 
+    /// How often this device reads the list of each repository it follows
+    /// (decision 2026-11-06 (joining), rule 3), for before the node
+    /// starts: ten minutes where it is not set, which no test waits.
+    pub fn reads_lists_every_secs(&self, secs: u64) {
+        let mut config = std::fs::read_to_string(self.config()).unwrap();
+        assert!(!config.contains("[members]"), "{config}");
+        config.push_str(&format!("\n[members]\nread_interval_secs = {secs}\n"));
+        std::fs::write(self.config(), config).unwrap();
+    }
+
     pub fn log_tail(&self) -> String {
         let log = std::fs::read_to_string(self.log()).unwrap_or_default();
         let lines: Vec<&str> = log.lines().collect();

@@ -38,6 +38,20 @@
 >   start on this version, a folder `before-<version>`: a copy of the
 >   database and of the key files of the older channels, as they were
 >   (operations.md §10.5).
+>
+> Per the [decision record of 2026-11-06 (joining)](../decisions/2026-11-06-joining-by-pull-request.md):
+>
+> - **Joining a repository's shared channel adds no setting for a
+>   deployment.** The repositories a device follows are in the node's
+>   database (schema step 33), kept by `cordelia subscribe` in a clone.
+>   How often the node reads each list is `MEMBERS_READ_INTERVAL_SECS`
+>   (600 seconds), a constant of `protocol.rs`. Only a test lowers it,
+>   with `[members] read_interval_secs` (§2.13).
+> - **The node runs the `git` that its `PATH` finds,** in an environment of
+>   its own (rule 3): of its own environment it keeps only `PATH` and the
+>   variables of a proxy and of a certificate authority, and `HOME` is
+>   `git-home`, an empty folder in its data directory, so no setting of the
+>   person's reaches git.
 
 ---
 
@@ -257,6 +271,16 @@ Messages between the person's own agents (decision 2026-10-09 §6). Read when th
 
 A value over 20, or a wait outside its range, is refused when the configuration is loaded: the node does not start, and every command that reads the configuration says why. Whatever is set, a device sends at most 60 messages an hour, its sends again included, and a message to every name counts as one.
 
+### 2.13 `[members]`
+
+The lists of the repositories a device follows (decision 2026-11-06 (joining), rule 3). Read when the node starts. **Only a test sets it:** no deployment has this table, and a configuration that does not set it is not written with it.
+
+| Parameter | Type | Default | Valid Range | Phase | Description | Source |
+|-----------|------|---------|-------------|-------|-------------|--------|
+| `read_interval_secs` | integer | not set: 600 | 1 to 600 (`MEMBERS_READ_INTERVAL_SECS`) | 1 | Test only. How often the node reads each list it follows, in seconds, besides at its start and when a person follows a repository. It exists so that a test of a join need not wait ten minutes for each read; it may only lower the interval. | parameter-rationale.md §12.14 |
+
+A value outside its range is refused when the configuration is loaded, as `[messages]`'s waits are.
+
 ## 3. Example Configuration
 
 A complete annotated `config.toml` with all sections and default values:
@@ -442,6 +466,7 @@ The node validates configuration at startup. Invalid configuration prevents the 
 | `node.http_port` == `node.p2p_port` | `port conflict: HTTP and P2P ports must differ` |
 | `messages.per_folder_per_hour` is over 20 (SS2.12) | `[messages] per_folder_per_hour is ...: it may be from 0 to 20` |
 | `messages.git_wait_ms` is outside 1 to 10000, or `messages.answer_wait_ms` outside 1 to 30000 (SS2.12) | `[messages] git_wait_ms is ...: it may be from 1 to 10000` (or `answer_wait_ms`, to 30000) |
+| `members.read_interval_secs` is outside 1 to 600 (SS2.13) | `[members] read_interval_secs is ...: it may be from 1 to 600` |
 
 **Warnings (node starts, logs warning):**
 

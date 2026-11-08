@@ -20,6 +20,9 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub history: HistoryConfig,
     pub messages: MessagesConfig,
+    /// Not written where nothing of it is set: no deployment sets it.
+    #[serde(skip_serializing_if = "MembersConfig::is_unset")]
+    pub members: MembersConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
     pub swarm: SwarmConfig,
@@ -235,6 +238,47 @@ impl MessagesConfig {
     }
 }
 
+/// The lists of the repositories a device follows (decision 2026-11-06
+/// (joining), rule 3). Read when the node starts. No deployment sets it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MembersConfig {
+    /// How often the node reads each list it follows, in seconds:
+    /// MEMBERS_READ_INTERVAL_SECS where it is not set. No deployment sets
+    /// it: a test lowers it, so that a join need not wait ten minutes for
+    /// each read. From 1 to MEMBERS_READ_INTERVAL_SECS; outside, the
+    /// configuration is refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_interval_secs: Option<u64>,
+}
+
+impl MembersConfig {
+    /// How often the node reads each list it follows.
+    pub fn read_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.read_interval_secs
+                .unwrap_or(protocol::MEMBERS_READ_INTERVAL_SECS),
+        )
+    }
+
+    /// Whether nothing of it is set.
+    fn is_unset(&self) -> bool {
+        self.read_interval_secs.is_none()
+    }
+
+    /// Refuse a read interval outside its range: it may only be lowered.
+    fn check(&self) -> Result<(), CordeliaError> {
+        let most = protocol::MEMBERS_READ_INTERVAL_SECS;
+        match self.read_interval_secs {
+            Some(secs) if !(1..=most).contains(&secs) => Err(CordeliaError::Config(format!(
+                "[members] read_interval_secs is {secs}: it may be from 1 to {most}, and is set \
+                 only so that a test need not wait"
+            ))),
+            _ => Ok(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitsConfig {
@@ -428,6 +472,7 @@ impl Config {
             .map_err(|e| CordeliaError::Config(format!("parse config: {e}")))?;
         config.network.check()?;
         config.messages.check()?;
+        config.members.check()?;
         Ok(config)
     }
 
@@ -664,6 +709,52 @@ http_port = 8080
         let written = toml::to_string_pretty(&Config::default()).unwrap();
         assert!(
             written.contains("[messages]\nper_folder_per_hour = 20\n"),
+            "{written}"
+        );
+    }
+
+    /// The read of each list a device follows is every ten minutes where
+    /// it is not set, and a test may set it from 1 second to that: more,
+    /// or 0, is refused when it is loaded. It is not written to a
+    /// configuration that does not set it.
+    #[test]
+    fn test_the_read_of_the_lists_is_every_ten_minutes_and_a_test_may_lower_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let loaded = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            Config::load(&path).map(|config| config.members.read_interval())
+        };
+        let secs = std::time::Duration::from_secs;
+        assert_eq!(loaded("").unwrap(), secs(600));
+        assert_eq!(
+            loaded("").unwrap(),
+            secs(protocol::MEMBERS_READ_INTERVAL_SECS)
+        );
+        assert_eq!(
+            loaded("[members]\nread_interval_secs = 1\n").unwrap(),
+            secs(1)
+        );
+        assert_eq!(
+            loaded("[members]\nread_interval_secs = 600\n").unwrap(),
+            secs(600)
+        );
+        for over in [0, 601] {
+            let refused = loaded(&format!("[members]\nread_interval_secs = {over}\n")).unwrap_err();
+            assert!(
+                refused
+                    .to_string()
+                    .contains(&format!("read_interval_secs is {over}")),
+                "{refused}"
+            );
+        }
+        let written = toml::to_string_pretty(&Config::default()).unwrap();
+        assert!(!written.contains("[members]"), "{written}");
+        let mut set = Config::default();
+        set.members.read_interval_secs = Some(5);
+        let written = toml::to_string_pretty(&set).unwrap();
+        assert!(
+            written.contains("[members]\nread_interval_secs = 5\n"),
             "{written}"
         );
     }

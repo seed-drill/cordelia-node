@@ -2910,6 +2910,62 @@ pub const SHARED_READ_PREFIX: &str = "sread/";
 /// the device's key follows it, and only its own entry there is its list.
 pub const PERSONAL_SHARED_PREFIX: &str = "shared/";
 
+// ── A repository's list (decision 2026-11-06 (joining)) ─────────────
+
+/// The most bytes of a repository's `.cordelia/members` that a device
+/// reads (decision 2026-11-06 (joining), rule 1): 16 KiB, room for the
+/// channel line with a long `without`, and 64 devices with their labels.
+/// A larger file is not read, and the last list read stands.
+pub const MEMBERS_FILE_MAX_BYTES: usize = 16_384;
+
+/// The longest label a device's line may give (rule 1): 32 characters of
+/// `a-z`, `0-9`, `.`, `_` and `-`.
+pub const MEMBERS_LABEL_MAX_CHARS: usize = 32;
+
+/// How long git is given to end after TERM, where a read of a clone has
+/// not ended within `STREAM_TIMEOUT_SECS`, before its process group is
+/// killed (decision 2026-11-06 (joining), rule 3): git ends on TERM in
+/// well under this.
+pub const MEMBERS_GIT_TERM_SECS: u64 = 2;
+
+/// How often the node reads each list it follows (decision 2026-11-06
+/// (joining), rules 3 and 4): every ten minutes, at its start, and when a
+/// person follows a repository. As `RELAY_ASK_AGAIN_SECS`: a join waits
+/// about ten minutes on each side once the list is read, one for the
+/// member's device to hand the channel over and one for the new member's
+/// to take it.
+pub const MEMBERS_READ_INTERVAL_SECS: u64 = 600;
+
+/// How many listed keys the node hands a repository's channel to at each
+/// read (decision 2026-11-06 (joining), rule 4.2): the next four in the
+/// list's order. Derived: a share lives for two reads, so at most
+/// `MAX_TYPED_KEYS` of the node's wait at once, and a device that is off
+/// for days holds no place.
+pub const MEMBERS_HANDED_AT_ONCE: usize = MAX_TYPED_KEYS / 2;
+
+/// The most keys the node typed at reads of repositories' lists that one
+/// whole pass asks the relays for, across every repository the device
+/// follows (decision 2026-11-06 (joining), rule 4.4): the rest are asked
+/// for at the passes after, each within the hour of its read. A device
+/// follows 16 repositories at most (`SHARED_MAX_CHANNELS`), of 64 keys
+/// each, so a thousand keys can be typed at once, and each asking is a
+/// proof and a pull of a share pair channel, so six passes a minute ask
+/// 384 at most: with the shared pass's first pages and proofs and the
+/// person's own typings, 592 of `SHARED_REQUESTS_PER_MINUTE`. A list's 64
+/// keys are asked for in two passes.
+pub const MEMBERS_ASKED_PER_PASS: usize = 32;
+
+/// The characters of a commit that the status and its line show (decision
+/// 2026-11-06 (joining), rule 7): the start of its hex, as git's own short
+/// form is. Twelve tell commits apart in any repository a team shares;
+/// `--json` gives the whole commit.
+pub const MEMBERS_COMMIT_SHOWN_CHARS: usize = 12;
+
+/// The labels of a list's members that the plain status shows of each
+/// repository before "and <n> more" (rule 7): `--json` and `shared list`
+/// give each.
+pub const MEMBERS_LABELS_SHOWN: usize = 6;
+
 // Checked at compile time (decision 2026-10-10 §14). The largest card is
 // the seed and two relays behind their count: with the form, the time and
 // the key it is for, it fits a share; and it fits an anew record, whose
@@ -4235,6 +4291,17 @@ mod tests {
         let shared = passes * channels + channels + passes * 2 * typed;
         assert_eq!(shared, 208);
         assert!(shared <= u64::from(SHARED_REQUESTS_PER_MINUTE));
+        // And the keys the node types at reads of repositories' lists
+        // (decision 2026-11-06 (joining), rule 4.4): a proof and a pull of
+        // the share pair channel of each, at most MEMBERS_ASKED_PER_PASS at
+        // each whole pass across every follow, since nothing bounds how
+        // many a device has: 384 more, within the 600.
+        let listed = passes * 2 * MEMBERS_ASKED_PER_PASS as u64;
+        assert_eq!(listed, 384);
+        assert_eq!(shared + listed, 592);
+        assert!(shared + listed <= u64::from(SHARED_REQUESTS_PER_MINUTE));
+        // A list's 64 keys are asked for in two passes.
+        assert_eq!(SHARED_MAX_KEYS.div_ceil(MEMBERS_ASKED_PER_PASS), 2);
         // The shows of a minute, as a device's side of a relay counts
         // them: one for each whole pass and each pass that sends, and as
         // many again.

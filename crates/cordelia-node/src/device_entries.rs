@@ -155,7 +155,7 @@ use cordelia_api::state::{
     NoRoom, ProvedBy, RefusedOf,
 };
 use cordelia_api::take::Taken;
-use cordelia_api::{marks, sender, shared_pass};
+use cordelia_api::{marks, members_read, sender, shared_pass};
 use cordelia_core::load::Kind as TakeKind;
 use cordelia_core::lock::{LockWhole, take_as, taking};
 use cordelia_core::protocol::{
@@ -626,6 +626,9 @@ pub struct DeviceEntries {
     /// Whether the lists that the store held from before step 20 are known
     /// to have been read: once they are, a pass asks no more.
     held_lists_read: AtomicBool,
+    /// One read at a time of the repositories' lists the device follows
+    /// (decision 2026-11-06 (joining), rules 3 and 4).
+    members_reading: Mutex<()>,
 }
 
 impl DeviceEntries {
@@ -670,6 +673,7 @@ impl DeviceEntries {
             started: AtomicBool::new(false),
             lists_seen: Mutex::default(),
             held_lists_read: AtomicBool::new(false),
+            members_reading: Mutex::default(),
         })
     }
 
@@ -791,6 +795,18 @@ impl DeviceEntries {
                 let links: Vec<Link> = links.iter().map(|link| (*link).clone()).collect();
                 asking.spawn(take_as(TakeKind::Pass, async move {
                     engine.asks_for_shares(&links, &typed).await
+                }));
+            }
+            // So are the keys the node typed at a read of a repository's
+            // list, once after each read (decision 2026-11-06 (joining),
+            // rule 4.4).
+            let listed = members_read::to_ask(&lock(&self.state.db), self.unix());
+            let listed = listed.unwrap_or_default();
+            if !listed.is_empty() {
+                let engine = Arc::clone(self);
+                let links: Vec<Link> = links.iter().map(|link| (*link).clone()).collect();
+                asking.spawn(take_as(TakeKind::Pass, async move {
+                    engine.asks_for_listed_shares(&links, &listed).await
                 }));
             }
         }
@@ -1738,6 +1754,62 @@ impl DeviceEntries {
     /// ahead ([`Clock::run_ahead`]) runs its time of day ahead with them.
     pub fn unix(&self) -> i64 {
         self.clock.unix_from(self.state.sync_control.now())
+    }
+
+    // ── The lists of the repositories followed ──────────────────────
+
+    /// The read of each repository's list the device follows (decision
+    /// 2026-11-06 (joining), rules 3 and 4;
+    /// [`cordelia_api::members_read::read_each`]): every
+    /// MEMBERS_READ_INTERVAL_SECS, at the node's start, and when a person
+    /// follows a repository. Each clone is read with git outside the lock,
+    /// and each read is then done under a hold of the lock of its own.
+    /// One read at a time: one asked while another runs waits for it, and
+    /// then reads, so a follow made meanwhile is read at once. A node that
+    /// is held up does nothing.
+    pub fn read_members(&self) {
+        if self.state.held.why().is_some() {
+            return;
+        }
+        let _one = lock(&self.members_reading);
+        let read = cordelia_api::members_read::read_each(&self.state, || self.unix());
+        let done = match read {
+            Ok(done) => done,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the lists of the repositories followed");
+                return;
+            }
+        };
+        use cordelia_api::members_read::Done;
+        for (repository, done) in done {
+            match done {
+                Ok(Done::Read {
+                    handed,
+                    not_handing,
+                }) => tracing::debug!(
+                    %repository,
+                    handed = handed.len(),
+                    not_handing = not_handing.as_ref().map(|why| why.word()),
+                    "a repository's list was read"
+                ),
+                Ok(Done::NotRead(not)) => tracing::info!(
+                    %repository,
+                    word = %not.word,
+                    why = %not.why,
+                    "a repository's list was not read: the last list read stands"
+                ),
+                Ok(Done::Stopped) => tracing::info!(
+                    %repository,
+                    "a repository is followed no more: its list names a channel that was dropped"
+                ),
+                Ok(Done::Nothing) => {}
+                Err(e) => tracing::warn!(
+                    %repository,
+                    error = %e,
+                    "could not do what a repository's list says"
+                ),
+            }
+        }
     }
 
     // ── The hourly task of messages ─────────────────────────────────
@@ -3883,88 +3955,37 @@ impl DeviceEntries {
     }
 
     /// Ask, at each relay of `links` that is the device's own by key, the
-    /// share pair channel of each key in `typed`, through its one door
-    /// ([`Leave::share_pair`]), and take the one share found of each key
-    /// where there is one (decision 2026-10-10 §3.2, §8.4). What each relay
-    /// hands is counted in the device's whole count and in the shared
-    /// pass's quarter, each page asked with a `limit` sized to that quarter;
-    /// a share pair channel is proved only where the connection has room
-    /// for its proof beside every channel of the device's own. Says whether
-    /// a share was taken.
+    /// share pair channel of each key in `typed`, and take the one share
+    /// found of each key where there is one (decision 2026-10-10 §3.2,
+    /// §8.4), as [`Self::shares_from`] reads them. Says whether a share was
+    /// taken.
     async fn asks_for_shares(
         &self,
         links: &[Link],
         typed: &[cordelia_storage::shared_sharing::TypedForChannel],
     ) -> bool {
         let identity = &self.state.identity;
-        let largest = entry_cost(MAX_ITEM_BYTES);
         let own_relays = self.own_by_key();
         let mut taken = false;
         for typing in typed {
-            let mut found: Vec<CheckedEntry> = Vec::new();
-            for link in links.iter().filter(|link| self.is_own_by_key(link)) {
-                if !self.room_for_a_share_pair(link, &typing.key) {
-                    continue;
-                }
-                let share = self.shared_room_to_take(link);
-                if !self.room_to_take(link) || share < largest {
-                    continue;
-                }
-                let limit = (share / largest).min(u64::from(ENTRY_PAGE_MAX_ENTRIES));
-                let counted = |handed: u64| {
-                    self.took(link, handed);
-                    let mut kept = lock(&self.kept);
-                    let of = kept.relays.entry(link.name().to_string()).or_default();
-                    shared_taken_from(of).record(handed);
-                };
-                let reads = |conn: &Connection, now: i64| {
-                    sharing::keys_that_read(conn, now).is_ok_and(|keys| {
-                        keys.iter()
-                            .any(|key| key.key == typing.key && key.typed_at == typing.typed_at)
-                    })
-                };
-                let accept = |conn: &Connection, entry: &CheckedEntry, now: i64| {
-                    cordelia_api::shared::accept_typed(
-                        conn,
-                        identity,
-                        &typing.key,
-                        typing.typed_at,
-                        entry,
-                        now,
-                    )
-                    .map_err(|e| e.to_string())
-                };
-                let read = self
-                    .leave
-                    .share_pair(
-                        &self.state,
-                        link,
-                        &typing.key,
-                        u32::try_from(limit).unwrap_or(ENTRY_PAGE_MAX_ENTRIES),
-                        counted,
-                        reads,
-                        accept,
-                    )
-                    .await;
-                match read {
-                    Ok(SharePairRead::Read(judged)) => {
-                        self.share_pair_proved(link, &typing.key);
-                        for judged in judged {
-                            match judged {
-                                cordelia_api::shared::Judged::Share(entry) => found.push(*entry),
-                                cordelia_api::shared::Judged::Not(why) => tracing::debug!(
-                                    relay = link.name(),
-                                    ?why,
-                                    "an entry of a share pair channel is no share to take"
-                                ),
-                            }
-                        }
-                    }
-                    Ok(SharePairRead::NotHeld) => self.share_pair_proved(link, &typing.key),
-                    Ok(SharePairRead::NotNow) => {}
-                    Err(refused) => self.shared_refused(link, &refused),
-                }
-            }
+            let reads = |conn: &Connection, now: i64| {
+                sharing::keys_that_read(conn, now).is_ok_and(|keys| {
+                    keys.iter()
+                        .any(|key| key.key == typing.key && key.typed_at == typing.typed_at)
+                })
+            };
+            let accept = |conn: &Connection, entry: &CheckedEntry, now: i64| {
+                cordelia_api::shared::accept_typed(
+                    conn,
+                    identity,
+                    &typing.key,
+                    typing.typed_at,
+                    entry,
+                    now,
+                )
+                .map_err(|e| e.to_string())
+            };
+            let (found, _) = self.shares_from(links, &typing.key, reads, accept).await;
             let now = self.unix();
             let became = sharing::take_share(
                 &lock(&self.state.db),
@@ -3987,6 +4008,147 @@ impl DeviceEntries {
             }
         }
         taken
+    }
+
+    /// Ask, at each relay of `links` that is the device's own by key, the
+    /// share pair channel of each key in `listed`, which the node typed at
+    /// a read of a repository's list, and take the one share found of the
+    /// channel the list names where there is one (decision 2026-11-06
+    /// (joining), rule 4.4), as [`Self::shares_from`] reads them. Each is
+    /// asked for once: where a relay was read, what became of it is kept,
+    /// and it is not asked for again until the next read types its key
+    /// again; where none was, it is asked for at the next pass. Says
+    /// whether a share was taken.
+    async fn asks_for_listed_shares(
+        &self,
+        links: &[Link],
+        listed: &[members_read::Typing],
+    ) -> bool {
+        let identity = &self.state.identity;
+        let own_relays = self.own_by_key();
+        let mut taken = false;
+        for typing in listed {
+            let reads = |conn: &Connection, now: i64| {
+                members_read::reads_now(conn, typing, now).unwrap_or(false)
+            };
+            let accept = |conn: &Connection, entry: &CheckedEntry, now: i64| {
+                members_read::judge(conn, identity, typing, entry, now).map_err(|e| e.to_string())
+            };
+            let (found, read) = self.shares_from(links, &typing.key, reads, accept).await;
+            if !read {
+                continue;
+            }
+            let now = self.unix();
+            let became = members_read::take(
+                &lock(&self.state.db),
+                identity,
+                typing,
+                &found,
+                &own_relays,
+                now,
+            );
+            match became {
+                Ok(Became::Taken(_)) => {
+                    tracing::info!(
+                        repository = %typing.of,
+                        "a repository's shared channel was taken from a key its list names"
+                    );
+                    taken = true;
+                }
+                Ok(Became::Refused(word)) => tracing::info!(
+                    repository = %typing.of,
+                    word,
+                    "a repository's shared channel was not taken"
+                ),
+                Ok(Became::Nothing | Became::NotNow) => {}
+                Err(e) => tracing::warn!(
+                    repository = %typing.of,
+                    error = %e,
+                    "could not take a repository's shared channel"
+                ),
+            }
+        }
+        taken
+    }
+
+    /// Read, at each relay of `links` that is the device's own by key, the
+    /// share pair channel of `key`, through its one door
+    /// ([`Leave::share_pair`]), while `reads` says the key reads, each
+    /// entry given to `accept` (decision 2026-10-10 §3.2, §8.4). What each
+    /// relay hands is counted in the device's whole count and in the
+    /// shared pass's quarter, each page asked with a `limit` sized to that
+    /// quarter; a share pair channel is proved only where the connection
+    /// has room for its proof beside every channel of the device's own.
+    /// Returns the shares `accept` passed, and whether any relay was read.
+    async fn shares_from<R, A>(
+        &self,
+        links: &[Link],
+        key: &[u8; 32],
+        reads: R,
+        accept: A,
+    ) -> (Vec<CheckedEntry>, bool)
+    where
+        R: Fn(&Connection, i64) -> bool,
+        A: Fn(
+            &Connection,
+            &CheckedEntry,
+            i64,
+        ) -> Result<Option<cordelia_api::shared::Judged>, String>,
+    {
+        let largest = entry_cost(MAX_ITEM_BYTES);
+        let mut found: Vec<CheckedEntry> = Vec::new();
+        let mut read_any = false;
+        for link in links.iter().filter(|link| self.is_own_by_key(link)) {
+            if !self.room_for_a_share_pair(link, key) {
+                continue;
+            }
+            let share = self.shared_room_to_take(link);
+            if !self.room_to_take(link) || share < largest {
+                continue;
+            }
+            let limit = (share / largest).min(u64::from(ENTRY_PAGE_MAX_ENTRIES));
+            let counted = |handed: u64| {
+                self.took(link, handed);
+                let mut kept = lock(&self.kept);
+                let of = kept.relays.entry(link.name().to_string()).or_default();
+                shared_taken_from(of).record(handed);
+            };
+            let read = self
+                .leave
+                .share_pair(
+                    &self.state,
+                    link,
+                    key,
+                    u32::try_from(limit).unwrap_or(ENTRY_PAGE_MAX_ENTRIES),
+                    counted,
+                    &reads,
+                    &accept,
+                )
+                .await;
+            match read {
+                Ok(SharePairRead::Read(judged)) => {
+                    read_any = true;
+                    self.share_pair_proved(link, key);
+                    for judged in judged {
+                        match judged {
+                            cordelia_api::shared::Judged::Share(entry) => found.push(*entry),
+                            cordelia_api::shared::Judged::Not(why) => tracing::debug!(
+                                relay = link.name(),
+                                ?why,
+                                "an entry of a share pair channel is no share to take"
+                            ),
+                        }
+                    }
+                }
+                Ok(SharePairRead::NotHeld) => {
+                    read_any = true;
+                    self.share_pair_proved(link, key);
+                }
+                Ok(SharePairRead::NotNow) => {}
+                Err(refused) => self.shared_refused(link, &refused),
+            }
+        }
+        (found, read_any)
     }
 
     /// Whether the connection at `link` has room for the proof of the share

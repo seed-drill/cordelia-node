@@ -2659,6 +2659,7 @@ pub async fn p2p_loop(
     relay_ask_again: std::time::Duration,
     most_proved: usize,
     reach: Option<std::sync::Arc<cordelia_node::device_entries::Reach>>,
+    members_read: std::time::Duration,
 ) {
     tracing::info!(role = %node_role, "P2P loop started (accept + push + peer-sharing)");
 
@@ -2905,6 +2906,12 @@ pub async fn p2p_loop(
         cordelia_core::protocol::AGENT_MESSAGE_CLEAR_INTERVAL_SECS,
     ));
     messages_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The read of each repository's list the device follows (decision
+    // 2026-11-06 (joining), rules 3 and 4), on a personal node: when it
+    // starts, and every MEMBERS_READ_INTERVAL_SECS after: a test sets it
+    // lower (`[members] read_interval_secs`).
+    let mut members_interval = tokio::time::interval(members_read);
+    members_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // Entries between relays that work together (§2.4 item 6): what a
     // relay took is passed on, and what it lacks is pulled.
     let mut entry_offer_interval = tokio::time::interval(std::time::Duration::from_secs(
@@ -3496,6 +3503,25 @@ pub async fn p2p_loop(
             _ = messages_interval.tick(), if device_entries.is_some() => {
                 if let Some(device) = device_entries.clone() {
                     tokio::task::spawn_blocking(move || device.messages_hourly());
+                }
+            }
+
+            // ── The lists of the repositories the device follows ─────
+            // Each clone is read with git, and what each list says is done
+            // (decision 2026-11-06 (joining), rules 3 and 4). Off the
+            // select loop: git may take seconds, and each read writes
+            // under the db lock.
+            _ = members_interval.tick(), if device_entries.is_some() => {
+                if let Some(device) = device_entries.clone() {
+                    tokio::task::spawn_blocking(move || device.read_members());
+                }
+            }
+
+            // A person followed a repository: its list is read now, not at
+            // the next tick.
+            _ = state.own_channels.wait_members_read(), if device_entries.is_some() => {
+                if let Some(device) = device_entries.clone() {
+                    tokio::task::spawn_blocking(move || device.read_members());
                 }
             }
 

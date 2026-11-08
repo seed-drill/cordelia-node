@@ -31,6 +31,14 @@
 //! [`messages`], behind the sender ([`sender`]), the reader ([`reader`])
 //! and the marks ([`marks`]).
 //!
+//! A repository's list of the devices that share its channel is read with
+//! git through [`git_list`] (decision 2026-11-06 (joining)): which
+//! repository a clone is, a read of the clone's copy of its list, and
+//! never back, each with nothing of the person's reaching git. Following a
+//! repository, `cordelia subscribe` in a clone, is [`following`]; the
+//! node's read of each list it follows, and what it then does, is
+//! [`members_read`]; what the status says of each, [`repository_status`].
+//!
 //! A personal node serves [`configure_device_routes`]: it carries no
 //! channel of the older kind (decision 2026-10-04 §10). A node of any
 //! other role serves [`configure_routes`], with the Channels API of the
@@ -50,7 +58,9 @@ pub use cut::{CutNow, may_have_dropped_links};
 pub mod entries;
 pub mod error;
 pub mod first_start;
+pub mod following;
 pub mod found;
+pub mod git_list;
 pub mod handlers;
 pub mod history;
 pub mod leaving;
@@ -59,6 +69,8 @@ pub mod lists;
 pub mod local;
 pub mod look;
 pub mod marks;
+pub mod members;
+pub mod members_read;
 pub mod messages;
 pub mod names;
 pub mod own_read;
@@ -66,6 +78,7 @@ pub mod person;
 pub mod publish;
 pub mod reader;
 pub mod recover;
+pub mod repository_status;
 pub mod sender;
 #[cfg(test)]
 mod several;
@@ -184,11 +197,16 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
             .route("/move", web::post().to(sharing_routes::move_to))
             .route("/stay", web::post().to(sharing_routes::stay))
             .route("/list", web::post().to(sharing_routes::list))
+            .route("/seen", web::post().to(sharing_routes::seen))
             // Subscribing and messages in a shared channel (§4, §5.6).
             .route(
                 "/subscribe",
                 web::post().to(crate::shared_routes::subscribe),
             )
+            // Following a repository: `subscribe` in a clone (decision
+            // 2026-11-06 (joining), rule 2).
+            .route("/follow", web::post().to(crate::shared_routes::follow))
+            .route("/unfollow", web::post().to(crate::shared_routes::unfollow))
             .route(
                 "/unsubscribe",
                 web::post().to(crate::shared_routes::unsubscribe),

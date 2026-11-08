@@ -410,7 +410,7 @@ fn a_share_waits_for_one_key_at_a_time_and_goes_after_two_hours() {
     let to = plan("review", &alice_typed, &relays()).unwrap();
     assert!(to.asks.contains("no label of yours"), "{}", to.asks);
     assert!(to.asks.contains(&six_words(&alice)), "{}", to.asks);
-    let said = make_share(conn, identity, &relays(), &to.what, now).unwrap();
+    let said = make_share(conn, identity, &relays(), &to.what, false, now).unwrap();
     assert!(
         said[1].starts_with("  cordelia accept cordelia_pk1"),
         "{said:?}"
@@ -435,7 +435,7 @@ fn a_share_waits_for_one_key_at_a_time_and_goes_after_two_hours() {
 
     // Another channel to the same key: the first is written over.
     let design = plan("design", &alice_typed, &relays()).unwrap();
-    make_share(conn, identity, &relays(), &design.what, now + 1).unwrap();
+    make_share(conn, identity, &relays(), &design.what, false, now + 1).unwrap();
     let first = entries::author_entry(conn, &pair, &slot_of(&review), &s.key(0))
         .unwrap()
         .unwrap();
@@ -446,7 +446,7 @@ fn a_share_waits_for_one_key_at_a_time_and_goes_after_two_hours() {
     for n in 2..9 {
         let key = encode_public_key(&member(n).public_key()).unwrap();
         let to = plan("review", &key, &relays()).unwrap();
-        make_share(conn, identity, &relays(), &to.what, now + 2).unwrap();
+        make_share(conn, identity, &relays(), &to.what, false, now + 2).unwrap();
     }
     let ninth = encode_public_key(&member(9).public_key()).unwrap();
     assert_eq!(word(plan("review", &ninth, &relays())), "too_many_shares");
@@ -677,7 +677,7 @@ fn the_list_says_each_channel_its_relays_and_what_waits() {
     make_new(conn, identity, &plan.what, now).unwrap();
     let alice = encode_public_key(&member(1).public_key()).unwrap();
     let to = share_plan(conn, identity, &relays(), "review", &alice, None, now).unwrap();
-    make_share(conn, identity, &relays(), &to.what, now).unwrap();
+    make_share(conn, identity, &relays(), &to.what, false, now).unwrap();
     typed(&s, 0, &member(2).public_key(), "design", now);
     let listed = list(conn, identity, &relays(), true, now).unwrap();
     let channel = &listed["channels"][0];
@@ -855,7 +855,7 @@ fn a_device_that_leaves_keeps_no_share_and_no_typed_key() {
     let alice = member(1).public_key();
     let typed_key = encode_public_key(&alice).unwrap();
     let to = share_plan(conn, identity, &relays(), "review", &typed_key, None, now).unwrap();
-    make_share(conn, identity, &relays(), &to.what, now).unwrap();
+    make_share(conn, identity, &relays(), &to.what, false, now).unwrap();
     typed(&s, 0, &member(2).public_key(), "design", now);
     let (pair, _) = share_pair(identity, &alice).unwrap();
     assert_eq!(
@@ -959,7 +959,7 @@ fn a_share_is_taken_only_by_what_its_key_wrote_since() {
         now + 60,
     )
     .unwrap();
-    make_share(conn, identity, &relays(), &to.what, now + 60).unwrap();
+    make_share(conn, identity, &relays(), &to.what, false, now + 60).unwrap();
     let listed = list(conn, identity, &relays(), false, now + 61).unwrap();
     assert_eq!(listed["shares"][0]["taken"], false, "{listed}");
 }

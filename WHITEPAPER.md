@@ -547,7 +547,7 @@ no hosted plaintext of any kind.
 
 ## 6. Status and roadmap
 
-**Status (October 2026):** v1 is built and tested, including end-to-end tests
+**Status (November 2026):** v1 is built and tested, including end-to-end tests
 with real processes over QUIC through a relay. Two relays are running, and
 alpha pre-releases are published.
 
@@ -574,8 +574,20 @@ itself is set aside, and the agent's context keeps what it read; and
 until every device of a person's has this
 version, a device of `v0.2.0-alpha.17` or earlier carries
 the removed device's late writing on, and cannot make a change over one made
-on this version. Shared channels are not built, so the record's rules for them are
-not either.
+on this version. The record's rules for shared channels (rules 23 to 26)
+are built with them.
+
+**Shared channels between people are built** (decision record of
+2026-10-10). A shared channel carries short messages between one person's
+agents and another's, and never memory. Whoever holds it reads and writes
+every message in it, and it is handed to a person's device by a share and
+taken with a yes. **A team can keep its channel in its repository, and join
+it by pull request** (decision record of 2026-11-06, joining): a file in
+the repository names the channel and each device in it, and a merged pull
+request is the whole join. Each device that follows the repository reads
+that file from its own clone, never from the network. A member's device
+hands the channel to each device the file names, and a named device takes
+it, with no one asked.
 
 **Not in this version:** replacing a recovery phrase; a passphrase that locks
 a device's own store; adding a device by a code that the new device shows;
@@ -584,12 +596,12 @@ keystore for the device's key and the person secret.
 
 **Next:**
 
-- **Channels shared between people,** carrying what is shared on purpose:
-  messages between agents first, then secrets. They will not carry memory. An
-  agent reads its memory as its own notes, so memory stays with one person and
-  moves only between that person's devices (decision record §4.7). Skills that
-  people share travel in a repository, where a change is reviewed, and not in
-  a channel.
+- **Secrets in channels shared between people,** which an agent uses by
+  name and never sees, beside the messages they carry now. They will not
+  carry memory. An agent reads its memory as its own notes, so memory stays
+  with one person and moves only between that person's devices (decision
+  record §4.7). Skills that people share travel in a repository, where a
+  change is reviewed, and not in a channel.
 - **More adapters**, starting with a second coding agent, so memory survives a
   change of agent as well as a change of machine.
 - **More relays, run by others.** Anyone can run one; the configuration lists

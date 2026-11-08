@@ -229,6 +229,10 @@ impl HeldUp {
 /// the device's own with places of its own ([`OwnChannels::ask_own`],
 /// decision 2026-10-17 §4.2), and keeps each such read under its ID
 /// between rounds ([`OwnChannels::reads`]).
+///
+/// And it carries the word that a person followed a repository
+/// ([`OwnChannels::ask_members_read`], decision 2026-11-06 (joining)),
+/// for which the node reads the lists it follows without waiting.
 #[derive(Default)]
 pub struct OwnChannels {
     said: Mutex<AtRelays>,
@@ -271,6 +275,10 @@ pub struct OwnChannels {
     /// not taken up yet.
     own: Mutex<std::collections::VecDeque<OwnAsk>>,
     own_asked: tokio::sync::Notify,
+    /// The word that a person followed a repository: the node reads its
+    /// list now, without waiting for its timer (decision 2026-11-06
+    /// (joining), rule 3).
+    members_asked: tokio::sync::Notify,
     /// The reads of channels of the device's own, each under its ID.
     reads: crate::own_read::OwnReads,
     /// The channels that a carry is being made into, each with when that
@@ -560,6 +568,19 @@ impl OwnChannels {
     /// Wait for a command to ask for a whole pass.
     pub async fn wait_asked(&self) {
         self.asked.notified().await;
+    }
+
+    /// A person followed a repository (`cordelia subscribe` in a clone):
+    /// the node reads the lists it follows now (decision 2026-11-06
+    /// (joining), rule 3). One asking is kept where the node is not
+    /// waiting for one, and no more than one.
+    pub fn ask_members_read(&self) {
+        self.members_asked.notify_one();
+    }
+
+    /// Wait for a person to follow a repository.
+    pub async fn wait_members_read(&self) {
+        self.members_asked.notified().await;
     }
 
     /// A command's work asks something through the door for a carry: the
