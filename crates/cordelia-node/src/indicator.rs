@@ -263,6 +263,10 @@ pub struct Devices {
     /// How many shared channels not yet clean the line names: those of a
     /// removal applied within the seven days.
     pub removed_holds_shared: usize,
+    /// What each amber line of a repository this device follows says
+    /// (decision 2026-11-06 (joining), rules 4.5 to 4.7, 5 and 6): the
+    /// joining record's ambers, by the person's ruling of 6 November.
+    pub repository_ambers: Vec<String>,
 }
 
 /// A relay that is not known to hold the latest change, as a status goes
@@ -344,9 +348,21 @@ pub fn without_shared(says: &str) -> &str {
     says.strip_prefix("shared: ").unwrap_or(says)
 }
 
-/// Whether `holds` is the one hold of a shared channel.
+/// Whether `holds` is the one hold of a removed device that holds a shared
+/// channel.
 pub fn is_shared(holds: &Holds) -> bool {
     holds.what == SHARED_HOLD
+}
+
+/// The word of each amber of a repository this device follows (decision
+/// 2026-11-06 (joining), rule 6), which the plain status says under the
+/// repository and not under `Memory:`.
+pub const REPOSITORY_HOLD: &str = "shared_repository";
+
+/// What the line says of an amber line of a repository: its words, after
+/// `shared: `.
+pub fn repository_says(says: &str) -> String {
+    format!("shared: {says}")
 }
 
 impl Holds {
@@ -532,7 +548,16 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 /// 12. pairs of the person's agents held, waiting for the person to read
 ///     their messages (decision 2026-10-25, rule 4): below every hold
 ///     about the person's devices and memory, so that it hides none of
-///     them, with sync on or off, wherever the node counts one.
+///     them, with sync on or off, wherever the node counts one;
+/// 13. each amber line of a repository this device follows (decision
+///     2026-11-06 (joining), rules 4.5 to 4.7, 5 and 6): a key that
+///     joined, a key dropped from the list, a changed channel line, rule
+///     1's gate, a new channel line to put in the list, a key left out
+///     that its channel line does not name, and a device of the person's
+///     left out of the channel the list names. The person ruled on 6
+///     November that these ambers stand beside the one of decision
+///     2026-10-10 §9, property 16. Last, so that they hide nothing of the
+///     person's own, with sync on or off.
 ///
 /// What is about folders (0 to 3, and 9 to 11) holds only with sync on,
 /// something mapped and a report; the eighth, as 4 to 7, wherever this
@@ -724,12 +749,22 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     if of_folders {
         folders_after(f, &mut out);
     }
-    // Last: agents held for their person, who alone ends it.
+    // Then agents held for their person, who alone ends it.
     if f.held_pairs > 0 {
         out.push(Holds {
             level: Level::Amber,
             what: MESSAGES_HOLD,
             says: MESSAGES_HELD_SAYS.into(),
+        });
+    }
+    // Last, so that they hide nothing of the person's own: the ambers of
+    // the repositories this device follows (decision 2026-11-06 (joining),
+    // rule 6, by the person's ruling of 6 November).
+    for says in &f.devices.repository_ambers {
+        out.push(Holds {
+            level: Level::Amber,
+            what: REPOSITORY_HOLD,
+            says: repository_says(says),
         });
     }
     out
@@ -838,10 +873,21 @@ pub fn running(f: &mut Facts, live: &serde_json::Value) {
 /// What the facts take from the status's `shared` object (decision
 /// 2026-10-10 §9, property 16), at `now` in seconds: **only
 /// `removed_device_holds`,** each removed device that still holds shared
-/// channels the person has not made anew, with since when. Nothing else
-/// of the object is read: nothing a shared channel holds, waits for or is
-/// refused sets a level, appears among the holds, or changes the line.
+/// channels the person has not made anew, with since when; **and each line
+/// of `repositories` that is amber,** the joining record's ambers, by the
+/// person's ruling of 6 November (decision 2026-11-06 (joining), rule 6).
+/// Nothing else of the object is read: nothing else a shared channel
+/// holds, waits for or is refused sets a level, appears among the holds,
+/// or changes the line.
 pub fn shared(devices: &mut Devices, shared: &serde_json::Value, now: i64) {
+    devices.repository_ambers = shared["repositories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|repository| repository["lines"].as_array().into_iter().flatten())
+        .filter(|line| line["amber"] == true)
+        .filter_map(|line| line["says"].as_str().map(str::to_string))
+        .collect();
     let mut latest: Option<u64> = None;
     let mut named: Vec<&str> = Vec::new();
     for holds in shared["removed_device_holds"]
@@ -1092,6 +1138,10 @@ fn of_its_folders(f: &Facts) -> (State, String) {
     (Synced, "memory synced".into())
 }
 
+/// The mark of amber: the line's, and that of each amber line the plain
+/// status says of a repository followed.
+pub const AMBER_MARK: &str = "◆";
+
 /// One line for a status bar: a mark and the summary, coloured unless
 /// `color` is false. Empty when there is nothing to show.
 ///
@@ -1102,11 +1152,11 @@ fn of_its_folders(f: &Facts) -> (State, String) {
 pub fn line(state: State, level: Option<Level>, summary: &str, color: bool) -> String {
     let (mark, code) = match (level, state) {
         (_, State::Uninitialised) => return String::new(),
-        (Some(Level::Red), _) => ("▲", "31"),    // red
-        (Some(Level::Amber), _) => ("◆", "33"),  // yellow, and its own mark
-        (None, State::Synced) => ("●", "32"),    // green
-        (None, State::Syncing) => ("◐", "33"),   // yellow
-        (None, State::Attention) => ("▲", "31"), // red
+        (Some(Level::Red), _) => ("▲", "31"),          // red
+        (Some(Level::Amber), _) => (AMBER_MARK, "33"), // yellow, and its own mark
+        (None, State::Synced) => ("●", "32"),          // green
+        (None, State::Syncing) => ("◐", "33"),         // yellow
+        (None, State::Attention) => ("▲", "31"),       // red
         (None, State::Offline | State::Off | State::Stopped) => ("○", "2"), // dim
     };
     if color {
@@ -3726,6 +3776,44 @@ mod tests {
                          "connected": false, "not_reached": "not_own" }],
             "offers": [{ "fault": "held" }], "also_a_name": true,
         });
+        // Each line a repository's view says that is not amber, as rule 6
+        // has them (decision 2026-11-06 (joining)), and one whose `amber`
+        // is not the value true.
+        let plain = [
+            "behind",
+            "late",
+            "not_a_list",
+            "followed_elsewhere",
+            "waiting",
+            "not_listed",
+            "no_channel",
+            "made_anew",
+            "not_own_relay",
+            "too_many_channels",
+            "name_taken",
+            "dropped",
+            "moved",
+            "handing",
+            "not_clean",
+            "not_reached",
+            "channel_full",
+            "not_held",
+            "twin_listed",
+        ];
+        let mut lines: Vec<serde_json::Value> = plain
+            .iter()
+            .map(|word| serde_json::json!({ "word": word, "says": "x", "amber": false }))
+            .collect();
+        lines.push(serde_json::json!({ "word": "joined", "says": "x", "amber": "true" }));
+        let repository = serde_json::json!({
+            "identity": "example.org/team/project", "name": "team/project", "held": true,
+            "channel": "00", "words": "able bake cold dune",
+            "read": { "at": "2026-10-01T00:00:00Z", "commit": "a", "from": "clone",
+                      "fetched": null, "says": "x" },
+            "members": [{ "label": "alice-laptop", "key": "cordelia_pk1x",
+                          "words": "a b c d e f", "in": false }],
+            "unread_by_an_agent": n, "unread_by_a_person": n, "lines": lines,
+        });
         serde_json::json!({
             "channels": vec![channel; 16],
             "typed": [{ "key": "cordelia_pk1x", "channel": "x", "until": "", "became": "x" }],
@@ -3734,14 +3822,18 @@ mod tests {
                                           "item": "x", "undo": "cordelia label x --none" }],
             "passed_over": [{ "key": "cordelia_pk1x", "acts": n }],
             "past_a_bound": ["x"],
+            "repositories": vec![repository; 16],
         })
     }
 
-    /// Nothing shared holds a level or changes the line (decision 2026-10-10
-    /// §9, property 16, §13 item 16): with every field of the `shared`
-    /// object at its worst, and no removed device, the facts, `holds`,
-    /// `derive`, the line and the bar are as without it, for a device that
-    /// is synced, one that waits, one with no relay, and one with sync off.
+    /// Nothing shared holds a level or changes the line but two facts
+    /// (decision 2026-10-10 §9, property 16, §13 item 16, as the person
+    /// ruled on 6 November for the ambers of decision 2026-11-06
+    /// (joining), rule 6): with every field of the `shared` object at its
+    /// worst, no removed device, and no repository's line amber, the facts,
+    /// `holds`, `derive`, the line and the bar are as without it, for a
+    /// device that is synced, one that waits, one with no relay, and one
+    /// with sync off.
     #[test]
     fn nothing_shared_holds_a_level_or_changes_the_line() {
         let now = 2_000_000_000;
@@ -3769,6 +3861,61 @@ mod tests {
             assert_eq!(seen(Some(&worst)), seen(None));
             assert_eq!(seen(Some(&serde_json::Value::Null)), seen(None));
         }
+    }
+
+    /// Each amber line of a repository this device follows is a hold of its
+    /// own, amber, with its words after `shared: ` (decision 2026-11-06
+    /// (joining), rule 6, by the person's ruling of 6 November): last, after
+    /// a removed device that holds a shared channel and agents held for
+    /// their person, so that it hides nothing of the person's own; with sync
+    /// off too. Only a line whose `amber` is true is one.
+    #[test]
+    fn a_repositorys_amber_lines_make_the_line_amber_and_come_last() {
+        let now = 2_000_000_000;
+        let joined = "bob-desktop joined team/project from the list at aaaa";
+        let gate = "carol-laptop is on the list of team/project but was left out of it: delete \
+                    its line in a pull request, or wait for that device to write in the channel";
+        let with_lines = |holds: serde_json::Value| {
+            let mut shared = shared_at_its_worst(holds);
+            let lines = &mut shared["repositories"][3]["lines"];
+            let lines = lines.as_array_mut().unwrap();
+            lines.push(serde_json::json!({ "word": "joined", "says": joined, "amber": true }));
+            lines.push(serde_json::json!({ "word": "left_out", "says": gate, "amber": true }));
+            shared
+        };
+        let seen = |shared: &serde_json::Value, edit: Edit| {
+            let mut f = synced();
+            edit(&mut f);
+            super::shared(&mut f.devices, shared, now);
+            shown(&f)
+        };
+        let shown = seen(&with_lines(serde_json::json!([])), &|_| {});
+        assert_eq!(shown.level, Some(Level::Amber));
+        assert_eq!(whats(&shown), [REPOSITORY_HOLD, REPOSITORY_HOLD]);
+        assert_eq!(shown.summary, format!("shared: {joined}"));
+        assert_eq!(shown.holds[1].says, repository_says(gate));
+        // With sync off, and with nothing mapped: still amber.
+        for edit in [(&|f: &mut Facts| f.sync_enabled = false) as Edit, &|f| {
+            f.mapped = 0;
+            f.folders = 0;
+        }] {
+            let shown = seen(&with_lines(serde_json::json!([])), edit);
+            assert_eq!(whats(&shown), [REPOSITORY_HOLD, REPOSITORY_HOLD]);
+        }
+        // Last: after the hold of a removed device and agents held.
+        let holding = serde_json::json!([
+            { "device": "tablet", "channels": ["review"], "since": before(now, 60) },
+        ]);
+        let all = seen(&with_lines(holding), &|f| f.held_pairs = 1);
+        assert_eq!(
+            whats(&all),
+            [SHARED_HOLD, MESSAGES_HOLD, REPOSITORY_HOLD, REPOSITORY_HOLD]
+        );
+        // Below red: a red line still says what is red.
+        let red = seen(&with_lines(serde_json::json!([])), &|f| {
+            f.errors = vec!["x".into()];
+        });
+        assert_eq!(red.level, Some(Level::Red));
     }
 
     /// A removed device that holds a shared channel makes the line amber for

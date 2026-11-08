@@ -77,6 +77,7 @@ pub mod person;
 pub mod publish;
 pub mod reader;
 pub mod recover;
+pub mod repository_status;
 pub mod sender;
 #[cfg(test)]
 mod several;
@@ -195,6 +196,7 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
             .route("/move", web::post().to(sharing_routes::move_to))
             .route("/stay", web::post().to(sharing_routes::stay))
             .route("/list", web::post().to(sharing_routes::list))
+            .route("/seen", web::post().to(sharing_routes::seen))
             // Subscribing and messages in a shared channel (§4, §5.6).
             .route(
                 "/subscribe",
@@ -203,6 +205,7 @@ pub fn configure_device_routes(cfg: &mut web::ServiceConfig) {
             // Following a repository: `subscribe` in a clone (decision
             // 2026-11-06 (joining), rule 2).
             .route("/follow", web::post().to(crate::shared_routes::follow))
+            .route("/unfollow", web::post().to(crate::shared_routes::unfollow))
             .route(
                 "/unsubscribe",
                 web::post().to(crate::shared_routes::unsubscribe),

@@ -103,6 +103,10 @@ enum Commands {
         /// Omarchy bar
         #[arg(long, conflicts_with_all = ["line", "json"])]
         waybar: bool,
+        /// Also show the fingerprint words of each repository's channel and
+        /// of each key on its list
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Run the node on this device
     ///
@@ -309,16 +313,22 @@ enum Commands {
     /// Stop showing an agent a shared channel, on every device of yours
     ///
     /// In the folder, or from anywhere with --agent.
+    ///
+    /// With no name, in a clone of a repository this device follows, it
+    /// stops this device following it: its list is read no more here. It
+    /// unsubscribes no agent and drops no channel, and `cordelia subscribe`
+    /// in the clone follows it again.
     Unsubscribe {
-        /// The name you file the shared channel under
-        name: String,
+        /// The name you file the shared channel under; none in a clone, to
+        /// stop following its repository
+        name: Option<String>,
         /// The agent, as `cordelia sync status` names it, in place of this
         /// folder's
-        #[arg(long)]
+        #[arg(long, requires = "name")]
         agent: Option<String>,
         /// The channel's four words, where two shared channels of yours
         /// have one name
-        #[arg(long, value_name = "FOUR WORDS")]
+        #[arg(long, value_name = "FOUR WORDS", requires = "name")]
         words: Option<String>,
     },
     /// Channels shared between people: messages between your agents and
@@ -684,11 +694,31 @@ enum SharedCommand {
         #[arg(long = "relay", value_name = "RELAY")]
         relays: Vec<String>,
     },
-    /// List the shared channels, their keys and their relays
+    /// List the shared channels, their keys and their relays, and the
+    /// repositories this device follows
     List {
         /// Also list each channel's keys, those refused for room among them
         #[arg(long)]
         keys: bool,
+        /// Also show the fingerprint words of each repository's channel and
+        /// of each key on its list
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
+    /// Clear the notices of a repository's channel on this device
+    ///
+    /// Run it in a terminal once you have read them in cordelia status. It
+    /// clears who joined and a new channel line, and says each one. A key
+    /// you left out that the list names again stays shown: if you brought
+    /// it back on purpose, clear it with its label. A key no longer on the
+    /// list stays shown until the list names the channel made anew without
+    /// it. It asks no yes.
+    Seen {
+        /// The channel's name, as cordelia status shows it
+        name: String,
+        /// The label of a key you left out and brought back on purpose: its
+        /// notice alone is cleared
+        label: Option<String>,
     },
     /// File a shared channel under another name, on every device of yours
     Rename {
@@ -941,9 +971,12 @@ fn main() -> anyhow::Result<()> {
             show_secrets,
             new_key: false,
         }) => cmd_init(&cli.config, name, non_interactive, force, show_secrets),
-        Some(Commands::Status { line, json, waybar }) => {
-            cmd_status(&cli.config, line, json, waybar)
-        }
+        Some(Commands::Status {
+            line,
+            json,
+            waybar,
+            verbose,
+        }) => cmd_status(&cli.config, line, json, waybar, verbose),
         Some(Commands::Start) => cmd_start(&cli.config),
         Some(Commands::Stop) => {
             println!("cordelia stop: not yet implemented (requires PID file / signal)");
@@ -983,12 +1016,18 @@ fn main() -> anyhow::Result<()> {
             remote,
             ..
         }) => shared_cmd::follow(&cli.config, new, remote.as_deref()),
-        Some(Commands::Unsubscribe { name, agent, words }) => {
-            shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
-        }
+        Some(Commands::Unsubscribe { name, agent, words }) => match name {
+            Some(name) => {
+                shared_cmd::unsubscribe(&cli.config, &name, agent.as_deref(), words.as_deref())
+            }
+            None => shared_cmd::unfollow(&cli.config),
+        },
         Some(Commands::Shared { what }) => match what {
             SharedCommand::New { name, relays } => shared_cmd::new(&cli.config, &name, &relays),
-            SharedCommand::List { keys } => shared_cmd::show(&cli.config, keys),
+            SharedCommand::List { keys, verbose } => shared_cmd::show(&cli.config, keys, verbose),
+            SharedCommand::Seen { name, label } => {
+                shared_cmd::seen(&cli.config, &name, label.as_deref())
+            }
             SharedCommand::Rename {
                 name,
                 new_name,
@@ -1572,9 +1611,12 @@ fn messages_line(says: &str) -> String {
 }
 
 /// What the plain status says under `Memory:`, worked out from `facts`
-/// without the hold of a shared channel and without the hold of agents
-/// held for their person, and that hold of a shared channel, where it
-/// holds (decision 2026-10-10 §9). The other is [`messages_held`]'s.
+/// without the holds of shared channels and without the hold of agents
+/// held for their person, and the hold of a removed device that holds a
+/// shared channel, where it holds (decision 2026-10-10 §9). The ambers of
+/// the repositories this device follows are said under each repository
+/// (decision 2026-11-06 (joining), rule 7), and the hold of agents by
+/// [`messages_held`].
 fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indicator::Holds>) {
     let shared = indicator::shown(facts)
         .holds
@@ -1582,6 +1624,7 @@ fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indi
         .find(indicator::is_shared);
     let mut without = facts.clone();
     without.devices.removed_holds_shared = 0;
+    without.devices.repository_ambers.clear();
     without.held_pairs = 0;
     (indicator::shown(&without), shared)
 }
@@ -1596,7 +1639,13 @@ fn messages_held(facts: &indicator::Facts) -> Option<indicator::Holds> {
         .find(indicator::is_messages_held)
 }
 
-fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow::Result<()> {
+fn cmd_status(
+    config_path: &str,
+    line: bool,
+    json: bool,
+    waybar: bool,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let status = gather_status(config_path);
     // The state, the level, and what the line says: the level is worked
     // out here, in the command, and nowhere else (decision 2026-10-04
@@ -1752,8 +1801,10 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
             }
             // What the node says of the shared channels, as it gave it,
             // where it gives it (decision 2026-10-10 §9): apart from
-            // `messages`, never mixed in one count. The level reads one
-            // fact of it alone ([`indicator::shared`]).
+            // `messages`, never mixed in one count. The level reads two
+            // facts of it alone: a removed device that holds a channel, and
+            // each amber line of a repository followed (decision 2026-11-06
+            // (joining), rule 7; [`indicator::shared`]).
             if live["shared"].is_object() {
                 out["shared"] = live["shared"].clone();
             }
@@ -1996,6 +2047,19 @@ fn cmd_status(config_path: &str, line: bool, json: bool, waybar: bool) -> anyhow
                 let now = chrono::Utc::now().timestamp();
                 for line in msg_cmd::status_bound_lines(&live["messages"], now) {
                     println!("{line}");
+                }
+                // Last, each repository this device follows, with its
+                // lines, its ambers among them (decision 2026-11-06
+                // (joining), rule 7).
+                for repository in person_cmd::list(&live["shared"], "repositories") {
+                    let lines = shared_cmd::repository_lines(repository, verbose, false);
+                    for (n, line) in lines.iter().enumerate() {
+                        let line = history_cmd::printable(line);
+                        match n {
+                            0 => println!("  Following: {line}"),
+                            _ => println!("  {line}"),
+                        }
+                    }
                 }
             }
         }
@@ -2314,6 +2378,7 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         // ([`indicator::shared`]).
         removed_holds_shared_secs: None,
         removed_holds_shared: 0,
+        repository_ambers: Vec::new(),
     }
 }
 
@@ -7643,6 +7708,7 @@ mod tests {
                 carried_to_go_secs: Some(20),
                 removed_holds_shared_secs: None,
                 removed_holds_shared: 0,
+                repository_ambers: Vec::new(),
             }
         );
 

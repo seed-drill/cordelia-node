@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use rusqlite::Connection;
 
-use cordelia_core::protocol::{MEMBERS_LABEL_MAX_CHARS, SHARED_MAX_KEYS};
+use cordelia_core::protocol::{MEMBERS_LABEL_MAX_CHARS, SHARED_MAX_CHANNELS, SHARED_MAX_KEYS};
 use cordelia_crypto::acts::{Filing, Subscription};
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
@@ -279,6 +279,15 @@ pub fn plan(
         Some(line) => followed_elsewhere(conn, &repository, &line.channel)?,
         None => None,
     };
+    // A device follows as many repositories as it holds shared channels at
+    // most: each follow's list names one, and the status works out each
+    // follow under the lock.
+    let followed = follows::follows(conn)?;
+    let adds_one =
+        replaces.is_none() && !followed.iter().any(|follow| follow.identity == repository);
+    if adds_one && followed.len() >= SHARED_MAX_CHANNELS {
+        return sharing::refused("too_many_follows", too_many_follows_line());
+    }
     let own = identity.public_key();
     // Only this device's key as `cordelia id` prints it counts: a member's
     // share to its twin is in another share pair channel, which this
@@ -512,6 +521,15 @@ pub fn plan(
     planned(asks, Then::Nothing)
 }
 
+/// What `subscribe` in a clone says where this device follows as many
+/// repositories as there can be.
+pub(crate) fn too_many_follows_line() -> String {
+    format!(
+        "This device follows {SHARED_MAX_CHANNELS} repositories, the most it can. To follow \
+         another, first run cordelia unsubscribe in a clone of one it follows. Nothing was done."
+    )
+}
+
 /// What is said where the list of `repository` names a twin of this
 /// device's key `own`, and not the key as `cordelia id` prints it (rule
 /// 4.4).
@@ -533,10 +551,12 @@ pub(crate) fn name_of(identity: &Identity) -> String {
 /// (rule 6): no other channel is filed as it, and no folder is synced as
 /// it. Refused, as `name_taken`, with what frees it.
 pub(crate) fn name_free(conn: &Connection, name: &str) -> Out<()> {
-    if sharing::filed(conn)?
-        .iter()
-        .any(|filing| filing.name == name)
-    {
+    name_free_in(conn, &sharing::filed(conn)?, name)
+}
+
+/// [`name_free`], given the person's filings.
+pub(crate) fn name_free_in(conn: &Connection, filings: &[Filing], name: &str) -> Out<()> {
+    if filings.iter().any(|filing| filing.name == name) {
         return sharing::refused(
             "name_taken",
             format!("You file another channel as {name}: rename it with cordelia shared rename."),
@@ -569,23 +589,33 @@ pub(crate) fn made_anew_from<'a>(
     channel: &[u8; 32],
 ) -> Result<Option<&'a Filing>, PersonError> {
     for filing in filings {
-        let Some(row) = kept::channel(conn, &filing.channel)? else {
-            continue;
-        };
-        let counts = crate::shared_anew::judged(conn, identity, &row, None)?
-            .iter()
-            .any(|one| {
-                one.offer.new_channel == *channel
-                    && matches!(
-                        one.is,
-                        OfferIs::ForThisDevice(_) | OfferIs::SealedElsewhere(_)
-                    )
-            });
-        if counts {
+        if made_anew_as(conn, identity, filing)?.contains(channel) {
             return Ok(Some(filing));
         }
     }
     Ok(None)
+}
+
+/// Each channel that an offer read in the channel of `filing` made it anew
+/// as, where the offer counts as [`made_anew_from`] counts one.
+pub(crate) fn made_anew_as(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    filing: &Filing,
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    let Some(row) = kept::channel(conn, &filing.channel)? else {
+        return Ok(Vec::new());
+    };
+    Ok(crate::shared_anew::judged(conn, identity, &row, None)?
+        .into_iter()
+        .filter(|one| {
+            matches!(
+                one.is,
+                OfferIs::ForThisDevice(_) | OfferIs::SealedElsewhere(_)
+            )
+        })
+        .map(|one| one.offer.new_channel)
+        .collect())
 }
 
 /// The other repository this device follows whose list kept names the
@@ -688,6 +718,97 @@ pub(crate) fn keys_in_channel(
     };
     keys.extend(crate::shared_anew::not_moved_yet(conn, own, &line.channel)?);
     Ok(keys)
+}
+
+/// The channel `channel`, then each channel it was made anew from, back
+/// along the moves this device keeps (a row's `came`), nearest first: at
+/// most one more than the 64 drops a list keeps. A channel made anew past
+/// a bound is filed by no device, so its chain is itself alone.
+pub(crate) fn back_along_moves(
+    conn: &Connection,
+    channel: &[u8; 32],
+) -> Result<Vec<[u8; 32]>, PersonError> {
+    let mut chain = vec![*channel];
+    let mut at = *channel;
+    for _ in 0..cordelia_core::protocol::SHARED_MAX_DROPPED {
+        match kept::channel(conn, &at)?.map(|row| row.came) {
+            Some(kept::Came::Moved(from)) if !chain.contains(&from) => {
+                chain.push(from);
+                at = from;
+            }
+            _ => break,
+        }
+    }
+    Ok(chain)
+}
+
+// ── Following no more: `unsubscribe` in a clone ─────────────────────
+
+/// What `unsubscribe` with no name read of the clone a folder is in: the
+/// top of its work tree, and the repository its remote names, where one
+/// remote names one.
+#[derive(Debug, Clone)]
+pub struct CloneOf {
+    pub top: PathBuf,
+    pub identity: Option<String>,
+}
+
+/// What `unsubscribe` with no name says in a folder of no repository.
+pub const NOT_IN_A_CLONE_TO_STOP: &str = "This folder is not in a git repository, so this device \
+                                          follows no repository from it, and nothing was done. \
+                                          To unsubscribe its agent from a shared channel, give \
+                                          the channel's name: cordelia unsubscribe <name>";
+
+/// Read the clone that `folder` is in, with the node's git under
+/// `data_dir`, until `deadline`, outside the node's lock: its top, and the
+/// repository its remote names (decision 2026-11-06 (joining), rule 2.5).
+pub fn clone_of(data_dir: &Path, folder: &Path, deadline: Instant) -> Out<CloneOf> {
+    let git =
+        Git::under(data_dir).map_err(|e| PersonError::Held(format!("the node's git: {e}")))?;
+    let top = match git.top_of(folder, deadline) {
+        Ok(top) => top,
+        Err(ListFailed::NotARepository) => {
+            return sharing::refused("not_a_repository", NOT_IN_A_CLONE_TO_STOP.into());
+        }
+        Err(failed) => return not_read(None, &failed),
+    };
+    let identity = git
+        .identity_of_clone_by(&top, None, deadline)
+        .ok()
+        .map(|(_, identity)| identity.to_string());
+    Ok(CloneOf { top, identity })
+}
+
+/// `cordelia unsubscribe` with no name, in a clone (rule 2.5), in one
+/// write: this device follows no more the repository it follows from that
+/// clone, or whose identity the clone's remote names. No yes, as
+/// `unsubscribe` asks none: it drops no channel and unsubscribes no agent,
+/// and `subscribe` there follows again. Returns what it says.
+pub fn unfollow(conn: &Connection, read: &CloneOf) -> Out<Vec<String>> {
+    let top = read.top.display().to_string();
+    let stopped = in_one(conn, || {
+        let mut stopped = Vec::new();
+        for follow in follows::follows(conn)? {
+            if follow.clone == top || read.identity.as_deref() == Some(follow.identity.as_str()) {
+                follows::unfollow(conn, &follow.identity)?;
+                stopped.push(follow.identity);
+            }
+        }
+        Ok(stopped)
+    })?;
+    if stopped.is_empty() {
+        return sharing::refused(
+            "not_followed",
+            format!(
+                "This device follows no repository from your clone at {}.",
+                cleaned(&top)
+            ),
+        );
+    }
+    Ok(stopped
+        .iter()
+        .map(|identity| format!("This device follows {identity} no more."))
+        .collect())
 }
 
 // ── On the yes ───────────────────────────────────────────────────────

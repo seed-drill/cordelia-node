@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use cordelia_core::protocol::SHARED_MAX_KEYS;
+use cordelia_core::protocol::{MEMBERS_LABELS_SHOWN, SHARED_MAX_KEYS};
 use cordelia_crypto::bech32::decode_public_key;
 
 use crate::person_cmd::{NOT_A_YES, list, own_key, text, time_of};
@@ -280,6 +280,17 @@ pub fn unsubscribe(
     Ok(())
 }
 
+/// `cordelia unsubscribe` with no name, in a clone (decision 2026-11-06
+/// (joining), rule 2.5): no yes; this device follows the clone's
+/// repository no more.
+pub fn unfollow(config_path: &str) -> anyhow::Result<()> {
+    refuse_another_version(config_path)?;
+    let (folder, _) = crate::msg_cmd::folder_of(config_path)?;
+    let body = json!({ "folder": folder });
+    print_said(&asked(config_path, "/api/v1/shared/unfollow", &body)?);
+    Ok(())
+}
+
 // ── cordelia shared anew, move and stay ──────────────────────────────
 
 /// What `shared anew` asks of each key (decision 2026-10-10 §7).
@@ -415,12 +426,114 @@ pub fn drop(config_path: &str, name: &str, words: Option<&str>) -> anyhow::Resul
 /// `cordelia shared list [--keys]` (§5.1): the shared channels, their keys
 /// (those refused for room among them, with `--keys`) and relays; the keys
 /// typed for a channel and what became of each; the shares waiting.
-pub fn show(config_path: &str, keys: bool) -> anyhow::Result<()> {
+pub fn show(config_path: &str, keys: bool, verbose: bool) -> anyhow::Result<()> {
     note_another_version(config_path);
     let listed = asked(config_path, "/api/v1/shared/list", &json!({ "keys": keys }))?;
-    for line in list_lines(&listed) {
+    let mut lines = list_lines(&listed);
+    let repositories: Vec<&Value> = list(&listed, "repositories").collect();
+    if !repositories.is_empty() {
+        lines.push("Repositories this device follows:".into());
+    }
+    for repository in repositories {
+        lines.extend(
+            repository_lines(repository, verbose, true)
+                .into_iter()
+                .map(|line| format!("  {line}")),
+        );
+    }
+    for line in lines {
         println!("{}", crate::history_cmd::printable(&line));
     }
+    Ok(())
+}
+
+/// The lines of one repository this device follows (decision 2026-11-06
+/// (joining), rule 7), as the node gave it: first the repository and the
+/// name its channel is filed under; then, each indented, when and from
+/// where its list was read, the members by the list's labels, each in or
+/// not yet where this device can see it, what waits unread, and each line
+/// of rules 4 to 6, an amber one after the line's amber mark, with any
+/// channel line it says to put in the list under it. The members are each
+/// said with `every`, and else the first [`MEMBERS_LABELS_SHOWN`] and how
+/// many more. The fingerprint words show only with `verbose` (#228).
+pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<String> {
+    let mut head = format!(
+        "{}, for {}",
+        text(repository, "identity"),
+        text(repository, "name")
+    );
+    if verbose && let Some(words) = repository["words"].as_str() {
+        head.push_str(&format!(" (channel {words})"));
+    }
+    let mut lines = vec![head];
+    match repository["read"]["says"].as_str() {
+        Some(says) => lines.push(format!("  {says}")),
+        None => lines.push("  The list has not been read yet.".into()),
+    }
+    let all: Vec<&Value> = list(repository, "members").collect();
+    let shown = match every {
+        true => all.len(),
+        false => all.len().min(MEMBERS_LABELS_SHOWN),
+    };
+    let mut members: Vec<String> = all[..shown]
+        .iter()
+        .map(|member| {
+            let mut shown = text(member, "label").to_string();
+            match member["in"].as_bool() {
+                Some(true) => shown.push_str(" (in)"),
+                Some(false) => shown.push_str(" (not yet)"),
+                None => {}
+            }
+            if verbose {
+                shown.push_str(&format!(" [{}]", text(member, "words")));
+            }
+            shown
+        })
+        .collect();
+    if all.len() > shown {
+        members.push(format!("and {} more", all.len() - shown));
+    }
+    if !members.is_empty() {
+        lines.push(format!("  Members: {}.", members.join(", ")));
+    }
+    if repository["held"] == true {
+        lines.push(format!(
+            "  Unread: {} by you, {} by an agent.",
+            repository["unread_by_a_person"].as_u64().unwrap_or(0),
+            repository["unread_by_an_agent"].as_u64().unwrap_or(0)
+        ));
+    }
+    for line in list(repository, "lines") {
+        let says = text(line, "says");
+        lines.push(match line["amber"] == true {
+            true => format!("  {} {says}", crate::indicator::AMBER_MARK),
+            false => format!("  {says}"),
+        });
+        if let Some(put) = line["line"].as_str() {
+            lines.push(format!("    {put}"));
+        }
+    }
+    lines
+}
+
+/// What `cordelia shared seen` says where its input is not a terminal.
+pub const SEEN_AT_A_TERMINAL: &str = "Run cordelia shared seen in a terminal: you clear these \
+                                      notices, not an agent. Nothing was cleared.";
+
+/// `cordelia shared seen <name> [<label>]` (decision 2026-11-06 (joining),
+/// rules 4.5, 5 and 6): at a terminal, and with no yes, it clears on this
+/// device the joins and changed line of the repository whose channel is
+/// `name`, or with `label` rule 5's notice of that key alone. A person clears
+/// them, so it refuses where its input is not a terminal, as an agent's
+/// is not.
+pub fn seen(config_path: &str, name: &str, label: Option<&str>) -> anyhow::Result<()> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!(SEEN_AT_A_TERMINAL);
+    }
+    refuse_another_version(config_path)?;
+    let body = json!({ "name": name, "label": label });
+    print_said(&asked(config_path, "/api/v1/shared/seen", &body)?);
     Ok(())
 }
 
@@ -833,5 +946,156 @@ mod tests {
             list_lines(&one_let_go)
                 .contains(&"    no longer known on this device: up to 1 key".to_string())
         );
+    }
+
+    /// Each repository this device follows is said with its read, its
+    /// members by the list's labels, what waits unread and its lines, an
+    /// amber one after "To know:" with the channel line it says to put
+    /// under it (decision 2026-11-06 (joining), rule 7). The fingerprint
+    /// words show only with `-v` (#228). A joiner, which cannot see who is
+    /// in the channel, says each member by its label alone, and nothing of
+    /// what waits unread.
+    #[test]
+    fn the_lines_of_a_repository_followed() {
+        let repository = json!({
+            "identity": "example.org/team/project", "name": "team/project", "held": true,
+            "words": "a b c d",
+            "read": { "says": "List of example.org/team/project read from your clone, fetched \
+                               2 hours ago. Read 5 minutes ago, at commit aaaa." },
+            "members": [
+                { "label": "alice-laptop", "words": "one two three four five six", "in": true },
+                { "label": "bob-desktop", "words": "six five four three two one", "in": false },
+            ],
+            "unread_by_a_person": 2, "unread_by_an_agent": 1,
+            "lines": [
+                { "word": "handing", "says": "Handing team/project to bob-desktop: waiting for \
+                                              that device to take it.", "amber": false },
+                { "word": "put_the_line", "says": "team/project was made anew here: put its new \
+                                                   channel line in .cordelia/members, in a pull \
+                                                   request",
+                  "amber": true, "line": "channel 00 cordelia_pk1x without 0" },
+            ],
+        });
+        let lines = repository_lines(&repository, false, false);
+        assert_eq!(
+            lines,
+            [
+                "example.org/team/project, for team/project",
+                "  List of example.org/team/project read from your clone, fetched 2 hours ago. \
+                 Read 5 minutes ago, at commit aaaa.",
+                "  Members: alice-laptop (in), bob-desktop (not yet).",
+                "  Unread: 2 by you, 1 by an agent.",
+                "  Handing team/project to bob-desktop: waiting for that device to take it.",
+                "  ◆ team/project was made anew here: put its new channel line in \
+                 .cordelia/members, in a pull request",
+                "    channel 00 cordelia_pk1x without 0",
+            ]
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("a b c d") || line.contains("one two"))
+        );
+        let verbose = repository_lines(&repository, true, false);
+        assert_eq!(
+            verbose[0],
+            "example.org/team/project, for team/project (channel a b c d)"
+        );
+        assert_eq!(
+            verbose[2],
+            "  Members: alice-laptop (in) [one two three four five six], bob-desktop (not yet) \
+             [six five four three two one]."
+        );
+        let mut joiner = repository.clone();
+        joiner["held"] = json!(false);
+        joiner["read"] = json!(null);
+        for member in joiner["members"].as_array_mut().unwrap() {
+            member["in"] = json!(null);
+        }
+        let lines = repository_lines(&joiner, false, false);
+        assert_eq!(lines[1], "  The list has not been read yet.");
+        assert_eq!(lines[2], "  Members: alice-laptop, bob-desktop.");
+        assert!(!lines.iter().any(|line| line.starts_with("  Unread")));
+        // The plain status shows the first few labels and how many more;
+        // `shared list` shows each.
+        let mut many = joiner.clone();
+        many["members"] = (1..=9)
+            .map(|n| json!({ "label": format!("m{n}"), "in": null }))
+            .collect();
+        assert_eq!(
+            repository_lines(&many, false, false)[2],
+            "  Members: m1, m2, m3, m4, m5, m6, and 3 more."
+        );
+        assert_eq!(
+            repository_lines(&many, false, true)[2],
+            "  Members: m1, m2, m3, m4, m5, m6, m7, m8, m9."
+        );
+    }
+
+    /// `cordelia unsubscribe` takes a name, as before, or none, in a clone,
+    /// to stop following its repository (decision 2026-11-06 (joining),
+    /// rule 2.5): `--agent` and `--words` go only with a name.
+    #[test]
+    fn unsubscribe_with_a_name_or_none_is_parsed_apart() {
+        let parsed = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        match parsed(&["cordelia", "unsubscribe"]) {
+            Ok(Some(Commands::Unsubscribe {
+                name: None,
+                agent: None,
+                words: None,
+            })) => {}
+            _ => panic!("unsubscribe"),
+        }
+        match parsed(&["cordelia", "unsubscribe", "review", "--agent", "notes"]) {
+            Ok(Some(Commands::Unsubscribe {
+                name: Some(name),
+                agent: Some(agent),
+                ..
+            })) => assert_eq!((name.as_str(), agent.as_str()), ("review", "notes")),
+            _ => panic!("unsubscribe <name> --agent"),
+        }
+        for refused in [
+            &["cordelia", "unsubscribe", "--agent", "notes"][..],
+            &["cordelia", "unsubscribe", "--words", "a b c d"],
+        ] {
+            assert!(parsed(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    /// `cordelia shared seen <name>` takes a name, and `shared list` and
+    /// `status` take `-v` (decision 2026-11-06 (joining), rule 7).
+    #[test]
+    fn shared_seen_and_v_are_parsed() {
+        let parsed = |args: &[&str]| Cli::try_parse_from(args).map(|cli| cli.command);
+        match parsed(&["cordelia", "shared", "seen", "team/project"]) {
+            Ok(Some(Commands::Shared {
+                what: SharedCommand::Seen { name, label: None },
+            })) => assert_eq!(name, "team/project"),
+            _ => panic!("shared seen"),
+        }
+        match parsed(&["cordelia", "shared", "seen", "team/project", "bob-desktop"]) {
+            Ok(Some(Commands::Shared {
+                what:
+                    SharedCommand::Seen {
+                        name,
+                        label: Some(label),
+                    },
+            })) => assert_eq!(
+                (name.as_str(), label.as_str()),
+                ("team/project", "bob-desktop")
+            ),
+            _ => panic!("shared seen <name> <label>"),
+        }
+        assert!(parsed(&["cordelia", "shared", "seen"]).is_err());
+        match parsed(&["cordelia", "shared", "list", "-v"]) {
+            Ok(Some(Commands::Shared {
+                what: SharedCommand::List { verbose: true, .. },
+            })) => {}
+            _ => panic!("shared list -v"),
+        }
+        match parsed(&["cordelia", "status", "-v"]) {
+            Ok(Some(Commands::Status { verbose: true, .. })) => {}
+            _ => panic!("status -v"),
+        }
     }
 }

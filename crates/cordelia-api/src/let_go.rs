@@ -398,7 +398,7 @@ pub fn not_read_says(name: &str) -> String {
 }
 
 /// How long ago `secs` seconds is, in words.
-fn ago(secs: i64) -> String {
+pub(crate) fn ago(secs: i64) -> String {
     let (n, unit) = match secs.max(0) {
         s if s < 60 => return "just now".into(),
         s if s < 3600 => (s / 60, "minute"),

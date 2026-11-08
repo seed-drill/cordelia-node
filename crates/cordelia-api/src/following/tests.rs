@@ -1362,3 +1362,86 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
     assert_eq!(refused["error"]["code"], "not_a_repository", "{refused}");
     assert_eq!(refused["error"]["message"], NOT_IN_A_CLONE);
 }
+
+/// A device follows 16 repositories at most, as many as the shared
+/// channels it can hold: `subscribe` in a clone of a 17th is refused, and
+/// nothing is done; following one of the 16 again is not refused.
+#[test]
+fn a_seventeenth_follow_is_refused() {
+    let s = devices(1);
+    let now = s.now + 10;
+    for n in 0..cordelia_core::protocol::SHARED_MAX_CHANNELS {
+        follows::follow(
+            &s[0].conn,
+            &format!("example.org/team/p{n}"),
+            "origin",
+            FOLDER,
+            now,
+        )
+        .unwrap();
+    }
+    let list = format!("{}   bob-laptop\n", id(&s.key(0)));
+    assert_eq!(
+        refusal(planned(&s, Some(&list), FIRST, false)),
+        (
+            "too_many_follows",
+            "This device follows 16 repositories, the most it can. To follow another, first run \
+             cordelia unsubscribe in a clone of one it follows. Nothing was done."
+                .to_string()
+        )
+    );
+    assert!(follow_row(&s).is_none());
+    // One of the sixteen, followed again from another clone, is a follow
+    // no more.
+    follows::unfollow(&s[0].conn, "example.org/team/p0").unwrap();
+    follows::follow(&s[0].conn, REPOSITORY, "origin", FOLDER, now).unwrap();
+    assert!(planned(&s, Some(&list), FIRST, false).is_ok());
+}
+
+/// `cordelia unsubscribe` with no name, in a clone (rule 2.5): this device
+/// follows no more the repository it follows from that clone, or whose
+/// identity the clone's remote names, and keeps nothing of it; the other
+/// follows stay. A clone it follows nothing from is refused.
+#[test]
+fn unsubscribe_in_a_clone_stops_the_follow_of_its_repository() {
+    let s = devices(1);
+    let now = s.now + 10;
+    let conn = &s[0].conn;
+    let other = "example.org/team/other";
+    follows::follow(conn, REPOSITORY, "origin", FOLDER, now).unwrap();
+    follows::follow(conn, other, "origin", "/home/bob/Work/other", now).unwrap();
+    let notice = follows::Notice {
+        of: follows::NoticeOf::LineChanged,
+        commit: FIRST.into(),
+        at: now,
+    };
+    follows::notice(conn, REPOSITORY, &notice).unwrap();
+    let here = CloneOf {
+        top: PathBuf::from(FOLDER),
+        identity: None,
+    };
+    assert_eq!(
+        unfollow(conn, &here).unwrap(),
+        [format!("This device follows {REPOSITORY} no more.")]
+    );
+    assert!(follow_row(&s).is_none());
+    assert!(follows::notices(conn, REPOSITORY).unwrap().is_empty());
+    assert!(follows::follow_of(conn, other).unwrap().is_some());
+    assert_eq!(
+        refusal(unfollow(conn, &here)),
+        (
+            "not_followed",
+            format!("This device follows no repository from your clone at {FOLDER}.")
+        )
+    );
+    // A clone elsewhere whose remote names the repository followed.
+    let moved = CloneOf {
+        top: PathBuf::from("/home/bob/elsewhere"),
+        identity: Some(other.into()),
+    };
+    assert_eq!(
+        unfollow(conn, &moved).unwrap(),
+        [format!("This device follows {other} no more.")]
+    );
+    assert!(follows::follows(conn).unwrap().is_empty());
+}

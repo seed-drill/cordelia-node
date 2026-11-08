@@ -200,6 +200,7 @@ fn a_notice_is_kept_once_until_seen_and_a_dropped_key_until_it_leaves() {
         of: NoticeOf::Joined {
             key: [5; 32],
             label: "alice-laptop".into(),
+            channel: [7; 32],
         },
         commit: commit('a'),
         at: 9,
@@ -329,4 +330,35 @@ fn what_a_making_anew_printed_is_kept_within_its_bounds() {
     assert!(made_line(&conn, &[0; 32], &keys[..1], &longer, 0).unwrap());
     let made = &made_lines(&conn).unwrap()[0];
     assert_eq!((made.left_out.len(), made.line.as_deref()), (1, None));
+}
+
+/// When a list first named the new channel is kept once, and stays the
+/// first time (rule 5's "from then on"); and the keys a person cleared the
+/// amber of are kept as left out no more, the others staying, in their
+/// order.
+#[test]
+fn when_a_list_first_named_the_new_channel_is_kept_and_cleared_keys_go() {
+    let conn = db();
+    conn.execute_batch(
+        "INSERT INTO shared_anew_made (channel, new_channel, rev, made_at, at_removal, delivering)
+             VALUES (zeroblob(32), zeroblob(32), 1, 9, 0, 1);",
+    )
+    .unwrap();
+    assert_eq!(made_lines(&conn).unwrap()[0].named_at, None);
+    assert!(!named(&conn, &[4; 32], 10).unwrap(), "not made here");
+    assert!(named(&conn, &[0; 32], 10).unwrap());
+    assert!(!named(&conn, &[0; 32], 11).unwrap(), "the first time stays");
+    assert_eq!(made_lines(&conn).unwrap()[0].named_at, Some(10));
+
+    assert_eq!(not_left_out(&conn, &[0; 32], &[[7; 32]]).unwrap(), 0);
+    made_line(&conn, &[0; 32], &[[7; 32], [8; 32], [6; 32]], "x", 0).unwrap();
+    assert_eq!(not_left_out(&conn, &[0; 32], &[[5; 32]]).unwrap(), 0);
+    assert_eq!(
+        not_left_out(&conn, &[0; 32], &[[8; 32], [7; 32]]).unwrap(),
+        2
+    );
+    let made = &made_lines(&conn).unwrap()[0];
+    assert_eq!(made.left_out, [[6; 32]]);
+    assert_eq!((made.line.as_deref(), made.named_at), (Some("x"), Some(10)));
+    assert_eq!(not_left_out(&conn, &[4; 32], &[[6; 32]]).unwrap(), 0);
 }

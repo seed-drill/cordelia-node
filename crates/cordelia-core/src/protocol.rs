@@ -2946,13 +2946,25 @@ pub const MEMBERS_HANDED_AT_ONCE: usize = MAX_TYPED_KEYS / 2;
 /// The most keys the node typed at reads of repositories' lists that one
 /// whole pass asks the relays for, across every repository the device
 /// follows (decision 2026-11-06 (joining), rule 4.4): the rest are asked
-/// for at the passes after, each within the hour of its read. Nothing
-/// bounds how many repositories a device follows, and each asking is a
+/// for at the passes after, each within the hour of its read. A device
+/// follows 16 repositories at most (`SHARED_MAX_CHANNELS`), of 64 keys
+/// each, so a thousand keys can be typed at once, and each asking is a
 /// proof and a pull of a share pair channel, so six passes a minute ask
 /// 384 at most: with the shared pass's first pages and proofs and the
 /// person's own typings, 592 of `SHARED_REQUESTS_PER_MINUTE`. A list's 64
 /// keys are asked for in two passes.
 pub const MEMBERS_ASKED_PER_PASS: usize = 32;
+
+/// The characters of a commit that the status and its line show (decision
+/// 2026-11-06 (joining), rule 7): the start of its hex, as git's own short
+/// form is. Twelve tell commits apart in any repository a team shares;
+/// `--json` gives the whole commit.
+pub const MEMBERS_COMMIT_SHOWN_CHARS: usize = 12;
+
+/// The labels of a list's members that the plain status shows of each
+/// repository before "and <n> more" (rule 7): `--json` and `shared list`
+/// give each.
+pub const MEMBERS_LABELS_SHOWN: usize = 6;
 
 // Checked at compile time (decision 2026-10-10 §14). The largest card is
 // the seed and two relays behind their count: with the form, the time and

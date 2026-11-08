@@ -19,8 +19,9 @@
 //!   key's with its label, which its line may no longer give.
 
 //! - **The node's shares** (`shared_shares.by_node`), and **what a making
-//!   anew left out, the line it printed and how many keys it was cut short
-//!   of** (`shared_anew_made.left_out`, `line` and `cut`, rule 5).
+//!   anew left out, the line it printed, how many keys it was cut short
+//!   of, and when a list first named the new channel**
+//!   (`shared_anew_made.left_out`, `line`, `cut` and `named_at`, rule 5).
 //!
 //! Nothing here reads a list or decides anything: that is done where these
 //! are read. Every time here is the node's.
@@ -412,8 +413,12 @@ pub fn untype(conn: &Connection, identity: &str, key: &[u8; 32]) -> Result<(), C
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoticeOf {
     /// A key that joined the channel from the list, with its label there
-    /// (rule 4.5). Kept until a person clears it.
-    Joined { key: [u8; 32], label: String },
+    /// and the channel it joined (rule 4.5). Kept until a person clears it.
+    Joined {
+        key: [u8; 32],
+        label: String,
+        channel: [u8; 32],
+    },
     /// The list's channel line changed (rule 6). Kept until a person clears
     /// it; a later change takes the place of an earlier one not yet cleared.
     LineChanged,
@@ -434,11 +439,16 @@ pub struct Notice {
 /// a changed line takes the place of one not yet cleared, with its commit.
 /// Returns whether anything was written.
 pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool, CordeliaError> {
-    let (kind, key, label): (i64, Vec<u8>, Option<&str>) = match &notice.of {
-        NoticeOf::Joined { key, label } => (1, key.to_vec(), Some(label)),
-        NoticeOf::LineChanged => (2, Vec::new(), None),
-        NoticeOf::Dropped { key, label } => (3, key.to_vec(), Some(label)),
-    };
+    let (kind, key, label, channel): (i64, Vec<u8>, Option<&str>, Option<&[u8; 32]>) =
+        match &notice.of {
+            NoticeOf::Joined {
+                key,
+                label,
+                channel,
+            } => (1, key.to_vec(), Some(label), Some(channel)),
+            NoticeOf::LineChanged => (2, Vec::new(), None, None),
+            NoticeOf::Dropped { key, label } => (3, key.to_vec(), Some(label), None),
+        };
     let on_conflict = match kind {
         2 => {
             "DO UPDATE SET at_commit = excluded.at_commit, at = excluded.at
@@ -449,11 +459,20 @@ pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool
     let written = conn
         .execute(
             &format!(
-                "INSERT INTO shared_follow_notices (identity, kind, key, label, at_commit, at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "INSERT INTO shared_follow_notices
+                     (identity, kind, key, label, at_commit, at, channel)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT (identity, kind, key) {on_conflict}"
             ),
-            params![identity, kind, key, label, notice.commit, notice.at],
+            params![
+                identity,
+                kind,
+                key,
+                label,
+                notice.commit,
+                notice.at,
+                channel.map(|channel| &channel[..])
+            ],
         )
         .map_err(storage)?;
     Ok(written == 1)
@@ -462,7 +481,7 @@ pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool
 /// The notices of `identity`, oldest first.
 pub fn notices(conn: &Connection, identity: &str) -> Result<Vec<Notice>, CordeliaError> {
     conn.prepare(
-        "SELECT kind, key, label, at_commit, at FROM shared_follow_notices
+        "SELECT kind, key, label, at_commit, at, channel FROM shared_follow_notices
              WHERE identity = ?1 ORDER BY at, kind, key",
     )
     .map_err(storage)?
@@ -471,9 +490,17 @@ pub fn notices(conn: &Connection, identity: &str) -> Result<Vec<Notice>, Cordeli
         let key: Vec<u8> = row.get(1)?;
         let key: [u8; 32] = key.try_into().unwrap_or([0; 32]);
         let label: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+        let channel: Option<Vec<u8>> = row.get(5)?;
+        let channel: [u8; 32] = channel
+            .and_then(|channel| channel.try_into().ok())
+            .unwrap_or([0; 32]);
         Ok(Notice {
             of: match kind {
-                1 => NoticeOf::Joined { key, label },
+                1 => NoticeOf::Joined {
+                    key,
+                    label,
+                    channel,
+                },
                 3 => NoticeOf::Dropped { key, label },
                 _ => NoticeOf::LineChanged,
             },
@@ -590,12 +617,15 @@ pub struct MadeLine {
     pub line: Option<String>,
     /// How many keys the line was cut short of, to fit a list.
     pub cut: u64,
+    /// When a list this device follows first named the new channel, or one
+    /// made anew from it: rule 5's "from then on".
+    pub named_at: Option<i64>,
 }
 
 /// Every channel this device made anew, with what it left out and printed.
 pub fn made_lines(conn: &Connection) -> Result<Vec<MadeLine>, CordeliaError> {
     conn.prepare(
-        "SELECT channel, new_channel, left_out, line, cut FROM shared_anew_made
+        "SELECT channel, new_channel, left_out, line, cut, named_at FROM shared_anew_made
              ORDER BY made_at, channel",
     )
     .map_err(storage)?
@@ -609,11 +639,66 @@ pub fn made_lines(conn: &Connection) -> Result<Vec<MadeLine>, CordeliaError> {
             left_out: left_out.unwrap_or_default().as_chunks::<32>().0.to_vec(),
             line: row.get(3)?,
             cut: row.get::<_, i64>(4)?.max(0) as u64,
+            named_at: row.get(5)?,
         })
     })
     .map_err(storage)?
     .collect::<Result<_, _>>()
     .map_err(storage)
+}
+
+/// A list this device follows names the channel that the making anew of
+/// `channel` made, or one made anew from it, at `at` (rule 5): kept where
+/// it was not yet, so that it stays the first time. Returns whether it was
+/// written.
+pub fn named(conn: &Connection, channel: &[u8; 32], at: i64) -> Result<bool, CordeliaError> {
+    let changed = conn
+        .execute(
+            "UPDATE shared_anew_made SET named_at = ?2 WHERE channel = ?1 AND named_at IS NULL",
+            params![&channel[..], at],
+        )
+        .map_err(storage)?;
+    Ok(changed == 1)
+}
+
+/// A person cleared the amber of rule 5 for `keys`, left out by the making
+/// anew of `channel` (`cordelia shared seen`): they are kept as left out by
+/// it no more, so that a key brought back on purpose ends its amber. The
+/// other keys it left out stay. Returns how many went.
+pub fn not_left_out(
+    conn: &Connection,
+    channel: &[u8; 32],
+    keys: &[[u8; 32]],
+) -> Result<usize, CordeliaError> {
+    in_savepoint(conn, || {
+        let kept: Option<Option<Vec<u8>>> = conn
+            .query_row(
+                "SELECT left_out FROM shared_anew_made WHERE channel = ?1",
+                [&channel[..]],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(storage)?;
+        let Some(Some(kept)) = kept else {
+            return Ok(0);
+        };
+        let before = kept.as_chunks::<32>().0;
+        let after: Vec<u8> = before
+            .iter()
+            .filter(|key| !keys.contains(key))
+            .flatten()
+            .copied()
+            .collect();
+        let went = before.len() - after.len() / 32;
+        if went > 0 {
+            conn.execute(
+                "UPDATE shared_anew_made SET left_out = ?2 WHERE channel = ?1",
+                params![&channel[..], after],
+            )
+            .map_err(storage)?;
+        }
+        Ok(went)
+    })
 }
 
 #[cfg(test)]

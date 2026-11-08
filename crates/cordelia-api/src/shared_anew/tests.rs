@@ -46,7 +46,13 @@ use cordelia_crypto::entry::CheckedEntry;
 
 /// Each member of `members` writes its empty anew record in `channel`, and
 /// device `n` stores it: the device then shows each key.
-fn written_by(s: &Several, n: usize, channel: &Shared, members: &[&NodeIdentity], now: i64) {
+pub(crate) fn written_by(
+    s: &Several,
+    n: usize,
+    channel: &Shared,
+    members: &[&NodeIdentity],
+    now: i64,
+) {
     for member in members {
         stores(s, n, &anew(member, channel, 1), now);
     }
@@ -1216,7 +1222,7 @@ fn follows(s: &mut Several, from: usize, to: usize, now: i64) {
     out(s, to, now);
 }
 
-fn filed_as(s: &Several, n: usize, name: &str) -> Shared {
+pub(crate) fn filed_as(s: &Several, n: usize, name: &str) -> Shared {
     let filing = sharing::filed(&s[n].conn)
         .unwrap()
         .into_iter()
@@ -2727,11 +2733,11 @@ fn a_shared_push_picked_before_a_removal_is_not_sent_after_it() {
 /// The relay of the channels of these tests whose new channel line is
 /// printed: a key that can be used, as a relay's is, since a line names
 /// only such a key. [`AT`] is not one, so its channels print no line.
-fn line_at() -> [u8; 32] {
+pub(crate) fn line_at() -> [u8; 32] {
     NodeIdentity::from_seed([0x52; 32]).unwrap().public_key()
 }
 
-fn line_relays() -> Vec<OwnRelay> {
+pub(crate) fn line_relays() -> Vec<OwnRelay> {
     vec![OwnRelay {
         name: "relay.example.org:9474".into(),
         key: line_at(),
@@ -2739,7 +2745,7 @@ fn line_relays() -> Vec<OwnRelay> {
 }
 
 /// The card made from `seed`, at [`line_at`].
-fn card_at_line_at(seed: u8) -> Card {
+pub(crate) fn card_at_line_at(seed: u8) -> Card {
     let mut bytes = vec![seed; 32];
     bytes.extend_from_slice(&Relays::new(&[line_at()]).unwrap().to_bytes());
     Card::from_bytes(&bytes).unwrap()
@@ -2755,7 +2761,7 @@ fn twin(key: [u8; 32]) -> [u8; 32] {
 
 /// Device `n` files the channel of the card made from `seed`, at
 /// [`line_at`], as `name`.
-fn holds_at_line_at(s: &Several, n: usize, seed: u8, name: &str, now: i64) -> Shared {
+pub(crate) fn holds_at_line_at(s: &Several, n: usize, seed: u8, name: &str, now: i64) -> Shared {
     let card = card_at_line_at(seed);
     let filing = Filing {
         channel: card.channel_id().unwrap(),
@@ -2773,7 +2779,7 @@ fn holds_at_line_at(s: &Several, n: usize, seed: u8, name: &str, now: i64) -> Sh
 /// Device `n` follows `repository`, whose list read at `at` has the
 /// channel line of `channel` with `without`, and a line for each of
 /// `devices`.
-fn follows_a_list(
+pub(crate) fn follows_a_list(
     s: &Several,
     n: usize,
     repository: &str,
@@ -2806,7 +2812,7 @@ fn follows_a_list(
 /// Device `n` makes the channel `name` anew with `shared anew`, keeping the
 /// keys of `keep` and leaving out every other key it is asked about.
 /// Returns what it said, and the keys it left out in the order asked.
-fn anew_keeping(
+pub(crate) fn anew_keeping(
     s: &Several,
     n: usize,
     name: &str,
@@ -2846,7 +2852,7 @@ fn anew_keeping(
 
 /// The new channel line said in `said`: the line after [`PUT_THE_LINE`],
 /// read as a list reads it.
-fn line_in(said: &[String]) -> (String, ChannelLine) {
+pub(crate) fn line_in(said: &[String]) -> (String, ChannelLine) {
     let at = said
         .iter()
         .position(|line| line == PUT_THE_LINE)
@@ -2858,7 +2864,7 @@ fn line_in(said: &[String]) -> (String, ChannelLine) {
 }
 
 /// What device `n` kept of its making anew of `channel`.
-fn kept_of(s: &Several, n: usize, channel: &Shared) -> follows::MadeLine {
+pub(crate) fn kept_of(s: &Several, n: usize, channel: &Shared) -> follows::MadeLine {
     follows::made_lines(&s[n].conn)
         .unwrap()
         .into_iter()
