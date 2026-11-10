@@ -853,9 +853,9 @@ pub fn make(
         // said whether this clone goes back from the last commit read, and
         // the commit it named is where never-back starts now. The list
         // last read is kept, and not this one: the node's next read, woken
-        // now, compares the list it reads with it (rule 4.6). So is when
-        // it was read, since when that read notices a key's join (rule
-        // 4.5). A first follow keeps this read whole.
+        // now, compares the list it reads with it (rules 4.5 and 4.6). A
+        // first follow keeps this read whole, and its list names each key
+        // on it as new (rule 4.5, as the person ruled on 10 November).
         // The follow this one replaces stops first, in the same write: a
         // channel follows one repository (rule 2.5).
         if let Some(other) = &following.replaces {
@@ -877,15 +877,22 @@ pub fn make(
         match earlier {
             Some(earlier) => {
                 read.at = earlier.last.map_or(now, |last| last.at);
-                follows::set_last_read(conn, &following.identity, &read)?
+                follows::set_last_read(conn, &following.identity, &read)?;
             }
-            None => follows::read_done(
-                conn,
-                &following.identity,
-                &read,
-                &following.list,
-                following.fetched_at,
-            )?,
+            None => {
+                follows::read_done(
+                    conn,
+                    &following.identity,
+                    &read,
+                    &following.list,
+                    following.fetched_at,
+                )?;
+                if let Ok(list) = members::read(&following.list) {
+                    let commit = &following.commit;
+                    let of = &following.identity;
+                    crate::members_read::joined(conn, identity, of, None, &list, commit, now)?;
+                }
+            }
         };
         said.push(format!(
             "Following {}, from its list at commit {}. cordelia status shows how it goes.",

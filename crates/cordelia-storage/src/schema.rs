@@ -1881,11 +1881,11 @@ CREATE TABLE shared_anew_not_clean (
 /// - `shared_follow_typed`: the node's own typings of listed keys, for each
 ///   repository, apart from the person's (`shared_typed_keys`), with what
 ///   became of each.
-/// - `shared_follow_notices`: a key that joined from the list (1) and a
-///   changed channel line (2), each kept until a person clears it with
-///   `cordelia shared seen`; and a key the list dropped (3), kept until it
-///   leaves the channel. Each with its commit, a key's with its label, and
-///   a join's with the channel it joined.
+/// - `shared_follow_notices`: a key new on the list (1) and a changed
+///   channel line (2), each kept until a person clears it with `cordelia
+///   shared seen`; and a key the list dropped (3), kept until it leaves the
+///   channel. Each with its commit, a key's with its label, and a new key's
+///   with the channel the list named.
 /// - `shared_shares.by_node`: whether the node made the share, not a person.
 /// - `shared_anew_made.left_out`, `line`, `cut` and `named_at`: the keys a
 ///   making anew left out, 32 bytes each (up to the 1,024 rows a table

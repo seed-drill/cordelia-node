@@ -17,9 +17,10 @@
 //!     nothing is handed over ([`acts_in`]), or each key handed it that
 //!     has not taken it yet; and where they do not, why nothing is taken
 //!     ([`takes_in`]), or the wait ([`waiting_line`]);
-//!   - **then the ambers:** a key that joined, a key dropped from the list,
-//!     a changed channel line, each until a person clears it (rules 4.5,
-//!     4.6 and 6); rule 1's gate, on a device that holds the channel and so
+//!   - **then the ambers:** the keys new on the list at a commit, in one
+//!     line, and a changed channel line, each until a person clears it
+//!     (rules 4.5 and 6); a key dropped from the list, until it leaves the
+//!     channel (rule 4.6); rule 1's gate, on a device that holds the channel and so
 //!     sees who is in it (rule 4.7); and of each making anew here (rule 5),
 //!     its new channel line until the list names the new channel, and from
 //!     then on each key it left out that the list names and its channel
@@ -33,7 +34,8 @@
 //!   lock at each status. An error in one follow's view is a line of that
 //!   view: the rest are said.
 //! - **`cordelia shared seen <name>`** ([`seen`]) clears, on this device,
-//!   the joins and a changed line, and says each it clears. **`cordelia
+//!   the keys new on the list and a changed line, and says each line it
+//!   clears. **`cordelia
 //!   shared seen <name> <label>`** clears rule 5's amber of that key alone:
 //!   a key left out comes back with a changed line, so the line's notice
 //!   must never take that amber with it. A key dropped from the list stays
@@ -42,6 +44,7 @@
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
+use cordelia_core::protocol::MEMBERS_LABELS_SHOWN;
 use cordelia_crypto::acts::Filing;
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
@@ -70,13 +73,15 @@ fn rfc3339(at: i64) -> String {
 
 /// One line of a follow's view: a word for a program, what it says, and
 /// whether it is amber. A line that says to put a channel line in the
-/// list carries it.
+/// list carries it. The line of keys new on the list carries its commit,
+/// whole, and each key, as `members` gives them (rule 4.5).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Said {
     pub word: String,
     pub says: String,
     pub amber: bool,
     pub line: Option<String>,
+    pub joined: Option<(String, Vec<Value>)>,
 }
 
 impl Said {
@@ -86,6 +91,7 @@ impl Said {
             says,
             amber: false,
             line: None,
+            joined: None,
         }
     }
 
@@ -97,12 +103,17 @@ impl Said {
     }
 
     fn to_json(&self) -> Value {
-        json!({
+        let mut said = json!({
             "word": self.word,
             "says": self.says,
             "amber": self.amber,
             "line": self.line,
-        })
+        });
+        if let Some((commit, devices)) = &self.joined {
+            said["commit"] = json!(commit);
+            said["devices"] = json!(devices);
+        }
+        said
     }
 }
 
@@ -198,15 +209,6 @@ impl Known {
             .iter()
             .find(|(new, _)| new == channel)
             .map(|(_, at)| &self.filings[*at]))
-    }
-
-    /// `channel` as a line says it: the person's name for it, or for the
-    /// channel they moved to from it, or else its words.
-    fn named(&self, channel: &[u8; 32]) -> String {
-        match self.filed(channel).or_else(|| self.moved_to(channel)) {
-            Some(filing) => cleaned(&filing.name),
-            None => format!("channel {}", channel_words(channel)),
-        }
     }
 }
 
@@ -326,10 +328,20 @@ pub fn handing_line(name: &str, label: &str) -> String {
     format!("Handing {name} to {label}: waiting for that device to take it.")
 }
 
-/// Rule 4.5's line, amber, until a person clears it: `name` is the channel
-/// the key joined.
-pub fn joined_line(label: &str, name: &str, commit: &str) -> String {
-    format!("{label} joined {name} from the list at {}", short(commit))
+/// Rule 4.5's line, amber, until a person clears it: the keys new on the
+/// list of `name` at `commit`, by `labels`, the first `shown` of them and
+/// then how many more. The status shows [`MEMBERS_LABELS_SHOWN`], and
+/// `shared list` every label.
+pub fn joined_line(name: &str, commit: &str, labels: &[&str], shown: usize) -> String {
+    let named = &labels[..labels.len().min(shown)];
+    let more = labels.len() - named.len();
+    let named = match (named.split_last(), more) {
+        (None, _) => String::new(),
+        (Some((last, [])), 0) => last.to_string(),
+        (Some((last, rest)), 0) => format!("{} and {last}", rest.join(", ")),
+        (Some(_), more) => format!("{} and {more} more", named.join(", ")),
+    };
+    format!("New on the list of {name} at {}: {named}", short(commit))
 }
 
 /// Rule 4.6's line, amber, until the key leaves the channel, as when the
@@ -374,21 +386,67 @@ pub fn not_said_line(label: &str, name: &str) -> String {
     )
 }
 
-/// The line of a notice, with its word.
-fn notice_said(known: &Known, repository: &str, name: &str, notice: &Notice) -> Said {
-    match &notice.of {
-        NoticeOf::Joined { label, channel, .. } => Said::amber(
-            "joined",
-            joined_line(label, &known.named(channel), &notice.commit),
-        ),
-        NoticeOf::LineChanged => Said::amber(
-            "line_changed",
-            line_changed_line(repository, name, &notice.commit),
-        ),
-        NoticeOf::Dropped { label, .. } => {
-            Said::amber("no_longer_listed", dropped_line(label, name))
+/// The lines of the notices of the follow of `repository`, whose channel
+/// is said as `name`: first the keys new on the list, one line for each
+/// commit, by label (rule 4.5); then each other notice, with its word.
+fn notices_said(
+    repository: &str,
+    name: &str,
+    notices: &[Notice],
+) -> Result<Vec<Said>, PersonError> {
+    let joins: Vec<(&str, &str, &[u8; 32])> = notices
+        .iter()
+        .filter_map(|notice| match &notice.of {
+            NoticeOf::Joined { key, label, .. } => {
+                Some((notice.commit.as_str(), label.as_str(), key))
+            }
+            _ => None,
+        })
+        .collect();
+    let mut commits: Vec<&str> = Vec::new();
+    for (commit, ..) in &joins {
+        if !commits.contains(commit) {
+            commits.push(commit);
         }
     }
+    let mut said = Vec::new();
+    for commit in commits {
+        let mut keys: Vec<(&str, &[u8; 32])> = joins
+            .iter()
+            .filter(|(at, ..)| *at == commit)
+            .map(|(_, label, key)| (*label, *key))
+            .collect();
+        keys.sort();
+        let labels: Vec<&str> = keys.iter().map(|(label, _)| *label).collect();
+        let mut devices = Vec::with_capacity(keys.len());
+        for (label, key) in &keys {
+            devices.push(json!({
+                "label": label,
+                "key": encode_public_key(key)?,
+                "words": six_words(key),
+            }));
+        }
+        said.push(Said {
+            joined: Some((commit.to_string(), devices)),
+            ..Said::amber(
+                "joined",
+                joined_line(name, commit, &labels, MEMBERS_LABELS_SHOWN),
+            )
+        });
+    }
+    for notice in notices {
+        match &notice.of {
+            NoticeOf::Joined { .. } => {}
+            NoticeOf::LineChanged => said.push(Said::amber(
+                "line_changed",
+                line_changed_line(repository, name, &notice.commit),
+            )),
+            NoticeOf::Dropped { label, .. } => {
+                said.push(Said::amber("no_longer_listed", dropped_line(label, name)));
+            }
+        }
+    }
+    Ok(said)
 }
 
 /// The lines of the follow `follow`, whose list kept is `list` and whose
@@ -459,9 +517,11 @@ fn lines_of(
             Err(refusal) => said.push(Said::plain(refusal.word, refusal.line)),
         }
     }
-    for notice in follows::notices(conn, repository)? {
-        said.push(notice_said(known, repository, name, &notice));
-    }
+    said.extend(notices_said(
+        repository,
+        name,
+        &follows::notices(conn, repository)?,
+    )?);
     said.extend(of_made);
     Ok(said)
 }
@@ -826,8 +886,9 @@ pub const DROPPED_STAYS: &str = "A key no longer on the list stays shown until t
 /// `cordelia shared seen <name>`, and with `label`, `cordelia shared seen
 /// <name> <label>` (rules 4.5, 5 and 6), in one write, for each repository
 /// this device follows whose channel is said as `name`, or whose identity
-/// is `name`. With no label, the joins and a changed channel line go, each
-/// said as it goes, and rule 5's amber of a key left out is said again,
+/// is `name`. With no label, the keys new on the list and a changed channel
+/// line go, each line said as it goes, and rule 5's amber of a key left out
+/// is said again,
 /// with how to clear it: a key left out comes back with a changed line,
 /// and clearing that must not take the one alarm with it. With a label,
 /// rule 5's amber of the key the list gives that label goes, and nothing
@@ -879,17 +940,15 @@ pub fn seen(
                     }
                 }
                 None => {
-                    for notice in follows::notices(conn, &follow.identity)? {
-                        match notice.of {
-                            NoticeOf::Joined { .. } | NoticeOf::LineChanged => {
-                                cleared
-                                    .push(notice_said(&known, &follow.identity, &of, &notice).says);
-                            }
-                            NoticeOf::Dropped { .. } => {
+                    let notices = follows::notices(conn, &follow.identity)?;
+                    for one in notices_said(&follow.identity, &of, &notices)? {
+                        match one.word.as_str() {
+                            "no_longer_listed" => {
                                 if !still.iter().any(|line| line == DROPPED_STAYS) {
                                     still.push(DROPPED_STAYS.to_string());
                                 }
                             }
+                            _ => cleared.push(one.says),
                         }
                     }
                     follows::seen(conn, &follow.identity)?;

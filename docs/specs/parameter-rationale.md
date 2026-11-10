@@ -3387,7 +3387,7 @@ reason there:
 
 **`MEMBERS_COMMIT_SHOWN_CHARS` = 12.** The characters of a commit that `cordelia status`, `shared list` and the status line show (rule 7): the start of its hex, as git's own short form. Seven, git's least, can name two commits of a large repository; twelve tell them apart in any repository a team shares, and keep a join's line short enough for a status bar. `--json` gives the whole commit, for a person or a program to check.
 
-**`MEMBERS_LABELS_SHOWN` = 6.** The labels of a list's members that the plain status shows of each repository, then "and <n> more" (rule 7). A list names up to 64 devices; six fit on one line of a terminal, and are enough to see who is in and who not yet. `--json` and `shared list` give every member.
+**`MEMBERS_LABELS_SHOWN` = 6.** The labels of a list's members that the plain status shows of each repository, then "and <n> more" (rule 7). A list names up to 64 devices; six fit on one line of a terminal, and are enough to see who is in and who not yet. `--json` and `shared list` give every member. The line of the keys new on the list at a commit names as many, then "and <n> more" (rule 4.5); `--json` and `shared list` give each.
 
 ## 13. Memory Across Connections (Change F)
 

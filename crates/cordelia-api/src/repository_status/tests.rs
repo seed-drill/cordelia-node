@@ -520,18 +520,30 @@ fn a_joiners_lines_say_the_wait_or_why_it_takes_nothing() {
     let left_out = list_with(Some((&channel.id, &[s.key(0), carol])), &devices);
     reads(&s, &left_out, &commit('d'), now + 3);
     let view = view_now(&s, now + 3);
+    // The first list with a channel line since one with none: each key on
+    // it but this device's is new on it (rule 4.5).
     assert_eq!(
         lines(&view),
-        [(
-            "left_out_of_it".to_string(),
-            format!(
-                "The list of {REPOSITORY} at {} names channel {}, which no device of yours holds \
-                 or can move to.",
-                short_of('d'),
-                channel_words(&channel.id)
+        [
+            (
+                "left_out_of_it".to_string(),
+                format!(
+                    "The list of {REPOSITORY} at {} names channel {}, which no device of yours \
+                     holds or can move to.",
+                    short_of('d'),
+                    channel_words(&channel.id)
+                ),
+                true
             ),
-            true
-        )]
+            (
+                "joined".to_string(),
+                format!(
+                    "New on the list of team/project at {}: m1 and m2",
+                    short_of('d')
+                ),
+                true
+            )
+        ]
     );
     assert!(list.contains("bob-0"));
 }
@@ -650,12 +662,13 @@ fn rule_1s_gate_is_amber_on_a_member() {
 
 // ── The notices (rules 4.5, 4.6 and 6), and `shared seen` ────────────
 
-/// A join, a key dropped and a changed channel line are each amber, with
-/// the record's words; `shared seen` clears the join and the changed line
-/// on this device, and not the dropped key, which stays until it leaves
-/// the channel; and nothing of another repository's.
+/// The keys new on the list at a commit, a key dropped and a changed
+/// channel line are each amber, with the record's words; `shared seen`
+/// clears the new keys and the changed line on this device, saying each
+/// line, and not the dropped key, which stays until it leaves the channel;
+/// and nothing of another repository's.
 #[test]
-fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
+fn the_notices_are_amber_and_seen_clears_the_new_keys_and_the_changed_line_alone() {
     let s = bob(1);
     let now = s.now + 10;
     let channel = holds(&s, 0, 7, "review", now);
@@ -667,12 +680,22 @@ fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
         (carol.public_key(), "carol-laptop"),
         (dave.public_key(), "dave-laptop"),
     ];
-    follows_at(&s, &list_named(&channel.id, &[], &all), &commit('a'), now);
-    // Another repository, whose list names "design", with a join.
+    follows_at(
+        &s,
+        &list_named(&channel.id, &[], &all[..2]),
+        &commit('a'),
+        now,
+    );
+    // Another repository, whose list names "design", with Dave new on it.
     let elsewhere = "example.org/team/other";
+    follows_as(
+        &s,
+        elsewhere,
+        &list_named(&other.id, &[], &[]),
+        &commit('a'),
+        now,
+    );
     let theirs = list_named(&other.id, &[], &all[2..]);
-    follows_as(&s, elsewhere, &theirs, &commit('a'), now);
-    write_in(&s, &other, &[&dave], now + 5);
     let read_there =
         crate::members_read::tests::read_as(&s, elsewhere, &theirs, &commit('e'), true);
     after_read(
@@ -684,11 +707,14 @@ fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
     )
     .unwrap();
     assert_eq!(
-        view_of(&s, elsewhere, now + READ)["lines"][0]["word"],
-        "joined"
+        ambers(&view_of(&s, elsewhere, now + READ)),
+        [format!(
+            "New on the list of design at {}: dave-laptop",
+            short_of('e')
+        )]
     );
 
-    write_in(&s, &channel, &[&dave], now + 5);
+    // Dave new on the list, and Carol, who is in the channel, dropped.
     let without_carol = list_named(&channel.id, &[], &[all[0], all[2]]);
     reads(&s, &without_carol, &commit('b'), now + READ);
     let view = view_now(&s, now + READ);
@@ -697,7 +723,7 @@ fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
         ambers(&view),
         [
             format!(
-                "dave-laptop joined review from the list at {}",
+                "New on the list of review at {}: dave-laptop",
                 short_of('b')
             ),
             "carol-laptop is no longer on the list of review: make it anew with cordelia shared \
@@ -729,13 +755,12 @@ fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
         )
     );
 
-    // Each it clears is said, by label; the join is said against the
-    // channel it joined.
+    // Each line it clears is said.
     assert_eq!(
         seen_on(&s, "notes").unwrap(),
         [
             format!(
-                "Cleared: dave-laptop joined review from the list at {}",
+                "Cleared: New on the list of notes at {}: dave-laptop",
                 short_of('b')
             ),
             format!(
@@ -750,8 +775,8 @@ fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
         ["no_longer_listed"]
     );
     assert_eq!(
-        view_of(&s, elsewhere, now + READ + 2)["lines"][0]["word"],
-        "joined",
+        amber_words(&view_of(&s, elsewhere, now + READ + 2)),
+        ["joined"],
         "another repository's notices stay"
     );
     // By its identity too; and a second time, nothing is left to clear.
@@ -759,6 +784,102 @@ fn the_notices_are_amber_and_seen_clears_the_join_and_the_changed_line_alone() {
         seen_on(&s, REPOSITORY).unwrap()[0],
         "Nothing to clear for example.org/team/project on this device."
     );
+}
+
+/// The keys new on the list at one commit are one amber line, by label:
+/// six of them, then how many more, and one alone by its label. Its JSON
+/// gives the commit, whole, and each key as `members` gives it. `shared
+/// seen` with a label leaves them; without, it says each line as it clears
+/// it, and a read after names nothing.
+#[test]
+fn the_keys_new_at_a_commit_are_one_line_by_label() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let first = list_with(Some((&channel.id, &[])), &listed(1..=1));
+    follows_at(&s, &first, &commit('a'), now);
+    let mut devices = listed(1..=9);
+    devices.insert(4, (s.key(0), "bob-laptop".into()));
+    let nine = list_with(Some((&channel.id, &[])), &devices);
+    reads(&s, &nine, &commit('b'), now + 1);
+    let eight = format!(
+        "New on the list of review at {}: m2, m3, m4, m5, m6, m7 and 2 more",
+        short_of('b')
+    );
+    let view = view_now(&s, now + 1);
+    assert_eq!(ambers(&view), std::slice::from_ref(&eight));
+    let line = view["lines"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|line| line["word"] == "joined")
+        .unwrap();
+    let mut fields: Vec<&str> = line
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    fields.sort();
+    assert_eq!(
+        fields,
+        ["amber", "commit", "devices", "line", "says", "word"]
+    );
+    assert_eq!(line["commit"], commit('b'), "whole");
+    let each: Vec<Value> = (2..=9)
+        .map(|n| {
+            json!({
+                "label": format!("m{n}"),
+                "key": encode_public_key(&member(n).public_key()).unwrap(),
+                "words": six_words(&member(n).public_key()),
+            })
+        })
+        .collect();
+    assert_eq!(line["devices"], Value::Array(each));
+
+    // One more at another commit: a line of its own.
+    devices.push((member(10).public_key(), "m10".into()));
+    let ten = list_with(Some((&channel.id, &[])), &devices);
+    reads(&s, &ten, &commit('c'), now + 2);
+    let one = format!("New on the list of review at {}: m10", short_of('c'));
+    assert_eq!(ambers(&view_now(&s, now + 2)), [eight.clone(), one.clone()]);
+
+    // `shared seen <name> <label>` clears rule 5's amber of a key alone,
+    // and none of these.
+    assert_eq!(
+        seen_key(&s, "review", "m2"),
+        ["Nothing to clear for m2 in review on this device."]
+    );
+    assert_eq!(ambers(&view_now(&s, now + 2)), [eight.clone(), one.clone()]);
+    assert_eq!(
+        seen_on(&s, "review").unwrap(),
+        [format!("Cleared: {eight}"), format!("Cleared: {one}")]
+    );
+    assert!(ambers(&view_now(&s, now + 3)).is_empty());
+    reads(&s, &ten, &commit('d'), now + 4);
+    assert!(ambers(&view_now(&s, now + 4)).is_empty());
+}
+
+/// The line names each label where there are six or fewer, the last after
+/// "and", and else the first six and how many more; `shared list` gives it
+/// every label.
+#[test]
+fn the_line_of_keys_new_on_the_list_names_six_then_how_many_more() {
+    let named = |labels: &[&str], shown: usize| {
+        joined_line("review", &commit('a'), labels, shown)
+            .split_once(": ")
+            .unwrap()
+            .1
+            .to_string()
+    };
+    let six = MEMBERS_LABELS_SHOWN;
+    assert_eq!(named(&["a"], six), "a");
+    assert_eq!(named(&["a", "b"], six), "a and b");
+    assert_eq!(named(&["a", "b", "c"], six), "a, b and c");
+    let seven = ["a", "b", "c", "d", "e", "f", "g"];
+    assert_eq!(named(&seven[..6], six), "a, b, c, d, e and f");
+    assert_eq!(named(&seven, six), "a, b, c, d, e, f and 1 more");
+    assert_eq!(named(&seven, 7), "a, b, c, d, e, f and g");
 }
 
 /// `shared seen` of a name no repository this device follows names says
@@ -884,28 +1005,37 @@ fn a_making_anew_here_shows_its_line_and_then_each_key_left_out_the_line_does_no
     assert!(ambers(&view_now(&s, now + 6)).is_empty());
 
     // A pull request brings Dave back: his line, and off `without`. Amber,
-    // and he is handed the channel.
+    // new on the list (rule 4.5), and he is handed the channel.
     let back = list_of_line_at(&new.id, &[carol.public_key()], &[devices[0], devices[2]]);
     reads(&s, &back, &commit('c'), now + 7);
     let gone_amiss = "dave-laptop was left out of review, and its channel line does not say so: \
                       add it after without, or delete its line";
+    let new_on =
+        |c: char, label: &str| format!("New on the list of review at {}: {label}", short_of(c));
     let view = view_now(&s, now + 8);
-    assert_eq!(ambers(&view), [gone_amiss]);
-    assert_eq!(words(&view), ["handing", "not_said"]);
+    assert_eq!(
+        ambers(&view),
+        [new_on('c', "dave-laptop").as_str(), gone_amiss]
+    );
+    assert_eq!(words(&view), ["handing", "joined", "not_said"]);
     // Carol listed again, and not after `without`: amber too. The line
     // that names her after `without` again ends hers.
     let both = list_of_line_at(&new.id, &[], &devices);
     reads(&s, &both, &commit('d'), now + 9);
     assert_eq!(
         amber_words(&view_now(&s, now + 10)),
-        ["not_said", "not_said"]
+        ["joined", "joined", "not_said", "not_said"]
     );
     let carol_out = list_of_line_at(&new.id, &[carol.public_key()], &devices);
     reads(&s, &carol_out, &commit('e'), now + 11);
     let view = view_now(&s, now + 11);
     assert_eq!(
-        ambers(&view)[1..],
-        [gone_amiss],
+        amber_words(&view),
+        ["left_out", "joined", "joined", "not_said"]
+    );
+    assert_eq!(
+        ambers(&view)[3],
+        gone_amiss,
         "the gate holds Carol, and Dave's stays"
     );
 
@@ -916,7 +1046,8 @@ fn a_making_anew_here_shows_its_line_and_then_each_key_left_out_the_line_does_no
     assert_eq!(
         seen_on(&s, "review").unwrap(),
         [
-            "Nothing to clear for review on this device.".to_string(),
+            format!("Cleared: {}", new_on('c', "dave-laptop")),
+            format!("Cleared: {}", new_on('d', "carol-laptop")),
             still_shown_line("dave-laptop", "review"),
         ]
     );
@@ -1281,7 +1412,10 @@ fn a_making_anew_at_a_removal_shows_its_line_until_the_list_names_the_new_channe
 #[test]
 fn the_record_says_each_line() {
     let lines = [
-        joined_line("<label>", "<name>", "<commit>"),
+        format!(
+            "{}<label>, <label> and <n> more",
+            joined_line("<name>", "<commit>", &[], 0)
+        ),
         dropped_line("<label>", "<name>").replace("'<name>'", "<name>"),
         gate_line("<label>", "<name>"),
         line_changed_line("<identity>", "<name>", "<commit>"),

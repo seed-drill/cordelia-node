@@ -453,9 +453,10 @@ pub fn show(config_path: &str, keys: bool, verbose: bool) -> anyhow::Result<()> 
 /// where its list was read, the members by the list's labels, each in or
 /// not yet where this device can see it, what waits unread, and each line
 /// of rules 4 to 6, an amber one after the line's amber mark, with any
-/// channel line it says to put in the list under it. The members are each
-/// said with `every`, and else the first [`MEMBERS_LABELS_SHOWN`] and how
-/// many more. The fingerprint words show only with `verbose` (#228).
+/// channel line it says to put in the list under it. The members, and the
+/// keys new on the list (rule 4.5), are each said with `every`, and else
+/// the first [`MEMBERS_LABELS_SHOWN`] and how many more. The fingerprint
+/// words show only with `verbose` (#228).
 pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<String> {
     let mut head = format!(
         "{}, for {}",
@@ -504,7 +505,16 @@ pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<S
         ));
     }
     for line in list(repository, "lines") {
-        let says = text(line, "says");
+        let labels: Vec<&str> = list(line, "devices")
+            .map(|device| text(device, "label"))
+            .collect();
+        let says = match (every, line["commit"].as_str()) {
+            (true, Some(commit)) if line["word"] == "joined" => {
+                let name = text(repository, "name");
+                cordelia_api::repository_status::joined_line(name, commit, &labels, labels.len())
+            }
+            _ => text(line, "says").to_string(),
+        };
         lines.push(match line["amber"] == true {
             true => format!("  {} {says}", crate::indicator::AMBER_MARK),
             false => format!("  {says}"),
@@ -522,10 +532,10 @@ pub const SEEN_AT_A_TERMINAL: &str = "Run cordelia shared seen in a terminal: yo
 
 /// `cordelia shared seen <name> [<label>]` (decision 2026-11-06 (joining),
 /// rules 4.5, 5 and 6): at a terminal, and with no yes, it clears on this
-/// device the joins and changed line of the repository whose channel is
-/// `name`, or with `label` rule 5's notice of that key alone. A person clears
-/// them, so it refuses where its input is not a terminal, as an agent's
-/// is not.
+/// device the keys new on the list and the changed line of the repository
+/// whose channel is `name`, or with `label` rule 5's notice of that key
+/// alone. A person clears them, so it refuses where its input is not a
+/// terminal, as an agent's is not.
 pub fn seen(config_path: &str, name: &str, label: Option<&str>) -> anyhow::Result<()> {
     use std::io::IsTerminal;
     if !std::io::stdin().is_terminal() {
@@ -1029,6 +1039,30 @@ mod tests {
         assert_eq!(
             repository_lines(&many, false, true)[2],
             "  Members: m1, m2, m3, m4, m5, m6, m7, m8, m9."
+        );
+        // The keys new on the list at a commit (rule 4.5): the status says
+        // the line the node gave, and `shared list` names every key.
+        let commit = "c".repeat(40);
+        let labels: Vec<String> = (1..=8).map(|n| format!("m{n}")).collect();
+        let said = cordelia_api::repository_status::joined_line(
+            "team/project",
+            &commit,
+            &labels.iter().map(String::as_str).collect::<Vec<_>>(),
+            MEMBERS_LABELS_SHOWN,
+        );
+        many["lines"] = json!([{
+            "word": "joined", "says": said, "amber": true, "line": null, "commit": commit,
+            "devices": labels.iter().map(|label| json!({ "label": label })).collect::<Vec<_>>(),
+        }]);
+        assert_eq!(
+            repository_lines(&many, false, false)[3],
+            "  ◆ New on the list of team/project at cccccccccccc: m1, m2, m3, m4, m5, m6 and 2 \
+             more"
+        );
+        assert_eq!(
+            repository_lines(&many, false, true)[3],
+            "  ◆ New on the list of team/project at cccccccccccc: m1, m2, m3, m4, m5, m6, m7 and \
+             m8"
         );
     }
 
