@@ -4,7 +4,7 @@
 **Decision maker**: Russell Wing
 **Reviewer**: Martin Stevens
 **Status**: Accepted. Built in cordelia-node #11 to #20 (2026-09-30).
-**Supersedes**: [`2026-03-09-architecture-simplification.md`](2026-03-09-architecture-simplification.md) (positioning and roadmap), and [`memory-model.md`](../archive/specs/memory-model.md) as the Phase 1 target.
+**Supersedes**: [`2026-03-09-architecture-simplification.md`](2026-03-09-architecture-simplification.md) (positioning and roadmap), and [`memory-model.md`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) as the Phase 1 target.
 **Source**: This is the build-facing part of a decision record kept in Seed Drill's private strategy repository. Section 7 (network effect and traction) and the open questions stay there, and section 9 here lists known limits instead. The other section numbers match that record, because code comments cite them (for example "decision 2026-09-30 §4.3"). Where the build refined the design, the change is marked **As built**.
 
 > **Read this with [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md).** That record replaces this one's model of devices, membership and keys, and parts of 4.5 where it says so. Each section below that it replaces says so in a line at its head, with the section of that record which replaces it.
@@ -401,7 +401,7 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 | Bayesian trust, culture policies, governance voting | **Drop** | |
 | SPO economics, Cardano as settlement | **Drop** | No settlement layer is chosen. There are many options and no benefit in picking one before real use shows what is needed; any future layer is optional and pluggable ([`docs/vision.md`](../vision.md) §4). |
 | `cordelia-proxy`, `cordelia-agent-sdk`, `cordelia-dashboard`, `rutherford`, `cordelia-portal` | **Archive** | All target the archived API |
-| `memory-model.md`, `search-indexing.md`, `sdk-api-reference.md`, `architecture-overview.md`, `game-theory.md` | **Archived** | [`docs/archive/`](../archive/README.md) |
+| `memory-model.md`, `search-indexing.md`, `sdk-api-reference.md`, `architecture-overview.md`, `game-theory.md` | **Archived** | [`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md) |
 
 ## 9. Known limits
 
@@ -456,7 +456,7 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 - Unmapping a folder stops the sync on that device and leaves it a member of the name's channel: it keeps the key, and its node keeps receiving the encrypted items, until the device is removed. Leaving a channel, with a key rotation, is not built yet.
 - Home memory does not sync between a device on 0.2.0-alpha.2 and one on 0.2.0-alpha.3, because the two keep it in different channels. Upgrade every device.
 - Where Claude Code keeps memory for a submodule, or for a worktree of a bare repository, is not confirmed. `cordelia sync map` says so when it maps one. Nor is its folder name confirmed for a path with accented characters on macOS.
-- The E2E topology suite (T1-T7) predates v1 and is stale, so its workflow runs only on demand. v1 is covered by real-process tests in `crates/cordelia-node/tests/devices_e2e.rs`.
+- The E2E topology suite (T1-T7) predates v1 and was stale and is removed; it stays in history, at [`tests/e2e/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/tests/e2e). v1 is covered by real-process tests in `crates/cordelia-node/tests/devices_e2e.rs`.
 
 - Local history (4.5b) keeps what sync replaced or removed. It does not cover:
   - Noticing. Nothing tells a person that a folder was emptied, and a change that nobody notices for 30 days is gone.

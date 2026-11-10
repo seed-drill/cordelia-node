@@ -15,7 +15,7 @@
 > The sync adapter's settings are not in this file: `cordelia sync claude`
 > and `cordelia sync map` store them in the node's database. The `[memory]`
 > and `[search]` sections (§2.7, §2.8) belong to archived specs
-> ([`docs/archive/`](../archive/README.md)). The `keeper` role was dropped
+> ([`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md)). The `keeper` role was dropped
 > ([decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md)),
 > and a configuration that names it is refused
 > ([decision record of 2026-10-17](../decisions/2026-10-17-a-devices-relays-and-connections.md) §5).
@@ -206,10 +206,10 @@ Memory model parameters: L2 storage quota, prefetch budget, expiry sweep, and no
 
 | Parameter | Type | Default | Valid Range | Phase | Description | Source |
 |-----------|------|---------|-------------|-------|-------------|--------|
-| `l2_quota_mb` | integer | `5` | > 0 | 1 | L2 soft quota per channel in megabytes. At 90%, a warning is logged. At 100%, oldest interrupt-domain items are tombstoned to reclaim space. | memory-model.md SS4.1 |
-| `prefetch_budget_bytes` | integer | `51200` (50 KB) | > 0 | 1 | Maximum total UTF-8 byte length of decrypted L2 content fetched during session prefetch. Value-domain items are capped at 20 most recently updated. If total exceeds budget, items ranked by `updated_at` descending and truncated. | memory-model.md SS7.3 |
-| `sweep_interval_hours` | integer | `24` | 1-168 | 1 | Hours between expiry sweep runs. Sweep is also triggered on session start. Idempotent and safe to run concurrently. | memory-model.md SS8.5 |
-| `novelty_threshold` | float | `0.3` | 0.0-1.0 | 2 | Minimum novelty score for automatic memory writes. Candidates below this are not persisted. Phase 1 explicit writes are always persisted regardless of this threshold. | memory-model.md SS8.4 |
+| `l2_quota_mb` | integer | `5` | > 0 | 1 | L2 soft quota per channel in megabytes. At 90%, a warning is logged. At 100%, oldest interrupt-domain items are tombstoned to reclaim space. | [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS4.1 |
+| `prefetch_budget_bytes` | integer | `51200` (50 KB) | > 0 | 1 | Maximum total UTF-8 byte length of decrypted L2 content fetched during session prefetch. Value-domain items are capped at 20 most recently updated. If total exceeds budget, items ranked by `updated_at` descending and truncated. | [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS7.3 |
+| `sweep_interval_hours` | integer | `24` | 1-168 | 1 | Hours between expiry sweep runs. Sweep is also triggered on session start. Idempotent and safe to run concurrently. | [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS8.5 |
+| `novelty_threshold` | float | `0.3` | 0.0-1.0 | 2 | Minimum novelty score for automatic memory writes. Candidates below this are not persisted. Phase 1 explicit writes are always persisted regardless of this threshold. | [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS8.4 |
 
 ### 2.8 `[search]`
 
@@ -217,11 +217,11 @@ Search tuning parameters for hybrid FTS5 + vector similarity scoring.
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
-| `dominant_weight` | float | `0.7` | 0.5-0.9 | Weight for the dominant signal in hybrid search scoring. Formula: `score = dominant_weight * max(semantic, keyword) + (1 - dominant_weight) * min(semantic, keyword)`. The stronger signal leads per-result. | search-indexing.md SS7, memory-model.md SS7.2 |
-| `embedding_model` | string | `"nomic-embed-text-v1.5"` | Any Ollama model name | Embedding model identifier. Must be available via Ollama when `embedding_enabled = true`. | search-indexing.md SS7 |
-| `ollama_url` | string | `"http://localhost:11434"` | URL | Ollama API base URL for embedding generation. | search-indexing.md SS7 |
-| `embedding_enabled` | boolean | `true` | `true` / `false` | Enable semantic search and embedding generation. Set to `false` on machines without Ollama or GPU. When `false`, search uses FTS5 only. | search-indexing.md SS7 |
-| `embedding_queue_size` | integer | `1000` | 100-10000 | Maximum pending embedding requests in the in-process queue. Items beyond this limit are deferred to backfill. | search-indexing.md SS7 |
+| `dominant_weight` | float | `0.7` | 0.5-0.9 | Weight for the dominant signal in hybrid search scoring. Formula: `score = dominant_weight * max(semantic, keyword) + (1 - dominant_weight) * min(semantic, keyword)`. The stronger signal leads per-result. | [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) SS7, [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS7.2 |
+| `embedding_model` | string | `"nomic-embed-text-v1.5"` | Any Ollama model name | Embedding model identifier. Must be available via Ollama when `embedding_enabled = true`. | [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) SS7 |
+| `ollama_url` | string | `"http://localhost:11434"` | URL | Ollama API base URL for embedding generation. | [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) SS7 |
+| `embedding_enabled` | boolean | `true` | `true` / `false` | Enable semantic search and embedding generation. Set to `false` on machines without Ollama or GPU. When `false`, search uses FTS5 only. | [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) SS7 |
+| `embedding_queue_size` | integer | `1000` | 100-10000 | Maximum pending embedding requests in the in-process queue. Items beyond this limit are deferred to backfill. | [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) SS7 |
 
 ### 2.9 `[api]`
 
@@ -575,8 +575,8 @@ Which spec defines each section:
 | `[governor]` | network-protocol.md SS5.3-5.5, SS12.2 | operations.md SS5.1 (note) |
 | `[replication]` | network-protocol.md SS12.3 | -- |
 | `[limits]` | network-protocol.md SS9, SS12.4, SS16 | -- |
-| `[memory]` | memory-model.md SS4.1, SS7.3, SS8.4, SS8.5 | -- |
-| `[search]` | search-indexing.md SS7 | memory-model.md SS7.2 |
+| `[memory]` | [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS4.1, SS7.3, SS8.4, SS8.5 | -- |
+| `[search]` | [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) SS7 | [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS7.2 |
 | `[api]` | operations.md SS5.1, SS5.4 | network-protocol.md SS12.2 |
 | `[logging]` | operations.md SS5.1, SS6 | -- |
 

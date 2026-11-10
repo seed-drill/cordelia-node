@@ -32,7 +32,7 @@ Use QUIC (UDP) via quinn for all P2P transport. No TCP fallback.
 
 ## Risks Accepted
 
-1. **Docker E2E testing friction.** UDP conntrack issues require kernel tuning (`nf_conntrack_udp_timeout=10`, `conntrack -F` flush between runs). Documented in topology-e2e.md §2.3.1.
+1. **Docker E2E testing friction.** UDP conntrack issues require kernel tuning (`nf_conntrack_udp_timeout=10`, `conntrack -F` flush between runs). Documented in [topology-e2e.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/topology-e2e.md) §2.3.1 (removed since).
 2. **QUIC connection ordering on Docker bridge.** Intermittent connection failures when multiple containers connect via the same Docker bridge. Mitigated by `depends_on` ordering and 10s bootstrap timeout.
 3. **No ecosystem precedent for P2P QUIC at scale.** We are early adopters. Production validation will come from bootnode deployment and progressive rollout.
 4. **No duplex connection negotiation.** Cardano's TCP bearer handles simultaneous inbound+outbound on the same connection. QUIC doesn't need this (connections are directional by design) but we may see redundant connections between peers.
@@ -45,6 +45,6 @@ Use QUIC (UDP) via quinn for all P2P transport. No TCP fallback.
 
 ## Consequences
 
-- All Docker E2E infrastructure must account for UDP conntrack (documented in topology-e2e.md).
+- All Docker E2E infrastructure must account for UDP conntrack (documented in [topology-e2e.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/topology-e2e.md), removed since).
 - The protocol layer (handshake, push, sync, peer-sharing) MUST remain transport-agnostic (operates on bidirectional streams, not raw sockets) so a TCP bearer could be added in future if needed.
 - Scale testing (500-1000 nodes) will validate QUIC at a scale not previously attempted in P2P contexts.

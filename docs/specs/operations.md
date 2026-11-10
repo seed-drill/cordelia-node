@@ -1456,7 +1456,7 @@ Note: Port 9473 (HTTP API) is NOT exposed externally. Keepers expose only P2P po
 - **specs/ecies-envelope-encryption.md**: Key types, encoding, ECIES envelope format
 - **specs/channels-api.md**: REST API endpoints, metrics, error codes
 - **specs/network-protocol.md**: P2P transport, peer management, replication, security
-- **decisions/2026-03-09-mvp-implementation-plan.md**: WP5 (enrollment), WP7 (install), WP13 (CLI/metrics)
+- **[decisions/2026-03-09-mvp-implementation-plan.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-09-mvp-implementation-plan.md)**: WP5 (enrollment), WP7 (install), WP13 (CLI/metrics)
 - **decisions/2026-03-09-architecture-simplification.md**: Two-component architecture, deployment profiles
 
 ---

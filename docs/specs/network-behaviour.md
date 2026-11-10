@@ -382,4 +382,4 @@ The `/api/v1/status` endpoint provides:
 *Spec version: 1.0*
 *Created: 2026-03-16*
 *Cross-refs: network-protocol.md (what), connection-lifecycle.md (where),
-debug-telemetry.md (how to observe), spec-alignment-audit.md (gaps)*
+debug-telemetry.md (how to observe), [spec-alignment-audit.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/reviews/spec-alignment-audit.md) (gaps)*

@@ -2,7 +2,7 @@
 
 **Russell Wing, Martin Stevens** -- Seed Drill (https://seeddrill.ai)
 **Version 3.0 draft** -- October 2026. Supersedes v2.3 (archived at
-[`docs/archive/whitepaper-v2.3.md`](docs/archive/whitepaper-v2.3.md)).
+[`docs/archive/whitepaper-v2.3.md`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/whitepaper-v2.3.md)).
 Long-term direction: [`docs/vision.md`](docs/vision.md).
 
 ---

@@ -187,7 +187,7 @@ fn handle_peer_streams(conn, peer_id, governor_state_fn, ...):
 `handle_peer_streams`. ItemPush and ItemSync are rejected from non-Hot peers
 (data protocols require full trust). PeerSharing is allowed on Warm + Hot.
 KeepAlive and ChannelAnnounce are allowed on all active states. This closes
-spec-alignment-audit gap #12 (ss8.1-8.4: protocol-per-state gating).
+[spec-alignment-audit](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/reviews/spec-alignment-audit.md) gap #12 (ss8.1-8.4: protocol-per-state gating).
 
 ### 2.2 State Query Mechanism
 

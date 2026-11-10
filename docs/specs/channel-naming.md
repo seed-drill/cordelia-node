@@ -5,7 +5,7 @@
 **Date**: 2026-03-10
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Implements**: WP2 (Name-Based Group Resolution)
-**Depends on**: specs/channels-api.md, decisions/2026-03-10-identity-privacy-model.md §8
+**Depends on**: specs/channels-api.md, [decisions/2026-03-10-identity-privacy-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-10-identity-privacy-model.md) §8
 
 > **v1 status (2026-09-30).** v1 creates only `grp_` channels, and accepts a
 > group channel ID only in the exact form `grp_<lowercase uuid>`. It adds the
@@ -327,7 +327,7 @@ On-chain registration is optional. Unregistered channels work fine locally and a
 
 - **RFC 1035**: Domain Names -- Implementation and Specification (label syntax)
 - **specs/channels-api.md**: Channel API endpoints, ID format table (§4)
-- **decisions/2026-03-10-identity-privacy-model.md**: Namespace model (§8), naming rules
+- **[decisions/2026-03-10-identity-privacy-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-10-identity-privacy-model.md)**: Namespace model (§8), naming rules
 - **decisions/2026-03-09-architecture-simplification.md**: Channel encryption model
 
 ---

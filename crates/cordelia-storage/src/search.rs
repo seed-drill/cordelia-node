@@ -1,6 +1,6 @@
 //! FTS5 full-text search: indexing, text extraction, and query.
 //!
-//! Spec: seed-drill/specs/search-indexing.md §2-§4
+//! Spec: <https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md> §2-§4
 
 use rusqlite::{Connection, params};
 
@@ -22,7 +22,7 @@ pub struct SearchableText {
 
 /// Extract searchable text from item content and metadata.
 ///
-/// Rules per search-indexing.md §3.1:
+/// Rules per <https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md> §3.1:
 /// - Memory items (item_type starts with "memory:", content has "name"): extract name/summary/content/tags
 /// - Structured content (has "text" field): extract text, tags from metadata
 /// - Plain string content: use as content_text

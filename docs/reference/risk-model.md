@@ -97,7 +97,7 @@ The only dated part of this page.
   version's conditions were met, 60 to 70 percent confidence that wide adoption
   is good on balance. They are judgements, not fitted models.
 - **Versions.** 2.0, October 2026: this page. 1.0, April 2026:
-  [archived](../archive/reference/risk-model-2026-04.md); it argued in part
+  [archived](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/reference/risk-model-2026-04.md); it argued in part
   from features that were not built.
 - **References.** [1] D. Amodei, "The Adolescence of Technology", 2026.
   [2] D. Kokotajlo et al., "AI 2027", AI Futures Project, 2025. [3] T. Lanham

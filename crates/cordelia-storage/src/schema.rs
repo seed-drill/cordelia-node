@@ -21,7 +21,7 @@ pub const RELEASED_SCHEMA_VERSION: u32 = 10;
 /// Migration v1: Phase 1 initial schema.
 ///
 /// All DDL from data-formats.md §3.1-§3.5.
-/// Search tables (§2 of search-indexing.md) deferred to WP8.
+/// Search tables (§2 of <https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md>) deferred to WP8.
 const MIGRATION_V1: &str = r#"
 -- Core tables (data-formats.md §3)
 
@@ -87,7 +87,7 @@ CREATE TABLE IF NOT EXISTS dm_peers (
 );
 "#;
 
-/// Migration v2: FTS5 search indexing (search-indexing.md §2).
+/// Migration v2: FTS5 search indexing (<https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md> §2).
 const MIGRATION_V2: &str = r#"
 CREATE TABLE IF NOT EXISTS search_content (
     rowid         INTEGER PRIMARY KEY AUTOINCREMENT,

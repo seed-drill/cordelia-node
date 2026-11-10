@@ -476,19 +476,6 @@ pub fn outbox(
     Ok(batch)
 }
 
-/// Put an item back in the outbox, so that it is pushed to a relay again
-/// (a relay that already holds it answers so). Returns false if the item
-/// is not stored here any more.
-pub fn mark_unrelayed(conn: &Connection, item_id: &str) -> Result<bool, CordeliaError> {
-    let changed = conn
-        .execute(
-            "UPDATE items SET relayed_at = NULL WHERE item_id = ?1",
-            params![item_id],
-        )
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-    Ok(changed > 0)
-}
-
 /// Which of `item_ids` are still in `author`'s outbox.
 pub fn still_in_outbox(
     conn: &Connection,
@@ -634,45 +621,6 @@ pub fn max_rev(
                AND author_id IN (SELECT entity_key FROM channel_members
                                  WHERE channel_id = ?1 AND posture = 'active')",
             params![channel_id, slot.as_slice()],
-            |row| row.get(0),
-        )
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-    Ok(rev.map(|r| r.max(0) as u64))
-}
-
-/// [`max_rev`], leaving one member out: the highest revision the channel's
-/// other current members stored for a slot.
-pub fn max_rev_except(
-    conn: &Connection,
-    channel_id: &str,
-    slot: &[u8; 32],
-    except: &[u8; 32],
-) -> Result<Option<u64>, CordeliaError> {
-    let rev: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(rev) FROM items
-             WHERE channel_id = ?1 AND slot = ?2 AND author_id != ?3
-               AND author_id IN (SELECT entity_key FROM channel_members
-                                 WHERE channel_id = ?1 AND posture = 'active')",
-            params![channel_id, slot.as_slice(), except.as_slice()],
-            |row| row.get(0),
-        )
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-    Ok(rev.map(|r| r.max(0) as u64))
-}
-
-/// The revision one author has stored for a slot, if any.
-pub fn author_rev(
-    conn: &Connection,
-    channel_id: &str,
-    slot: &[u8; 32],
-    author: &[u8; 32],
-) -> Result<Option<u64>, CordeliaError> {
-    let rev: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(rev) FROM items
-             WHERE channel_id = ?1 AND slot = ?2 AND author_id = ?3",
-            params![channel_id, slot.as_slice(), author.as_slice()],
             |row| row.get(0),
         )
         .map_err(|e| CordeliaError::Storage(e.to_string()))?;

@@ -57,7 +57,7 @@
 >   two relays, `relay1` and `relay2.cordelia.seeddrill.ai:9474`
 >   (`FALLBACK_PEERS`).
 > - Specs this one cites that are now archived (`sdk-api-reference.md`, the
->   identity ADR) are in [`docs/archive/`](../archive/README.md).
+>   identity ADR) are in [`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md).
 >
 > The TLA+ model (`network-protocol.tla`) is of the governor and of the
 > replication of items (§4.4 to §4.6). It has no model of §4.9.
@@ -2788,7 +2788,7 @@ CBOR's extensibility (unknown fields preserved) means message types can gain new
 - **decisions/2026-10-04-a-persons-devices.md**: A channel from its secret, what a relay does and its room (§2.4, §2.5), how a statement reaches a device (§4.6)
 - **specs/data-formats.md §9**: An entry on the wire and inside its ciphertext, the statement, the change entry, the hand-over
 - **RFC 5705**: Keying Material Exporters for TLS (the value a proof is made over, §4.9.1)
-- **specs/sdk-api-reference.md**: TypeScript SDK interface
+- **[specs/sdk-api-reference.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/sdk-api-reference.md)**: TypeScript SDK interface
 - **cordelia-core/docs/architecture/network-model.md**: Scaling analysis, adversarial model, TLA+ specs (reference)
 - **Coutts, D. et al.**: "The Shelley Networking Protocol" -- Cardano's Ouroboros networking design (peer governor, mini-protocol multiplexing)
 - **Davies, N. & Coutts, D.**: "Introduction to the design of the Data Diffusion and Networking for Cardano Shelley" (IOG technical report)
@@ -2801,7 +2801,7 @@ Cross-spec review completed 2026-03-10. Nine issues identified (X1-X9) and resol
 
 - **X1-X4**: ecies-envelope-encryption.md -- DM channel ID derivation, PSK rotation phase alignment, signed metadata envelope (is_tombstone + author_id encoding)
 - **X5-X8**: channels-api.md -- GroupExchange -> Channel-Announce references, published_at cursor, Bech32 node IDs, bearer auth on identity endpoint
-- **X9**: sdk-api-reference.md -- nodeId type description (Bech32 Ed25519 pubkey)
+- **X9**: [sdk-api-reference.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/sdk-api-reference.md) -- nodeId type description (Bech32 Ed25519 pubkey)
 - **L1**: channels-api.md -- chatty/taciturn terminology replaced with realtime/batch (developer-facing terms)
 
 ---

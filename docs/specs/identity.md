@@ -36,7 +36,7 @@
 >   machine, with the phrase.
 > - Layers 1-3 (§2.2-§2.4), DM channels (§7.3) and proof of agency (§9) are
 >   not in v1. The identity ADR this spec cites is archived
->   ([`docs/archive/`](../archive/README.md)).
+>   ([`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md)).
 
 ---
 
@@ -386,7 +386,7 @@ channel_id = hex(SHA-256("cordelia:channel:__personal:" + hex(ed25519_pubkey)))
 ```
 
 Domain-separated, entity-specific: each entity's personal channel has a unique ID (channel-naming.md SS2.1). The personal channel stores:
-- L1-equivalent personal memory (`item_type = "kv"` for key-value pairs, `memory:*` prefix for typed memory items per memory-model.md SS10)
+- L1-equivalent personal memory (`item_type = "kv"` for key-value pairs, `memory:*` prefix for typed memory items per [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS10)
 - PSK envelope distribution (`item_type = "psk_envelope"`)
 - Agent attestation storage (`item_type = "attestation"`)
 
@@ -635,7 +635,7 @@ Test vectors in ecies-envelope-encryption.md SS3.6, SS8.5.
 | specs/operations.md | SS2 (cordelia init), SS3 (device pairing), SS5.4 (security constraints), SS9 (backup and recovery) |
 | specs/channel-naming.md | SS2.1 (personal channel), SS4.2 (DM derivation) |
 | specs/channels-api.md | SS1.3 (authentication), SS3.4 (author field) |
-| decisions/2026-03-10-identity-privacy-model.md | SS2 (4-layer model), SS3 (entity types), SS4 (operator-agent chain), SS5 (Proof of Agency), SS7 (DMs), SS8 (namespace), SS9 (privacy principles) |
+| [decisions/2026-03-10-identity-privacy-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-10-identity-privacy-model.md) | SS2 (4-layer model), SS3 (entity types), SS4 (operator-agent chain), SS5 (Proof of Agency), SS7 (DMs), SS8 (namespace), SS9 (privacy principles) |
 | specs/glossary.md | Entity, Node, Peer, Creator, Author, Agent definitions |
 
 ---
