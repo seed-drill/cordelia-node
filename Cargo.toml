@@ -7,7 +7,6 @@ members = [
     "crates/cordelia-api",
     "crates/cordelia-sync",
     "crates/cordelia-node",
-    "crates/cordelia-test",
 ]
 resolver = "2"
 
@@ -27,7 +26,6 @@ cordelia-storage = { path = "crates/cordelia-storage" }
 cordelia-network = { path = "crates/cordelia-network" }
 cordelia-api = { path = "crates/cordelia-api" }
 cordelia-sync = { path = "crates/cordelia-sync" }
-cordelia-test = { path = "crates/cordelia-test" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -35,7 +33,6 @@ tokio = { version = "1", features = ["full"] }
 # Crypto
 ring = "0.17"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
 curve25519-dalek = "4"
 rand = "0.8"
 # The twelve words of a recovery phrase (decision 2026-10-04 §5): the
@@ -109,8 +106,6 @@ tempfile = "3"
 # a second at a time, and a command that asks its node would not be
 # answered within its second.
 [profile.dev.package.curve25519-dalek]
-opt-level = 3
-[profile.dev.package.ed25519-dalek]
 opt-level = 3
 [profile.dev.package.x25519-dalek]
 opt-level = 3
