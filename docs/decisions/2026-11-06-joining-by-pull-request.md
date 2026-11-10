@@ -136,11 +136,11 @@ At each read, each device that follows the repository does the following, with n
    - It takes only a share made within the hour of the latest read (`PAIR_KEY_TYPED_SECS`), so a share left at a relay long ago is not taken.
    - It files the channel on every device of the person's, as `accept --channel` does.
 5. **Says a key is new on the list** (the person's ruling of 10 November: "by the list alone"). At each read that counts whose `channel` line names a channel, each key on the list that the list kept before did not name shows amber. Where no list was kept, or the one kept named no channel, every key on the list is new: at a first follow, at a new follow after `cordelia unsubscribe`, and at the first list with a `channel` line. The keys new at one commit share one line: `New on the list of <name> at <commit>: <label>, <label> and <n> more`. New means new to this device.
-   - **Only your own devices are left out:** this device and your other devices, a twin counting as its key. A device of yours that was removed is not yours any more, so it shows.
-   - **Nothing else counts:** not who wrote in the channel, nor when, nor whether this device holds it. So a clone that lags, and a channel made anew between two reads, hide no key. A key whose line is deleted and then added again shows again, at the later commit.
+   - **Only your own devices are left out:** this device and your other devices, a twin counting as its key. A device of yours that was removed is not yours any more, so it shows where a list newly names it, or at a first follow. Its removal's own ambers cover the rest (rule 5).
+   - **Nothing else counts:** not who wrote in the channel, nor when, nor whether this device holds it. So a clone that lags, and a channel made anew between two reads, hide no key. A key whose line is deleted and then added again shows again, at the commit of the read that lists it again.
    - **A read that counts for nothing shows nothing.** Following again (rule 2.5) keeps the list kept, so it shows nothing new at its yes.
    - **Each line stays until a person clears it** on that device with `cordelia shared seen <name>`, which says each line it clears. The plain status names the first six labels (`MEMBERS_LABELS_SHOWN`) and how many more; `shared list` names every label; `--json` gives the whole commit and each key, as `members` gives it.
-   - **The upgrade:** a device that upgrades from `v0.2.0-alpha.19` keeps the lists it read, so a key that alpha.19 never showed is not shown now. It is in the status's list of members.
+   - **The upgrade:** a device that upgrades from `v0.2.0-alpha.19` keeps the lists it read, so a key that alpha.19 never showed is not shown now. That was the person's choice on 10 November: no catch-up amber at the upgrade. Keys listed before the upgrade still show in the status's list of members.
 6. **Says a key was dropped.** A key in the channel that an earlier read named and the latest does not shows amber: `<label> is no longer on the list of <name>: make it anew with cordelia shared anew <name>`.
 7. **Says a listed key was left out.** A key the list names, that its `channel` line names after `without`, and that is not in the channel, shows once, on each follower that holds the channel and so sees who is in it: `<label> is on the list of <name> but was left out of it: delete its line in a pull request, or wait for that device to write in the channel`. A follower that does not hold the channel cannot tell, and shows nothing. Until it goes, the list names no channel (rule 1). A key that is in the channel, as a device of a person who stays is (§7 there), is not shown.
 
@@ -219,7 +219,7 @@ The notices of rules 4.5 to 4.7 show only on devices that follow the repository.
 
 ## 10. Who can do what
 
-- **Whoever can merge to the default branch** admits any key, at once, and names the channel. That is the person's rule: the repository decides. Each key a merge adds shows on every follower's status (rule 4.5), at that follower's first read of a list that names it, and every key on the list shows at a first follow. A stolen account with merge rights is the same as its owner.
+- **Whoever can merge to the default branch** admits any key, at once, and names the channel. That is the person's rule: the repository decides. Each key a merge adds shows on every follower's status (rule 4.5), at that follower's first read of a list that names it. Every key on the list shows at a first follow where the list has a `channel` line already, and otherwise at the first list with one. The one exception is a device that upgrades from `v0.2.0-alpha.19`: a key it never showed stays unshown (rule 4.5). A stolen account with merge rights is the same as its owner.
 - **The host** decides what the branch is, as the person's own git fetches it. The node itself reaches no host.
 - **A program that runs as a member** can change the clone, and so the list, for example with `git update-ref`. It can already run `share` with a yes (the README's security section). Each join's notice names the commit, for the person to check.
 - **A list in a public repository** shows the channel's ID, its relays, its keys and their labels. None of it lets anyone read the channel: that needs a member to hand it over. Nor can a stranger with the channel's ID and relays write there, or fill its room at a relay. A relay hands a channel only on a proof made with its secret, and takes an entry only where it is signed by the channel's own key, which comes from the seed (§2.1 and §10 there; decision 2026-10-04 §2.4).
@@ -289,8 +289,9 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
   - Following again names nothing at its yes; `unsubscribe`, then `subscribe`, names every key again.
   - A clone that lags: a key that this device held before its list named it is named at the read that first lists it.
   - A channel made anew between two reads, with the same keys listed, names nothing; a key listed for the first time then is named.
-  - A key dropped, then listed again, is named again, at the later commit.
-  - A read that counts for nothing names nothing. A list with no `channel` line names nothing, and the first read of one with a line names every key.
+  - A key dropped, then listed again, is named again, at the commit of the read that lists it again.
+  - A read that counts for nothing names nothing, one of a channel another follow names among them. A list with no `channel` line names nothing, and the first read of one with a line names every key.
+  - A key's twin, listed in its place, is not new. A first follow that replaces another names every key. A list that does not parse at the yes names nothing, and the next read of one that parses names every key.
   - The plain line names six labels and how many more, and one label alone; `shared list` names them all; `--json` gives the commit and each key.
   - `shared seen <name>` clears the lines, and says each line as it clears it; `shared seen <name> <label>` leaves them.
 

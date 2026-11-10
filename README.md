@@ -348,7 +348,8 @@ says what.
 
 - When a merged pull request adds a device to the list, each device that
   follows the repository shows it in amber, with its label and the
-  commit, once its clone has that commit. When you start to follow, each
+  commit its clone was at when it first listed the device. A clone that
+  lags can be past the merge by then. When you start to follow, each
   device already on the list but your own shows the same way. Check that
   you expect those commits. Then run `cordelia shared seen <name>` to
   clear them.

@@ -738,14 +738,27 @@ fn joined_at(label: &str, commit: &str) -> String {
 /// with the list `list` at `commit`, at `now`: a first follow, or a follow
 /// again (rule 2.5).
 fn subscribes(s: &Several, list: &str, commit: &str, now: i64) {
+    subscribes_as(s, REPOSITORY, None, list, commit, now);
+}
+
+/// [`subscribes`], to `repository`, replacing the follow of `replaces`,
+/// where it names one.
+fn subscribes_as(
+    s: &Several,
+    repository: &str,
+    replaces: Option<&str>,
+    list: &str,
+    commit: &str,
+    now: i64,
+) {
     let following = crate::following::Following {
-        identity: REPOSITORY.into(),
+        identity: repository.into(),
         remote: "origin".into(),
         clone: FOLDER.into(),
         commit: commit.into(),
         list: list.as_bytes().to_vec(),
         fetched_at: None,
-        replaces: None,
+        replaces: replaces.map(str::to_string),
         agent: "project".into(),
         then: crate::following::Then::Nothing,
     };
@@ -937,6 +950,97 @@ fn a_read_that_counts_for_nothing_names_nothing() {
     assert!(notices(&s).is_empty(), "{:?}", notices(&s));
     reads(&s, &later, &commit('b'), now + 4);
     assert_eq!(named_new(&s), [joined_at("m2", &commit('b'))]);
+}
+
+/// A key's twin is the same key (rule 4.5): a list that names the twin of
+/// a key the list kept names, in its place, names nothing new.
+#[test]
+fn a_twin_of_a_key_on_the_list_kept_is_not_new() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let alice = member(1).public_key();
+    let line = Some((&channel.id, &[][..]));
+    follows_at(&s, &list_of(line, &[(alice, "alice")]), &commit('a'), now);
+    reads(
+        &s,
+        &list_of(line, &[(twin(&alice), "alice")]),
+        &commit('b'),
+        now + 1,
+    );
+    assert!(named_new(&s).is_empty(), "{:?}", notices(&s));
+}
+
+/// A first follow that replaces another, as a channel follows one
+/// repository (rule 2.5), names every key on its list but the person's own;
+/// the follow it replaces goes, with its notices.
+#[test]
+fn a_first_follow_that_replaces_another_names_every_key() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = Shared::of(7);
+    let (alice, carol) = (member(1), member(2));
+    let theirs = list_of(Some((&channel.id, &[])), &[(alice.public_key(), "alice")]);
+    subscribes_as(&s, OTHER, None, &theirs, &commit('a'), now);
+    assert_eq!(follows::notices(&s[0].conn, OTHER).unwrap().len(), 1);
+    let ours = list_of(
+        Some((&channel.id, &[])),
+        &[
+            (alice.public_key(), "alice"),
+            (s.key(0), "bob-laptop"),
+            (carol.public_key(), "carol"),
+        ],
+    );
+    subscribes_as(&s, REPOSITORY, Some(OTHER), &ours, &commit('b'), now + 1);
+    assert!(row_of(&s, OTHER).is_none());
+    assert!(follows::notices(&s[0].conn, OTHER).unwrap().is_empty());
+    assert_eq!(
+        named_new(&s),
+        [
+            joined_at("alice", &commit('b')),
+            joined_at("carol", &commit('b'))
+        ]
+    );
+}
+
+/// A list that does not parse at the yes names nothing; the next read of
+/// one that parses names every key on it, as no list was kept.
+#[test]
+fn a_list_that_does_not_parse_at_the_yes_names_nothing_until_one_does() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = Shared::of(7);
+    subscribes(&s, "not a key and a label\n", &commit('a'), now);
+    assert!(notices(&s).is_empty(), "{:?}", notices(&s));
+    let list = list_with(Some((&channel.id, &[])), &listed(1..=2));
+    reads(&s, &list, &commit('b'), now + 1);
+    assert_eq!(
+        named_new(&s),
+        [joined_at("m1", &commit('b')), joined_at("m2", &commit('b'))]
+    );
+}
+
+/// A read that counts for nothing because its list names a channel that
+/// another follow names (rule 2.5) names nothing, though its list adds a
+/// key.
+#[test]
+fn a_read_of_a_channel_followed_elsewhere_names_nothing() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let review = holds(&s, 0, 7, "review", now);
+    let design = holds(&s, 0, 8, "design", now);
+    let alice = member(1).public_key();
+    let a = list_of(Some((&review.id, &[])), &[(alice, "alice")]);
+    let b = list_of(Some((&design.id, &[])), &[(alice, "alice")]);
+    follows_as(&s, REPOSITORY, &a, &commit('a'), now);
+    follows_as(&s, OTHER, &b, &commit('a'), now);
+    let names_review = list_of(
+        Some((&review.id, &[])),
+        &[(alice, "alice"), (member(2).public_key(), "carol")],
+    );
+    let read = reads_as(&s, OTHER, &names_review, &commit('b'), now + READ);
+    assert!(matches!(&read, Done::NotRead(not) if not.word == "followed_elsewhere"));
+    assert!(follows::notices(&s[0].conn, OTHER).unwrap().is_empty());
 }
 
 /// A list with no channel line names nothing; the first read whose list

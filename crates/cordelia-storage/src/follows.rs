@@ -415,7 +415,7 @@ pub enum NoticeOf {
     /// A key new on the list, with its label there and the channel the list
     /// named (rule 4.5, as the person ruled on 10 November: by the list
     /// alone). Kept until a person clears it; listed new again, it takes
-    /// the later commit.
+    /// the latest read's commit.
     Joined {
         key: [u8; 32],
         label: String,
@@ -438,9 +438,9 @@ pub struct Notice {
 }
 
 /// A notice for `identity`. A key new on the list again, and a changed
-/// line, take the place of one not yet cleared, at the later commit; a
-/// dropped key's notice already kept stays as it is. Returns whether
-/// anything was written.
+/// line, take the place of one not yet cleared, at the latest read's
+/// commit, wherever it differs; a dropped key's notice already kept stays
+/// as it is. Returns whether anything was written.
 pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool, CordeliaError> {
     let (kind, key, label, channel): (i64, Vec<u8>, Option<&str>, Option<&[u8; 32]>) =
         match &notice.of {
