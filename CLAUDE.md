@@ -24,16 +24,14 @@ carries.
 - `crates/cordelia-api`: the local REST API (actix-web) and the logic behind each device command.
 - `crates/cordelia-sync`: the adapter between Claude Code memory folders and channels.
 - `crates/cordelia-node`: the binary: the CLI (`main.rs`), the commands and their prompts (`*_cmd.rs`), the daemon and P2P (`p2p.rs`), a relay's and a device's sides of the entry streams, the status indicator.
-- `crates/cordelia-test`: an older harness (TestNode, TestMesh) that no other crate uses.
 - `docs/decisions/`: the records that code comments cite (below).
 - `docs/specs/`: protocol and component specs, and the TLA+ model. Most predate v1; those open with a "v1 status" note. `parameter-rationale.md` gives every constant's reason; `demand-model.md` the rates they derive from.
 - `docs/security/threat-model.md`: what Cordelia defends against, naming the test of each claim.
 - `docs/reference/`: test vectors, the network model, the risk model. `docs/vision.md`: direction after v1.
-- `docs/archive/`: pre-v1 documents, kept for history. Never current.
-- `tests/e2e/`: the Docker topology and scale suites, which predate v1 and are stale. The live tests are in `crates/*/tests/`.
+- `crates/*/tests/`: the integration and real-process tests (below).
 - `deploy/relay/`: the relay's image, Compose file and guide. `scripts/install.sh`: the installer, which `release.yml` attaches to each release; `seeddrill.ai/install.sh` redirects to a release's copy, not to main, so a change reaches people with a release.
 
-Module headers that say `Spec: .../specs/<file>.md` mean `docs/specs/<file>.md` here (`search-indexing.md` is in `docs/archive/specs/`).
+Module headers that say `Spec: .../specs/<file>.md` mean `docs/specs/<file>.md` here, where that file still exists.
 
 ## Decision records
 
@@ -95,7 +93,6 @@ This repository is public.
 
 ## What not to do
 
-- Do not treat `docs/archive/` as current.
-- Do not use the archived repositories of the older design (a libp2p, JSON and axum build among them) that old documents name. The workspace's own crate `cordelia-core` is live.
+- Do not use repositories of the older design (a libp2p, JSON and axum build among them). The workspace's own crate `cordelia-core` is live.
 - Do not add a protocol constant outside `protocol.rs`, or a timeout without its reason in `parameter-rationale.md`.
 - Do not change the governor's defaults without checking `demand-model.md`.
