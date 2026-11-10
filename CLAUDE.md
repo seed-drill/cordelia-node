@@ -90,6 +90,7 @@ This repository is public.
 - Examples name no particular machine: say laptop and desktop.
 - Name no host, IP or private repository. A private repository holds strategy and planning: nothing from it comes here unless it is meant to be public. Every Cordelia spec lives here, in `docs/specs/`.
 - No emojis.
+- A security gap is reported privately first. Never push its fix, test or wording here until the owner says.
 
 ## What not to do
 
