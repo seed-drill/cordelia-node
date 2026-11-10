@@ -5,7 +5,7 @@
 **Date**: 2026-03-12
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Implements**: Storage layer for WP2, WP3, WP4, WP8
-**Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md, specs/search-indexing.md, specs/identity.md
+**Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md, [specs/search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md), specs/identity.md
 
 > **v1 status.** The schema is at version 18. There are two kinds of channel
 > in it, and each has tables of its own:
@@ -190,7 +190,7 @@
 >
 > PSK envelope items (§4) are replaced by sealed channel states, items of type
 > `invite` in inbox channels (decision 2026-09-30 §4.1). The search index
-> (`search-indexing.md`, now in [`docs/archive/`](../archive/README.md)) is built
+> (`search-indexing.md`, now in [`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md)) is built
 > from what is published through the Channels API of the older kind, and v1
 > does not use it. A personal node serves none of that API, and the step of
 > §12 empties the index.
@@ -503,7 +503,7 @@ On startup:
 
 ### 5.3 Migration v1 (Initial Schema)
 
-The complete Phase 1 schema. Comprises all DDL from §3 and §4, plus the search tables from search-indexing.md §2.
+The complete Phase 1 schema. Comprises all DDL from §3 and §4, plus the search tables from [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) §2.
 
 ```sql
 -- Migration v1: Phase 1 initial schema
@@ -519,7 +519,7 @@ The complete Phase 1 schema. Comprises all DDL from §3 and §4, plus the search
 PRAGMA user_version = 1;
 ```
 
-The full DDL is the concatenation of §3.1-§3.5 above and search-indexing.md §2.2-§2.6. Both are authoritative for their respective tables.
+The full DDL is the concatenation of §3.1-§3.5 above and [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) §2.2-§2.6. Both are authoritative for their respective tables.
 
 ### 5.4 Additive Migrations Only
 
@@ -1885,7 +1885,7 @@ operations.md §10.5.
 | specs/ecies-envelope-encryption.md | ECIES envelope format (§4.4), item encryption (§5), key ring (§6.4), CBOR signing (§11) |
 | specs/channels-api.md | REST API endpoints, item_type values (§3.2), error codes |
 | specs/channel-naming.md | Channel ID derivation (§4), prefix disambiguation (§5) |
-| specs/search-indexing.md | FTS5 + sqlite-vec DDL (§2), indexing pipeline |
+| [specs/search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) | FTS5 + sqlite-vec DDL (§2), indexing pipeline |
 | specs/identity.md | Key types, entity ID format |
 | specs/network-protocol.md | ChannelDescriptor CBOR format (§4.4.6), PSK-Exchange (§4.7), the streams of entries (§4.9) |
 | decisions/2026-10-04-a-persons-devices.md | A channel from its secret, the statement, the change entry, adding, removing and recovery: what §9 to §12 are the forms of |

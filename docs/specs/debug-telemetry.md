@@ -244,4 +244,4 @@ Before a protocol handler is considered complete, verify:
 *Spec version: 1.0*
 *Created: 2026-03-14*
 *Motivation: BV-22, Cordelia Phase 1 E2E testing*
-*Cross-refs: network-protocol.md §4, [topology-e2e.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/topology-e2e.md), review-build-verification.md*
+*Cross-refs: network-protocol.md §4, [topology-e2e.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/topology-e2e.md), [review-build-verification.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/reviews/review-build-verification.md)*

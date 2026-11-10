@@ -5,7 +5,7 @@
 **Date**: 2026-03-10
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Implements**: WP3 (Pub/Sub API Endpoints)
-**Depends on**: specs/ecies-envelope-encryption.md, decisions/2026-03-09-mvp-implementation-plan.md
+**Depends on**: specs/ecies-envelope-encryption.md, [decisions/2026-03-09-mvp-implementation-plan.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-09-mvp-implementation-plan.md)
 **Reference**: cordelia-core/docs/reference/api.md (existing node API, pre-pivot)
 
 > **v1 status.** A node serves one of two sets of routes, by its role
@@ -259,7 +259,7 @@ Publish content to a channel. Content is encrypted by the node before storage an
 | `memory:learning` | API (memory convention) | Memory item: pattern, insight, skill (memory-model.md §5.3) |
 | `memory:session` | API (memory convention) | Memory item: session record (memory-model.md §5.3) |
 
-Node-internal types are written by the node itself (during subscribe, PSK rotation, init, relay probing). The API rejects requests with node-internal `item_type` values. Memory types use the `memory:` prefix convention to avoid collision with application-defined types (see memory-model.md §5.2). Custom application types are permitted -- `item_type` is not a closed enum.
+Node-internal types are written by the node itself (during subscribe, PSK rotation, init, relay probing). The API rejects requests with node-internal `item_type` values. Memory types use the `memory:` prefix convention to avoid collision with application-defined types (see [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) §5.2). Custom application types are permitted -- `item_type` is not a closed enum.
 
 **Response (200):**
 ```json
@@ -823,7 +823,7 @@ Delete (tombstone) an item from a channel. Propagates via replication.
 
 ### 3.13 POST /api/v1/channels/search
 
-Hybrid search within a channel (FTS5 keyword + semantic similarity, scored by dominant-signal formula). See search-indexing.md for full implementation.
+Hybrid search within a channel (FTS5 keyword + semantic similarity, scored by dominant-signal formula). See [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) for full implementation.
 
 **Request:**
 ```json
@@ -918,7 +918,7 @@ Return the node's identity information (public keys, entity name).
 - `node_id` is the Ed25519 public key in Bech32 encoding (`cordelia_pk1...`), same as `ed25519_public_key`
 - Useful for DM initiation (caller needs peer's public key)
 - `entity_id` is the human-readable name set during `cordelia init`
-- SDK field mapping: the SDK transforms `ed25519_public_key` -> `publicKey` and `x25519_public_key` -> `encryptionKey` (custom mapping, not simple snake_case -> camelCase). See sdk-api-reference.md §7.1.
+- SDK field mapping: the SDK transforms `ed25519_public_key` -> `publicKey` and `x25519_public_key` -> `encryptionKey` (custom mapping, not simple snake_case -> camelCase). See [sdk-api-reference.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/sdk-api-reference.md) §7.1.
 
 ---
 
@@ -1783,9 +1783,9 @@ For invite-only channels: step 7 fails (`not_authorized`). PSK must be distribut
 
 - **specs/ecies-envelope-encryption.md**: Cryptographic primitives (ECIES, AES-256-GCM, Bech32 encoding, CBOR signing, AAD binding)
 - **cordelia-core/docs/reference/api.md**: Pre-pivot node API (reference only, not carried forward)
-- **decisions/2026-03-09-mvp-implementation-plan.md**: WP3 scope and endpoint definitions
+- **[decisions/2026-03-09-mvp-implementation-plan.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-09-mvp-implementation-plan.md)**: WP3 scope and endpoint definitions
 - **decisions/2026-03-09-architecture-simplification.md**: Provider interface, channel encryption model
-- **decisions/2026-03-10-identity-privacy-model.md**: DM derivation, namespace rules, access policies
+- **[decisions/2026-03-10-identity-privacy-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-10-identity-privacy-model.md)**: DM derivation, namespace rules, access policies
 - **decisions/2026-03-10-phase1-design-decisions.md**: Node is encryption boundary, greenfield build
 - **RFC 4287**: Atom Syndication Format (cursor-based polling model)
 - **W3C Server-Sent Events**: Push delivery specification (Phase 2)
