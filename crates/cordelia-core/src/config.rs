@@ -822,24 +822,18 @@ http_port = 8080
     }
 
     /// Every configuration that this repository writes for a node loads:
-    /// the relays' own (`deploy/relay`), and those of the topology tests
-    /// (`tests/e2e/configs`). Each names a role this version knows.
+    /// the relays' own (`deploy/relay`). Each names a role this version knows.
     #[test]
     fn test_the_configurations_in_this_repository_load() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let mut files = vec![
-            root.join("deploy/relay/relay1.toml"),
-            root.join("deploy/relay/relay2.toml"),
-        ];
-        for topology in std::fs::read_dir(root.join("tests/e2e/configs")).unwrap() {
-            for file in std::fs::read_dir(topology.unwrap().path()).unwrap() {
-                let file = file.unwrap().path();
-                if file.extension().is_some_and(|ext| ext == "toml") {
-                    files.push(file);
-                }
+        let mut files = Vec::new();
+        for file in std::fs::read_dir(root.join("deploy/relay")).unwrap() {
+            let file = file.unwrap().path();
+            if file.extension().is_some_and(|ext| ext == "toml") {
+                files.push(file);
             }
         }
-        assert!(files.len() > 2, "{files:?}");
+        assert!(!files.is_empty(), "{files:?}");
         for file in files {
             let config = Config::load(&file).unwrap_or_else(|e| panic!("{}: {e}", file.display()));
             assert!(

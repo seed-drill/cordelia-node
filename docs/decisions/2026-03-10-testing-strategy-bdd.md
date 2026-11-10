@@ -126,7 +126,7 @@ Each layer catches failures the layer below cannot:
 4. CLI exercise -- `cordelia status`, `cordelia channels`, `cordelia stats`, `cordelia peers`
 5. Cleanup -- kill daemon, remove temp data
 
-**Location:** `cordelia-node/tests/e2e/smoke-test.sh`
+**Location:** [`cordelia-node/tests/e2e/smoke-test.sh`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/tests/e2e/smoke-test.sh)
 
 **Assertions:** HTTP status codes, JSON response field presence, Prometheus metric names, CLI output strings. Uses `curl` + `jq` for API, grep for CLI output.
 

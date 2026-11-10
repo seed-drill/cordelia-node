@@ -456,7 +456,7 @@ If dogfooding shows these differences don't matter in practice, that is our answ
 - Unmapping a folder stops the sync on that device and leaves it a member of the name's channel: it keeps the key, and its node keeps receiving the encrypted items, until the device is removed. Leaving a channel, with a key rotation, is not built yet.
 - Home memory does not sync between a device on 0.2.0-alpha.2 and one on 0.2.0-alpha.3, because the two keep it in different channels. Upgrade every device.
 - Where Claude Code keeps memory for a submodule, or for a worktree of a bare repository, is not confirmed. `cordelia sync map` says so when it maps one. Nor is its folder name confirmed for a path with accented characters on macOS.
-- The E2E topology suite (T1-T7) predates v1 and is stale, so its workflow runs only on demand. v1 is covered by real-process tests in `crates/cordelia-node/tests/devices_e2e.rs`.
+- The E2E topology suite (T1-T7) predates v1 and was stale and is removed; it stays in history, at [`tests/e2e/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/tests/e2e). v1 is covered by real-process tests in `crates/cordelia-node/tests/devices_e2e.rs`.
 
 - Local history (4.5b) keeps what sync replaced or removed. It does not cover:
   - Noticing. Nothing tells a person that a folder was emptied, and a change that nobody notices for 30 days is gone.
