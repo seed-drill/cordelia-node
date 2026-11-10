@@ -301,24 +301,6 @@ pub fn set_state(
     Ok(())
 }
 
-/// Make the channel's active members exactly `members` (key, role):
-/// listed keys are added or updated, anyone else is soft-removed.
-pub fn replace_members(
-    conn: &Connection,
-    channel_id: &str,
-    members: &[([u8; 32], &str)],
-) -> Result<(), CordeliaError> {
-    for (key, role) in members {
-        add_member(conn, channel_id, key, role)?;
-    }
-    for existing in list_active_member_keys(conn, channel_id)? {
-        if !members.iter().any(|(k, _)| *k == existing) {
-            remove_member(conn, channel_id, &existing)?;
-        }
-    }
-    Ok(())
-}
-
 /// Active members of a channel with their roles.
 pub fn list_active_members(
     conn: &Connection,
@@ -344,51 +326,6 @@ pub fn list_active_members(
         if let Ok(key) = <[u8; 32]>::try_from(blob.as_slice()) {
             out.push((key, role));
         }
-    }
-    Ok(out)
-}
-
-/// When `entity_key` joined the channel (RFC 3339), if it is a member.
-pub fn member_joined_at(
-    conn: &Connection,
-    channel_id: &str,
-    entity_key: &[u8; 32],
-) -> Result<Option<String>, CordeliaError> {
-    match conn.query_row(
-        "SELECT joined_at FROM channel_members
-         WHERE channel_id = ?1 AND entity_key = ?2 AND posture = 'active'",
-        params![channel_id, entity_key.as_slice()],
-        |row| row.get(0),
-    ) {
-        Ok(at) => Ok(Some(at)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(CordeliaError::Storage(e.to_string())),
-    }
-}
-
-/// Group channels (network scope) in which `entity_key` is an active owner.
-pub fn list_owned_groups(
-    conn: &Connection,
-    entity_key: &[u8; 32],
-) -> Result<Vec<Channel>, CordeliaError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.channel_id, c.channel_name, c.channel_type, c.mode, c.access,
-                    c.creator_id, c.key_version, c.psk_hash, c.created_at, c.updated_at, c.scope
-             FROM channels c
-             INNER JOIN channel_members m ON c.channel_id = m.channel_id
-             WHERE m.entity_key = ?1 AND m.posture = 'active' AND m.role = 'owner'
-               AND c.channel_type = 'group' AND c.scope = 'network'
-             ORDER BY c.created_at ASC",
-        )
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-    let rows = stmt
-        .query_map(params![entity_key.as_slice()], channel_from_row)
-        .map_err(|e| CordeliaError::Storage(e.to_string()))?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row.map_err(|e| CordeliaError::Storage(e.to_string()))?);
     }
     Ok(out)
 }
@@ -977,40 +914,6 @@ pub fn list_active_member_keys(
         }
     }
     Ok(keys)
-}
-
-/// Every key that is an active member of any channel this node has a row
-/// for, each once.
-pub fn all_active_member_keys(conn: &Connection) -> Result<Vec<[u8; 32]>, CordeliaError> {
-    let storage = |e: rusqlite::Error| CordeliaError::Storage(e.to_string());
-    let mut stmt = conn
-        .prepare("SELECT DISTINCT entity_key FROM channel_members WHERE posture = 'active'")
-        .map_err(storage)?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
-        .map_err(storage)?;
-    let mut keys = Vec::new();
-    for row in rows {
-        if let Ok(key) = <[u8; 32]>::try_from(row.map_err(storage)?.as_slice()) {
-            keys.push(key);
-        }
-    }
-    Ok(keys)
-}
-
-/// Soft-remove a key from every channel it is an active member of. Returns
-/// how many channels that was.
-pub fn remove_member_everywhere(
-    conn: &Connection,
-    entity_key: &[u8; 32],
-) -> Result<usize, CordeliaError> {
-    let now = Utc::now().to_rfc3339();
-    conn.execute(
-        "UPDATE channel_members SET posture = 'removed', removed_at = ?1
-         WHERE entity_key = ?2 AND posture = 'active'",
-        params![now, entity_key.as_slice()],
-    )
-    .map_err(|e| CordeliaError::Storage(e.to_string()))
 }
 
 /// Increment key_version and update psk_hash after a PSK rotation.

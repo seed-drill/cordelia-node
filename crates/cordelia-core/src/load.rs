@@ -607,11 +607,6 @@ impl ConnectionCounts {
     pub fn closures_of(&self, key: &[u8; 32]) -> u64 {
         self.relays.sum_of(key).map_or(0, |counts| counts[CLOSURES])
     }
-
-    /// The inbound connections turned away for `why` so far.
-    pub fn turned_away_for(&self, why: TurnedAway) -> u64 {
-        self.turned_away[why as usize].load(Ordering::Relaxed)
-    }
 }
 
 // ── The governor ─────────────────────────────────────────────────────
