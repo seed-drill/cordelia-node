@@ -1,509 +1,99 @@
-# Claude Configuration - cordelia-node
+# cordelia-node
 
-> Inherits global rules from seed-drill/CLAUDE.md (quality over speed, commit format,
-> security, no emojis). This file adds cordelia-node-specific context.
+## What this is
 
-## What This Is
+Cordelia keeps an AI agent's memory on every machine its operator uses:
+end-to-end encrypted, carried by relays that hold no keys. v1 syncs Claude
+Code memory, and carries messages between a person's own agents and shared
+channels between people. One Rust binary, `cordelia`: QUIC, CBOR, an Ed25519
+key per device, AES-256-GCM per channel. A person's devices share one secret,
+from which each channel of their own is derived; a recovery phrase of twelve
+words removes a device and recovers. Overview: `WHITEPAPER.md` (v3).
 
-Cordelia: an AI agent's memory on every machine its operator uses, end-to-end
-encrypted, carried by relays that hold no keys. v1 syncs Claude Code memory
-(`crates/cordelia-sync`). Rust workspace, single binary daemon. QUIC transport,
-CBOR wire format, Ed25519 per-device identity, AES-256-GCM channel encryption.
-A person's devices share one secret, from which every channel of their own is
-derived, and a recovery phrase of twelve words removes a device and recovers.
-Design: `WHITEPAPER.md` (v3) and two decision records:
+There are two kinds of channel in the code: a channel from its secret
+(decision 2026-10-04), which every device uses, and "the older kind" (a
+random ID, a ring of keys, a list of members), which only a relay still
+carries.
 
-- `docs/decisions/2026-10-04-a-persons-devices.md`: a person's devices, the
-  recovery phrase, statements, channels from their secrets, what a relay
-  does, removal, recovery and the upgrade. It replaces the device, membership
-  and key model of the record below.
-- `docs/decisions/2026-09-30-agent-memory-sync.md`: the sync adapter, ties,
-  conflict copies, deletes, the index, local history and the two relays. Each
-  section that the newer record replaces says so at its head.
+## Where things are
 
-Code comments cite their sections ("decision 2026-10-04 §4.6", "decision
-2026-09-30 §4.5"). There are two kinds of channel in the code: a channel from
-its secret (the first record), which every device uses, and "the older kind"
-(the second), which a relay carries for one version more and a personal node
-does not carry. Specs predate v1: each live spec opens with a "v1 status"
-note saying what v1 changed, and pre-v1 documents are in `docs/archive/` (see
-its README).
+- `crates/cordelia-core`: shared types, config, errors; `protocol.rs` holds every protocol constant.
+- `crates/cordelia-crypto`: keys and what derives from a secret, the phrase, statements, entries sealed and on the wire, shared channels' cards and shares.
+- `crates/cordelia-storage`: SQLite; `schema.rs` has the numbered steps of the schema.
+- `crates/cordelia-network`: QUIC transport, the codec (framing), the governor, rate limits, the mini-protocols.
+- `crates/cordelia-api`: the local REST API (actix-web) and the logic behind each device command.
+- `crates/cordelia-sync`: the adapter between Claude Code memory folders and channels.
+- `crates/cordelia-node`: the binary: the CLI (`main.rs`), the commands and their prompts (`*_cmd.rs`), the daemon and P2P (`p2p.rs`), a relay's and a device's sides of the entry streams, the status indicator.
+- `docs/decisions/`: the records that code comments cite (below).
+- `docs/specs/`: protocol and component specs, and the TLA+ model. Most predate v1; those open with a "v1 status" note. `parameter-rationale.md` gives every constant's reason; `demand-model.md` the rates they derive from.
+- `docs/security/threat-model.md`: what Cordelia defends against, naming the test of each claim.
+- `docs/reference/`: test vectors, the network model, the risk model. `docs/vision.md`: direction after v1.
+- `crates/*/tests/`: the integration and real-process tests (below).
+- `deploy/relay/`: the relay's image, Compose file and guide. `scripts/install.sh`: the installer, which `release.yml` attaches to each release; `seeddrill.ai/install.sh` redirects to a release's copy, not to main, so a change reaches people with a release.
 
-## Repo Structure
+Module headers that say `Spec: .../specs/<file>.md` mean `docs/specs/<file>.md` here, where that file still exists.
 
-```
-cordelia-node/
-  crates/
-    cordelia-core/       # Shared types, config, errors; protocol.rs (every constant);
-                         #   revision.rs (a revision as a band and a count); load.rs
-                         #   and lock.rs (the counters of the scale test, served at
-                         #   /api/v1/metrics/load, and the node's lock, timed by kind)
-    cordelia-crypto/     # Ed25519/X25519, ECIES, AES-256-GCM, Bech32. A channel from its
-                         #   secret: derive (what comes from a secret), phrase, statement,
-                         #   change_entry, entry and wire (an entry, sealed and on the wire),
-                         #   chain and version (what an entry was written after; a slot's
-                         #   current version), addition, hand_over, proof, fingerprint;
-                         #   message (the value of a message, its ID and the ring);
-                         #   reached (the value of the carried word, decision 2026-10-19);
-                         #   slots (a name's slot, for both kinds). A shared channel
-                         #   (decision 2026-10-10): share (the card and
-                         #   the share), shared (forms 6 and 5, and the anew seal),
-                         #   acts (a device's list, each act signed by its maker).
-                         #   The older kind: channel_state, psk_envelope, signing
-    cordelia-storage/    # SQLite (schema.rs: steps 1 to 33: the removal's 21 to 26, the shared
-                         #   channels' 27 to 32, and 33, the repositories followed).
-                         #   entries; arrivals (the arrivals of
-                         #   each file, decision 2026-10-24 rule 7); person and acts (what a
-                         #   device holds of its person, and what a person did at a terminal);
-                         #   relay (a relay's channels and room, and its sweeps); at_relays
-                         #   (where a device stands at each relay); sync_state, index_lines,
-                         #   history; meta (the keys of node_meta); first_start (the copy,
-                         #   the step and the guard); messages (step 19: what a device keeps
-                         #   of messages between its agents, a generation being a messages
-                         #   channel it held; H and the live numbers, the index, places
-                         #   and the shown time; a row overwritten before it goes, in the
-                         #   caller's write); shared_lists (step 27: what a device keeps
-                         #   beside its list of shared channels); shared (step 28: the
-                         #   shared channels a device holds, the table of keys of each
-                         #   with its room, and the index of shared messages);
-                         #   shared_pass (step 29: the places at each relay of a
-                         #   shared channel, what each relay answered of a push,
-                         #   and the take-outs begun and not ended); shared_sharing
-                         #   (step 30: the keys typed for a channel and what became of
-                         #   each, the shares this device wrote and what each relay
-                         #   answered of them); shared_messages (step 31:
-                         #   subscriptions' starts, the table of shared marks and
-                         #   the other devices' sread/ lists, a person's reads of
-                         #   shared messages, the channel's hour, the kept values);
-                         #   shared_anew (step 32: the offers read in each
-                         #   channel, the channels made anew here, those not
-                         #   yet clean); follows (step 33: the repositories
-                         #   a device follows, the node's own typings of
-                         #   listed keys, the notices until `shared seen`;
-                         #   the node's shares, and what each making anew
-                         #   left out and the channel line it printed); db
-                         #   (secure_delete, set
-                         #   before the steps run,
-                         #   and the truncating checkpoint of a personal node); the older
-                         #   kind: channels, items, psk, search
-    cordelia-network/    # Governor, codec, rate limiting, mini-protocols; messages.rs has
-                         #   the five streams of entries (0x10 to 0x14); transport.rs
-                         #   exports the session's value for a proof
-    cordelia-api/        # REST API (actix-web). A device: person (applying a statement, who
-                         #   counts, carrying), adding, change, leaving, look, names, publish,
-                         #   take (the one door for an entry), lists (the person's lists
-                         #   of shared channels, decision 2026-10-10 §3.4), shared (the
-                         #   door's branch for a shared channel and its reader: the room,
-                         #   the keys shown, taking out in steps, reading again; the
-                         #   judge of a share), sharing and sharing_routes (`shared
-                         #   new`, `share`, `accept --channel`, `label`, `shared
-                         #   rename`, `drop` and `list`, the empty anew record, and
-                         #   their routes under /api/v1/shared/),
-                         #   shared_pass (what the shared pass reads and writes
-                         #   under the lock: where a channel lives, its door's
-                         #   checks, pages, places and what waits), shared_messages
-                         #   (subscriptions, who is shown what, the sread/ list, the
-                         #   hold), shared_sender (Address::Shared in sender::send:
-                         #   form 6 in the device's ring, the channel's hour, sending
-                         #   again, clearing) and shared_routes (`subscribe`,
-                         #   `unsubscribe`, and `read`, `send`, `summary` and `log`
-                         #   of shared channels, under /api/v1/shared/), shared_anew
-                         #   (offers read and judged, `shared anew`, `move` and
-                         #   `stay`, a channel made anew at a removal and after
-                         #   a recovery, not clean, paused, and what a removal,
-                         #   `devices` and `recover` name), shared_status (the
-                         #   status's `shared` object, decision 2026-10-10 §9),
-                         #   members (a repository's `.cordelia/members`
-                         #   read: its channel line, its devices, rule 1's gate;
-                         #   decision 2026-11-06 (joining)), git_list (a
-                         #   clone read with git, in an environment cleared so
-                         #   that nothing asks: which repository it is, its
-                         #   list at the remote's default branch, never back),
-                         #   following (`subscribe` and `unsubscribe` in a
-                         #   clone, and `subscribe --new`), members_read (the
-                         #   node's read of each list it follows: the hand-overs
-                         #   in turns, the take, the notices),
-                         #   repository_status (what the status and `shared list`
-                         #   say of each repository followed, its ambers, and
-                         #   `shared seen`, decision 2026-11-06 (joining), rules 6
-                         #   and 7),
-                         #   at_relays (and
-                         #   known: what a device knows of which relay holds which change),
-                         #   local (the local
-                         #   API for the names a device holds), commands (the routes behind
-                         #   the device commands), carry and carrying (a carry that a person
-                         #   asks for, and the phrase's word for it), recover, swept (old
-                         #   deletes in a device's own store), found (what `map` would sync,
-                         #   and the notice), first_start (a node that is held up), sync,
-                         #   history; reader (what a device keeps of an entry of the
-                         #   messages channel that the door stores, and the hourly task of
-                         #   messages); cut and arrivals (a removed key's cut time, and
-                         #   what a carry leaves out, decision 2026-10-24 rules 2, 6, 7);
-                         #   own_read (a read of a channel of the device's own
-                         #   with places of its own, kept in memory under its ID: the read
-                         #   before a carried name is let go); let_go (what that read
-                         #   finds: the entries this device signed, each held where a
-                         #   relay handed it or moved its slot on, and when it reads on;
-                         #   what a device that has stopped counts from its notes; the
-                         #   lines before and after a `discard`);
-                         #   sender (what a device does
-                         #   to send a message: the next number, its checks, sending again
-                         #   and clearing); marks (what an agent read: the device's table
-                         #   and its list, the other devices' lists, and whether a message
-                         #   is unread; and what a person read, said to the other devices,
-                         #   decision 2026-10-25); bounds (a bound a person set for each
-                         #   pair, which one holds, and the list of bounds);
-                         #   messages (the routes of `msg summary`, `msg read`, `msg
-                         #   send` and `msg log`: the folder's agent, the message an ID
-                         #   names, the seven categories taken out of text another device
-                         #   chose, what a relay refused for room, and a person's mark). The
-                         #   older Channels API (handlers, entries, verify): a
-                         #   relay's and a bootnode's
-    cordelia-sync/       # Sync adapters: Claude Code memory <-> the channel of a name
-                         #   (claude.rs, plan.rs; claude/sequences.rs is the harness of
-                         #   sequences over several devices)
-    cordelia-node/       # Binary: CLI (main.rs), person_cmd and terminal (the device
-                         #   commands and their prompts), carry_cmd (`sync carry`),
-                         #   msg_cmd (`msg summary`, `msg read`, `msg send` and `msg
-                         #   log`: the folder, the frame, the cleaning, the lines and
-                         #   log's question), shared_cmd (the commands that make,
-                         #   share and take a shared channel, `subscribe`,
-                         #   `unsubscribe`, `shared anew`, `move` and `stay`,
-                         #   `id --words`; `subscribe` and `unsubscribe` in a
-                         #   clone, `shared seen`, and the lines of each
-                         #   repository followed),
-                         #   recover_cmd (`recover`), daemon lifecycle, p2p.rs
-                         #   (with the read of each repository's list a device
-                         #   follows: at the start, every ten minutes, and when
-                         #   a person follows one),
-                         #   relay_entries (a relay's side of the streams of entries),
-                         #   device_entries (a device's passes, the pass of shared
-                         #   channels, the node's asking for a share after a
-                         #   list's read, and leave with the doors of shared channels;
-                         #   reach: whether
-                         #   each relay can be reached, and its class), indicator (the
-                         #   state and the level of a status; of a shared channel
-                         #   only a removed device that holds one, and the ambers of
-                         #   a repository followed, each a hold `shared_repository`
-                         #   after every other, by the person's ruling of 6
-                         #   November)
-    cordelia-test/       # Test harness: TestNode, TestMesh
-  docs/
-    specs/               # Protocol and component specs + TLA+ model
-    decisions/           # ADRs; 2026-10-04-a-persons-devices.md and
-                         #   2026-09-30-agent-memory-sync.md are the current design
-    reference/           # Test vectors (step4-test-vectors.json: the derivations;
-                         #   change-entry-test-vectors.json: the change entry's
-                         #   layout with its lineage), network model, risk model
-    archive/             # Pre-v1 documents, kept for history
-    vision.md            # Direction after v1
-  tests/                 # Integration tests
-  deploy/relay/          # Relay image, Docker Compose and guide (Fly.io optional)
-  scripts/               # Install script
-  .github/workflows/     # ci.yml, e2e.yml, release.yml
-```
+## Decision records
 
-## Key Specs
+Comments cite a record by its date and section or rule: `decision 2026-10-04 §4.6`, `decision 2026-11-06 (joining), rule 6`. Some add a short name: `(memory)`, `(removal)`, `(joining)`. Where two records share a date and no name is given, the subject says which; a bare `decision 2026-10-24` with a rule above 10 is the removal record, and with a lower rule usually the words of a change. In `docs/decisions/`:
 
-Start here when working on a module:
+- `2026-09-30-agent-memory-sync.md`: the sync adapter, ties, conflict copies, deletes, the index, local history (§4.5b). Its device and key model is replaced by 2026-10-04.
+- `2026-10-04-a-persons-devices.md`: a person's devices, the phrase, statements, channels from their secrets, a relay's rules, removal, recovery, the upgrade. The most cited.
+- `2026-10-09-messages-between-your-own-agents.md`: `msg` between a person's own agents.
+- `2026-10-10-a-shared-channel-for-messages.md`: shared channels between people.
+- `2026-10-14-a-personal-node-shares-no-peers.md`: a personal node shares no peers.
+- `2026-10-17-a-devices-relays-and-connections.md`: a device's relays, churn, proofs on a connection, a node's role.
+- `2026-10-17-recovery-and-carrying.md`: four changes to recovery and carrying.
+- `2026-10-19-a-relay-out-of-reach.md`: a relay out of reach, and what the status says of it.
+- `2026-10-19-names-at-the-limit.md`: the warning before the personal channel fills a relay's room.
+- `2026-10-22-a-scale-test-for-r1.md`: the scale test (`scale.rs`) and its load counters.
+- `2026-10-22-memory-across-connections.md` (memory): what a relay holds across its connections; small messages and large permits.
+- `2026-10-24-removal-fails-safe.md` (removal): a removal fails safe.
+- `2026-10-24-the-words-of-a-change.md`: the words of a change, its waits and its relay lines.
+- `2026-10-25-a-persons-hold-on-messages.md`: a person's hold on messages.
+- `2026-11-06-joining-by-pull-request.md` (joining): `.cordelia/members`, `subscribe` in a clone, the node's read of each list.
 
-| Module | Spec |
-|--------|------|
-| A person's devices, the recovery phrase, statements, channels from their secrets, a relay's rules, removal, recovery, the upgrade | `docs/decisions/2026-10-04-a-persons-devices.md` |
-| The adapter, ties, conflict copies, deletes, the index, the two relays (its device and key model is replaced) | `docs/decisions/2026-09-30-agent-memory-sync.md` |
-| Wire format | `docs/specs/network-protocol.md` (Section 3: CBOR tags, framing) |
-| Mini-protocols | `docs/specs/network-protocol.md` (Sections 4-8) |
-| Governor | `docs/specs/network-behaviour.md` |
-| Channels/API | `docs/specs/channels-api.md` |
-| Encryption | `docs/specs/ecies-envelope-encryption.md` |
-| Data/storage | `docs/specs/data-formats.md` |
-| Local history (what sync replaced, and restore) | `docs/decisions/2026-09-30-agent-memory-sync.md` §4.5b |
-| Shared channels between people | `docs/decisions/2026-10-10-a-shared-channel-for-messages.md` |
-| A repository's shared channel, joined by pull request (`.cordelia/members`, `subscribe` in a clone, the node's read of each list) | `docs/decisions/2026-11-06-joining-by-pull-request.md` |
-| Parameters | `docs/specs/parameter-rationale.md` (every value explained) |
-| Demand model | `docs/specs/demand-model.md` (persona-derived rates) |
-| Identity | `docs/specs/identity.md` |
-| Config | `docs/specs/configuration.md` |
-| Real-process tests | `crates/cordelia-node/tests/`: `person_e2e.rs` (the device commands, at a pseudo-terminal), `memory_e2e.rs` (memory between devices), `carry_e2e.rs` (`sync carry`, with and without the phrase; the read before a carried name is let go, and the `discard`), `recover_e2e.rs` (`recover`), `devices_e2e.rs` (two devices through a relay; the older kind at a relay), `relay_entries_e2e.rs` (a relay's streams and room), `device_entries_e2e.rs` (a device's passes, the show and leave, a read of its own channel with places of its own), `msg_e2e.rs` (messages between a person's agents: the commands of `msg`), `removal_e2e.rs` (a removal fails safe, decision 2026-10-24 (removal), section 7; the window's test is ignored for its length), `shared_e2e.rs` (making, sharing and taking a shared channel; subscribing, and messages in it; making anew, moving, a removal and a recovery; the status's `shared` object), `joining_e2e.rs` (joining a repository's shared channel by pull request, with clones of a bare repository on the disk, each device reading its lists every few seconds by `[members] read_interval_secs`, which only a test sets: the whole join; a device that follows first waits; never back across a restart; only the named channel, only to listed keys; nine keys in turns; leaving by hand and coming back; a removed device still listed handed nothing; the git of the list's reads has its own tests in `cordelia-api/tests/git_list.rs`, against a server of git over HTTPS on loopback), `first_start_e2e.rs` (the first start on this version), `threat_model.rs`, `scale.rs` (the scale test of R1's gate 10, decision 2026-10-22: its parts in `tests/scale/`). `CORDELIA_E2E_KEEP=1` keeps node dirs. See TESTING.md |
-| Topology/E2E (stale, manual) | `docs/specs/topology-e2e.md`, `topology-scale.md` |
-| TLA+ model | `docs/specs/network-protocol.tla` + `.cfg` |
+The design today is 2026-10-04 with 2026-09-30, and the later records that add to them. Each record's Status line says what is built and what it amends. `2026-11-05` is accepted but not built. The March records are older and in part superseded, as each says at its head.
 
-## Key Parameters (from protocol.rs)
+## Engineering rules
 
-All protocol constants live in `crates/cordelia-core/src/protocol.rs` -- the single source of truth.
-Do not add new protocol constants outside `protocol.rs`. All other modules derive from it.
+1. **A function defends itself.** A public async function has its own timeout; never rely on the caller.
+2. **One timeout.** `STREAM_TIMEOUT_SECS` (10 s) at the codec covers all stream I/O. Add another only with its reason in `parameter-rationale.md`.
+3. **A node never allocates by a length straight off the wire.** Bound every length a peer chose (by `MAX_MESSAGE_BYTES` or tighter) before reading or allocating by it. Code comments cite this rule as "(CLAUDE.md)".
+4. **Constants.** Every protocol constant lives in `crates/cordelia-core/src/protocol.rs`, each with its reason in `docs/specs/parameter-rationale.md`. Never add one elsewhere. Values derive from `docs/specs/demand-model.md`: change a value, and change the rationale with it.
+5. **Records' wording is checked by tests.** `shared_cmd.rs`, `msg_cmd.rs`, `cordelia-api/src/sharing/words.rs` and `cordelia-api/src/repository_status/tests.rs` read the records of 2026-10-09, 2026-10-10 and 2026-11-06 with `include_str!` and assert what a command prints is in them (`RECORD.contains`, `says(`, `as_written(`). Change a line at a prompt, and change the record in the same commit.
+6. **The threat model names tests.** `docs/security/threat-model.md` names tests by name, and `the_threat_model_names_tests_that_exist` checks it. Rename a test, then run `cargo test -p cordelia-node --test threat_model`.
 
-| Parameter | Value | Spec Section |
-|-----------|-------|-------------|
-| `STREAM_TIMEOUT_SECS` | 10s | parameter-rationale.md §6 |
-| `NODE_STOP_TIMEOUT_SECS` | 30s | parameter-rationale.md §6 |
-| `MAX_MESSAGE_BYTES` | 1MB | parameter-rationale.md §5.2 |
-| `FRAME_LENGTH_BYTES` | 4 (derived: a frame's length, a big-endian u32, before its message) | network-protocol.md §3.1 |
-| `MAX_ITEM_BYTES` | 64KB | parameter-rationale.md §4 |
-| `ENTRY_OVERHEAD_BYTES` | 1KB (counted for each entry, in every limit on bytes) | parameter-rationale.md §4 |
-| `QUIC_KEEPALIVE_INTERVAL_SECS` | 15s | network-protocol.md §2.1 |
-| `QUIC_MAX_IDLE_TIMEOUT_SECS` | 60s | network-protocol.md §2.1 |
-| `PING_INTERVAL_SECS` | 30s | network-protocol.md §4.2 |
-| `DEAD_TIMEOUT_SECS` | 90s | network-protocol.md §4.2 |
-| `HOT_MAX` | 2 (personal) | parameter-rationale.md §3 |
-| `WARM_MAX` | 10 (personal) | parameter-rationale.md §3 |
-| `COLD_MAX` | 50 (personal) | parameter-rationale.md §3 |
-| `MIN_WARM_TENURE_SECS` | 300s | parameter-rationale.md §3 |
-| `CHURN_INTERVAL_SECS` | 3600s | parameter-rationale.md §3 |
-| `EMA_ALPHA` | 0.1 | parameter-rationale.md §3 |
-| `MAX_CONNECTIONS_PER_IP` | 5 | network-protocol.md §9.1 |
-| `QUIC_MAX_BIDI_STREAMS`, `MAX_CONCURRENT_STREAMS` | 8 (64 with a relay listed by key) | parameter-rationale.md §1 |
-| `QUIC_STREAM_RECEIVE_WINDOW`, `QUIC_RECEIVE_WINDOW` | 32,256 bytes a stream, 288KB a connection (derived: two of `SMALL_MESSAGE_BYTES` a connection, and seven eighths of that over `QUIC_MAX_BIDI_STREAMS` a stream, so that every stream fits within the connection's window with the eighth quinn waits for left; 1MB and 2MB with a relay listed by key) | parameter-rationale.md §1 |
-| `QUIC_SEND_WINDOW` | 288KB a connection (derived: 2 x `SMALL_MESSAGE_BYTES`; 2MB to a relay listed by key; a write beyond it waits for acknowledgements, and fails after `STREAM_TIMEOUT_SECS`) | parameter-rationale.md §1 |
-| `PUSH_BYTES_PER_PEER_PER_MINUTE` | 2MB | parameter-rationale.md §4 |
-| `MAX_CHANNEL_BYTES_AT_RELAY` | 16MB | parameter-rationale.md §4 |
-| `NEW_CHANNELS_PER_ADDRESS_PER_HOUR` | 16 | parameter-rationale.md §4 |
-| `OUTBOX_BYTES_PER_MINUTE` | 1.5MB | parameter-rationale.md §4 |
-| `SYNC_PAGE_STEPS` | 100, 14, 3, 1 | parameter-rationale.md §4 |
-| `MAX_HANDSHAKE_ROLES`, `MAX_SHARED_PEER_ADDRS` | 8, 8 (lists of the older streams, bounded where they are read) | parameter-rationale.md §1 |
-| `SHORTEST_CHANNEL_ID_LEN`, `MAX_LISTED_CHANNEL_IDS` | 40, 24,966 (derived: that many of the shortest ID fill one message) | parameter-rationale.md §1 |
-| `MAX_PUSHED_ITEMS` | 2048 (derived: the items of no ciphertext one peer's allowance takes in a minute) | parameter-rationale.md §1 |
-| `OUTBOX_FLUSH_INTERVAL_SECS` | 2s | parameter-rationale.md §4 |
-| `OUTBOX_REFUSED_RETRY_MAX_SECS` | 600s | parameter-rationale.md §4 |
-| `RELAY_ASK_AGAIN_SECS` | 600s | parameter-rationale.md §4 |
-| `MAX_CHANNELS_ASKED_OF_A_PEER` | 1024 | parameter-rationale.md §4 |
-| `STATE_OFFER_RETRY_BASE_SECS`, `STATE_OFFER_RETRY_MAX_SECS` | 60s, 6h | parameter-rationale.md §4 |
-| `MAX_STATE_KEYS` | 1024 | parameter-rationale.md §4 |
-| `KEYED_TOMBSTONE_RETENTION_DAYS` | 90 (also a delete among entries, at a relay and on a device) | decision 2026-09-30 §4.4; parameter-rationale.md §12.7 |
-| `HISTORY_DAYS`, `HISTORY_MAX_BYTES` | 30, 256MB | parameter-rationale.md §10 |
-| `HISTORY_TURN_WAIT_SECS`, `HISTORY_SWEEP_INTERVAL_SECS` | 10s, 3600s | parameter-rationale.md §10 |
-| `HISTORY_SWEEP_SHARE` | 8 (swept at a cycle's end once an eighth of the size is kept) | parameter-rationale.md §10 |
-| `INDEX_LINE_PAIR_SECS`, `INDEX_LINE_KEPT_DAYS` | 3600s, 90 | parameter-rationale.md §11 |
-| `INDEX_LINE_MAX_RECORDS`, `INDEX_LINE_MAX_PUT_BACKS` | 1024, 3 | parameter-rationale.md §11 |
-| `INDEX_LINE_LOOK_SECS`, `INDEX_LINE_LOOK_GAP_SECS` | 60s, 30s | parameter-rationale.md §11 |
-| `MAX_REV`, `MAX_EPOCH` | 2^53 - 1 | parameter-rationale.md §4 |
-| `MAX_EPOCH_STEP` | 2^20 | parameter-rationale.md §4 |
-| `FALLBACK_PEERS` | relay1/relay2.cordelia.seeddrill.ai:9474 | decision 2026-09-30 §4.6 |
-| `FALLBACK_PEER_KEYS` | the default relays' public keys, in the same order | decision 2026-09-30 §4.6 |
+## Branches, commits and merges
 
-The constants of a channel from its secret (decision 2026-10-04). A value
-marked "derived" is computed in `protocol.rs` from the ones it names:
+- Branch from main (`feat/`, `fix/`, `docs/`, `chore/`). Large work goes on a feature branch, built in slices that branch from it.
+- A slice, a fix or a docs change merges by squash. Main merging into a feature branch, and a feature branch merging into main, keep a merge commit.
+- Merge only with CI green.
+- Commit types: `feat`, `fix`, `docs`, `refactor`, `chore`. The first line is under 72 characters.
+- A change to the wire format (codec, sync protocol) goes on its own branch, never mixed with feature work.
+- Before pushing: `cargo fmt --all`, then `cargo clippy --all-targets -- -D warnings` (as CI runs it).
 
-| Parameter | Value | Spec Section |
-|-----------|-------|-------------|
-| `REV_BAND_BITS`, `REV_COUNT_BITS` | 9, 44 (a revision is a band and a count) | parameter-rationale.md §12.1 |
-| `REV_BAND_SIZE`, `REV_BAND_HALF` | 2^44, 2^43 (derived) | parameter-rationale.md §12.1 |
-| `MAX_STATEMENT_NUMBER` | 256 (the highest statement, and the highest band) | parameter-rationale.md §12.2 |
-| `MAX_STATEMENT_DEVICES`, `MAX_STATEMENT_REMOVED`, `MAX_STATEMENT_CHAIN` | 64, 256, 256 | parameter-rationale.md §12.2 |
-| `MAX_DEVICE_LABEL_BYTES`, `STATEMENT_HASH_BYTES` | 64, 16 | parameter-rationale.md §12.2 |
-| `MAX_STATEMENT_BYTES` | 20,784 (derived) | parameter-rationale.md §12.2 |
-| `CHANGE_ENTRY_BYTES` | 32KB, always | parameter-rationale.md §12.3 |
-| `CHANGE_ENTRY_DEVICES_PART_BYTES`, `CHANGE_ENTRY_PHRASE_PART_BYTES`, `CHANGE_ENTRY_LINEAGE_BYTES` | 28,672 (fixed: where the version before opens it), 1KB, 3KB (derived) (decision 2026-10-24 rule 13) | parameter-rationale.md §12.3 |
-| `CHANGE_ENTRY_PHRASE_PART_BEFORE_BYTES` | 4KB (derived: the part for the phrase of the version before, opened for a change made over its entry) | parameter-rationale.md §12.3 |
-| `LINEAGE_HASH_BYTES`, `LINEAGE_MARK_BYTES`, `MAX_LINEAGE_BYTES` | 8, 8, 2,074 (derived: a lineage of a chain at its bound) | parameter-rationale.md §12.3 |
-| `SEALED_SECRET_BYTES`, `MAX_EARLIER_SECRETS` | 92, 8 | parameter-rationale.md §12.3 |
-| `MIN_ENTRY_CONTENT_BYTES` | 256 (a content is a power of two from this to `MAX_ITEM_BYTES`) | parameter-rationale.md §12.4 |
-| `MAX_ENTRY_LINKS`, `ENTRY_LINK_HASH_BYTES`, `ENTRY_LINK_SIGNER_BYTES` | 100, 16, 16 | parameter-rationale.md §12.4 |
-| `MAX_ENTRY_CHAIN_BYTES` | 3,202 (derived) | parameter-rationale.md §12.4 |
-| `MAX_ENTRY_NAME_AND_VALUE_BYTES` | 60KB | parameter-rationale.md §12.4 |
-| `ENTRY_CLEAR_BYTES`, `ENTRY_WIRE_OVERHEAD_BYTES`, `MAX_ENTRY_WIRE_BYTES` | 233, 237, 65,773 (derived) | parameter-rationale.md §12.4 |
-| `PHRASE_WORDS`, `PHRASE_BYTES` | 12, 16 | parameter-rationale.md §12.5 |
-| `PHRASE_TYPED_BACK_MISSES`, `PHRASE_MISS_PAUSE_SECS` | 3 (the third word typed back that is not the word shown stops `cordelia phrase`), 2s (before the first miss is said, and twice as long before the second) | parameter-rationale.md §12.5 |
-| `PHRASE_QUIET_AFTER_CROSS_SECS` | 1s (after a cross, what is typed is dropped until nothing has been typed for this long; then the same number is asked) | parameter-rationale.md §12.5 |
-| `LABEL_*` (35 of them, all in `LABELS`; `LABEL_CHANGE_LINEAGE` among them; `LABEL_CARRY_WORD` and `LABEL_CARRY_BATCH` among them, the three of messages and the six of a shared channel below) | `cordelia v2 ...`, one for each thing derived, signed or sealed | parameter-rationale.md §12.5 |
-| `FINGERPRINT_WORDS_SHOWN` | 4 | parameter-rationale.md §12.5 |
-| `MAX_ADDITION_BYTES` | 226 (derived) | parameter-rationale.md §12.6 |
-| `CHANGE_ENTRY_NAME`, `HAND_OVER_NAME` | `change`, `hand-over` | parameter-rationale.md §12.6 |
-| `PAIR_KEY_TYPED_SECS`, `TYPED_KEY_KEPT_SECS`, `HAND_OVER_KEPT_SECS` | 3600s, 86400s, 7200s | parameter-rationale.md §12.6 |
-| `MAX_TYPED_KEYS`, `MAX_HAND_OVER_RECORDS` | 8 (within their hour at one time), 2 | parameter-rationale.md §12.6 |
-| `HAND_OVER_CHANGE_ENTRY_BYTES`, `MAX_HAND_OVER_BYTES` | 32,960, 54,275 (derived) | parameter-rationale.md §12.6 |
-| `MAX_COUNTED_DEVICES`, `MAX_NOT_COUNTED_RECORDS` | 64 (derived), 256 | parameter-rationale.md §12.6 |
-| `KEPT_OUT_PER_ADDER` | 3 (derived: the keys that the 64 kept out that each adder that may add keeps, in both bounds of 256) | parameter-rationale.md §12.6 |
-| `LEFT_SECRET_KEPT_DAYS` | 90 | parameter-rationale.md §12.6 |
-| `MAX_CHANGE_HEADS` | 8 (the heads a device and a relay keep, decision 2026-10-24 (removal)) | parameter-rationale.md §12.6 |
-| `REMOVAL_TAKEN_MARGIN_SECS`, `MAX_FILE_ARRIVALS` | 600s (derived: 2 x `MAX_CLOCK_SKEW_SECS`; a removed key's cut time is the time of the change that first removes it less this), 1,024 (the arrivals a device keeps for a file, decision 2026-10-24 (removal), rules 2 and 7) | parameter-rationale.md §12.6 |
-| `CHANGE_HEADS_ROOM` | 2 (the heads a relay keeps room for in a slot whose entry carries a lineage, where it has the room; it makes none, decision 2026-10-24 (removal) rule 15) | parameter-rationale.md §12.7 |
-| `RELAY_ROLE_HEADS` | `heads` (the role a relay of this version names in its handshake: it keeps every head, and a device shows it each; at a relay that does not name it, none above the change followed, decision 2026-10-24 (removal) rule 18) | parameter-rationale.md §12.7 |
-| `MAX_KNOWN_REMOVED`, `MAX_KNOWN_HOLDERS` | 2,048 (derived: `MAX_STATEMENT_REMOVED` x `MAX_CHANGE_HEADS`), 2,048 (the keys a device keeps as removed, and as holding one change's secret by its records; past either it is closed) | parameter-rationale.md §12.6 |
-| `PERSONAL_NAME_PREFIX`, `PERSONAL_ADDED_PREFIX`, `PERSONAL_APPLIED_PREFIX`, `PERSONAL_LEFT_PREFIX`, `PERSONAL_APPLIED_SENT` | `name/`, `added/`, `applied/`, `left/`, ` sent` | parameter-rationale.md §12.6 |
-| `PERSONAL_REACHED_PREFIX` | `reached/` (the carried word: what a device carried is at the relays it reaches, decision 2026-10-19 rule 4) | parameter-rationale.md §12.6 |
-| `REACHED_WORD_MAX_RELAYS`, `REACHED_WORD_MAX_COUNT` | 8 (keys the carried word names; at its bound one content of 512 bytes), 256 (either count) | parameter-rationale.md §12.6 |
-| `PROTOCOL_ENTRY_SHOW`, `PROTOCOL_CHANNEL_PROVE`, `PROTOCOL_ENTRY_PULL`, `PROTOCOL_ENTRY_PUSH`, `PROTOCOL_RELAY_ENTRIES` | 0x10, 0x11, 0x12, 0x13, 0x14 | network-protocol.md §4.9 |
-| `SESSION_VALUE_BYTES` | 32 | parameter-rationale.md §12.7 |
-| `MAX_CHANNELS_PROVED_ON_A_CONNECTION`, `MAX_SLOTS_SHOWN_ON_A_CONNECTION` | 1024 (derived), 8 | parameter-rationale.md §12.7 |
-| `CHANNEL_MARK_BYTES` | 8 | parameter-rationale.md §12.7 |
-| `ENTRY_PAGE_MAX_ENTRIES`, `ENTRY_PAGE_MAX_BYTES` | 100, 896KB (derived) | parameter-rationale.md §12.7 |
-| `RELAY_CHANNELS_PAGE_MAX` | 1000 | parameter-rationale.md §12.7 |
-| `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` | 16MB (derived) | parameter-rationale.md §12.7 |
-| `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR` | 256 | parameter-rationale.md §12.7 |
-| `ENTRY_CHANNEL_UNUSED_DAYS`, `ENTRY_CHANNEL_USED_STEP_SECS`, `ENTRY_CHANNEL_SWEEP_INTERVAL_SECS` | 90, 3600s, 3600s (derived) | parameter-rationale.md §12.7 |
-| `RELAY_USES_WRITE_INTERVAL_SECS` | 60s (a relay writes the uses of channels it keeps in memory: a proof and a show are reads; also at the sweep and a clean stop) | parameter-rationale.md §12.7 |
-| `RELAY_CHECKPOINT_INTERVAL_SECS`, `RELAY_CHECKPOINT_LOG_PAGES`, `RELAY_LOG_KEPT_BYTES` | 1s (a relay's connection has SQLite's automatic checkpoint off; a tick of this timer, as kind Checkpoint, checkpoints passively once the log holds the pages, and a clean stop truncates), 1000 (SQLite's own threshold, so that a push pays for no more syncs than it did), 64 MiB (a longer log's file is cut to this when the log starts again; above a second's log at the most a relay takes in) | parameter-rationale.md §12.7 |
-| `ENTRY_OFFER_INTERVAL_SECS`, `RELAY_ENTRY_PULL_INTERVAL_SECS` | 5s, 10s (derived) | parameter-rationale.md §12.7 |
-| `RELAY_ENTRY_PULL_PAGES`, `RELAY_CHANNEL_PAGES_PER_PASS` | 10, 10 | parameter-rationale.md §12.7 |
-| `ENTRY_REQUESTS_PER_PEER_PER_MINUTE`, `OWN_ENTRY_REQUESTS_PER_MINUTE` | 3000, 2250 (derived) | parameter-rationale.md §12.8 |
-| `SHOW_ANSWER_ROOM_BYTES` | 66,560 (derived: one entry of the largest size, as it is counted) | parameter-rationale.md §12.8 |
-| `SHOW_LEAVE_SECS`, `WAKE_WAIT_SECS` | 10s (derived), 30s | parameter-rationale.md §12.8 |
-| `LEAVING_SEND_WAIT_SECS`, `FIRST_FETCH_WAIT_SECS` | 30s, 30s (derived) | parameter-rationale.md §12.8 |
-| `CHANNEL_PROOF_AGAIN_SECS` | 86400s | parameter-rationale.md §12.8 |
-| `CHANGE_FETCH_MAX_SECS`, `CHANGE_FETCH_PASSES` | 120s, 3 | parameter-rationale.md §12.9 |
-| `STATEMENTS_LEFT_SAID_BELOW` | 16 | parameter-rationale.md §12.9 |
-| `RECEIVED_LAST_DAY_SECS`, `RECEIVED_LAST_WEEK_SECS` | 86400s, 604800s | parameter-rationale.md §12.9 |
-| `CARRY_READ_MAX_SECS`, `CARRY_FIRST_MAX_SECS` | 120s, 180s (derived) | parameter-rationale.md §12.9 |
-| `RECOVERY_READ_ON_MAX_SECS`, `RECOVERY_READ_ON_READS` | 615s (derived: a channel at its cap at what one relay hands a minute, and a round more), 5 (derived: the readings that fit in it) | parameter-rationale.md §12.9 |
-| `CARRY_FROM_WORDS`, `CARRY_WORD_SECS` | 6, 600s | parameter-rationale.md §12.9 |
-| `LET_GO_READ_STANDS_SECS` | 600s (derived: a read before a let-go stands for its `discard`, on the monotonic clock) | parameter-rationale.md §12.9 |
-| `CARRY_PART_MAX_BYTES` | 512KB (derived) | parameter-rationale.md §12.9 |
-| `LEFT_PROOFS_MARGIN_SHARE`, `CARRY_PROOFS_MADE_AGAIN` | 64 (one place in 64 kept back), 2 | parameter-rationale.md §12.9 |
-| `DEVICE_DELETE_SWEEP_INTERVAL_SECS` | 86400s (a device's sweep of old deletes) | parameter-rationale.md §12.9 |
-| `LOCAL_API_BODY_MAX_BYTES`, `CARRY_HANDED_MAX_BYTES` | 2MB, 512KB (derived) | parameter-rationale.md §12.9 |
-| `RECOVERY_MAX_NAMES`, `RECOVERY_MAX_DEVICES_SHOWN`, `RECOVERY_MAX_LEFT_SECRETS` | 1024, 256, 9 (derived) | parameter-rationale.md §12.9 |
-| `FILE_NAME_SHOWN_CHARS` | 120 | parameter-rationale.md §12.9 |
-| `STATUS_AMBER_WAIT_SECS`, `REMOVAL_NOT_APPLIED_SHOWN_DAYS` | 300s, 7 | parameter-rationale.md §12.10 |
-| `NO_ROOM_STANDS_SECS` | 1200s (derived) | parameter-rationale.md §12.10 |
-| `OUT_OF_REACH_SECS` | 300s (derived: `STATUS_AMBER_WAIT_SECS`; a relay not reached, with every attempt at it failed, for this long since its reference is out of reach) | parameter-rationale.md §12.10 |
-| `PERSONAL_CHANNEL_HEADROOM_BYTES`, `PERSONAL_CHANNEL_WARN_BYTES` | 4 MiB, 12 MiB (derived: the status warns past it, decision 2026-10-19; nothing is refused) | parameter-rationale.md §12.10 |
-| `FIRST_START_RETRY_BASE_SECS`, `FIRST_START_RETRY_MAX_SECS`, `FIRST_START_RETRY_SLACK_SECS` | 5s, 600s (derived), 1s | parameter-rationale.md §12.11 |
-| `NODE_LOCK_WAIT_MS` | 500ms (a node that finds its data directory's lock held tries again for this long) | parameter-rationale.md §12.11 |
+## Running tests
 
-The constants of messages between your own agents (decision 2026-10-09, and
-a person's hold on them, decision 2026-10-25), each with its reason in
-parameter-rationale.md §12.12:
-
-| Parameter | Value | Spec Section |
-|-----------|-------|-------------|
-| `LABEL_AGENT_MESSAGES`, `LABEL_AGENT_MESSAGE_ID`, `LABEL_AGENT_MESSAGE_READ` | `cordelia v2 messages`, `cordelia v2 message id`, `cordelia v2 message read` | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_PREFIX`, `AGENT_MESSAGE_READ_PREFIX` | `msg/`, `read/` | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_RING` | 64 (a device's slots for messages; a signer's live numbers; places in an hour; the highest bound a person sets) | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_CONTENT_BYTES`, `AGENT_MESSAGE_VALUE_BYTES` | 2,048, 1,936 (derived) | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_BODY_MAX_BYTES`, `AGENT_MESSAGE_NAME_MAX_BYTES` | 1,024, 200 | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_LINK_OWNER_MAX_BYTES`, `AGENT_MESSAGE_LINK_REPO_MAX_BYTES`, `AGENT_MESSAGE_LINK_NUMBER_MAX_DIGITS`, `AGENT_MESSAGE_LINK_MAX_BYTES` | 39, 100, 10, 151 (derived) | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_ID_BYTES`, `AGENT_MESSAGE_ID_SHOWN_CHARS`, `AGENT_MESSAGE_READ_MARK_BYTES` | 16, 8, 16 | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_READ_MARKS_MAX` | 120 (derived) | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_KEPT_DAYS`, `AGENT_MESSAGE_AHEAD_MAX_SECS`, `AGENT_MESSAGE_SENDS_MAX` | 30, 600s, 4 | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGES_PER_FOLDER_PER_HOUR`, `AGENT_MESSAGES_PER_DEVICE_PER_HOUR`, `AGENT_MESSAGE_PAIR_UNREAD_MAX` | 20, 60, 10 | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_SUMMARY_LINES`, `AGENT_MESSAGE_SUBJECT_CHARS`, `AGENT_MESSAGE_AGENT_NAME_CHARS` | 5, 80, 48 | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_SUMMARY_WAIT_MS`, `AGENT_MESSAGE_HOOK_INPUT_WAIT_MS`, `AGENT_MESSAGE_HOOK_INPUT_MAX_BYTES` | 100ms, 20ms, 64KB | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_MARKER_BYTES`, `AGENT_MESSAGE_CLEAR_INTERVAL_SECS` | 6, 3600s (derived) | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_NUMBER_MAX` | 2^42 - 1 (derived: a clearing's revision stays below `REV_BAND_HALF`) | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_PERSON_PREFIX`, `AGENT_MESSAGE_PAIR_BOUNDS_PREFIX` | `person/`, `hold/` (a device's lists of what a person read on it and of the bounds a person set on it, decision 2026-10-25, rules 1 and 2) | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_PAIR_BOUND_SECS`, `AGENT_MESSAGE_PAIR_BOUND_MAX_SECS`, `AGENT_MESSAGE_PAIR_BOUND_MIN_SECS` | 28,800s (`--for` where none is given), 604,800s (the longest, and the `for` of a 10), 60s | parameter-rationale.md §12.12 |
-| `AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS` | 605,400s (derived: how long after its `at` a device lists the latest bound it set for a pair, rule 3.5) | parameter-rationale.md §12.12 |
-
-The constants of what a relay holds across its connections (decision
-2026-10-22, change F), each with its reason in parameter-rationale.md §13:
-
-| Parameter | Value | Spec Section |
-|-----------|-------|-------------|
-| `SMALL_PAGE_BYTES` | 131,072 (the most entries in a page for an unlisted peer and in a device's push; the least power of two that holds one entry of the largest size) | parameter-rationale.md §13 |
-| `SMALL_MESSAGE_BYTES` | 147,456 (derived: `SMALL_PAGE_BYTES` and 16 KiB for what is around the entries; nothing a device of this version sends or is sent is larger) | parameter-rationale.md §13 |
-| `LARGE_MESSAGES_AT_ONCE` | 4 (the large permits a node holds across all its connections; at most one for each /24 or /48) | parameter-rationale.md §13 |
-| `ERR_LARGE_MESSAGE_LATER` | 0x05 (a large message the node could not take within `STREAM_TIMEOUT_SECS`, to be sent again) | parameter-rationale.md §13 |
-| `QUIC_LISTED_STREAM_RECEIVE_WINDOW`, `QUIC_LISTED_RECEIVE_WINDOW`, `QUIC_LISTED_SEND_WINDOW`, `QUIC_LISTED_MAX_BIDI_STREAMS` | 1MB, 2MB, 2MB, 64 (derived: today's values, for a connection with a relay listed by key, dialled with `connect_with` and accepted with `accept_with`) | parameter-rationale.md §13 |
-| `PUSH_RETRY_STREAMS_AT_ONCE` | 4 (derived: half of `QUIC_MAX_BIDI_STREAMS`; the older kind's push retries a node runs to one peer at once, the rest waiting for a later round without spending a try) | parameter-rationale.md §13 |
-| `SMALL_WINDOWS_PULL_ENTRIES` | 1 (derived: the entries of the largest size on the wire that a small page holds; what a relay asks a listed relay for in a page where its own end of their connection has every peer's windows, as behind a NAT) | parameter-rationale.md §13 |
-The constants of a shared channel, for messages between people (decision
-2026-10-10, made, shared and taken by the node from its slice 6 on), each with its reason in
-parameter-rationale.md §12.13:
-
-| Parameter | Value | Spec Section |
-|-----------|-------|-------------|
-| `LABEL_SHARED`, `LABEL_SHARED_RELAYS`, `LABEL_SHARE_PAIR` | `cordelia v2 shared`, `cordelia v2 relays`, `cordelia v2 share pair` | parameter-rationale.md §12.13 |
-| `LABEL_ANEW_SEAL`, `LABEL_SHARED_SENT`, `LABEL_SHARED_ACT` | `cordelia v2 anew seal`, `cordelia v2 message sent`, `cordelia v2 act` | parameter-rationale.md §12.13 |
-| `SHARED_SEED_BYTES`, `SHARED_MAX_RELAYS` | 32, 2 (a card is the seed and one or two relays by key: 97 bytes at most) | parameter-rationale.md §12.13 |
-| `SHARED_MAX_CHANNELS`, `SHARED_MAX_DROPPED`, `SHARED_MAX_SUBSCRIPTIONS`, `SHARED_MAX_LABELS` | 16, 64, 32, 64 | parameter-rationale.md §12.13 |
-| `SHARED_LABEL_MAX_BYTES` | 64 (derived: `MAX_DEVICE_LABEL_BYTES`) | parameter-rationale.md §12.13 |
-| `SHARED_LIST_MAX_VALUE_BYTES` | 41,333 (derived: a device's list at every bound, which seals at 65,536) | parameter-rationale.md §12.13 |
-| `SHARED_ACT_TIME_MAX` | 2^40 (the latest time and the highest count an act may say) | parameter-rationale.md §12.13 |
-| `SHARED_MAX_KEYS`, `SHARED_KEYS_KEPT` | 64, 1,024 | parameter-rationale.md §12.13 |
-| `SHARED_TAKE_OUT_STEP_ENTRIES` | 65 (derived: one key's entries, taken out of a device's store under one hold of its lock) | parameter-rationale.md §12.13 |
-| `SHARED_OFFER_DELIVERED_SECS` | 2,592,000 (derived: `AGENT_MESSAGE_KEPT_DAYS`; how long a channel moved from keeps its entries for its offer to reach each relay) | parameter-rationale.md §12.13 |
-| `SHARED_BYTES_PER_MINUTE`, `SHARED_PUSH_BYTES_PER_MINUTE` | 512KB, 384KB (derived: a quarter of what a relay hands, and of what a device pushes) | parameter-rationale.md §12.13 |
-| `SHARED_READ_AGAIN_SECS`, `SHARED_REQUESTS_PER_MINUTE` | 86400s, 600 (with the device's own 2,250 and its 72 shows, 2,922 of 3,000) | parameter-rationale.md §12.13 |
-| `SHARED_KEY_WORDS_SHOWN` | 6 (66 bits, as `CARRY_FROM_WORDS`) | parameter-rationale.md §12.13 |
-| `SHARED_ANEW_CONTENT_BYTES`, `SHARED_ANEW_VALUE_BYTES` | 16,384, 16,274 (derived) | parameter-rationale.md §12.13 |
-| `SHARE_VALUE_BYTES` | 407 (derived: a share seals at 512) | parameter-rationale.md §12.13 |
-| `SHARE_PREFIX`, `SHARED_ANEW_PREFIX`, `SHARED_READ_PREFIX`, `PERSONAL_SHARED_PREFIX` | `share/`, `anew/`, `sread/`, `shared/` | parameter-rationale.md §12.13 |
-
-The constants of a repository's list, for joining its shared channel by
-pull request (decision 2026-11-06 (joining)), each with its reason in
-parameter-rationale.md §12.14:
-
-| Parameter | Value | Spec Section |
-|-----------|-------|-------------|
-| `MEMBERS_FILE_MAX_BYTES` | 16,384 (the most of `.cordelia/members` a device reads; a larger file is not read, and the last list read stands) | parameter-rationale.md §12.14 |
-| `MEMBERS_LABEL_MAX_CHARS` | 32 (a device's label in the list, of `a-z`, `0-9`, `.`, `_` and `-`) | parameter-rationale.md §12.14 |
-| `MEMBERS_GIT_TERM_SECS` | 2s (after TERM, before git is killed, where a read of a clone has not ended within `STREAM_TIMEOUT_SECS`) | parameter-rationale.md §12.14 |
-| `MEMBERS_READ_INTERVAL_SECS` | 600s (how often the node reads each list it follows; also at its start, and when a person follows a repository) | parameter-rationale.md §12.14 |
-| `MEMBERS_HANDED_AT_ONCE` | 4 (derived: `MAX_TYPED_KEYS` / 2; the listed keys handed the channel at each read, each share kept for two reads) | parameter-rationale.md §12.14 |
-| `MEMBERS_ASKED_PER_PASS` | 32 (the node's typings asked of the relays in one whole pass, across every follow: 384 requests a minute, 592 of `SHARED_REQUESTS_PER_MINUTE` with the rest of the shared pass) | parameter-rationale.md §12.14 |
-| `MEMBERS_COMMIT_SHOWN_CHARS` | 12 (a commit's characters that the status, `shared list` and the line show; `--json` gives it whole) | parameter-rationale.md §12.14 |
-| `MEMBERS_LABELS_SHOWN` | 6 (the members the plain status names of each repository, then "and <n> more") | parameter-rationale.md §12.14 |
-
-## Running Tests
-
-See **[TESTING.md](TESTING.md)** for the full testing guide: pre-flight checks, Docker cleanup,
-build steps, all test suites (unit, integration, S2/S3 scale), known-good baselines,
-common failure modes, and post-test verification.
-
-Quick reference:
 ```bash
-# All unit + integration tests
-cargo test --all
-
-# Specific crate
-cargo test -p cordelia-network
-cargo test -p cordelia-crypto
+cargo test --all                                      # everything, the real-process tests too
+cargo test -p cordelia-node --test devices_e2e        # one test file
+cargo test -p cordelia-network <name> -- --nocapture  # one test, with output
 ```
 
-The constants of the counters of the scale test (decision 2026-10-22 §1,
-§7.3), each with its reason in parameter-rationale.md §14:
+The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" job runs them. A few tests need the binary of an earlier release (`CORDELIA_TEST_BINARY_BEFORE`, `CORDELIA_TEST_BINARY_BEFORE_SHARED`); without it they pass without running, except in CI. TESTING.md has the rest.
 
-| Parameter | Value | Spec Section |
-|-----------|-------|-------------|
-| `LOAD_HISTOGRAM_BUCKETS` | 25 (powers of two of µs from 1 µs to 16 s, and one more) | parameter-rationale.md §14 |
-| `LOCK_COUNTED_OVER_MS` | 5, 10, 50, 100, 250 (waits and holds counted apart, for bars 4 and 5; 10 ms settles bar 4 (a): a kind's wait p99 is at most 10 ms where at most 1% of its waits are over 10 ms) | parameter-rationale.md §14 |
-| `LOAD_RELAYS_COUNTED` | 16 (derived: the relays counted apart by key) | parameter-rationale.md §14 |
-| `LOCK_HOLD_MEDIAN_NANOS`, `LOCK_TIMING_COST_MAX_NANOS` | 12,000, 120 (derived: what timing a take may cost) | parameter-rationale.md §14 |
+## Public text
 
-## Engineering Principles
+This repository is public.
 
-1. **Self-defending functions**: Public async functions have built-in timeouts.
-   Don't rely on callers to timeout -- if a test can break it, the code handles it.
+- Examples name no particular machine: say laptop and desktop.
+- Name no host, IP or private repository. A private repository holds strategy and planning: nothing from it comes here unless it is meant to be public. Every Cordelia spec lives here, in `docs/specs/`.
+- No emojis.
+- A security gap is reported privately first. Never push its fix, test or wording here until the owner says.
 
-2. **Minimise timeout diversity**: One value (STREAM_TIMEOUT=10s) at one layer
-   (codec) for all stream I/O. Add a new timeout only with documented justification.
+## What not to do
 
-3. **Spec is source of truth**: Parameter values derive from `demand-model.md`
-   personas. If you change a value, update the spec and the rationale.
-
-## Branch and Merge Workflow
-
-Feature work goes on branches (`feat/X`). Merge to main only after CI passes, including the real-process tests in `devices_e2e.rs`.
-
-1. **Branch from main**: `git checkout -b feat/my-feature`
-2. **Small, tested commits**: Each commit independently testable. Never bundle code + test harness changes.
-3. **Test after each meaningful change**: Run `cargo test --all` locally; for P2P or sync changes, `cargo test -p cordelia-node --test devices_e2e`.
-4. **PR to main**: Squash merge preserves clean history.
-5. **Protocol changes get their own branch**: Wire format changes (codec, sync protocol) are never mixed with feature work.
-
-## E2E topology and scale suites (stale)
-
-The Docker topology suite (T1-T7) and the S2/S3 scale runs predate v1 and
-are stale; `e2e.yml` runs only on demand. They ran on a self-hosted runner,
-whose details are in the private infrastructure docs, not here. To run them
-anywhere with Docker: `bash tests/e2e/build-image.sh`, then the scripts in
-`tests/e2e/` (`run-e2e.sh`, `scale/run-s2.sh`, `scale/run-s3.sh`). v1 is
-covered by `crates/cordelia-node/tests/devices_e2e.rs`.
-
-## Related Repos
-
-- **seed-drill** (private): strategy and planning. Nothing from it belongs in this repository unless it is meant to be public
-- **seeddrill-website**: seeddrill.ai (Astro, Cloudflare Pages); `/install.sh` redirects to `scripts/install.sh` here
-- **cordelia-sdk**: TypeScript SDK (`@seeddrill/cordelia`), deferred
-- **ARCHIVED, do not use:** cordelia-core (old libp2p+JSON+axum implementation), cordelia-proxy,
-  cordelia-agent-sdk, cordelia-dashboard, cordelia-portal, rutherford
-
-## What NOT to Do
-
-- Do not reference cordelia-core or the other archived repos for anything.
-- Do not treat `docs/archive/` as current; it describes the pre-v1 design.
-- Do not put specs in seed-drill. All Cordelia specs live here in docs/specs/.
-- Do not add new timeout values without updating parameter-rationale.md.
-- Do not change governor defaults without checking demand-model.md derivations.
-- Do not add new protocol constants outside `protocol.rs`. All modules derive from it.
+- Do not use repositories of the older design (a libp2p, JSON and axum build among them). The workspace's own crate `cordelia-core` is live.
+- Do not add a protocol constant outside `protocol.rs`, or a timeout without its reason in `parameter-rationale.md`.
+- Do not change the governor's defaults without checking `demand-model.md`.
