@@ -1,7 +1,7 @@
 # Decision: removing the older kind of channel, and one baseline for the schema
 
 **Date**: 2026-11-10
-**Status**: Accepted by the person on 10 November ("ok to remove older channels and schema"); reviewed once, 10 November. To be built in the three slices of section 7.
+**Status**: Accepted by the person on 10 November ("ok to remove older channels and schema"); reviewed, and its fixes checked, 10 November. To be built in the three slices of section 7.
 **Cited as**: "decision 2026-11-10 (older kind), rule 4". The numbers do not change.
 **Lines** are main's (c3cc5756, `v0.2.0-alpha.19`, whose code is alpha.19's); paths are under `crates/`.
 
@@ -66,7 +66,7 @@ A relay carries the older kind of channel (a random ID, a ring of keys, a list o
 - `person::judge_kept` (decision 2026-10-24 (removal), rule 12), which the first start calls at every start (API `first_start.rs:250`): the node calls it then instead;
 - **one wording for a device that follows no phrase,** "no recovery phrase yet" (`look.rs:550`); "not added yet", which read the first start's mark (`look.rs:555`), goes.
 
-Also going: `sync.claude.all`, written only for earlier versions (`sync.rs:180-183`), with `scope_off_at_start` (`sync.rs:187`); cost: none, as none opens this database. The notice of folders that stopped syncing (§10.1, rule 3), with `--seen` and `stopped_syncing`; cost: a device that has not cleared it stops naming them, and `cordelia sync status` still lists each folder found, with the command that maps it.
+Also going: `sync.claude.all`, written only for earlier versions (`sync.rs:180-183`, and at every turn-on, `sync.rs:374`: removing `meta::SYNC_CLAUDE_ALL` lets the compiler find each), with `scope_off_at_start` (`sync.rs:187`); cost: none, as none opens this database. The notice of folders that stopped syncing (§10.1, rule 3), with `--seen` and `stopped_syncing`; cost: a device that has not cleared it stops naming them, and `cordelia sync status` still lists each folder found, with the command that maps it. The panels' `sync status --seen` action, shown only while the notice exists, goes with it.
 
 ## 5. CI and tests
 
@@ -74,10 +74,10 @@ Also going: `sync.claude.all`, written only for earlier versions (`sync.rs:180-1
 
 - **CI pins one binary, alpha.19,** in place of alpha.10 and alpha.17 (`ci.yml:17-26`, `57-81`). `msg_e2e.rs:2716` and `shared_e2e.rs:2882` go (steps 18 and 20); `shared_e2e.rs:2782`, the one test of a shared channel through an older relay, runs on alpha.19.
 - **New, on alpha.19:**
-  - (a) An alpha.19 relay and one of this build list each other. The alpha.19 relay holds over 64 older channels (made through its `/api/v1/channels`) and passes on older items a client pushes it. A laptop on this build uses both relays, a desktop on alpha.19 the other. A file and a message go each way; the older asks and pushes get nothing; the link stays up.
+  - (a) An alpha.19 relay and one of this build list each other. The alpha.19 relay holds over 64 older channels, made through its own `/api/v1/channels`, and publishes older items through its own `/api/v1/channels/publish`, which its outbox pushes to the relays it lists (`handlers.rs:269`, `p2p.rs:2053-2056`). So the test needs none of this build's older types, which slice 2 removes. A laptop on this build uses both relays, a desktop on alpha.19 the other. A file and a message go each way; the older asks and pushes get nothing; the link stays up.
   - (b) alpha.19's own `init` makes a database; this build's baseline, before step 34, has the same `sqlite_master` (type, name, table, text, as a set), `user_version` and rows, but the random mark.
   - (c) A device and a relay that ran alpha.19 are taken over, the relay with items in a channel, the device with older rows put in once its guard is dropped (storage `first_start.rs:736`). No older table is left, `sync.claude.activity` is, and they sync on.
-- **Changed:** the lock test (`person_e2e.rs:4870`) uses an alpha.19 database; the later-database test gains steps 32 and 10, unchanged byte for byte; the answer with nothing (`devices_e2e.rs:4212`, `threat_model.rs:3015`) runs at a relay too; `first_start_e2e.rs` keeps the lock, port, mode and refusal tests.
+- **Changed:** the lock test (`person_e2e.rs:4870`) uses an alpha.19 database; the later-database test gains steps 32 and 10, unchanged byte for byte; the answer with nothing (`devices_e2e.rs:4212`, `threat_model.rs:3015`) runs at a relay too, and sends raw bytes after the protocol byte, since a node refuses before it reads them (`p2p.rs:5840-5848`) and the older message types go in slice 2; the kept metrics test (`api_integration.rs:1213`) is rewritten without the older routes and `cordelia_items_total`; `first_start_e2e.rs` keeps the lock, port, mode and refusal tests.
 - **Every threat keeps a test for each claim.** T1, T2, T3, T10, T16, T18 and T20 name tests rule 2 removes (T3 about 20; `threat_model.rs:1672`, `1924-2104` push the older kind). A claim left with none gets a test over entry pushes (0x13) first. T3's "the sender is told which and why" is of the older kind (`messages.rs:684-693`), and is reworded.
 - **Goes:** the tests of the older kind (`threat_model.rs:2341-3013` among them), of swarm-init and of each step (`schema.rs` from 2333), but those of checks and bounds.
 
