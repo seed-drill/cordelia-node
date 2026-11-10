@@ -90,6 +90,11 @@ If you have a recovery phrase already and every device is lost, do not make a ne
 Press Ctrl-C, and recover with the phrase you have:
   cordelia recover";
 
+/// What `cordelia phrase` asks on a machine that follows no phrase, after
+/// [`HAS_ONE_ALREADY`]: the words wait for an Enter, so that the warning is
+/// read before they take the screen.
+const SEE_THE_WORDS: &str = "Otherwise, press Enter to see your new phrase. ";
+
 /// What `cordelia phrase` says before it goes on, by where the device
 /// stands among its person's devices (`among`): [`WHOSE_WORDS`], and on
 /// a machine that follows no phrase [`HAS_ONE_ALREADY`] after it.
@@ -522,7 +527,11 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         println!("{waits}");
     }
     let agreed = match among.as_str() {
-        "no_phrase" => true,
+        // Only an Enter with nothing typed goes on: `cordelia recover`
+        // typed here by mistake shows no word.
+        "no_phrase" => at
+            .answer(SEE_THE_WORDS)?
+            .is_some_and(|typed| typed.is_empty()),
         "alone" => at.yes(
             "This replaces the recovery phrase that this device follows: the old one stops \
              working here, and what the relays hold under it is left behind.",
@@ -546,7 +555,10 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         ),
     };
     if !agreed {
-        println!("{NOT_A_YES}");
+        match among.as_str() {
+            "no_phrase" => println!("Nothing was done."),
+            _ => println!("{NOT_A_YES}"),
+        }
         return Ok(());
     }
     let label = name.unwrap_or_else(default_label);

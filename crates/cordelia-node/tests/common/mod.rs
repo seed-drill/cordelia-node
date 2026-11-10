@@ -1520,11 +1520,12 @@ pub fn words_shown(said: &str) -> String {
     words.join(" ")
 }
 
-/// `cordelia phrase` on a device that follows none: the words are read
-/// off the terminal, as a person writes them down, and typed back.
-/// Returns the words.
+/// `cordelia phrase` on a device that follows none: an Enter to see the
+/// words, which are read off the terminal, as a person writes them down,
+/// and typed back. Returns the words.
 pub fn makes_a_phrase(device: &Node, label: &str) -> String {
     let mut at = device.at_terminal(&["phrase", "--name", label]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");
