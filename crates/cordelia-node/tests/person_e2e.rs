@@ -107,10 +107,10 @@ fn relay_holds_latest(node: &Node) -> Option<()> {
 
 /// A new install follows no phrase, and says so, in the words of §5.2
 /// and §5.1, in `status`, in `status --json` and in `devices`. `cordelia
-/// phrase` makes one at a terminal: the words are shown once, typed back
-/// whole, and the command says first what a phrase is for and that it
-/// is no wallet's. The device then follows it, alone, and its relay is
-/// shown the change entry and holds it.
+/// phrase` makes one at a terminal: the words are shown once, after an
+/// Enter, and typed back whole, and the command says first what a phrase
+/// is for and that it is no wallet's. The device then follows it, alone,
+/// and its relay is shown the change entry and holds it.
 #[test]
 fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     let relay = relay_started();
@@ -160,6 +160,7 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
 
     // The phrase, made at a terminal.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");
@@ -184,8 +185,13 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
          do not make a new one.\r\nPress Ctrl-C, and recover with the phrase you have:\r\n  \
          cordelia recover\r\n";
     let pointed_at = said.find(has_one_already).expect("the way to recover");
+    // The words wait for an Enter after it: the warning is read first.
+    let see_the_words = said
+        .find("Otherwise, press Enter to see your new phrase. ")
+        .expect("an Enter is asked for");
     assert!(
-        pointed_at < said.find("Your recovery phrase (shown once):").unwrap(),
+        pointed_at < see_the_words
+            && see_the_words < said.find("Your recovery phrase (shown once):").unwrap(),
         "{said:?}"
     );
     for says in [
@@ -563,7 +569,8 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
 /// so, and changes nothing: a yes stops a command that is run by a
 /// script that has none (decision 2026-10-04 §5). The commands that only
 /// read are not refused. A phrase whose words are typed back wrongly
-/// three times makes nothing, and nor does a yes that is not given.
+/// three times makes nothing, and nor does a yes that is not given, or
+/// anything but an Enter before the words of a first phrase.
 #[test]
 fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_nothing() {
     let relay = relay_started();
@@ -743,10 +750,23 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
         .send_json(json!({}));
     assert!(unasked.is_err());
 
+    // Anything but an Enter before the words, `cordelia recover` typed
+    // there by mistake among it: no word is shown, and nothing is made.
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase")
+        .types("cordelia recover");
+    let stopped = at.says_one_of(&["Nothing was done.", "(shown once)"]);
+    assert_eq!(stopped, 0, "{}", at.said);
+    let said = at.done();
+    assert!(said.ends_with("Nothing was done.\r\n"), "{said:?}");
+    assert!(!said.contains("(shown once)"), "{said}");
+    assert_eq!(holds(&laptop), before);
+
     // Three words typed back that are not the words shown: nothing is
     // made.
     let soon = std::time::Duration::from_secs(60);
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");
@@ -771,6 +791,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     // Words that are no words of the list are asked for again, and the
     // command is ended there: nothing either.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have").types("");
     at.says("Now type the words back")
         .types("these are not twelve words");
@@ -2209,6 +2230,7 @@ fn a_phrase_is_shown_only_on_a_terminal_and_is_cleared_from_it() {
     // At a terminal: the words are shown on the other screen, which is
     // cleared, with what scrolled off, before it is put away.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     let rows = rows_shown(&at.said).to_string();
@@ -2281,6 +2303,7 @@ fn on_a_terminal_narrower_than_the_rows_the_words_are_shown_one_to_a_line() {
     wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
 
     let mut at = laptop.at_terminal_of(58, 19, &["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let shown = at.says_one_of(&["Press Enter when you have", "too small"]);
     assert_eq!(shown, 0, "{}", at.said);
     let rows = rows_shown(&at.said).to_string();
@@ -2335,6 +2358,7 @@ fn on_a_terminal_too_small_for_the_twelve_words_nothing_is_shown_or_made() {
         ((13, 200), (14, 29)),
     ] {
         let mut at = laptop.at_terminal_of(has.0, has.1, &["phrase", "--name", "laptop"]);
+        at.says("press Enter to see your new phrase").types("");
         let stopped = at.says_one_of(&["too small", "Press Enter when you have"]);
         assert_eq!(stopped, 0, "{has:?}:\n{}", at.said);
         let said = at.refused_within(soon);
@@ -2352,6 +2376,7 @@ fn on_a_terminal_too_small_for_the_twelve_words_nothing_is_shown_or_made() {
 
     // With the eighth line, the rows of four are shown.
     let mut at = laptop.at_terminal_of(80, 8, &["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let shown = at.says_one_of(&["Press Enter when you have", "too small"]);
     assert_eq!(shown, 0, "{}", at.said);
     let words = words_shown(&at.said);
@@ -2458,6 +2483,7 @@ fn ctrl_c_is_read_as_a_key_and_what_was_typed_ahead_answers_nothing() {
 
     // While the screen that shows a new phrase is up.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     assert_eq!(at.is_as_it_was(), (false, false), "each key is read");
     let shown = rows_shown(&at.said).to_string();
@@ -2473,6 +2499,7 @@ fn ctrl_c_is_read_as_a_key_and_what_was_typed_ahead_answers_nothing() {
     // While what is typed is hidden: at the words typed back, in the
     // middle of a word, and at the phrase of a change.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have").types("");
     at.says("Now type the words back");
     std::thread::sleep(std::time::Duration::from_millis(200));
@@ -2498,6 +2525,7 @@ fn ctrl_c_is_read_as_a_key_and_what_was_typed_ahead_answers_nothing() {
     // or a line. The words are typed back with all three, and are the
     // phrase: no word got a cross.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");
@@ -2633,7 +2661,8 @@ fn each_word_of_the_list_gets_a_tick_and_nothing_that_is_typed_is_shown() {
         }
     };
 
-    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     types_each(&mut at, ASKS_THE_WORDS_BACK, &words);
     let said = at.done();
@@ -2669,7 +2698,8 @@ fn twelve_words_on_one_line_are_taken_in_their_order() {
     let laptop = device_started("laptop", &relay);
     let all_ticks = |asks: &str| format!("{asks}\r\n\r\n{}", ticks(1, 12));
 
-    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     let shown: Vec<&str> = words.split(' ').collect();
     let one_line = format!(
@@ -2748,7 +2778,8 @@ fn a_word_that_is_not_in_the_list_is_asked_again_and_is_no_miss() {
     let relay = relay_started();
     let laptop = device_started("laptop", &relay);
 
-    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     let shown: Vec<&str> = words.split(' ').collect();
     let another = another_word_than(shown[0]);
@@ -3033,7 +3064,8 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
     };
 
     // The third miss, at a third word: the command stops.
-    let at = laptop.at_terminal_through(through.port, &["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal_through(through.port, &["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     let shown: Vec<&str> = words.split(' ').collect();
     let to_the_ninth = two_misses(&mut at, &shown);
@@ -3067,7 +3099,8 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
     assert_eq!(text(&look(&laptop), "state"), "no_phrase");
 
     // Two misses, and then each word as it was shown: the phrase.
-    let at = laptop.at_terminal_through(through.port, &["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal_through(through.port, &["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     let shown: Vec<&str> = words.split(' ').collect();
     let to_the_ninth = two_misses(&mut at, &shown);
@@ -3114,7 +3147,8 @@ fn a_miss_is_said_after_its_pause_and_any_other_word_is_answered_at_once() {
     laptop.start();
     wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
 
-    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     let shown: Vec<&str> = words.split(' ').collect();
     let line = |word: &str| format!("{word}\n").into_bytes();
@@ -3237,7 +3271,8 @@ fn what_is_typed_while_a_miss_waits_is_not_taken_as_the_next_word() {
         )
     };
 
-    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     let shown: Vec<&str> = words.split(' ').collect();
     let another = another_word_than(shown[1]);
@@ -3422,6 +3457,7 @@ fn the_words_are_shown_numbered_and_are_gone_from_the_screen_afterwards() {
     wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
 
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let rows = rows_shown(&at.said).to_string();
     let words = words_shown(&at.said);
@@ -3511,7 +3547,8 @@ fn a_person_who_goes_on_typing_after_a_miss_spends_one_miss_and_not_three() {
     laptop.start();
     wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
 
-    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     let shown: Vec<&str> = words.split(' ').collect();
     let line = |word: &str| format!("{word}\n").into_bytes();
@@ -3651,7 +3688,8 @@ fn the_prompt_ends_with_the_line_that_the_twelfth_word_is_on() {
     };
 
     // The words typed back. Thirteen on one line.
-    let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
     at.sends(format!("{words} thirteenth\n").as_bytes());
     let (made, said, left) = at.ends_and_leaves();
@@ -3721,7 +3759,8 @@ fn every_way_out_of_the_prompt_drops_what_was_typed_ahead() {
     // `typed` is sent at once, as a line that is pasted is. What the
     // command said from the line that asks, and what it left.
     let typed_back = |typed: &dyn Fn(&[&str]) -> Vec<u8>| -> (String, String) {
-        let at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+        let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+        at.says("press Enter to see your new phrase").types("");
         let (mut at, words) = makes_a_phrase_to_the_typing_back(at);
         let shown: Vec<&str> = words.split(' ').collect();
         at.says("   1. ");
@@ -4025,6 +4064,7 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
 
     // `cordelia phrase`, while the words are on the screen.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     #[cfg(target_os = "linux")]
     assert_eq!(guarded(at.pid()), (true, "0 0".to_string()));
@@ -4099,6 +4139,7 @@ fn no_word_of_a_new_phrase_reaches_the_node() {
 
     let through = Answers::in_the_place_of(&laptop, |_, _| {});
     let mut at = laptop.at_terminal_through(through.port, &["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");
@@ -4327,6 +4368,7 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
         |path| (path == "/api/v1/phrase/make").then_some(false),
     );
     let mut at = laptop.at_terminal_through(never.port, &["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");
@@ -4363,6 +4405,7 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
         |path| (path == "/api/v1/phrase/make").then_some(true),
     );
     let mut at = laptop.at_terminal_through(after.port, &["phrase", "--name", "laptop"]);
+    at.says("press Enter to see your new phrase").types("");
     at.says("Press Enter when you have");
     let words = words_shown(&at.said);
     at.types("");

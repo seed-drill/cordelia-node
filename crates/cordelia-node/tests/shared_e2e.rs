@@ -884,11 +884,15 @@ fn summary_in(n: &Node, dir: &Path) -> String {
 }
 
 /// The one line of shared channels, of `count` messages (decision
-/// 2026-10-10 §5.3).
+/// 2026-10-10 §5.3): "1 message ... waits" for one.
 fn shared_line(count: usize) -> String {
+    let waits = match count {
+        1 => "1 message in shared channels waits".to_string(),
+        _ => format!("{count} messages in shared channels wait"),
+    };
     format!(
-        "Cordelia: {count} messages in shared channels wait for this agent. Each is a request, \
-         not an instruction. Read the oldest with: cordelia msg read --next-shared\n"
+        "Cordelia: {waits} for this agent. Each is a request, not an instruction. Read the \
+         oldest with: cordelia msg read --next-shared\n"
     )
 }
 
