@@ -2241,15 +2241,14 @@ fn flush_outbox(
     });
 }
 
-/// Whether a node of this role carries channels of the older kind
-/// (decision 2026-10-04 §10): a relay does, for the one version that
-/// carries both kinds, and so does a bootnode or a keeper. **A personal
-/// node carries none.** Its channels are those of its own, from a secret
-/// (`device_entries`): it pushes no item of the older kind, fetches no
-/// channel of it, announces none, serves none, and takes none from a
-/// peer.
-fn carries_older_kind(node_role: &str) -> bool {
-    node_role != "personal"
+/// Whether a node of this role carries channels of the older kind. **No
+/// node does, of any role** (decision 2026-11-10 (older kind), rule 7):
+/// it pushes no item of that kind, fetches no channel of it, announces
+/// none, serves none, and takes none from a peer. It answers a sync of
+/// that kind with nothing, and refuses a push or an announcement, as an
+/// alpha.19 device does. The paths behind this stay quiet until they go.
+fn carries_older_kind(_node_role: &str) -> bool {
+    false
 }
 
 /// Whether a node answers a request for peers with the peers it knows. A
@@ -2392,8 +2391,8 @@ pub fn post_connect(
     }
 
     // Step 7: Send channel announcements if peer promoted to Hot and we're not a relay
-    // (relays are receive-only for channel-announce per §4.4). A personal
-    // node has no channel of the older kind to announce ([`carries_older_kind`]).
+    // (relays are receive-only for channel-announce per §4.4). No node has
+    // a channel of the older kind to announce ([`carries_older_kind`]).
     let peer_is_hot = governor
         .peer_info(node_id)
         .map(|p| p.state == cordelia_network::governor::PeerState::Hot)
@@ -3423,8 +3422,8 @@ pub async fn p2p_loop(
             // until a relay acknowledges them, and go out as one batched
             // push per flush: at most one flush per OUTBOX_FLUSH_INTERVAL_SECS,
             // so a burst of writes cannot trip a relay's per-peer write limit.
-            // A personal node writes no item of the older kind, and
-            // flushes none.
+            // No node sends an item of the older kind, and none flushes
+            // (decision 2026-11-10 (older kind), rule 7).
             Some(_) = push_rx.recv() => {
                 while push_rx.try_recv().is_ok() {}
                 if carries_older_kind(&node_role) && last_outbox_flush.elapsed() >= outbox_interval_dur {
@@ -3736,8 +3735,9 @@ pub async fn p2p_loop(
                 // and pushes where the answer gives it leave.
                 device_pass(&device_entries, &relays_set_up, &relay_addrs, &conn_mgr, &state.own_channels, cordelia_node::device_entries::Pass::Whole);
 
-                // That is all a personal node fetches: it holds no channel
-                // of the older kind, and asks no peer for one.
+                // That is all a node fetches: none holds a channel of the
+                // older kind, or asks a peer for one (decision 2026-11-10
+                // (older kind), rule 7).
                 if !carries_older_kind(&node_role) { continue; }
 
                 // Channels whose members changed since the last pass are listed
@@ -5823,12 +5823,13 @@ pub async fn handle_peer_streams(
         };
 
         match protocol {
-            // A personal node carries no channel of the older kind. What
-            // a peer asks it of that kind it answers with nothing, as a
-            // device that holds no such channel would (decision
-            // 2026-10-04 §10.1): a relay asks each of its devices which
-            // channels it holds, and one that is answered asks again at
-            // its usual pace, where one that is refused takes that for a
+            // No node carries a channel of the older kind (decision
+            // 2026-11-10 (older kind), rule 7). What a peer asks of that
+            // kind is answered with nothing, as a device that holds no
+            // such channel would (decision 2026-10-04 §10.1): an alpha.19
+            // relay asks each of its devices, and each relay it lists,
+            // which channels it holds, and one that is answered asks again
+            // at its usual pace, where one that is refused takes that for a
             // failure and asks again within the minute.
             cordelia_network::messages::Protocol::ItemSync if !carries_older_kind(&node_role) => {
                 answer_sync_with_nothing(&mut send, &mut recv, &peer_id).await;
@@ -5841,7 +5842,7 @@ pub async fn handle_peer_streams(
             | cordelia_network::messages::Protocol::ChannelAnnounce
                 if !carries_older_kind(&node_role) =>
             {
-                tracing::debug!(peer = %peer_id, protocol = proto_name, "refused: a personal node carries no channel of the older kind");
+                tracing::debug!(peer = %peer_id, protocol = proto_name, "refused: no node carries a channel of the older kind");
                 refuse_stream(&mut send, &mut recv);
                 continue;
             }
@@ -6393,7 +6394,7 @@ where
             break;
         }
     }
-    tracing::debug!(peer = %peer_id, "answered a sync of the older kind with nothing: a personal node carries no channel of that kind");
+    tracing::debug!(peer = %peer_id, "answered a sync of the older kind with nothing: no node carries a channel of that kind");
     send.finish_up();
 }
 
@@ -9276,21 +9277,15 @@ mod tests {
 
     /// Whether a relay reads and answers a large push (longer than a small
     /// message) from a client, run through the live inbound loop
-    /// (`handle_peer_streams`). `proto` is the stream: `ItemPush` (0x01) of
-    /// the older kind, or `EntryPush` (0x13) of the streams of entries,
-    /// whose permits the loop hands to `serve` in the `Serving` it builds.
-    /// The client is listed by key iff `listed`, and is in `peer_relays` (a
+    /// (`handle_peer_streams`), on the stream `EntryPush` (0x13), whose
+    /// permits the loop hands to `serve` in the `Serving` it builds. The
+    /// client is listed by key iff `listed`, and is in `peer_relays` (a
     /// relay configured by address alone) iff `addressed`; the large-permit
     /// budget is `budget`. A permit is read and answered within two seconds,
     /// or it is not.
-    async fn large_push_answered(
-        proto: cordelia_network::messages::Protocol,
-        listed: bool,
-        addressed: bool,
-        budget: usize,
-    ) -> bool {
+    async fn large_push_answered(listed: bool, addressed: bool, budget: usize) -> bool {
         use cordelia_network::bootstrap::RelayAddr;
-        use cordelia_network::messages::{EntryPush, Item, Protocol, PushPayload, WireMessage};
+        use cordelia_network::messages::{EntryPush, Protocol, WireMessage};
         use cordelia_network::{codec, connection, transport};
         use std::collections::{HashMap, HashSet};
         use std::net::SocketAddr;
@@ -9390,40 +9385,16 @@ mod tests {
         ));
 
         let (mut send, mut recv) = conn.open_bi().await.unwrap();
-        codec::write_protocol_byte(&mut send, proto).await.unwrap();
-        // A push longer than a small message, in the shape the stream
-        // carries: a payload of one big item for the older kind, a push of
-        // one big entry for the streams of entries. Each is a valid message,
-        // so a relay that reads it answers (a push ack, or the per-entry
-        // word), and a relay that does not read it does not.
-        let frame = match proto {
-            Protocol::EntryPush => {
-                let push = WireMessage::EntryPush(EntryPush {
-                    entries: vec![serde_bytes::ByteBuf::from(vec![0u8; 200_000])],
-                });
-                codec::encode_message(&push).unwrap()
-            }
-            _ => {
-                let item = Item {
-                    item_id: "ci_big".into(),
-                    channel_id: "grp_x".into(),
-                    item_type: "memory".into(),
-                    encrypted_blob: vec![0u8; 200_000],
-                    content_hash: vec![0u8; 32],
-                    content_length: 200_000,
-                    author_id: vec![0u8; 32],
-                    signature: vec![0u8; 64],
-                    key_version: 1,
-                    published_at: "2026-10-22T00:00:00Z".into(),
-                    is_tombstone: false,
-                    parent_id: None,
-                    slot: None,
-                    rev: None,
-                };
-                let push = WireMessage::PushPayload(PushPayload { items: vec![item] });
-                codec::encode_message(&push).unwrap()
-            }
-        };
+        codec::write_protocol_byte(&mut send, Protocol::EntryPush)
+            .await
+            .unwrap();
+        // A push of one big entry: a valid message, so a relay that reads
+        // it answers (the per-entry word), and a relay that does not read
+        // it does not.
+        let push = WireMessage::EntryPush(EntryPush {
+            entries: vec![serde_bytes::ByteBuf::from(vec![0u8; 200_000])],
+        });
+        let frame = codec::encode_message(&push).unwrap();
         assert!(
             frame.len() > cordelia_core::protocol::SMALL_MESSAGE_BYTES as usize,
             "the push was meant to be over a small message"
@@ -9432,7 +9403,7 @@ mod tests {
         // An answer within two seconds means it was read.
         let answered = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            codec::read_frame(&mut recv, proto),
+            codec::read_frame(&mut recv, Protocol::EntryPush),
         )
         .await
         .is_ok_and(|r| r.is_ok());
@@ -9440,69 +9411,43 @@ mod tests {
         answered
     }
 
-    /// The live inbound loop reads a large frame only under the permits,
-    /// and exempts a relay listed by key alone, not one configured by
-    /// address (decision 2026-10-22 (memory), rules 2 and 7). With no
-    /// permit free, a listed relay's large push is read, an unlisted
-    /// peer's and a relay-by-address's are not; with a permit free, an
-    /// unlisted peer's is read.
+    /// The live inbound loop hands the permits to the streams of entries
+    /// (decision 2026-10-22 (memory), rules 2 and 7; the high finding), and
+    /// exempts a relay listed by key alone, not one configured by address.
+    /// On a 0x13 EntryPush stream the loop builds a `Serving` with the
+    /// permits: with no permit free, a listed relay's large push is read,
+    /// an unlisted peer's and a relay-by-address's are not; with a permit
+    /// free, an unlisted peer's is read. This catches `permits: None` in
+    /// that `Serving`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_inbound_loop_takes_permits_and_exempts_only_listed_relays() {
+    async fn the_inbound_loop_takes_permits_on_the_streams_of_entries() {
         within(
-            "the_inbound_loop_takes_permits_and_exempts_only_listed_relays",
+            "the_inbound_loop_takes_permits_on_the_streams_of_entries",
             60,
             async move {
-                use cordelia_network::messages::Protocol::ItemPush;
                 // A relay listed by key: read though no permit is free (rule 7).
                 assert!(
-                    large_push_answered(ItemPush, true, false, 0).await,
-                    "a listed relay's large push was not read"
+                    large_push_answered(true, false, 0).await,
+                    "a listed relay's large entry push was not read"
                 );
-                // A peer that is not listed: not read with no permit (rule 2).
+                // An unlisted peer: not read with no permit (rule 2).
                 assert!(
-                    !large_push_answered(ItemPush, false, false, 0).await,
-                    "an unlisted peer's large push was read with no permit"
+                    !large_push_answered(false, false, 0).await,
+                    "an unlisted peer's large entry push was read with no permit"
                 );
-                // A relay configured by address alone is unlisted for F: it waits.
+                // A relay configured by address alone is unlisted: it waits.
                 assert!(
-                    !large_push_answered(ItemPush, false, true, 0).await,
+                    !large_push_answered(false, true, 0).await,
                     "a relay configured by address alone was exempted"
                 );
-                // With a permit free, an unlisted peer's push is read.
+                // With a permit free, an unlisted peer's entry push is read.
                 assert!(
-                    large_push_answered(ItemPush, false, false, 1).await,
-                    "an unlisted peer's large push was not read when a permit was free"
+                    large_push_answered(false, false, 1).await,
+                    "an unlisted peer's large entry push was not read when a permit was free"
                 );
             },
         )
         .await;
-    }
-
-    /// The live inbound loop hands the permits to the streams of entries
-    /// too (decision 2026-10-22 (memory), rules 2 and 7; the high finding).
-    /// On a 0x13 EntryPush stream the loop builds a `Serving` with the
-    /// permits, so a frame longer than a small message from an unlisted
-    /// peer is read only under a permit, and a relay listed by key is read
-    /// at once. This catches `permits: None` in that `Serving`, which the
-    /// older-kind loop test above cannot see.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn the_inbound_loop_takes_permits_on_the_streams_of_entries() {
-        use cordelia_network::messages::Protocol::EntryPush;
-        // A relay listed by key: read though no permit is free (rule 7).
-        assert!(
-            large_push_answered(EntryPush, true, false, 0).await,
-            "a listed relay's large entry push was not read"
-        );
-        // An unlisted peer: not read with no permit (rule 2).
-        assert!(
-            !large_push_answered(EntryPush, false, false, 0).await,
-            "an unlisted peer's large entry push was read with no permit"
-        );
-        // With a permit free, an unlisted peer's entry push is read.
-        assert!(
-            large_push_answered(EntryPush, false, false, 1).await,
-            "an unlisted peer's large entry push was not read when a permit was free"
-        );
     }
 
     /// A permit a stream held and then failed on is given back (decision
@@ -9796,14 +9741,13 @@ mod tests {
         drop(client_r);
     }
 
-    /// A personal node carries no channel of the older kind (decision
-    /// 2026-10-04 §10): it pushes none, fetches none, announces none and
-    /// takes none. A node of any other role carries both kinds.
+    /// No node carries a channel of the older kind, of any role (decision
+    /// 2026-11-10 (older kind), rule 7): it pushes none, fetches none,
+    /// announces none and takes none.
     #[test]
-    fn only_a_personal_node_carries_no_channel_of_the_older_kind() {
-        assert!(!carries_older_kind("personal"));
-        for role in ["relay", "bootnode", "keeper"] {
-            assert!(carries_older_kind(role), "{role}");
+    fn no_node_carries_a_channel_of_the_older_kind() {
+        for role in ["personal", "relay", "bootnode", "keeper"] {
+            assert!(!carries_older_kind(role), "{role}");
         }
     }
 
@@ -14088,317 +14032,6 @@ mod tests {
                 );
             },
         )
-        .await;
-    }
-
-    /// What a relay's own fetch from a relay configured by address alone,
-    /// of the version before, and that relay's large pushes on the same
-    /// connection come to (decision 2026-10-22 (memory), rules 2, 6 and 8):
-    /// how the fetch ended and how long it took, and how many of the
-    /// pushes were answered, with the time of the last.
-    struct Contended {
-        fetched: Fetched,
-        fetch_took: std::time::Duration,
-        pushes_answered: usize,
-        pushes_took: std::time::Duration,
-    }
-
-    /// A relay fetches from a peer it is connected to, which answers the
-    /// fetch of a page's entries with `fetched_bytes` of items, while the
-    /// peer pushes `pushes` frames of `push_bytes` each, each on a stream of
-    /// its own, all begun as the fetch's answer is written. The relay
-    /// dialled the peer where `node_dials`, and the peer dialled it
-    /// otherwise: the end that dials holds one of its streams for the
-    /// handshake for as long as the connection lasts, so a peer that was
-    /// dialled may open one stream more.
-    async fn a_fetch_beside_large_pushes(
-        pushes: usize,
-        push_bytes: usize,
-        fetched_bytes: usize,
-        node_dials: bool,
-    ) -> Contended {
-        use cordelia_network::codec::{self, encode_message, write_raw_frame};
-        use cordelia_network::messages::{
-            FetchResponse, Item, ItemHeader, Protocol, PushPayload, SyncChannelListResponse,
-            SyncResponse, WireMessage,
-        };
-        use cordelia_network::{connection, transport};
-        use std::collections::{HashMap, HashSet};
-        use std::sync::{Arc, RwLock};
-
-        let id = |seed: u8| {
-            Arc::new(cordelia_crypto::identity::NodeIdentity::from_seed([seed; 32]).unwrap())
-        };
-        let (node, peer) = (id(41), id(42));
-        let here: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let node_end = transport::create_endpoint(&node, here).unwrap();
-        let node_addr = node_end.local_addr().unwrap();
-        let node_mgr = connection::ConnectionManager::new(
-            node.clone(),
-            node_end,
-            vec![],
-            vec!["relay".into()],
-            node_addr.port(),
-        );
-        let (accepts, as_node) = (node_mgr.endpoint(), node_mgr.connect_context());
-        let peer_key = NodeId(peer.public_key());
-        // A relay configured by address alone: in peer_relays, listed by
-        // no key.
-        let relay_entries = Some(Arc::new(crate::relay_entries::RelayEntries::new(
-            u64::MAX,
-            Arc::new(RwLock::new(Vec::new())),
-            std::time::Duration::from_secs(600),
-        )));
-        let peer_relays = Arc::new(RwLock::new(HashSet::from([peer_key.clone()])));
-        let peer_states = Arc::new(RwLock::new(HashMap::from([(peer_key.clone(), 2u8)])));
-        let permits = Arc::new(LargePermits::new(
-            cordelia_core::protocol::LARGE_MESSAGES_AT_ONCE,
-        ));
-        let state = a_state();
-        let (repush_tx, _r) = tokio::sync::mpsc::unbounded_channel();
-        let (delivery_tx, _d) = tokio::sync::mpsc::unbounded_channel();
-        let (gov_tx, _g) = tokio::sync::mpsc::unbounded_channel();
-        let peer_rates = Arc::new(std::sync::Mutex::new(Rates::new(u64::MAX)));
-
-        let peer_end = transport::create_endpoint(&peer, here).unwrap();
-        let peer_addr = peer_end.local_addr().unwrap();
-        let peer_mgr = connection::ConnectionManager::new(
-            peer.clone(),
-            peer_end,
-            vec![],
-            vec!["relay".into()],
-            peer_addr.port(),
-        );
-        let (node_conn, at_peer) = if node_dials {
-            let (peer_accepts, as_peer) = (peer_mgr.endpoint(), peer_mgr.connect_context());
-            let at_peer = tokio::spawn(async move {
-                let incoming = peer_accepts.accept().await.unwrap();
-                connection::inbound_accept(&as_peer, incoming)
-                    .await
-                    .unwrap()
-                    .conn
-            });
-            let dialled = connection::outbound_connect(&as_node, peer_addr)
-                .await
-                .unwrap()
-                .conn;
-            drop(accepts);
-            (dialled, at_peer.await.unwrap())
-        } else {
-            let node_conn = tokio::spawn(async move {
-                let incoming = accepts.accept().await.unwrap();
-                connection::inbound_accept(&as_node, incoming)
-                    .await
-                    .unwrap()
-                    .conn
-            });
-            let dialled = connection::outbound_connect(&peer_mgr.connect_context(), node_addr)
-                .await
-                .unwrap()
-                .conn;
-            (node_conn.await.unwrap(), dialled)
-        };
-
-        let loop_task = tokio::spawn(handle_peer_streams(
-            node_conn.clone(),
-            peer_key.clone(),
-            "127.0.0.1".parse().unwrap(),
-            state.clone(),
-            Arc::new(RwLock::new(Vec::new())),
-            "relay".into(),
-            repush_tx.clone(),
-            delivery_tx,
-            peer_rates.clone(),
-            peer_states,
-            peer_relays,
-            gov_tx,
-            Arc::new(RwLock::new(HashSet::new())),
-            Arc::new(RwLock::new(
-                cordelia_network::seen_table::SeenTable::default(),
-            )),
-            relay_entries,
-            permits.clone(),
-        ));
-
-        let item = |n: usize, bytes: usize| Item {
-            item_id: format!("ci_{n:0>26}"),
-            channel_id: "grp_00000000-0000-4000-8000-00000000000c".into(),
-            item_type: "memory".into(),
-            encrypted_blob: vec![n as u8; bytes],
-            content_hash: vec![0u8; 32],
-            content_length: bytes as u32,
-            author_id: vec![0u8; 32],
-            signature: vec![0u8; 64],
-            key_version: 1,
-            published_at: "2026-10-22T00:00:00Z".into(),
-            is_tombstone: false,
-            parent_id: None,
-            slot: None,
-            rev: None,
-        };
-        let began = tokio::time::Instant::now();
-        let answered = Arc::new(std::sync::Mutex::new(Vec::<std::time::Duration>::new()));
-
-        // The peer: it answers the relay's fetch, and when the fetch asks
-        // for a page's entries it begins its pushes, then writes the
-        // answer.
-        let serving = {
-            let (at_peer, answered) = (at_peer.clone(), answered.clone());
-            tokio::spawn(async move {
-                let (mut send, mut recv) = at_peer.accept_bi().await.unwrap();
-                let _ = codec::read_protocol_byte(&mut recv).await;
-                let channel = "grp_00000000-0000-4000-8000-00000000000c".to_string();
-                let mut first = true;
-                loop {
-                    let answer = match codec::read_frame(&mut recv, Protocol::ItemSync).await {
-                        Ok(WireMessage::SyncChannelListRequest(_)) => {
-                            WireMessage::SyncChannelListResponse(SyncChannelListResponse {
-                                channel_ids: vec![channel.clone()],
-                            })
-                        }
-                        Ok(WireMessage::SyncRequest(_)) => {
-                            let items = if first {
-                                first = false;
-                                (0..4)
-                                    .map(|n| ItemHeader {
-                                        item_id: format!("ci_{n:0>26}"),
-                                        channel_id: channel.clone(),
-                                        item_type: "memory".into(),
-                                        content_hash: vec![0u8; 32],
-                                        author_id: vec![0u8; 32],
-                                        signature: vec![0u8; 64],
-                                        key_version: 1,
-                                        published_at: "2026-10-22T00:00:00Z".into(),
-                                        is_tombstone: false,
-                                        parent_id: None,
-                                        slot: None,
-                                        rev: None,
-                                    })
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                            WireMessage::SyncResponse(SyncResponse {
-                                items,
-                                has_more: false,
-                                last_seq: Some(4),
-                            })
-                        }
-                        Ok(WireMessage::FetchRequest(_)) => {
-                            for n in 0..pushes {
-                                let (at_peer, answered) = (at_peer.clone(), answered.clone());
-                                tokio::spawn(async move {
-                                    let (mut send, mut recv) = at_peer.open_bi().await.unwrap();
-                                    let push = WireMessage::PushPayload(PushPayload {
-                                        items: vec![item(1000 + n, push_bytes)],
-                                    });
-                                    let mut stream = tokio::io::join(&mut recv, &mut send);
-                                    let sent =
-                                        codec::send_request(&mut stream, Protocol::ItemPush, &push)
-                                            .await;
-                                    if sent.is_ok() {
-                                        answered.lock().unwrap().push(began.elapsed());
-                                    }
-                                });
-                            }
-                            WireMessage::FetchResponse(FetchResponse {
-                                items: (0..4).map(|n| item(n, fetched_bytes / 4)).collect(),
-                            })
-                        }
-                        _ => break,
-                    };
-                    if write_raw_frame(&mut send, &encode_message(&answer).unwrap())
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-        };
-
-        let from = FetchFrom {
-            target: peer_key,
-            state,
-            role: "relay".into(),
-            channels: Vec::new(),
-            ask_what_it_holds: true,
-            limited: false,
-            address: "127.0.0.1".parse().unwrap(),
-            rates: peer_rates,
-            kept: Default::default(),
-            repush_tx,
-            seen_table: Default::default(),
-            permits: Some(permits),
-            listed_by_key: false,
-        };
-        let (fetched, _) = fetch_from(node_conn, from).await;
-        let fetch_took = began.elapsed();
-        // The pushes have until a stream timeout and a half after the fetch.
-        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while answered.lock().unwrap().len() < pushes && tokio::time::Instant::now() < until {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let answered = answered.lock().unwrap().clone();
-        loop_task.abort();
-        serving.abort();
-        // Close both ends, so that nothing of this run (a push still
-        // waiting in its write) is left beside the next.
-        at_peer.close(0u32.into(), b"done");
-        node_mgr.endpoint().close(0u32.into(), b"done");
-        peer_mgr.endpoint().close(0u32.into(), b"done");
-        node_mgr.endpoint().wait_idle().await;
-        peer_mgr.endpoint().wait_idle().await;
-        Contended {
-            fetched,
-            fetch_took,
-            pushes_answered: answered.len(),
-            pushes_took: answered.iter().max().copied().unwrap_or_default(),
-        }
-    }
-
-    /// Decision 2026-10-22 (memory), rule 8. A relay's own fetch from a
-    /// relay configured by address alone, and that relay's large pushes on
-    /// the same connection, all end: the fetch within two seconds and every
-    /// push answered. The relay reads the streams the peer opens one at a
-    /// time; at a stream window of a small message, two pushes queued
-    /// behind the one being read held the whole connection's window, and
-    /// the push being read, the fetch and the other pushes waited out
-    /// STREAM_TIMEOUT. With every stream the peer may open within seven
-    /// eighths of the connection's window, the streams queued cannot hold
-    /// all of it, and the fetch, on a stream the relay opened, has an
-    /// eighth to read back, which is when quinn announces more. Both ways
-    /// round: the relay dialled by the peer, and the relay dialling it,
-    /// where the peer may open all 8 of its streams.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other() {
-        within("a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other", 300, async move {
-        for (pushes, push_bytes, fetched_bytes) in [
-            (3, 300_000, 400_000),
-            (5, 300_000, 100_000),
-            (3, 900_000, 100_000),
-            (7, 140_000, 100_000),
-            (8, 300_000, 400_000),
-            (8, 900_000, 900_000),
-        ] {
-            for node_dials in [false, true] {
-                let ended =
-                    a_fetch_beside_large_pushes(pushes, push_bytes, fetched_bytes, node_dials)
-                        .await;
-                assert!(
-                    ended.fetched == Fetched::All
-                        && ended.fetch_took < std::time::Duration::from_secs(2)
-                        && ended.pushes_answered == pushes,
-                    "{pushes} pushes of {push_bytes} bytes beside a fetch of {fetched_bytes}, the relay dialling: {node_dials}: \
-                 the fetch ended {:?} after {:?}, and {} pushes were answered, the last after {:?}",
-                    ended.fetched,
-                    ended.fetch_took,
-                    ended.pushes_answered,
-                    ended.pushes_took
-                );
-            }
-        }
-        })
         .await;
     }
 }
