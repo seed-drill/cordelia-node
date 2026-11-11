@@ -787,6 +787,9 @@ fn two_people_join_by_a_merged_pull_request_alone() {
         plain.contains("Members: bob-desktop (in), alice-laptop (in)."),
         "{plain}"
     );
+    // Something waits on the list, so its read says when the next read is
+    // (#323 item 1).
+    assert!(plain.contains(". Next read in "), "{plain}");
     let refused = bob.refused(&["shared", "seen", NAME]);
     assert!(
         refused.contains("Run cordelia shared seen in a terminal"),
@@ -809,6 +812,17 @@ fn two_people_join_by_a_merged_pull_request_alone() {
     // reached the network.
     let view = view_of(&bob);
     assert_eq!(view["read"]["from"], "clone", "{view}");
+    // Nothing waits now: the plain status says the repository in one line
+    // (issue #338), and the node's timer says when it reads the list next.
+    assert_eq!(view["in_step"], true, "{view}");
+    assert!(view["next_read"].is_string(), "{view}");
+    let plain = bob.cli(&["status"]);
+    assert!(
+        plain.contains(&format!(
+            "  Following: {REPOSITORY}, for {NAME}: 2 members, all in"
+        )),
+        "{plain}"
+    );
     let says = view["read"]["says"].as_str().unwrap();
     assert!(
         says.starts_with(&format!(

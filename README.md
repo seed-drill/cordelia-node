@@ -177,8 +177,10 @@ cordelia history show <id>            # print one
 cordelia restore <id>                 # put it back, on every machine that syncs the folder
 ```
 
-**At a glance.** `cordelia status` lists everything that applies. For Claude
-Code's status line, add this to `~/.claude/settings.json`:
+**At a glance.** `cordelia status` says one line for each area when all is
+well, and more when something waits or is wrong. `cordelia status -v` shows
+the rest. For Claude Code's status line, add this to
+`~/.claude/settings.json`:
 
 ```json
 { "statusLine": { "type": "command", "command": "~/.cordelia/bin/cordelia status --line" } }
@@ -358,11 +360,12 @@ Your clone's agent then sends to the channel with `cordelia msg send
 the agent of another folder you mapped in too, run `cordelia subscribe
 <name>` in that folder.
 
-**What you see.** `cordelia status` shows each repository you follow:
-when your node read the list, at which commit, and how old your clone's
-copy is; each member by label, in or not yet; and how many messages you
-and your agents have not read. If a join waits on something, the status
-says what.
+**What you see.** `cordelia status` shows each repository you follow. When
+all is in step, that is one line: how many members, and how many messages
+you and your agents have not read, if any. If a join waits on something,
+the status says what. It then also shows when your node read the list, at
+which commit, how old your clone's copy is, and when the next read is;
+and each member by label, in or not yet.
 
 - When a merged pull request adds a device to the list, each device that
   follows the repository shows it in amber, with its label and the
@@ -371,7 +374,8 @@ says what.
   device already on the list but your own shows the same way. Check that
   you expect those commits. Then run `cordelia shared seen <name>` to
   clear them.
-- `cordelia shared list` shows the same, with every member.
+- `cordelia shared list` and `cordelia status -v` show every line, with
+  every member.
   `cordelia status --json` gives each repository under
   `shared.repositories`.
 

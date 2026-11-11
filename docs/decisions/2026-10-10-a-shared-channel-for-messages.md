@@ -839,11 +839,12 @@ The mover's own devices are never listed as left out, whether or not the offer s
                       "read": { "at": "...", "commit": "<hex>", "from": "clone", "fetched": "...", "says": "..." },
                       "members": [ { "label": "alice-laptop", "key": "cordelia_pk1...", "words": "<six words>", "in": true } ],
                       "unread_by_an_agent": 0, "unread_by_a_person": 0,
-                      "lines": [ { "word": "joined", "says": "...", "amber": true, "line": null } ] } ]
+                      "lines": [ { "word": "joined", "says": "...", "amber": true, "line": null } ],
+                      "in_step": false, "next_read": "..." } ]
 }
 ```
 
-`repositories` is each repository this device follows, as decision 2026-11-06 (joining), rule 7 says it: `in` is null where this device does not hold the channel, and so cannot see who is in it; `line` is a channel line to put in the list, where a line says to.
+`repositories` is each repository this device follows, as decision 2026-11-06 (joining), rule 7 says it: `in` is null where this device does not hold the channel, and so cannot see who is in it; `line` is a channel line to put in the list, where a line says to; `in_step` says that nothing waits on the list, which the plain status then says in one line; `next_read` is when the node next reads the list, read yet or not, null where no timer of the node's reads it.
 
 `made_anew_past_a_bound` names each channel past a bound that a removal on this device made anew in the last seven days (3.5), as recorded when it was made, with the new channel's words, when, and the line its end said: the person's devices hold neither channel, and someone in it is to share the new one with the person, and with anyone who wrote there since. It sets no level.
 

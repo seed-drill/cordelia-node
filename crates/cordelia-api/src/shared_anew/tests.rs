@@ -747,6 +747,7 @@ fn removed_device_holds(s: &Several, n: usize, now: i64) -> serde_json::Value {
         own_relays: &own,
         connected: &[AT],
         said: &said,
+        next_read: None,
     };
     let shared = crate::shared_status::status_of(&s[n].conn, &s[n].identity, &beside, now)
         .unwrap()
@@ -2503,6 +2504,7 @@ fn the_status_names_no_device_for_a_channel_first_held_after_a_removal() {
         own_relays: &own,
         connected: &[AT],
         said: &said,
+        next_read: None,
     };
     let shared = crate::shared_status::status_of(&s[0].conn, &s[0].identity, &beside, now)
         .unwrap()

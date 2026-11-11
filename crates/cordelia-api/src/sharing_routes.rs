@@ -358,13 +358,14 @@ pub async fn list(
     crate::commands::asked(&req, &state)?;
     let own = sharing::own_relays(&state);
     let now = state.sync_control.now();
+    let next_read = state.own_channels.next_members_read(now);
     let conn = db(&state);
     let mut listed = sharing::list(&conn, &state.identity, &own, body.keys, now)
         .map_err(crate::commands::refused)?;
     // Each repository this device follows (decision 2026-11-06 (joining),
     // rule 7), as the status says it.
     listed["repositories"] =
-        crate::repository_status::views(&conn, &state.identity, &own, None, now).into();
+        crate::repository_status::views(&conn, &state.identity, &own, None, next_read, now).into();
     std::mem::drop(conn);
     listed["this_device"] = this_device(&state)?.into();
     Ok(HttpResponse::Ok().json(listed))

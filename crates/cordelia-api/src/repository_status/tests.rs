@@ -23,7 +23,7 @@ const RECORD: &str =
 
 /// The view on device 0 of the repository `repository` at `now`.
 fn view_of(s: &Several, repository: &str, now: i64) -> Value {
-    views(&s[0].conn, &s[0].identity, &own_relays(), None, now)
+    views(&s[0].conn, &s[0].identity, &own_relays(), None, None, now)
         .into_iter()
         .find(|view| view["identity"] == repository)
         .unwrap_or_else(|| panic!("no view of {repository}"))
@@ -207,10 +207,12 @@ fn the_status_carries_each_repositorys_view_with_its_fields() {
     let (_, list) = joins(&s, 7, now);
     let own = own_relays();
     let said = crate::state::SharedSaid::default();
+    // The node's timer reads the lists next in 140 seconds.
     let beside = crate::shared_status::Beside {
         own_relays: &own,
         connected: &[],
         said: &said,
+        next_read: Some(now + 140),
     };
     let shared = crate::shared_status::status_of(&s[0].conn, &s[0].identity, &beside, now)
         .unwrap()
@@ -229,9 +231,11 @@ fn the_status_carries_each_repositorys_view_with_its_fields() {
             "channel",
             "held",
             "identity",
+            "in_step",
             "lines",
             "members",
             "name",
+            "next_read",
             "read",
             "unread_by_a_person",
             "unread_by_an_agent",
@@ -246,6 +250,12 @@ fn the_status_carries_each_repositorys_view_with_its_fields() {
         .collect();
     read.sort();
     assert_eq!(read, ["at", "commit", "fetched", "from", "says"]);
+    // When the next read is, by the node's clock, in RFC 3339; null where
+    // no timer reads the lists, as in these tests' views.
+    assert_eq!(view["next_read"], rfc3339(now + 140), "{view}");
+    assert_eq!(view_now(&s, now)["next_read"], Value::Null);
+    // A joiner waits to be handed the channel: not in step.
+    assert_eq!(view["in_step"], false, "{view}");
     let mut member: Vec<&str> = view["members"][0]
         .as_object()
         .unwrap()
@@ -276,6 +286,98 @@ fn the_status_carries_each_repositorys_view_with_its_fields() {
     // once taken.
     assert_eq!(view["name"], "team/project");
     assert!(list.contains("channel "));
+}
+
+/// **In step** (rule 7, as the person ruled on 11 November, issue #338):
+/// the last read counted, no line of rules 4 to 6 stands, and no member is
+/// not yet in. Only then does the plain status say the repository in one
+/// line. A member not yet in with no line, as one waits out the read at
+/// which its share goes (rule 4.2), is not in step; nor is a line where
+/// every member is in, as a read that counted for nothing; nor a list not
+/// read since it was followed afresh, nor one whose last read is long
+/// overdue.
+#[test]
+fn a_view_is_in_step_only_where_nothing_waits_on_the_list() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    write_in(&s, &channel, &[&alice], now);
+    let list = list_named(
+        &channel.id,
+        &[],
+        &[
+            (alice.public_key(), "alice-laptop"),
+            (carol.public_key(), "carol-laptop"),
+        ],
+    );
+    follows_at(&s, &list, &commit('a'), now);
+    // Handed to Carol, at two reads; her share goes at the third, and she
+    // waits out that read with no line.
+    for n in 1..=2 {
+        reads(&s, &list, &commit('a'), now + n * READ);
+        let view = view_now(&s, now + n * READ);
+        assert_eq!(words(&view), ["handing"]);
+        assert_eq!(view["in_step"], false, "{view}");
+    }
+    reads(&s, &list, &commit('a'), now + 3 * READ);
+    let view = view_now(&s, now + 3 * READ);
+    assert!(lines(&view).is_empty(), "{view}");
+    assert_eq!(members_of(&view)[1].1, json!(false));
+    assert_eq!(view["in_step"], false, "{view}");
+    // Once Carol writes in the channel, nothing waits.
+    write_in(&s, &channel, &[&carol], now + 3 * READ + 1);
+    let view = view_now(&s, now + 3 * READ + 2);
+    assert!(lines(&view).is_empty(), "{view}");
+    assert_eq!(view["in_step"], true, "{view}");
+    // Followed afresh, as `subscribe` does again, the list waits for its
+    // read, though the list kept says nothing waits.
+    follows::follow(&s[0].conn, REPOSITORY, "origin", FOLDER, now + 3 * READ + 3).unwrap();
+    let view = view_now(&s, now + 3 * READ + 3);
+    assert_eq!(view["read"], Value::Null, "{view}");
+    assert_eq!(view["in_step"], false, "{view}");
+    let last = now + 3 * READ + 4;
+    reads(&s, &list, &commit('a'), last);
+    assert_eq!(view_now(&s, last)["in_step"], true);
+    // A last read that counted, long overdue, as where reads keep failing
+    // with no line, is not in step: its lines show how old it is.
+    let overdue = MEMBERS_READ_OVERDUE_SECS as i64;
+    assert_eq!(view_now(&s, last + overdue)["in_step"], true);
+    let view = view_now(&s, last + overdue + 1);
+    assert!(lines(&view).is_empty(), "{view}");
+    assert_eq!(view["in_step"], false, "{view}");
+    assert!(
+        view["read"]["says"]
+            .as_str()
+            .unwrap()
+            .contains("Read 20 minutes ago"),
+        "{view}"
+    );
+    assert!(RECORD.contains("older than two read intervals (`MEMBERS_READ_OVERDUE_SECS`)"));
+    // A read that counts for nothing is a line, with every member in.
+    let behind = after_read(
+        &s[0].conn,
+        &s[0].identity,
+        &own_relays(),
+        &read_of(&s, &list, &commit('c'), false),
+        now + 4 * READ,
+    )
+    .unwrap();
+    assert!(matches!(behind, Done::NotRead(_)), "{behind:?}");
+    let view = view_now(&s, now + 4 * READ);
+    assert_eq!(words(&view), ["behind"]);
+    assert!(
+        members_of(&view)
+            .iter()
+            .all(|(_, is_in)| *is_in == json!(true)),
+        "{view}"
+    );
+    assert_eq!(view["in_step"], false, "{view}");
+    // A view that could not be worked out is never in step.
+    assert_eq!(
+        not_worked_out(&row(&s).unwrap(), "a fault")["in_step"],
+        false
+    );
 }
 
 /// Rule 3's line says how old the clone's copy is where the clone says
@@ -309,6 +411,15 @@ fn the_read_says_how_old_the_clones_copy_is_or_that_it_is_not_known() {
     assert!(!unknown.contains("stale") && !unknown.contains("old"));
     // Rule 3's own words.
     assert!(RECORD.contains("list of <identity> read from your clone, fetched 2 hours ago"));
+    // Where something waits on the list, its line ends with when the next
+    // read is (#323 item 1), in rule 3's words.
+    assert_eq!(next_read_line(140), "Next read in about 2 minutes.");
+    assert!(RECORD.contains("Next read in about 2 minutes."));
+    assert_eq!(next_read_line(80), "Next read in about 1 minute.");
+    assert_eq!(next_read_line(600), "Next read in about 10 minutes.");
+    for due in [29, 0, -5] {
+        assert_eq!(next_read_line(due), "Next read in under a minute.");
+    }
 
     // In the view, from the row a read kept.
     let s = bob(1);
@@ -611,7 +722,7 @@ fn a_member_whose_channel_is_not_reached_says_so() {
     let list = list_with(Some((&channel.id, &[])), &listed(1..=1));
     follows_at(&s, &list, &commit('a'), now);
     let only_the_lines = vec![own_relays()[1].clone()];
-    let views = views(&s[0].conn, &s[0].identity, &only_the_lines, None, now);
+    let views = views(&s[0].conn, &s[0].identity, &only_the_lines, None, None, now);
     assert_eq!(
         lines(&views[0]),
         [(
@@ -1474,6 +1585,7 @@ fn the_cost_of_the_views_of_16_follows_of_64_keys() {
         own_relays: &own,
         connected: &[],
         said: &said,
+        next_read: None,
     };
     let time = |what: &dyn Fn()| {
         let mut took: Vec<u128> = (0..9)
@@ -1502,7 +1614,10 @@ fn the_cost_of_the_views_of_16_follows_of_64_keys() {
         );
     }
     let views_took = time(&|| {
-        assert_eq!(views(&s[0].conn, &s[0].identity, &own, None, now).len(), 16);
+        assert_eq!(
+            views(&s[0].conn, &s[0].identity, &own, None, None, now).len(),
+            16
+        );
     });
     let with_follows = time(&status);
     println!(

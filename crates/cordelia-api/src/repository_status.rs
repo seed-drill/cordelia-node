@@ -6,8 +6,10 @@
 //!   its channel is filed under; when the list was read, from where, at
 //!   which commit, and how old the clone's copy is (rule 3); the members,
 //!   by the list's labels, each in the channel or not yet; what waits
-//!   unread; and its lines ([`lines_of`]). Each is worked out again from
-//!   what the follow keeps, and nothing is written.
+//!   unread; its lines ([`lines_of`]); whether it is in step, which the
+//!   plain status says in one line; and when the next read is (rule 7).
+//!   Each is worked out again from what the follow keeps, and nothing is
+//!   written.
 //! - **Its lines,** each a line of rule 6, or of rules 4.5 to 4.7 and 5, in
 //!   this order:
 //!   - **why the latest read counted for nothing,** where it did, and then
@@ -44,7 +46,7 @@
 use rusqlite::Connection;
 use serde_json::{Value, json};
 
-use cordelia_core::protocol::MEMBERS_LABELS_SHOWN;
+use cordelia_core::protocol::{MEMBERS_LABELS_SHOWN, MEMBERS_READ_OVERDUE_SECS};
 use cordelia_crypto::acts::Filing;
 use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
@@ -268,6 +270,17 @@ pub fn read_line(identity: &str, last: &LastRead, fetched_at: Option<i64>, now: 
             "List of {identity} read from your clone; your clone's last fetch is not known. \
              {read}"
         ),
+    }
+}
+
+/// Rule 3's words of when the next read is, `secs` seconds from now: the
+/// end of the read's line, or of the line of a list not read yet, where a
+/// status shows it (#323 item 1).
+pub fn next_read_line(secs: i64) -> String {
+    match (secs.max(0) + 30) / 60 {
+        0 => "Next read in under a minute.".into(),
+        1 => "Next read in about 1 minute.".into(),
+        n => format!("Next read in about {n} minutes."),
     }
 }
 
@@ -702,14 +715,17 @@ fn made_lines(
 /// The view of each repository this device follows, by identity, at
 /// `now` (rule 7), from what is worked out once ([`Known`]). `own_relays`
 /// are the device's relays known by their keys; `unread`, the unread
-/// messages of each channel held, where the status has them already. An
-/// error in one view is a line of it, so that the others are said; where
-/// the follows themselves cannot be read, there are none to say.
+/// messages of each channel held, where the status has them already;
+/// `next_read`, when the node's timer next reads the lists, where one
+/// does. An error in one view is a line of it, so that the others are
+/// said; where the follows themselves cannot be read, there are none to
+/// say.
 pub fn views(
     conn: &Connection,
     identity: &NodeIdentity,
     own_relays: &[OwnRelay],
     unread: Option<&Unread>,
+    next_read: Option<i64>,
     now: i64,
 ) -> Vec<Value> {
     let followed = match follows::follows(conn) {
@@ -736,6 +752,7 @@ pub fn views(
                 follow,
                 unread,
                 &mut subscriptions,
+                next_read,
                 now,
             );
             view.unwrap_or_else(|e| not_worked_out(follow, &e.to_string()))
@@ -764,11 +781,14 @@ fn not_worked_out(follow: &Follow, why: &str) -> Value {
         "unread_by_an_agent": 0,
         "unread_by_a_person": 0,
         "lines": [said.to_json()],
+        "in_step": false,
+        "next_read": null,
     })
 }
 
 /// One follow's view (rule 7). `subscriptions` are the subscriptions in
-/// force, read where a view first needs them.
+/// force, read where a view first needs them; `next_read`, when the
+/// node's timer next reads the list, where one does.
 #[allow(clippy::too_many_arguments)]
 fn view_of(
     conn: &Connection,
@@ -778,6 +798,7 @@ fn view_of(
     follow: &Follow,
     unread: Option<&Unread>,
     subscriptions: &mut Option<Vec<([u8; 32], String)>>,
+    next_read: Option<i64>,
     now: i64,
 ) -> Result<Value, PersonError> {
     let list = kept_list(follow);
@@ -845,6 +866,16 @@ fn view_of(
             "says": read_line(&follow.identity, last, follow.fetched_at, now),
         })
     });
+    // In step (rule 7): the list was read, and its last read that counted
+    // is not long overdue; no line of rules 4 to 6 stands, and no member is
+    // not yet in. A read that counted for nothing is a line. Nothing waits
+    // on the list, and the plain status says it in one line.
+    let in_step = follow
+        .last
+        .as_ref()
+        .is_some_and(|last| now - last.at <= MEMBERS_READ_OVERDUE_SECS as i64)
+        && lines.is_empty()
+        && !members.iter().any(|member| member["in"] == false);
     Ok(json!({
         "identity": follow.identity,
         "name": name,
@@ -856,6 +887,8 @@ fn view_of(
         "unread_by_an_agent": unread_by_an_agent,
         "unread_by_a_person": unread_by_a_person,
         "lines": lines.iter().map(Said::to_json).collect::<Vec<_>>(),
+        "in_step": in_step,
+        "next_read": next_read.map(rfc3339),
     }))
 }
 

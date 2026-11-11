@@ -26,6 +26,7 @@ fn object(s: &crate::several::Several, n: usize, said: &SharedSaid, now: i64) ->
         own_relays: &own,
         connected: &[AT],
         said,
+        next_read: None,
     };
     status_of(&s[n].conn, &s[n].identity, &beside, now).unwrap()
 }
@@ -96,6 +97,7 @@ fn the_shared_object_says_each_channel_held() {
         own_relays: &none,
         connected: &[],
         said: &said,
+        next_read: None,
     };
     let unreached = status_of(&s[0].conn, &s[0].identity, &beside, now + 1)
         .unwrap()

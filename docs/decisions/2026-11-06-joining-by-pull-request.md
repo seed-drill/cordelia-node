@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Accepted on 6 November, and built for `v0.2.0-alpha.19`. Amended by the person's rulings of 7, 8 and 10 November (section 14); the last (rule 4.5) comes after alpha.19. It replaces the members record's command, and overturns property 16 of the shared channels record (section 7).
+**Status**: Accepted on 6 November, and built for `v0.2.0-alpha.19`. Amended by the person's rulings of 7, 8, 10 and 11 November (section 14); the last two (rule 4.5, and the one line of rule 7) come after alpha.19. It replaces the members record's command, and overturns property 16 of the shared channels record (section 7).
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -101,7 +101,7 @@ bob@laptop$ cordelia subscribe
 
 - **From the clone, read only.** It reads `refs/remotes/<remote>/<branch>`, the default branch as the person's own git last fetched it. `<branch>` is the one that `refs/remotes/<remote>/HEAD` names, and the remote must still have an address that names the identity. Where that ref is missing, as after a default branch is renamed, the status says to run `git remote set-head <remote> --auto`. It reads the file with `git cat-file blob`, and never touches the working tree, a local branch, the clone's refs or its files.
 - **When.** Every ten minutes (`MEMBERS_READ_INTERVAL_SECS`), at the node's start, and when a person follows, the node reads each clone it follows.
-- **The list is as fresh as the clone,** for a public repository as for a private one. It comes from the person's own `git fetch` or `git pull`. The status says how old it is: `list of <identity> read from your clone, fetched 2 hours ago`, or that the age is not known. So a join waits until a member's clone has the merged list: a member runs `git pull` there.
+- **The list is as fresh as the clone,** for a public repository as for a private one. It comes from the person's own `git fetch` or `git pull`. The status says how old it is: `list of <identity> read from your clone, fetched 2 hours ago`, or that the age is not known. Where something waits on the list, the line ends with when the node next reads it: `Next read in about 2 minutes.` (#323). So does `The list has not been read yet.` So a join waits until a member's clone has the merged list: a member runs `git pull` there.
 - **Nothing of the person's reaches git, so nothing can ask.** Every git command the node runs, reads of the clone included, runs in a cleared environment:
   - only `PATH` is kept, and the variables of a proxy and of a company's own certificate authority (`HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `GIT_SSL_CAINFO`), which never ask;
   - `HOME` and `XDG_CONFIG_HOME` are an empty folder of the node's, so no global setting is read, on any version of git;
@@ -182,7 +182,7 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 | A member who moved | `The list names the channel you moved from. The device that made it anew shows its new channel line: put that line in .cordelia/members.` |
 | An offer read in the named channel | `<name> was made anew by <label>: nothing is handed over until the list names the new channel.` |
 | The gate of rule 1 | amber, rule 4.7's line, once, on a device that holds the channel: `<label> is on the list of <name> but was left out of it: delete its line in a pull request, or wait for that device to write in the channel`. Nothing is handed over until then. |
-| The list, from the clone | rule 3's line, with how old it is |
+| The list, from the clone | rule 3's line, with how old it is and when the next read is |
 | A list naming a channel that another follow names | `The list of <identity> names <name>, which this device follows from <other identity>: run cordelia subscribe in a clone of the one it should follow.` |
 | This device follows no list of the channel | `This device follows no repository whose channel is <name>.` Said by `cordelia shared seen <name>`. Only a device that follows a repository knows that a channel is its, and another device's follows are its own. |
 | The channel line changed | amber, as a key new on the list is: `The list of <identity> names a new channel for <name> at <commit>.` Cleared by `cordelia shared seen <name>`. |
@@ -195,6 +195,8 @@ For each repository channel:
 - **the members, by the list's labels,** each in or not yet;
 - **what waits:** messages unread by the person and by an agent;
 - **any line of rules 4 to 6.**
+
+**A repository in step is one line** (made terser on 11 November 2026, on the person's ruling, issue #338). In step means: the last read counted, no line of rules 4 to 6 stands, and no member is not yet in. Nothing then waits on the list, and the plain status says `<identity>, for <name>: 2 members, all in`, with what waits unread where any does: `; 2 unread by you, 1 by an agent`. Otherwise it shows each line above, and the read's line ends with when the next read is (rule 3). A last read that counted, older than two read intervals (`MEMBERS_READ_OVERDUE_SECS`), is not in step either, so a read that keeps failing shows how long ago the list was read. `-v` and `cordelia shared list` show every line, the next read with the read. The node works out whether a repository is in step, and `--json` gives it as `in_step`, and the next read as `next_read`.
 
 The notices of rules 4.5 to 4.7 show only on devices that follow the repository. Rule 1's gate shows as rule 4.7's line, once, on a device that holds the channel: a joiner cannot see who is in it, and shows nothing of it. Commits show by their first twelve characters (`MEMBERS_COMMIT_SHOWN_CHARS`), and the plain status names the first six members (`MEMBERS_LABELS_SHOWN`) and how many more, and so does each line of keys new on the list; `--json` gives the whole commit, every member and every key new on the list. The fingerprint words show only with `-v` (#228).
 
@@ -237,6 +239,7 @@ Each is in `protocol.rs`, and explained at length in parameter-rationale.md §12
 | `MEMBERS_LABEL_MAX_CHARS` | 32 | Long enough to tell devices apart, short enough to sit beside a key on one line; its characters need no escaping where it is shown (rule 1) |
 | `MEMBERS_GIT_TERM_SECS` | 2 | Git ends on TERM in milliseconds; two seconds is room for a loaded machine before it is killed (rule 3) |
 | `MEMBERS_READ_INTERVAL_SECS` | 600 | As `RELAY_ASK_AGAIN_SECS`: a join waits about ten minutes on each side once the list is read, and the list changes only with a merge and a fetch (rules 3 and 4) |
+| `MEMBERS_READ_OVERDUE_SECS` | 1,200 | Derived: two read intervals. One late is a read running or a busy timer; two are reads that fail with no line, which the status then shows (rule 7) |
 | `MEMBERS_HANDED_AT_ONCE` | 4 | Derived: half of `MAX_TYPED_KEYS`, as a share lives for two reads, so a device that is off holds no place for long (rule 4.2) |
 | `MEMBERS_ASKED_PER_PASS` | 32 | The node's typings asked of the relays in one pass, across every follow: 384 requests a minute, 592 with the rest of the shared pass, within the 600 of `SHARED_REQUESTS_PER_MINUTE` (rule 4.4) |
 | `MEMBERS_COMMIT_SHOWN_CHARS` | 12 | As git's short form: twelve tell commits apart in any repository a team shares, and keep a join's line short; `--json` gives the whole commit (rule 7) |
@@ -303,7 +306,7 @@ Each round's findings and what changed are on pull request #297. What changed mo
 - **The node reads the clone only** (the person, 7 November). Its own fetch of a public repository drew findings in three rounds of slice 2's review: it fetched a whole tree; a git older than 2.44 fetches lazily; and a host sends a blob asked for by its ID whatever the filter says, so a size bound needed a watch on the fetch.
 - **A channel follows one repository, and a key waits while any share of it does** (rules 2.5, 4.2 and 6). Two lists that named one channel, or one key, wrote over each other's shares.
 
-## 14. The person's answers (6 to 10 November)
+## 14. The person's answers (6 to 11 November)
 
 1. **`cordelia shared seen <name>`** clears the notice of a key new on the list (rule 4.5) and of a changed channel line (rule 6), on each device: yes. Rule 5's amber of a key left out has an act of its own, `cordelia shared seen <name> <label>`.
 2. **The default name is the repository's `owner/name`:** yes.
@@ -312,3 +315,4 @@ Each round's findings and what changed are on pull request #297. What changed mo
 5. **A channel follows one repository** (7 November): kept.
 6. **An offer "without you" stops hand-overs too** (8 November): a device hands over nothing in a channel in which it has read any offer that is no fault (rule 4.1).
 7. **A join is judged by the list alone** (10 November): "by the list alone". A key shows when a list that this device reads names it and the list read before did not (rule 4.5).
+8. **The plain status says a repository in step in one line** (11 November, issue #338). More shows only when something waits, and then the read says when the next read is (rules 3 and 7). A read long overdue is not in step.

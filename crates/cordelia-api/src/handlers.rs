@@ -292,16 +292,19 @@ pub(crate) async fn status_with(
     let shared = match relay || state.held.why().is_some() {
         true => None,
         false => {
+            let now = state.sync_control.now();
             let beside = crate::shared_status::Beside {
                 own_relays: &own_relays,
                 connected: &connected,
                 said: &said,
+                next_read: state.own_channels.next_members_read(now),
             };
-            crate::shared_status::status_of(&db, &state.identity, &beside, state.sync_control.now())
-                .unwrap_or_else(|e| {
+            crate::shared_status::status_of(&db, &state.identity, &beside, now).unwrap_or_else(
+                |e| {
                     tracing::debug!(error = %e, "the status says nothing of shared channels");
                     None
-                })
+                },
+            )
         }
     };
     drop(db);

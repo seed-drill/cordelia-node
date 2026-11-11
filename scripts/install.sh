@@ -624,7 +624,7 @@ next_steps() {
     echo "Next steps:"
     echo "  ${START_CMD}"
     echo "${START_SAYS}"
-    echo "  cordelia status       # the node and its relays"
+    echo "  cordelia status       # whether all is well"
     echo "  cordelia id           # this device's key, to pair another device"
     echo "  cordelia sync claude  # turn on memory sync: lists what it found"
     echo "  cordelia sync map <folder>"

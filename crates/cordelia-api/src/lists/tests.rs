@@ -4213,6 +4213,7 @@ fn a_removal_makes_a_channel_past_its_bound_anew() {
         own_relays: &own_relays,
         connected: &[AT],
         said: &said,
+        next_read: None,
     };
     let status = crate::shared_status::status_of(conn, identity, &beside, now)
         .unwrap()

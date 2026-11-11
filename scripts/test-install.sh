@@ -671,7 +671,7 @@ setup() {
 run "the-version-before-is-kept"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 # A later run with no node running ends as it did.
-has "  cordelia status       # the node and its relays"
+has "  cordelia status       # whether all is well"
 has_not "Then one of these three:"
 check "the copy kept" "$(cat "$HOME_DIR/.cordelia/bin/cordelia.prev")" "the one before"
 again "the-version-before-is-kept-at-a-second-run"
