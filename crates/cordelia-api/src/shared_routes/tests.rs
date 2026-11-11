@@ -1057,6 +1057,7 @@ fn unread_by_an_agent_counts_for_each_subscribed_folder() {
             own_relays: &own,
             connected: &[AT],
             said: &said,
+            next_read: None,
         };
         crate::shared_status::status_of(&s[0].conn, &s[0].identity, &beside, now)
             .unwrap()

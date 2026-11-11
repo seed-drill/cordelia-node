@@ -1253,6 +1253,7 @@ mod tests {
             own_relays: &[],
             connected: &[AT],
             said: &said,
+            next_read: None,
         };
         crate::shared_status::status_of(conn, identity, &beside, now)
             .unwrap()

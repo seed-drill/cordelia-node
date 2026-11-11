@@ -264,7 +264,9 @@ Prometheus exposition format metrics endpoint. Bearer token authentication requi
 > them; nothing of the older kind is counted on any node. Of the example
 > below, `cordelia_items_pushed_total` and `cordelia_items_synced_total`
 > (of the older kind's push and sync), `cordelia_replication_lag_seconds`
-> and `cordelia_bandwidth_bytes_total` are not served.
+> and `cordelia_bandwidth_bytes_total` are not served, and
+> `cordelia_sync_errors_total` is always 0: nothing counts it in this
+> version.
 
 **Response (200):** `text/plain; version=0.0.4`
 
@@ -677,7 +679,8 @@ never held, comes in only under **a word that the phrase signed:**
 - **`GET /api/v1/status`** answers `status`; `version`, so that a command
   can tell a node of another version; `uptime_secs`; `peers_hot` and
   `peers_warm`; `channels_subscribed` (the names a device holds, or the
-  channels a relay holds); `sync_errors`; `outbox_waiting`; `held`, which
+  channels a relay holds); `sync_errors`, always 0, as nothing counts
+  them in this version; `outbox_waiting`; `held`, which
   is null, or by what the node is held up (`by`: `later_database`;
   `earlier_database` for a database from before 0.2.0-alpha.19; or
   `step_failed` for a step of the schema that did not finish) and why
@@ -776,14 +779,14 @@ never held, comes in only under **a word that the phrase signed:**
     its fields are in decision 2026-10-10 §9. Its `repositories` is each
     repository this device follows (decision 2026-11-06 (joining), rule
     7): `identity`, `name`, `held`, `channel` and `words`; `read`, when the
-    list was read, at which commit, from the clone, when the clone was
-    fetched, and `next`, when the node next reads it (null where no timer
-    of the node's reads it); `members`, each with `label`, `key`, `words`
-    and `in` (null where this device does not hold the channel); the
-    unread counts; `lines`, each with a `word`, what it `says`, whether it
-    is `amber`, and a channel `line` to put in the list, where it says to;
-    and `in_step`, true where nothing waits on the list, which plain
-    `cordelia status` then says in one line. A line whose
+    list was read, at which commit, from the clone, and when the clone was
+    fetched; `members`, each with `label`, `key`, `words` and `in` (null
+    where this device does not hold the channel); the unread counts;
+    `lines`, each with a `word`, what it `says`, whether it is `amber`, and
+    a channel `line` to put in the list, where it says to; `in_step`, true
+    where nothing waits on the list, which plain `cordelia status` then
+    says in one line; and `next_read`, when the node next reads the list,
+    read yet or not (null where no timer of the node's reads it). A line whose
     word is `joined`, the keys new on the list at one commit (decision
     2026-11-06 (joining), rule 4.5, as the person ruled on 10 November),
     also gives that `commit`, whole, and `devices`, each with `label`,

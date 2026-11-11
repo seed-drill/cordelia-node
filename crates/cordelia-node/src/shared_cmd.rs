@@ -451,13 +451,14 @@ pub fn show(config_path: &str, keys: bool, verbose: bool) -> anyhow::Result<()> 
 /// The lines of one repository this device follows (decision 2026-11-06
 /// (joining), rule 7), as the node gave it, at `now`: first the repository
 /// and the name its channel is filed under; then, each indented, when and
-/// from where its list was read, and when the next read is, the members by
-/// the list's labels, each in or not yet where this device can see it,
-/// what waits unread, and each line of rules 4 to 6, an amber one after
-/// the line's amber mark, with any channel line it says to put in the list
-/// under it. The members, and the keys new on the list (rule 4.5), are each
-/// said with `every`, and else the first [`MEMBERS_LABELS_SHOWN`] and how
-/// many more. The fingerprint words show only with `verbose` (#228).
+/// from where its list was read, or that it was not yet, and when the next
+/// read is, the members by the list's labels, each in or not yet where
+/// this device can see it, what waits unread, and each line of rules 4 to
+/// 6, an amber one after the line's amber mark, with any channel line it
+/// says to put in the list under it. The members, and the keys new on the
+/// list (rule 4.5), are each said with `every`, and else the first
+/// [`MEMBERS_LABELS_SHOWN`] and how many more. The fingerprint words show
+/// only with `verbose` (#228).
 ///
 /// **A repository the node says is in step is one line** in the plain
 /// status, neither `verbose` nor `every` ([`in_step_line`], issue #338).
@@ -474,17 +475,20 @@ pub fn repository_lines(repository: &Value, verbose: bool, every: bool, now: i64
         head.push_str(&format!(" (channel {words})"));
     }
     let mut lines = vec![head];
-    let next = repository["read"]["next"]
+    let read = match repository["read"]["says"].as_str() {
+        Some(says) => format!("  {says}"),
+        None => "  The list has not been read yet.".into(),
+    };
+    let next = repository["next_read"]
         .as_str()
         .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
-    match (repository["read"]["says"].as_str(), next) {
-        (Some(says), Some(next)) => lines.push(format!(
-            "  {says} {}",
+    lines.push(match next {
+        Some(next) => format!(
+            "{read} {}",
             cordelia_api::repository_status::next_read_line(next.timestamp() - now)
-        )),
-        (Some(says), None) => lines.push(format!("  {says}")),
-        (None, _) => lines.push("  The list has not been read yet.".into()),
-    }
+        ),
+        None => read,
+    });
     let all: Vec<&Value> = list(repository, "members").collect();
     let shown = match every {
         true => all.len(),
@@ -1128,7 +1132,7 @@ mod tests {
         in_step["in_step"] = json!(true);
         in_step["lines"] = json!([]);
         in_step["members"][1]["in"] = json!(true);
-        in_step["read"]["next"] = json!("2026-11-11T12:02:20Z");
+        in_step["next_read"] = json!("2026-11-11T12:02:20Z");
         let read = "  List of example.org/team/project read from your clone, fetched 2 hours ago. \
                     Read 5 minutes ago, at commit aaaa. Next read in about 2 minutes.";
         assert_eq!(
@@ -1162,6 +1166,13 @@ mod tests {
                 "  Members: alice-laptop (in), bob-desktop (not yet).",
                 "  Unread: 0 by you, 0 by an agent."
             ]
+        );
+        // A list not read yet says when it will be.
+        let mut not_yet = waits.clone();
+        not_yet["read"] = json!(null);
+        assert_eq!(
+            repository_lines(&not_yet, false, false, NOW)[1],
+            "  The list has not been read yet. Next read in about 2 minutes."
         );
         // A node that says nothing of it, as alpha.19 did not, shows every
         // line, as before.

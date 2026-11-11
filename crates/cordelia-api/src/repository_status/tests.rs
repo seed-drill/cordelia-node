@@ -206,16 +206,13 @@ fn the_status_carries_each_repositorys_view_with_its_fields() {
     let now = s.now + 10;
     let (_, list) = joins(&s, 7, now);
     let own = own_relays();
+    let said = crate::state::SharedSaid::default();
     // The node's timer reads the lists next in 140 seconds.
-    let due = std::time::Instant::now() + std::time::Duration::from_secs(140);
-    let said = crate::state::SharedSaid {
-        members_read_due: Some(due),
-        ..Default::default()
-    };
     let beside = crate::shared_status::Beside {
         own_relays: &own,
         connected: &[],
         said: &said,
+        next_read: Some(now + 140),
     };
     let shared = crate::shared_status::status_of(&s[0].conn, &s[0].identity, &beside, now)
         .unwrap()
@@ -238,6 +235,7 @@ fn the_status_carries_each_repositorys_view_with_its_fields() {
             "lines",
             "members",
             "name",
+            "next_read",
             "read",
             "unread_by_a_person",
             "unread_by_an_agent",
@@ -251,14 +249,11 @@ fn the_status_carries_each_repositorys_view_with_its_fields() {
         .map(String::as_str)
         .collect();
     read.sort();
-    assert_eq!(read, ["at", "commit", "fetched", "from", "next", "says"]);
+    assert_eq!(read, ["at", "commit", "fetched", "from", "says"]);
     // When the next read is, by the node's clock, in RFC 3339; null where
     // no timer reads the lists, as in these tests' views.
-    let next = chrono::DateTime::parse_from_rfc3339(view["read"]["next"].as_str().unwrap())
-        .unwrap()
-        .timestamp();
-    assert!((now + 130..=now + 140).contains(&next), "{view}");
-    assert_eq!(view_now(&s, now)["read"]["next"], Value::Null);
+    assert_eq!(view["next_read"], rfc3339(now + 140), "{view}");
+    assert_eq!(view_now(&s, now)["next_read"], Value::Null);
     // A joiner waits to be handed the channel: not in step.
     assert_eq!(view["in_step"], false, "{view}");
     let mut member: Vec<&str> = view["members"][0]
@@ -298,7 +293,9 @@ fn the_status_carries_each_repositorys_view_with_its_fields() {
 /// not yet in. Only then does the plain status say the repository in one
 /// line. A member not yet in with no line, as one waits out the read at
 /// which its share goes (rule 4.2), is not in step; nor is a line where
-/// every member is in, as a read that counted for nothing.
+/// every member is in, as a read that counted for nothing; nor a list not
+/// read since it was followed afresh, nor one whose last read is long
+/// overdue.
 #[test]
 fn a_view_is_in_step_only_where_nothing_waits_on_the_list() {
     let s = bob(1);
@@ -339,8 +336,24 @@ fn a_view_is_in_step_only_where_nothing_waits_on_the_list() {
     let view = view_now(&s, now + 3 * READ + 3);
     assert_eq!(view["read"], Value::Null, "{view}");
     assert_eq!(view["in_step"], false, "{view}");
-    reads(&s, &list, &commit('a'), now + 3 * READ + 4);
-    assert_eq!(view_now(&s, now + 3 * READ + 4)["in_step"], true);
+    let last = now + 3 * READ + 4;
+    reads(&s, &list, &commit('a'), last);
+    assert_eq!(view_now(&s, last)["in_step"], true);
+    // A last read that counted, long overdue, as where reads keep failing
+    // with no line, is not in step: its lines show how old it is.
+    let overdue = MEMBERS_READ_OVERDUE_SECS as i64;
+    assert_eq!(view_now(&s, last + overdue)["in_step"], true);
+    let view = view_now(&s, last + overdue + 1);
+    assert!(lines(&view).is_empty(), "{view}");
+    assert_eq!(view["in_step"], false, "{view}");
+    assert!(
+        view["read"]["says"]
+            .as_str()
+            .unwrap()
+            .contains("Read 20 minutes ago"),
+        "{view}"
+    );
+    assert!(RECORD.contains("older than two read intervals (`MEMBERS_READ_OVERDUE_SECS`)"));
     // A read that counts for nothing is a line, with every member in.
     let behind = after_read(
         &s[0].conn,
@@ -1572,6 +1585,7 @@ fn the_cost_of_the_views_of_16_follows_of_64_keys() {
         own_relays: &own,
         connected: &[],
         said: &said,
+        next_read: None,
     };
     let time = |what: &dyn Fn()| {
         let mut took: Vec<u128> = (0..9)

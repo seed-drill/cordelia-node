@@ -358,7 +358,7 @@ pub async fn list(
     crate::commands::asked(&req, &state)?;
     let own = sharing::own_relays(&state);
     let now = state.sync_control.now();
-    let next_read = state.own_channels.shared_said().next_read(now);
+    let next_read = state.own_channels.next_members_read(now);
     let conn = db(&state);
     let mut listed = sharing::list(&conn, &state.identity, &own, body.keys, now)
         .map_err(crate::commands::refused)?;

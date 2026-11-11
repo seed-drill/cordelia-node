@@ -26,7 +26,8 @@ pub struct AppState {
     pub home_dir: PathBuf,
     /// Instant when the node was started (for uptime).
     pub started_at: Instant,
-    /// Cumulative sync errors (Phase 2+, incremented by replication).
+    /// Sync errors: nothing counts them in this version, so always 0. The
+    /// status and the metrics keep the field for tools that read it.
     pub sync_errors: AtomicU64,
     /// Number of peers in Hot state (updated by governor tick).
     pub peers_hot: AtomicU64,
@@ -228,6 +229,11 @@ pub struct OwnChannels {
     /// list now, without waiting for its timer (decision 2026-11-06
     /// (joining), rule 3).
     members_asked: tokio::sync::Notify,
+    /// When the node's timer next reads the lists of the repositories it
+    /// follows (decision 2026-11-06 (joining), rule 3): set at each tick,
+    /// and never where no timer reads them, as on a node with no network.
+    /// By the clock the timer runs on, not the time of day.
+    members_read_due: Mutex<Option<Instant>>,
     /// The reads of channels of the device's own, each under its ID.
     reads: crate::own_read::OwnReads,
     /// The channels that a carry is being made into, each with when that
@@ -250,16 +256,10 @@ pub struct OwnChannels {
 }
 
 /// What the shared pass said since the node started, for the status's
-/// `shared` object (decision 2026-10-10 §9), and when the node's timer
-/// next reads the lists of the repositories it follows. Kept in memory:
-/// each is said again at the next pass that meets it.
+/// `shared` object (decision 2026-10-10 §9). Kept in memory: each is said
+/// again at the next pass that meets it.
 #[derive(Debug, Default, Clone)]
 pub struct SharedSaid {
-    /// When the node's timer next reads the list of each repository it
-    /// follows (decision 2026-11-06 (joining), rule 3): set at each tick,
-    /// and never where no timer reads them, as on a node with no network.
-    /// By the clock the timer runs on, not the time of day.
-    pub members_read_due: Option<Instant>,
     /// For each shared channel, by its ID: how many entries the door did
     /// not store, as no honest member writes them (§2.3, rule 3).
     pub not_stored: std::collections::HashMap<[u8; 32], u64>,
@@ -270,17 +270,6 @@ pub struct SharedSaid {
     /// Each shared channel and relay where the channel was not proved at
     /// the latest pass: no room for more proofs on the connection (§8.4).
     pub no_proof_room: std::collections::HashSet<([u8; 32], [u8; 32])>,
-}
-
-impl SharedSaid {
-    /// When the node's timer next reads the lists it follows, by the
-    /// node's clock, where `now` is its time: `None` where no timer reads
-    /// them. A read that is due and not yet begun is due `now`.
-    pub fn next_read(&self, now: i64) -> Option<i64> {
-        let due = self.members_read_due?;
-        let secs = due.saturating_duration_since(Instant::now()).as_secs();
-        Some(now.saturating_add(secs as i64))
-    }
 }
 
 /// How a channel's key is proved to a relay, through the door for a carry.
@@ -549,6 +538,28 @@ impl OwnChannels {
         self.members_asked.notified().await;
     }
 
+    /// The node's timer reads the lists of the repositories it follows
+    /// now, and next at `due` (decision 2026-11-06 (joining), rule 3). A
+    /// read asked by a follow moves no timer, and so not this.
+    pub fn members_read_next(&self, due: Instant) {
+        *self
+            .members_read_due
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(due);
+    }
+
+    /// When the node's timer next reads the lists it follows, by the
+    /// node's clock, where `now` is its time: `None` where no timer reads
+    /// them. A read that is due and not yet begun is due `now`.
+    pub fn next_members_read(&self, now: i64) -> Option<i64> {
+        let due = (*self
+            .members_read_due
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()))?;
+        let secs = due.saturating_duration_since(Instant::now()).as_secs();
+        Some(now.saturating_add(secs as i64))
+    }
+
     /// A command's work asks something through the door for a carry: the
     /// node takes it up, and answers on the asking's own channel.
     pub fn ask_door(&self, ask: DoorAsk) {
@@ -656,14 +667,6 @@ impl OwnChannels {
             .shared_recovered
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = said;
-    }
-
-    /// The node's timer reads the lists of the repositories it follows
-    /// now, and next at `due` (decision 2026-11-06 (joining), rule 3). A
-    /// read asked by a follow moves no timer, and so not this.
-    pub fn members_read_next(&self, due: Instant) {
-        let mut said = self.shared_said.lock().unwrap_or_else(|e| e.into_inner());
-        said.members_read_due = Some(due);
     }
 
     /// The door did not store `n` entries of the shared channel `channel`,
@@ -1902,12 +1905,7 @@ impl AppState {
         self.started_at.elapsed().as_secs_f64()
     }
 
-    /// Increment sync error counter.
-    pub fn inc_sync_errors(&self) {
-        self.sync_errors.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Read sync error counter.
+    /// Read sync error counter: always 0, as nothing counts them.
     pub fn sync_error_count(&self) -> u64 {
         self.sync_errors.load(Ordering::Relaxed)
     }

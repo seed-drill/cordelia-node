@@ -2037,9 +2037,9 @@ fn cmd_status(
 /// `verbose`, every line. Plain, one line for each area when all is well
 /// (issue #338): whether it runs, memory, the devices, and each repository
 /// followed in one line where it is in step. What waits or is wrong shows
-/// in full: another version, sync errors, a hold, memory's other holds,
-/// a shared channel's, conflicts and errors, what is said of the devices,
-/// of messages, and each repository not in step. A relay keeps its peers.
+/// in full: another version, no peer, a hold, memory's other holds, a
+/// shared channel's, conflicts and errors, what is said of the devices, of
+/// messages, and each repository not in step. A relay keeps its peers.
 fn node_lines(
     status: &GatheredStatus,
     live: &serde_json::Value,
@@ -2056,14 +2056,17 @@ fn node_lines(
     if let Some(note) = version_note(live["version"].as_str(), env!("CARGO_PKG_VERSION")) {
         lines.push(format!("  Version:   {note}"));
     }
-    if verbose || role != "personal" {
+    // A relay's peers are its work; a device with none is reached by no
+    // relay, which the level does not say where nothing is mapped.
+    if verbose || role != "personal" || n("peers_hot") == 0 {
         lines.push(format!(
             "  Peers:     {} hot, {} warm",
             n("peers_hot"),
             n("peers_warm")
         ));
     }
-    if verbose || n("sync_errors") > 0 {
+    // Nothing counts sync errors in this version: always 0.
+    if verbose {
         lines.push(format!("  Sync errors: {}", n("sync_errors")));
     }
     // A node that is held up says why (decision 2026-10-04 §10.1).
@@ -8945,8 +8948,8 @@ mod tests {
     /// sync errors at nought, and every line of each repository. What
     /// waits or is wrong still shows in the plain form, in full: a
     /// repository with an amber line, with its read and when the next read
-    /// is (#323 item 1); sync errors; a memory amber. A relay keeps its
-    /// peers.
+    /// is (#323 item 1); a hold; memory's holds; the devices' lines; no
+    /// peer. A relay keeps its peers.
     #[test]
     fn the_plain_status_says_one_line_for_each_area_when_all_is_well() {
         use serde_json::{Value, json};
@@ -8967,7 +8970,7 @@ mod tests {
         let repository = json!({
             "identity": "example.org/team/project", "name": "team/project", "held": true,
             "words": "a b c d",
-            "read": { "says": read, "next": "2026-11-11T12:02:20Z" },
+            "read": { "says": read }, "next_read": "2026-11-11T12:02:20Z",
             "members": [
                 { "label": "alice-laptop", "words": "one two three four five six", "in": true },
                 { "label": "bob-desktop", "words": "six five four three two one", "in": true },
@@ -9046,8 +9049,9 @@ mod tests {
             ]
         );
 
-        // Sync errors and a hold show where there are any, and memory's
-        // holds, the devices' lines and each repository as they are.
+        // A hold shows where there is one, and memory's holds, the
+        // devices' lines and each repository as they are. Sync errors show
+        // only with -v: nothing counts them.
         let mut wrong = well.clone();
         wrong["sync_errors"] = json!(3);
         wrong["held"] = json!({ "by": "later_database", "why": "the database is newer" });
@@ -9075,7 +9079,6 @@ mod tests {
             ),
             [
                 "  Running:   yes, up 2h 03m",
-                "  Sync errors: 3",
                 "  Held up:   the database is newer",
                 "  Memory:    1 conflict",
                 "    also:     To know: a device has left",
@@ -9083,6 +9086,18 @@ mod tests {
                 "  Devices:   2 devices under a recovery phrase (change 4)",
                 "    new device: desktop",
                 "  Following: example.org/team/project, for team/project: 2 members, all in",
+            ]
+        );
+        // A device that no relay reaches shows its peers, though the level
+        // says nothing of it where nothing is mapped.
+        let mut alone = well.clone();
+        alone["peers_hot"] = json!(0);
+        assert_eq!(
+            lines_of(&facts, &alone, "personal", false)[..3],
+            [
+                "  Running:   yes, up 2h 03m",
+                "  Peers:     0 hot, 0 warm",
+                "  Memory:    synced",
             ]
         );
         // A relay keeps its peers, and has nothing else to say.

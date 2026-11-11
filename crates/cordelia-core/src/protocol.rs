@@ -2708,6 +2708,13 @@ pub const MEMBERS_GIT_TERM_SECS: u64 = 2;
 /// to take it.
 pub const MEMBERS_READ_INTERVAL_SECS: u64 = 600;
 
+/// How old the last read of a list that counted may be before the status
+/// no longer says the repository in one line (decision 2026-11-06
+/// (joining), rule 7): two read intervals. Its lines then show, with how
+/// long ago it was read. A test that lowers the read interval does not
+/// lower this.
+pub const MEMBERS_READ_OVERDUE_SECS: u64 = 2 * MEMBERS_READ_INTERVAL_SECS;
+
 /// How many listed keys the node hands a repository's channel to at each
 /// read (decision 2026-11-06 (joining), rule 4.2): the next four in the
 /// list's order. Derived: a share lives for two reads, so at most

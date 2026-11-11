@@ -4982,8 +4982,9 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
     }
     assert!(!beside.join("node.lock").exists());
-    // `cordelia status` says the note, and reads nothing of the database.
-    let out = laptop.command_given(&through, &["status"]);
+    // `cordelia status -v` says the note, and reads nothing of the
+    // database: no size.
+    let out = laptop.command_given(&through, &["status", "-v"]);
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{said}");
     assert!(said.contains("Storage:\n  Not read:  "), "{said}");
@@ -5062,8 +5063,9 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
     }
     assert_eq!(std::fs::read(beside.join("identity.key")).unwrap(), key);
-    // `cordelia status` still answers, and reads nothing of the database.
-    let out = laptop.command_given(&through, &["status"]);
+    // `cordelia status -v` still answers, and reads nothing of the
+    // database: no size.
+    let out = laptop.command_given(&through, &["status", "-v"]);
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(out.status.success(), "{said}");
     assert!(

@@ -465,8 +465,11 @@ JSON output (`--json`):
 }
 ```
 
-> **v1 status.** `cordelia status` shows this device and, while the node
-> runs, its peers and memory sync; `cordelia status --json` gives the same as
+> **v1 status.** `cordelia status` says one line for each area when all is
+> well: whether the node runs, memory sync, the devices, and each
+> repository followed. It shows more when something waits or is wrong, and
+> `-v` shows the rest: this device's key, storage and settings, and its
+> peers. `cordelia status --json` gives everything as
 > data, with a `state` of `synced`, `syncing`, `offline`, `attention`, `off`,
 > `stopped` or `uninitialised`. **The status has one level** beside its state
 > (decision 2026-10-04 §8, §10.1): red, amber or none. The command works it

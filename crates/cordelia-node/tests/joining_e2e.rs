@@ -815,7 +815,7 @@ fn two_people_join_by_a_merged_pull_request_alone() {
     // Nothing waits now: the plain status says the repository in one line
     // (issue #338), and the node's timer says when it reads the list next.
     assert_eq!(view["in_step"], true, "{view}");
-    assert!(view["read"]["next"].is_string(), "{view}");
+    assert!(view["next_read"].is_string(), "{view}");
     let plain = bob.cli(&["status"]);
     assert!(
         plain.contains(&format!(

@@ -143,13 +143,12 @@ relay to one core, and so to 6 MiB for its cores.
    cordelia-relay: node key cordelia_pk1...        <- the relay's public key; record it
    ... P2P endpoint listening ... 9474
    ```
-2. **Status.** `docker exec cordelia-relay1 cordelia status` ends with:
+2. **Status.** `docker exec cordelia-relay1 cordelia status` shows:
    ```
-   Node:
      Running:   yes, up 2m 10s
      Peers:     1 hot, 0 warm
-     Sync errors: 0
    ```
+   `cordelia status -v` adds the relay's key, storage and settings.
    Peers stay at 0 until the other relay is running and both DNS names
    resolve (step 4). Then each relay shows the other within a minute.
    `docker exec cordelia-relay1 cordelia peers` lists each connected peer:
@@ -166,7 +165,7 @@ relay to one core, and so to 6 MiB for its cores.
 5. **From outside.** On a machine on another network (not the relay's own,
    whose router may not loop back to its public address), a node with the
    default config dials both relays: `cordelia init`, `cordelia start`, then
-   `cordelia status` shows `Peers: 1 hot` or more.
+   `cordelia status -v` shows `Peers: 1 hot` or more.
 
 ## 5. Watch it
 

@@ -49,12 +49,14 @@ fn rfc3339(at: i64) -> String {
 }
 
 /// What the status is given beside the database: the relays the device
-/// knows by their keys, the keys of those connected now, and what the
-/// shared pass said since the node started.
+/// knows by their keys, the keys of those connected now, what the shared
+/// pass said since the node started, and when the node's timer next reads
+/// the lists of the repositories it follows, where one does.
 pub struct Beside<'a> {
     pub own_relays: &'a [OwnRelay],
     pub connected: &'a [[u8; 32]],
     pub said: &'a SharedSaid,
+    pub next_read: Option<i64>,
 }
 
 /// The `shared` object at `now` (§9), or `None` where the device does not
@@ -223,7 +225,7 @@ pub fn status_of(
             identity,
             beside.own_relays,
             Some(&unread),
-            beside.said.next_read(now),
+            beside.next_read,
             now,
         );
 
