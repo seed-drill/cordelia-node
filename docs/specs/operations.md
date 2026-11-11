@@ -131,17 +131,7 @@ Data directory (`~/.cordelia/`) is preserved by default. The user must explicitl
 
 ```
 $ cordelia init
-Generating Ed25519 keypair... done.
-Deriving X25519 key... done.
-Creating personal channel... done.
-Starting node on port 9473 (HTTP) / 9474 (P2P)... done.
-Discovering network... connected to 2 bootnodes.
-
-Your identity:
-  Entity ID:  russwing_a1b2
-  Public key: cordelia_pk1...
-
-Node is running. Install SDK: npm install @seeddrill/cordelia
+Made this device's key and database in ~/.cordelia. Run `cordelia start` to begin.
 ```
 
 > **v1 status.** `cordelia init` creates this device's key, its token, its

@@ -75,7 +75,6 @@ detect_platform() {
     esac
 
     BINARY="cordelia-${PLATFORM}-${ARCH}"
-    echo "Detected: ${PLATFORM}/${ARCH}"
 }
 
 # ── Download ────────────────────────────────────────────────────────
@@ -91,7 +90,6 @@ resolve_version() {
             exit 1
         fi
     fi
-    echo "Version: ${VERSION}"
 }
 
 download_binary() {
@@ -115,7 +113,6 @@ download_binary() {
     fi
 
     # Verify checksum
-    echo "Verifying checksum..."
     EXPECTED=$(cat "${TMPDIR}/checksum.sha256" | awk '{print $1}')
     if command -v sha256sum >/dev/null 2>&1; then
         ACTUAL=$(sha256sum "${TMPDIR}/cordelia" | awk '{print $1}')
@@ -132,7 +129,6 @@ download_binary() {
         echo "  actual:   ${ACTUAL}"
         exit 1
     fi
-    echo "Checksum verified."
 }
 
 # ── Install ─────────────────────────────────────────────────────────
@@ -437,7 +433,11 @@ finish() {
 
 # ── PATH setup ──────────────────────────────────────────────────────
 
+# NOT_ON_PATH is set where the directory is not on this shell's PATH: a
+# terminal opened before its line was added to a shell's file does not
+# find `cordelia`, and the closing words say so.
 setup_path() {
+    NOT_ON_PATH=""
     CORDELIA_BIN="$INSTALL_DIR"
     PATH_LINE="export PATH=\"${CORDELIA_BIN}:\$PATH\""
 
@@ -445,6 +445,7 @@ setup_path() {
     case ":$PATH:" in
         *":${CORDELIA_BIN}:"*) return ;;
     esac
+    NOT_ON_PATH=yes
 
     # Detect shell and RC file
     SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
@@ -462,7 +463,6 @@ setup_path() {
     echo "# Cordelia" >> "$RC_FILE"
     echo "$PATH_LINE" >> "$RC_FILE"
     echo "Added ${CORDELIA_BIN} to PATH in ${RC_FILE}"
-    echo "  Run: source ${RC_FILE}  (or open a new terminal)"
 }
 
 # ── System service ──────────────────────────────────────────────────
@@ -521,10 +521,6 @@ PLIST
     # plist's path is quoted, for a home whose name has a space.
     RESTART_CMD="launchctl bootout ${AGENT_TARGET}; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\" || (sleep 30; launchctl bootstrap ${AGENT_DOMAIN} \"${PLIST_FILE}\")"
     LOGS_CMD="tail -n 50 ${DATA_DIR}/logs/cordelia.log"
-    echo "LaunchAgent installed: ${PLIST_FILE}"
-    echo "  Start:  ${START_CMD}"
-    echo "  Stop:   launchctl unload ${PLIST_FILE}"
-    echo "  Logs:   tail -f ${DATA_DIR}/logs/cordelia.log"
 }
 
 # Whether a systemd user session answers on this machine. Only then can
@@ -574,17 +570,11 @@ SERVICE
         return
     fi
 
-    echo "systemd user service installed: ${SERVICE_FILE}"
-    echo "  Start:  ${START_CMD}"
-    echo "  Status: systemctl --user status cordelia"
-    echo "  Logs:   journalctl --user -u cordelia -f"
-
     # Check for lingering (required for user services to run without active session)
     if command -v loginctl >/dev/null 2>&1; then
         if ! loginctl show-user "$(whoami)" 2>/dev/null | grep -q "Linger=yes"; then
-            echo ""
-            echo "  Note: run 'sudo loginctl enable-linger $(whoami)' to keep"
-            echo "  the service running after logout."
+            echo "Note: run 'sudo loginctl enable-linger $(whoami)' to keep"
+            echo "the service running after logout."
         fi
     fi
 }
@@ -592,15 +582,13 @@ SERVICE
 # ── Init ────────────────────────────────────────────────────────────
 
 # A machine with no key yet is set up here: that makes this a first
-# install. `--non-interactive` has init say nothing of how the node is
-# started: the closing words below name the one command that starts it as
-# the service.
+# install. `--non-interactive` has init say nothing when it works: the
+# closing words below name the one command that starts the node as the
+# service.
 maybe_init() {
     FIRST_INSTALL=""
     if [ ! -f "${DATA_DIR}/identity.key" ]; then
         FIRST_INSTALL=yes
-        echo ""
-        echo "Running cordelia init..."
         export PATH="${INSTALL_DIR}:$PATH"
         if ! as_the_service init --non-interactive; then
             echo "Error: cordelia init failed. The binary is installed; the node is not set up."
@@ -618,7 +606,6 @@ first_steps() {
     echo "Next steps:"
     echo "  ${START_CMD}"
     echo "${START_SAYS}"
-    echo ""
     echo "Then one of these three:"
     echo "  cordelia phrase       # this is your first machine: make a phrase here"
     echo "  cordelia id           # another machine has the phrase: add this one from it."
@@ -626,7 +613,6 @@ first_steps() {
     echo "                        #   prints the cordelia accept to run here"
     echo "  cordelia recover      # every device that has the phrase is lost: recover"
     echo "                        #   here with it. Do not make a new phrase first"
-    echo ""
     echo "Then:"
     echo "  cordelia sync claude  # turn on memory sync: lists what it found"
     echo "  cordelia sync map <folder>"
@@ -661,22 +647,23 @@ main() {
     # Again, now that a first install has its configuration file.
     private_data_dir
 
-    echo ""
-    echo "Cordelia installed successfully."
-    echo ""
+    # The script ends with what is left to do, and the line for a program.
     settle_running_node
     if [ -n "$THERE" ]; then
         echo ""
         finish
         return
     fi
+    echo ""
     if [ -n "$FIRST_INSTALL" ]; then
         first_steps
     else
         next_steps
     fi
-    echo ""
-    echo "Open a new terminal first if 'cordelia' is not found."
+    if [ -n "$NOT_ON_PATH" ]; then
+        echo ""
+        echo "Open a new terminal first if 'cordelia' is not found."
+    fi
     echo ""
     finish
 }

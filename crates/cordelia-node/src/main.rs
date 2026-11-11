@@ -9,7 +9,7 @@ use clap::Parser;
 
 use cordelia_api::commands::restart_command;
 use cordelia_core::config::{self, Config};
-use cordelia_crypto::bech32::{HRP_X25519_PK, encode_public_key};
+use cordelia_crypto::bech32::encode_public_key;
 use cordelia_crypto::identity::NodeIdentity;
 
 mod carry_cmd;
@@ -62,7 +62,8 @@ enum Commands {
         name: Option<String>,
 
         /// For a script that starts the node itself, such as the install
-        /// script. Do not print how to start the node
+        /// script. Print nothing when it works, unless asked for the token
+        /// with --show-secrets
         #[arg(long)]
         non_interactive: bool,
 
@@ -71,8 +72,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Print the node token. Without this, only the file that stores
-        /// it is named
+        /// Print the node token
         #[arg(long)]
         show_secrets: bool,
 
@@ -1294,15 +1294,78 @@ fn keeps_secure_delete(role: &str) -> bool {
     role == "personal"
 }
 
-/// The last line of `cordelia init`. Run by a person, it says how the
-/// node is started. Run by a script (`--non-interactive`), as the install
-/// script runs it, it does not: the script starts the node itself, as
-/// the service it sets up, and says how in its own closing words.
-fn node_is_ready(by_a_script: bool) -> &'static str {
-    match by_a_script {
-        true => "Node is ready.",
-        false => "Node is ready. Run `cordelia start` to begin.",
+/// What `cordelia init` made, or wrote again.
+#[derive(Clone, Copy, Default)]
+struct Made {
+    key: bool,
+    database: bool,
+    token: Wrote,
+    config: Wrote,
+}
+
+/// Whether `cordelia init` wrote a file: where there was none, or again
+/// in the place of the one there (`--force`).
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Wrote {
+    #[default]
+    No,
+    New,
+    Again,
+}
+
+impl Wrote {
+    /// A file written, where one `was_there` or not.
+    fn over(was_there: bool) -> Self {
+        match was_there {
+            true => Wrote::Again,
+            false => Wrote::New,
+        }
     }
+}
+
+/// What `cordelia init` says when it succeeds. Run by a script
+/// (`--non-interactive`), as the install script runs it: nothing, since
+/// the script starts the node itself, as the service it sets up, and
+/// says how in its own closing words. Run by a person: one line, of what
+/// it made or wrote again and how the node is started, or that nothing
+/// changed. `dir` is the data directory.
+fn init_says(made: Made, dir: &str, by_a_script: bool) -> Option<String> {
+    if by_a_script {
+        return None;
+    }
+    let start = "Run `cordelia start` to begin.";
+    if made.key && made.database {
+        return Some(format!(
+            "Made this device's key and database in {dir}. {start}"
+        ));
+    }
+    let mut new: Vec<String> = Vec::new();
+    let mut again: Vec<String> = Vec::new();
+    for (it, what) in [(made.key, "key"), (made.database, "database")] {
+        if it {
+            new.push(format!("this device's {what}"));
+        }
+    }
+    match made.token {
+        Wrote::New => new.push("this device's node token".into()),
+        Wrote::Again => new.push("a new node token".into()),
+        Wrote::No => {}
+    }
+    match made.config {
+        Wrote::New => new.push("this device's configuration file".into()),
+        Wrote::Again => again.push("this device's configuration file".into()),
+        Wrote::No => {}
+    }
+    let (new, again) = (
+        cordelia_api::look::joined(&new),
+        cordelia_api::look::joined(&again),
+    );
+    Some(match (new.is_empty(), again.is_empty()) {
+        (true, true) => "This device has its key and database already: nothing changed.".into(),
+        (false, true) => format!("Made {new}. {start}"),
+        (true, false) => format!("Wrote {again} again. {start}"),
+        (false, false) => format!("Made {new}, and wrote {again} again. {start}"),
+    })
 }
 
 /// Whether anyone but its owner and its group may read, write or enter
@@ -1507,22 +1570,20 @@ fn init_with(
         eprintln!("{says}");
     }
 
+    // What this run makes, or writes again: what it says at the end.
+    let mut made = Made::default();
+
     // 1. Generate or load Ed25519 identity
     let identity_path = data_dir.join("identity.key");
+    made.key = !identity_path.exists();
     let identity = if identity_path.exists() && !force {
-        println!("Identity exists at {}", identity_path.display());
         NodeIdentity::from_file(&identity_path)?
     } else {
-        println!("Generating Ed25519 keypair...");
-        let id = NodeIdentity::load_or_create(&identity_path)?;
-        println!("  done.");
-        id
+        NodeIdentity::load_or_create(&identity_path)?
     };
 
     let pk = identity.public_key();
     let pk_bech32 = encode_public_key(&pk)?;
-    let x_pub = identity.x25519_public_key();
-    let x_bech32 = cordelia_crypto::bech32::bech32_encode(HRP_X25519_PK, &x_pub)?;
 
     // 2. Derive entity ID
     let entity_name = name.unwrap_or_else(default_entity_name);
@@ -1532,10 +1593,9 @@ fn init_with(
     // 3. Generate node token (32 bytes CSPRNG, hex-encoded)
     let token_path = config.token_path();
     let token_hex = if token_path.exists() && !force {
-        println!("Node token exists at {}", token_path.display());
         std::fs::read_to_string(&token_path)?.trim().to_string()
     } else {
-        println!("Generating node token...");
+        made.token = Wrote::over(token_path.exists());
         let token_bytes = cordelia_crypto::generate_psk()?; // 32 random bytes
         let hex_str = hex::encode(token_bytes);
         if let Some(parent) = token_path.parent() {
@@ -1547,22 +1607,18 @@ fn init_with(
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
         }
-        println!("  written to {}", token_path.display());
         hex_str
     };
 
     // 4. Create database
     if !db_path.exists() || force {
-        println!("Creating database...");
+        made.database = !db_path.exists();
         let _conn = open_database(&db_path, &config)?;
-        println!("  done.");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600))?;
         }
-    } else {
-        println!("Database exists at {}", db_path.display());
     }
 
     // No channel is made here. A device's channels are made from its
@@ -1574,6 +1630,7 @@ fn init_with(
     config.identity.entity_id = entity_id.clone();
     config.identity.public_key = pk_bech32.clone();
     if !config_file.exists() || force {
+        made.config = Wrote::over(config_file.exists());
         config.save(config_file)?;
         // The file that this wrote is its owner's alone to read. Where
         // it was written through a link, the file is kept elsewhere, and
@@ -1582,24 +1639,17 @@ fn init_with(
         if !is_a_link(config_file) {
             owners_alone(config_file)?;
         }
-        println!("Config written to {}", config_file.display());
     }
 
-    // Output
-    println!();
-    println!("Your identity:");
-    println!("  Entity ID:  {entity_id}");
-    println!("  Public key: {pk_bech32}");
-    println!("  X25519 key: {x_bech32}");
-
+    // The key is `cordelia id`'s to print, and the token is printed only
+    // when it is asked for.
     if show_secrets {
-        println!("  Node token: {token_hex}");
-    } else {
-        println!("  Node token: <written to {}>", token_path.display());
+        println!("Node token: {token_hex}");
     }
-
-    println!();
-    println!("{}", node_is_ready(non_interactive));
+    let dir = short_path(&data_dir.display().to_string());
+    if let Some(says) = init_says(made, &dir, non_interactive) {
+        println!("{says}");
+    }
 
     Ok(())
 }
@@ -2515,7 +2565,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     }
 
     let identity = NodeIdentity::from_file(&identity_path)?;
-    let pk_bech32 = encode_public_key(&identity.public_key())?;
 
     // Load bearer token
     let token_path = config.token_path();
@@ -2575,18 +2624,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     let warm_min = config.governor.warm_min;
     let warm_max = config.governor.warm_max;
 
-    println!("Cordelia v{version}");
-    println!("  Entity:    {}", config.identity.entity_id);
-    println!("  Public key: {pk_bech32}");
-    println!("  HTTP API:  http://{listen_addr}/api/v1/channels/identity");
-    if config.network.accepts_inbound() {
-        println!("  P2P port:  {p2p_port}/UDP");
-    } else {
-        println!("  P2P:       outbound only (no listening port)");
-    }
-    println!("  Role:      {role}");
-    println!();
-
+    // A daemon prints no banner: the log says that it started.
     tracing::info!(
         version,
         %role,
@@ -4938,8 +4976,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     short_path(&mapped_folder),
                     sync_label(&mapped)
                 );
-                println!();
-                since = None;
+                return Ok(());
             } else {
                 // `map` checks when it is run: it is not sent where it
                 // would sync another folder than one that was found
@@ -5066,14 +5103,18 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     }),
                     Some(carry_cmd::MAP_WAITS),
                 )?;
-                since = settings["generation"].as_u64();
-                if root != given {
-                    println!(
-                        "Claude Code keeps one memory for a repository, shared by its folders and worktrees."
-                    );
-                }
+                // Claude Code keeps one memory for a repository, shared by
+                // its folders and worktrees: a folder of one maps the
+                // repository, and the line says so.
+                let of = match root != given {
+                    true => format!(
+                        " (the repository of {})",
+                        short_path(&given.display().to_string())
+                    ),
+                    false => String::new(),
+                };
                 println!(
-                    "Mapped {} to {}.",
+                    "Mapped {}{of} to {}.",
                     short_path(&mapped_folder),
                     sync_label(&name)
                 );
@@ -5094,13 +5135,17 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                             .unwrap_or_default()
                     );
                 }
-                if std::path::Path::new(claude_dir) != home_dir.join(".claude") {
-                    println!(
-                        "Note: sync uses {}, not ~/.claude: the memory is kept under that directory.",
-                        short_path(claude_dir)
-                    );
+                // `map` says what it did, and not what syncs: `sync status`
+                // lists that. A device that sends nothing says so, with
+                // why, once its node has looked under the new mapping.
+                let generation = settings["generation"].as_u64();
+                let after = sync_status_since(config_path, generation)?;
+                if report_since(&after, generation)
+                    && let Some(why) = after["report"]["publishes_nothing"].as_str()
+                {
+                    println!("Nothing is sent from this device: {why}");
                 }
-                println!();
+                return Ok(());
             }
         }
         SyncCommand::Unmap { folder } => {
@@ -5185,7 +5230,6 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                 "/api/v1/sync/unmap",
                 serde_json::json!({ "folder": mapped }),
             )?;
-            since = after["generation"].as_u64();
             println!(
                 "No longer synced from this device: {} ({}). Its files stay where they are.",
                 short_path(mapped),
@@ -5194,7 +5238,10 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             if let Some(still_held) = still_held_says(&after) {
                 println!("{still_held}");
             }
-            println!();
+            // It returns once the node has looked under the change, as
+            // it always has: what is asked next sees the folder gone.
+            sync_status_since(config_path, after["generation"].as_u64())?;
+            return Ok(());
         }
         SyncCommand::Off => {
             set(serde_json::json!({ "enabled": false }))?;
@@ -5623,26 +5670,41 @@ fn map_would_sync_another(
     Some(history_cmd::printable(&why))
 }
 
-/// Print what syncs on this device, what was found and is not syncing, and
-/// what this person's other devices sync. After a change (`since` is the
-/// settings generation it left), waits briefly for a report made under
-/// the new settings: a cycle that was already running reports the old ones.
-fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()> {
+/// Whether the sync status `resp` holds a report made under the settings
+/// generation `since` or a later one.
+fn report_since(resp: &serde_json::Value, since: Option<u64>) -> bool {
+    !resp["report"].is_null() && resp["report"]["generation"].as_u64() >= since
+}
+
+/// The sync status. After a change (`since` is the settings generation
+/// it left), and with sync on, it waits briefly for a report made under
+/// the new settings: a cycle that was already running reports the old
+/// ones.
+fn sync_status_since(config_path: &str, since: Option<u64>) -> anyhow::Result<serde_json::Value> {
     let status = || api_post(config_path, "/api/v1/sync/status", serde_json::json!({}));
     let mut resp = status()?;
     if resp["enabled"].as_bool() != Some(true) {
-        println!("Sync is off. Turn it on with `cordelia sync claude`.");
-        return Ok(());
+        return Ok(resp);
     }
-    let fresh = |resp: &serde_json::Value| {
-        !resp["report"].is_null() && resp["report"]["generation"].as_u64() >= since
-    };
     for _ in 0..80 {
-        if fresh(&resp) {
+        if report_since(&resp, since) {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
         resp = status()?;
+    }
+    Ok(resp)
+}
+
+/// Print what syncs on this device, what was found and is not syncing, and
+/// what this person's other devices sync, from a report made under the
+/// settings generation `since` where one comes in time
+/// ([`sync_status_since`]).
+fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()> {
+    let resp = sync_status_since(config_path, since)?;
+    if resp["enabled"].as_bool() != Some(true) {
+        println!("Sync is off. Turn it on with `cordelia sync claude`.");
+        return Ok(());
     }
 
     let text = |v: &serde_json::Value| v.as_str().unwrap_or_default().to_string();
@@ -5653,7 +5715,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         short_path(&text(&resp["dir"]))
     );
     let report = &resp["report"];
-    if !fresh(&resp) {
+    if !report_since(&resp, since) {
         println!("  (still working on it: try `cordelia sync status` in a few seconds)");
         return Ok(());
     }
@@ -5766,8 +5828,12 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         print_columns(&elsewhere);
     }
 
-    println!();
-    println!("Only mapped folders sync. `cordelia sync map <folder>` syncs one.");
+    // Said only where nothing syncs, or a folder was found that does not:
+    // there is then one to map.
+    if folders.is_empty() || !unmapped.is_empty() {
+        println!();
+        println!("Only mapped folders sync. `cordelia sync map <folder>` syncs one.");
+    }
     for e in list(&report["errors"]) {
         println!("error: {}", text(&e));
     }
@@ -9160,17 +9226,48 @@ mod tests {
         assert!(help.contains("--since <SINCE>"), "{help}");
     }
 
-    /// Run by a person, `cordelia init` ends by saying how the node is
-    /// started. Run by a script, as the install script runs it, it says
-    /// nothing of that: the script names the command that starts the node
-    /// as the service.
+    /// Run by a person, `cordelia init` says in one line what it made
+    /// and how the node is started, or that nothing changed. Run by a
+    /// script, as the install script runs it, it says nothing: the script
+    /// names the command that starts the node as the service.
     #[test]
     fn test_init_run_by_a_script_does_not_say_how_to_start_the_node() {
+        let all = Made {
+            key: true,
+            database: true,
+            token: Wrote::New,
+            config: Wrote::New,
+        };
+        let forced = Made {
+            token: Wrote::Again,
+            config: Wrote::Again,
+            ..Made::default()
+        };
+        let a_database_put_back = Made {
+            database: true,
+            ..Made::default()
+        };
+        for made in [all, forced, a_database_put_back, Made::default()] {
+            assert_eq!(init_says(made, "~/.cordelia", true), None);
+        }
+        let says = |made| init_says(made, "~/.cordelia", false).unwrap();
         assert_eq!(
-            node_is_ready(false),
-            "Node is ready. Run `cordelia start` to begin."
+            says(all),
+            "Made this device's key and database in ~/.cordelia. Run `cordelia start` to begin."
         );
-        assert_eq!(node_is_ready(true), "Node is ready.");
+        assert_eq!(
+            says(forced),
+            "Made a new node token, and wrote this device's configuration file again. Run \
+             `cordelia start` to begin."
+        );
+        assert_eq!(
+            says(a_database_put_back),
+            "Made this device's database. Run `cordelia start` to begin."
+        );
+        assert_eq!(
+            says(Made::default()),
+            "This device has its key and database already: nothing changed."
+        );
     }
 
     /// `PRAGMA secure_delete` reads 1 on the connection a personal node

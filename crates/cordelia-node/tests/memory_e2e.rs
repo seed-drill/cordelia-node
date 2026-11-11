@@ -28,11 +28,13 @@ fn notes_of(n: &Node) -> (PathBuf, PathBuf) {
 }
 
 /// Turn sync on for `n`, and map its folder `notes` to the name `lab`.
-fn syncs_notes_as_lab(n: &Node, notes: &Path) {
+/// Returns what `map` said.
+fn syncs_notes_as_lab(n: &Node, notes: &Path) -> String {
     let out = n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
     assert!(out.starts_with("Sync turned on.\n"), "{out}");
     let out = n.cli(&["sync", "map", &path(notes), "lab"]);
     assert!(out.contains("Mapped ~/notes to lab."), "{out}");
+    out
 }
 
 /// The files of a memory folder, by name, with their texts: hidden files
@@ -136,8 +138,13 @@ fn a_phrase_is_made_its_folders_are_published_and_a_second_devices_folders_meet_
     }
 
     // Before there is a phrase: sync can be turned on and a folder
-    // mapped, and nothing is published. The status says why.
-    syncs_notes_as_lab(&a, &a_notes);
+    // mapped, and nothing is published. `map` says so, and the status
+    // says why.
+    let mapped = syncs_notes_as_lab(&a, &a_notes);
+    assert!(
+        mapped.contains("Nothing is sent from this device: no recovery phrase yet"),
+        "{mapped}"
+    );
     let said = wait_for("a says that nothing is sent", &all, 60, || {
         let out = a.cli(&["sync", "status"]);
         out.contains("Nothing is sent from this device")

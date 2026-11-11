@@ -21,12 +21,12 @@ use std::time::{Duration, Instant};
 
 use common::*;
 
-/// What a node writes to its log on the way to running: its banner, its
-/// endpoint, and the relays it worked out. The test of a node that stops
-/// before all that looks for none of them, and a test of a node that
-/// starts looks for each: a line that is reworded is then missed there,
-/// where it shows, and not only here, where it would pass.
-const A_STARTED_NODE_LOGS: [&str; 3] = ["Cordelia v", "P2P endpoint", "relays configured"];
+/// What a node writes to its log on the way to running: that it is
+/// starting, its endpoint, and the relays it worked out. The test of a
+/// node that stops before all that looks for none of them, and a test of
+/// a node that starts looks for each: a line that is reworded is then
+/// missed there, where it shows, and not only here, where it would pass.
+const A_STARTED_NODE_LOGS: [&str; 3] = ["node starting", "P2P endpoint", "relays configured"];
 
 fn path(p: &Path) -> String {
     p.to_str().unwrap().to_string()
@@ -1261,10 +1261,10 @@ fn a_node_with_no_identity_stops_before_it_dials() {
     assert!(!status.success());
     let log = std::fs::read_to_string(n.log()).unwrap();
     assert!(log.contains("Node not initialised"), "{log}");
-    // It got no further: not to the banner it prints once it has its
-    // identity, not to its endpoint, and not to the relays it would then
-    // have worked out. (The harness's configuration logs at debug, and
-    // the node is given no `RUST_LOG` to say otherwise.)
+    // It got no further: not to the line that says it is starting, once
+    // it has its identity, not to its endpoint, and not to the relays it
+    // would then have worked out. (The harness's configuration logs at
+    // debug, and the node is given no `RUST_LOG` to say otherwise.)
     for later in A_STARTED_NODE_LOGS {
         assert!(!log.contains(later), "{later}: {log}");
     }
@@ -1743,9 +1743,9 @@ fn a_node_at_the_ipv6_address_is_reached_there() {
     let own = format!("This device: {}", key_of(&n));
     assert!(out.status.success() && listed.contains(&own), "{listed}");
 
-    // There, as the node says when it starts.
+    // There, as the node's log says when it starts.
     let log = std::fs::read_to_string(n.log()).unwrap();
-    assert!(log.contains(&format!("http://[::1]:{}/", n.http)), "{log}");
+    assert!(log.contains(&format!("[::1]:{}", n.http)), "{log}");
     n.stop();
 }
 
@@ -1897,21 +1897,34 @@ fn cli_reports_when_the_node_is_not_running() {
     );
 }
 
-/// `cordelia init` ends by saying how the node is started, where a
-/// person runs it. Run by a script (`--non-interactive`), as the install
-/// script runs it, it says nothing of `cordelia start`: the script names
-/// the command that starts the node as the service.
+/// `cordelia init` says nothing where a script runs it
+/// (`--non-interactive`), as the install script does: the script names
+/// the command that starts the node as the service. Run by a person, it
+/// says in one line what it made and how the node is started, or that
+/// nothing changed.
 #[test]
 fn init_run_by_a_script_does_not_say_how_to_start_the_node() {
     let n = node("fresh", "personal", None);
-    let by_a_person = n.cli(&["init"]);
-    assert!(
-        by_a_person.ends_with("\nNode is ready. Run `cordelia start` to begin.\n"),
-        "{by_a_person}"
+    std::fs::create_dir_all(n.home()).unwrap();
+    let home = n.home().canonicalize().unwrap();
+    let init_in = |dir: &Path, args: &[&str]| {
+        let out = n.command_given(&[("CORDELIA_DATA_DIR", &path(dir))], args);
+        assert!(out.status.success(), "{out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let by_a_script = home.join("by-a-script");
+    assert_eq!(init_in(&by_a_script, &["init", "--non-interactive"]), "");
+    assert!(by_a_script.join("identity.key").exists());
+    let by_a_person = home.join("by-a-person");
+    assert_eq!(
+        init_in(&by_a_person, &["init"]),
+        "Made this device's key and database in ~/by-a-person. Run `cordelia start` to begin.\n"
     );
-    let by_a_script = n.cli(&["init", "--non-interactive"]);
-    assert!(by_a_script.ends_with("\nNode is ready.\n"), "{by_a_script}");
-    assert!(!by_a_script.contains("cordelia start"), "{by_a_script}");
+    assert_eq!(
+        init_in(&by_a_person, &["init"]),
+        "This device has its key and database already: nothing changed.\n"
+    );
+    assert_eq!(init_in(&by_a_person, &["init", "--non-interactive"]), "");
 }
 
 /// A clone of this repository at `rel` under `home`: a git repository
@@ -1999,7 +2012,10 @@ fn a_map_whose_git_does_not_answer_is_refused_in_time_and_maps_nothing() {
     assert!(mapped_names(&state(&laptop)).is_empty());
 
     let said = laptop.cli(&["sync", "map", &path(&deep), "tools"]);
-    assert!(said.contains("Mapped ~/work/tools to tools."), "{said}");
+    assert!(
+        said.contains("Mapped ~/work/tools (the repository of ~/work/tools/src) to tools."),
+        "{said}"
+    );
     assert_eq!(mapped_names(&state(&laptop)), ["tools"]);
 }
 
@@ -2040,7 +2056,15 @@ fn a_map_with_no_name_whose_git_does_not_give_the_remote_is_refused_in_time() {
     let mut laptop = node("laptop", "personal", None);
     laptop.start();
     wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
-    sync_on(&laptop);
+    // Nothing is mapped, and nothing was found: turning sync on says how
+    // a folder comes to sync.
+    let on = sync_on(&laptop);
+    assert!(!on.contains("Found on this machine"), "{on}");
+    assert!(
+        on.contains("Nothing syncs yet.")
+            && on.contains("Only mapped folders sync. `cordelia sync map <folder>` syncs one."),
+        "{on}"
+    );
     let repo = clone_at(&laptop.home(), "work/tools");
     let path_var = git_that_hangs_for_get_url(laptop.dir.path());
 
@@ -2236,12 +2260,17 @@ fn claude_memory_syncs_between_two_machines() {
 
     // A maps the project (from one of its subdirectories: the repository is
     // what gets mapped, under its remote), the folder under a name, and home.
+    // `map` says what it did, and nothing more: what syncs is for `sync
+    // status` to list.
     let sub = a_repo.join("crates/x");
     std::fs::create_dir_all(&sub).unwrap();
     let out = a.cli(&["sync", "map", &path(&sub)]);
-    assert!(
-        out.contains(&format!("Mapped ~/Work/cordelia-node to {PROJECT}.")),
-        "{out}"
+    assert_eq!(
+        out,
+        format!(
+            "Mapped ~/Work/cordelia-node (the repository of ~/Work/cordelia-node/crates/x) to \
+             {PROJECT}.\n"
+        )
     );
     a.cli(&["sync", "map", &path(&a_notes), "lab-notes"]);
     let out = a.cli(&["sync", "map", &path(&a.home()), "--home"]);
@@ -2350,6 +2379,9 @@ fn claude_memory_syncs_between_two_machines() {
         "{status}"
     );
     assert!(!status.contains("Found on this machine"), "{status}");
+    // Nothing was found that does not sync: there is nothing to map, and
+    // so no word of mapping.
+    assert!(!status.contains("Only mapped folders sync"), "{status}");
 
     // The status indicator: once everything has reached the relay, both
     // devices say so.
@@ -2524,13 +2556,22 @@ fn claude_memory_syncs_between_two_machines() {
     assert_eq!(mapped_names(&s), [PROJECT, "lab-notes", "~"], "{s}");
 
     // Unmapping, by name or by folder, stops the sync from this device and
-    // leaves the files. The folder is back among those found.
+    // leaves the files. `unmap` says that, and nothing more. The folder is
+    // back among those found.
     let out = a.cli(&["sync", "unmap", "lab-notes"]);
-    assert!(out.contains("Its files stay where they are."), "{out}");
-    assert!(out.contains("cordelia sync map ~/notes <name>"), "{out}");
+    assert_eq!(
+        out,
+        "No longer synced from this device: ~/notes (lab-notes). Its files stay where they \
+         are.\n"
+    );
+    let found = a.cli(&["sync", "status"]);
     assert!(
-        out.contains("cordelia sync map <folder> lab-notes"),
-        "B still syncs it:\n{out}"
+        found.contains("cordelia sync map ~/notes <name>"),
+        "{found}"
+    );
+    assert!(
+        found.contains("cordelia sync map <folder> lab-notes"),
+        "B still syncs it:\n{found}"
     );
     assert_eq!(
         read(&a_notes_mem.join("idea.md")).as_deref(),

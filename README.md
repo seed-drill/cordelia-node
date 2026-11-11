@@ -154,6 +154,9 @@ cordelia sync status                  # what syncs, what was found, what your ot
   of your devices can read every name you have.
 - **A memory file syncs if it fits in 60 KB,** with its name. A larger file
   stays as it is, and `cordelia sync status` names it.
+- `cordelia sync map` says only what it mapped. Once the folder syncs,
+  the status line shows its errors and files too large to sync, and
+  `cordelia sync status` names every file that does not sync.
 - `cordelia sync unmap <folder or name>` stops a folder syncing from this
   device; its files stay. `cordelia sync off` stops all syncing.
 
