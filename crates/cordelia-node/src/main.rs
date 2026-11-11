@@ -1157,12 +1157,35 @@ fn from_a_later_version(db_path: &std::path::Path, found: u32, own: u32) -> Stri
     )
 }
 
+/// What is said of a database from a Cordelia before 0.2.0-alpha.19, in
+/// the words of decision 2026-11-10 (older kind), rule 6: that this
+/// version cannot open it and changed nothing, and the two ways on, with
+/// the data directory that holds it.
+fn from_an_earlier_version(data_dir: &std::path::Path) -> String {
+    format!(
+        "This database is from a Cordelia before 0.2.0-alpha.19. This version cannot open it, \
+         and changed nothing.\n\
+         To keep it: install 0.2.0-alpha.19 (`CORDELIA_VERSION=v0.2.0-alpha.19`, for the \
+         install command or a relay's image), start it once, then install this version \
+         again.\n\
+         Or start afresh: move {} aside and run `cordelia init`. Then run `cordelia phrase` on \
+         your first device, add this one from another of yours, or run `cordelia recover`.",
+        data_dir.display()
+    )
+}
+
+/// The data directory that holds the database at `db_path`.
+fn data_dir_of(db_path: &std::path::Path) -> &std::path::Path {
+    db_path.parent().unwrap_or(db_path)
+}
+
 /// Open the node's database, as a command that opens it itself does, with
 /// the schema's steps run, and set on the connection, before they run,
 /// what a node of the role that `config` gives keeps
-/// ([`keeps_secure_delete`]). **A database
-/// from a later version is refused** (decision 2026-10-04 §10.1): the
-/// command names both versions, and changes nothing.
+/// ([`keeps_secure_delete`]). **A database from a later version is
+/// refused** (decision 2026-10-04 §10.1): the command names both
+/// versions, and changes nothing. **So is one from before alpha.19**
+/// (decision 2026-11-10 (older kind), rule 6), in that record's words.
 fn open_database(
     db_path: &std::path::Path,
     config: &Config,
@@ -1173,24 +1196,30 @@ fn open_database(
         Err(StorageError::LaterVersion { found, own }) => {
             anyhow::bail!("{}", from_a_later_version(db_path, found, own))
         }
+        Err(StorageError::EarlierVersion { .. }) => {
+            anyhow::bail!("{}", from_an_earlier_version(data_dir_of(db_path)))
+        }
         Err(e) => Err(e.into()),
     }
 }
 
 /// Open the database as the node opens it when it starts (decision
-/// 2026-10-04 §10.1). One from a later version is refused: a personal
-/// node then stays up, over a database of its own in memory, with why
-/// (the second of what is returned); a node of any other role does not
-/// start without its database, and says why. The connection is set as a
-/// node of the role that `config` gives keeps it, before the schema's
-/// steps run ([`keeps_secure_delete`]); a relay's has the automatic
-/// checkpoint off, for it checkpoints on a timer of its own in a take of
-/// its lock of kind Checkpoint (issue #224; [`relay_entries::kept_by`],
-/// the same test that gives the node the relay's part that runs it).
+/// 2026-10-04 §10.1). One from a later version is refused, and so is one
+/// from before alpha.19 (decision 2026-11-10 (older kind), rule 6): a
+/// personal node then stays up, over a database of its own in memory,
+/// held, with why (the second of what is returned); a node of any other
+/// role does not start without its database, and says why. The log names
+/// the step an earlier one is at. The connection is set as a node of the
+/// role that `config` gives keeps it, before the schema's steps run
+/// ([`keeps_secure_delete`]); a relay's has the automatic checkpoint off,
+/// for it checkpoints on a timer of its own in a take of its lock of kind
+/// Checkpoint (issue #224; [`relay_entries::kept_by`], the same test that
+/// gives the node the relay's part that runs it).
 fn open_the_nodes_database(
     db_path: &std::path::Path,
     config: &Config,
-) -> anyhow::Result<(rusqlite::Connection, Option<String>)> {
+) -> anyhow::Result<(rusqlite::Connection, Option<cordelia_api::state::Held>)> {
+    use cordelia_api::state::Held;
     let role = config.network.role.as_str();
     let secure_delete = keeps_secure_delete(role);
     match cordelia_storage::db::open_as(db_path, secure_delete) {
@@ -1206,18 +1235,27 @@ fn open_the_nodes_database(
             }
             Ok((conn, None))
         }
-        Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
-            let why = from_a_later_version(db_path, found, own);
+        Err(e) => {
+            let held = match e {
+                cordelia_storage::StorageError::LaterVersion { found, own } => {
+                    Held::LaterDatabase(from_a_later_version(db_path, found, own))
+                }
+                cordelia_storage::StorageError::EarlierVersion { found } => {
+                    let why = from_an_earlier_version(data_dir_of(db_path));
+                    tracing::error!("the database is at schema step {found}: {why}");
+                    Held::EarlierDatabase(why)
+                }
+                e => return Err(e.into()),
+            };
             if role != "personal" {
-                anyhow::bail!("{why}");
+                anyhow::bail!("{}", held.says());
             }
             let conn = cordelia_storage::db::open_in_memory()?;
             if secure_delete {
                 cordelia_storage::db::secure_delete_on(&conn)?;
             }
-            Ok((conn, Some(why)))
+            Ok((conn, Some(held)))
         }
-        Err(e) => Err(e.into()),
     }
 }
 
@@ -2565,14 +2603,15 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     }
 
     // Open database. One from a later version is refused (decision
-    // 2026-10-04 §10.1). A personal node then stays up, over a database
-    // of its own in memory, and says so in its status: nothing of the
-    // one on disk is read or changed, and under a service that restarts
-    // what stops, stopping would be a loop. A node of any other role
-    // carries what other nodes hand it, and does not start without its
-    // database: it says why, and stops.
+    // 2026-10-04 §10.1), and so is one from before alpha.19 (decision
+    // 2026-11-10 (older kind), rule 6). A personal node then stays up,
+    // over a database of its own in memory, and says so in its status:
+    // nothing of the one on disk is read or changed, and under a service
+    // that restarts what stops, stopping would be a loop. A node of any
+    // other role carries what other nodes hand it, and does not start
+    // without its database: it says why, and stops.
     let db_path = data_dir.join("cordelia.db");
-    let (conn, later) = open_the_nodes_database(&db_path, &config)?;
+    let (conn, open_held) = open_the_nodes_database(&db_path, &config)?;
 
     let version = env!("CARGO_PKG_VERSION");
     let role = &config.network.role;
@@ -4465,9 +4504,10 @@ fn refuse_beside_its_node(config: &Config) -> anyhow::Result<()> {
 /// - **Where a node holds it,** it is opened for reading only, and none of
 ///   the schema's steps is run: nothing is written beside the node. It is
 ///   read only where it stands at this command's schema version, which
-///   the running node has stepped it to. One from a later version is
-///   refused, as any command refuses it ([`from_a_later_version`]); at an
-///   earlier one the node is of another version, and nothing is opened
+///   the running node has stepped it to. One from a later version, or from
+///   before alpha.19, is refused, as any command refuses it
+///   ([`from_a_later_version`], [`from_an_earlier_version`]); at alpha.19's
+///   the node is of another version, and nothing is opened
 ///   ([`not_read_beside_another_version`]).
 fn open_to_read(config: &Config) -> anyhow::Result<rusqlite::Connection> {
     open_to_read_knowing(config, Known::Ask)
@@ -4496,6 +4536,11 @@ fn open_to_read_knowing(config: &Config, known: Known) -> anyhow::Result<rusqlit
     let own = cordelia_storage::schema::SCHEMA_VERSION;
     if found > own {
         anyhow::bail!("{}", from_a_later_version(&db_path, found, own));
+    }
+    // A node of this version holds a database from before alpha.19 as it
+    // found it (decision 2026-11-10 (older kind), rule 6).
+    if (1..cordelia_storage::schema::ALPHA_19_VERSION).contains(&found) {
+        anyhow::bail!("{}", from_an_earlier_version(&data_dir));
     }
     if found != own {
         anyhow::bail!(
@@ -8364,6 +8409,16 @@ mod tests {
             open_to_read(&config).unwrap_err().to_string(),
             from_a_later_version(&database, later, SCHEMA_VERSION)
         );
+        // And one from before alpha.19, in the words of decision
+        // 2026-11-10 (older kind), rule 6.
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 32)
+            .unwrap();
+        assert_eq!(
+            open_to_read(&config).unwrap_err().to_string(),
+            from_an_earlier_version(dir.path())
+        );
         drop(held);
 
         // What is said names the commands to run instead, on each system.
@@ -9753,9 +9808,35 @@ mod tests {
             .unwrap();
         let (held, why) = open_the_nodes_database(&later, &as_a("personal")).unwrap();
         assert_eq!(secure_delete(&held), 1);
-        assert!(why.is_some_and(|why| why.contains("later version")));
+        assert!(why.is_some_and(|why| why.says().contains("later version")));
         assert!(open_the_nodes_database(&later, &as_a("relay")).is_err());
         assert!(open_database(&later, &as_a("personal")).is_err());
+
+        // And one from before alpha.19 (decision 2026-11-10 (older kind),
+        // rule 6).
+        let earlier = dir.path().join("earlier.db");
+        rusqlite::Connection::open(&earlier)
+            .unwrap()
+            .pragma_update(None, "user_version", 32)
+            .unwrap();
+        let (held, why) = open_the_nodes_database(&earlier, &as_a("personal")).unwrap();
+        assert_eq!(secure_delete(&held), 1);
+        assert_eq!(
+            why,
+            Some(cordelia_api::state::Held::EarlierDatabase(
+                from_an_earlier_version(dir.path())
+            ))
+        );
+        for role in ["relay", "bootnode"] {
+            let refused = open_the_nodes_database(&earlier, &as_a(role)).unwrap_err();
+            assert_eq!(refused.to_string(), from_an_earlier_version(dir.path()));
+        }
+        assert_eq!(
+            open_database(&earlier, &as_a("personal"))
+                .unwrap_err()
+                .to_string(),
+            from_an_earlier_version(dir.path())
+        );
     }
 
     /// The connection a relay's node runs on has SQLite's automatic
@@ -9881,6 +9962,22 @@ mod tests {
             let command = open_database(&path, &as_a(role)).unwrap();
             assert_eq!(held(&command, &path), times, "{role}");
         }
+    }
+
+    /// What is said of a database from before alpha.19 is the record's
+    /// words, line for line, with the data directory in its place
+    /// (decision 2026-11-10 (older kind), rule 6).
+    #[test]
+    fn a_database_from_before_alpha_19_is_said_in_the_records_words() {
+        const RECORD: &str =
+            include_str!("../../../docs/decisions/2026-11-10-removing-the-older-kind.md");
+        let said = from_an_earlier_version(std::path::Path::new("<data directory>"));
+        assert_eq!(said.lines().count(), 3, "{said}");
+        for line in said.lines() {
+            assert!(RECORD.contains(&format!("\n> {line}\n")), "{line}");
+        }
+        let said = from_an_earlier_version(std::path::Path::new("/home/sam/.cordelia"));
+        assert!(said.contains("move /home/sam/.cordelia aside"), "{said}");
     }
 
     #[test]

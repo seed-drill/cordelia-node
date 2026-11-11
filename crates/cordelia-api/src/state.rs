@@ -54,33 +54,33 @@ pub struct AppState {
     pub held: HeldUp,
 }
 
-/// Why a node is held up (decision 2026-10-04 §10.1).
+/// Why a node is held up (decision 2026-10-04 §10.1; decision 2026-11-10
+/// (older kind), rule 6). Either way the node runs over a database of its
+/// own in memory, and nothing of the one on disk is read or changed, for
+/// as long as it runs. It says why, in words for a person.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Held {
-    /// Its first start on this version has not succeeded: the copy could
-    /// not be made, or the step failed. It is tried again each time a
-    /// cycle would have run. It says why, in words for a person.
-    FirstStart(String),
-    /// Its database is from a later version than its own: the node runs
-    /// over a database of its own in memory, and nothing of the one on
-    /// disk is read or changed, for as long as the node runs. It says
-    /// so, with both versions.
+    /// Its database is from a later version than its own: it says so,
+    /// with both versions.
     LaterDatabase(String),
+    /// Its database is from a Cordelia before alpha.19, which this version
+    /// does not take over: it says so, with the ways on.
+    EarlierDatabase(String),
 }
 
 impl Held {
     /// Why the node is held up, in words for a person.
     pub fn says(&self) -> &str {
         match self {
-            Held::FirstStart(why) | Held::LaterDatabase(why) => why,
+            Held::LaterDatabase(why) | Held::EarlierDatabase(why) => why,
         }
     }
 
     /// What it is held up by, as a status names it.
     pub fn kind(&self) -> &'static str {
         match self {
-            Held::FirstStart(_) => "first_start",
             Held::LaterDatabase(_) => "later_database",
+            Held::EarlierDatabase(_) => "earlier_database",
         }
     }
 }
@@ -90,38 +90,12 @@ impl Held {
 /// A node that is held up does not stop: under a service that restarts
 /// what stops, stopping would be a loop, and a stopped node can say
 /// nothing. It stays up, and says why.
-///
-/// It is kept in memory: a step that fails because the database cannot
-/// be written has nowhere else to put it.
-///
-/// With it is what one start of the node keeps of its first start on this
-/// version: what its tries keep between them, and how many key files of
-/// an older version were left in place.
 #[derive(Default)]
 pub struct HeldUp {
     why: Mutex<Option<Held>>,
-    tries: Mutex<crate::first_start::Tries>,
-    key_files_in_place: std::sync::atomic::AtomicUsize,
 }
 
 impl HeldUp {
-    /// What the tries at the first start keep between them. One try is
-    /// made at a time: the next waits here for it.
-    pub fn tries(&self) -> std::sync::MutexGuard<'_, crate::first_start::Tries> {
-        self.tries.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// How many key files of an older version were left in place at this
-    /// start, since no copy holds them (decision 2026-10-04 §10.1).
-    pub fn key_files_in_place(&self) -> usize {
-        self.key_files_in_place.load(Ordering::Relaxed)
-    }
-
-    /// Note how many key files of an older version were left in place.
-    pub fn set_key_files_in_place(&self, files: usize) {
-        self.key_files_in_place.store(files, Ordering::Relaxed);
-    }
-
     /// Why the node is held up, where it is.
     pub fn why(&self) -> Option<Held> {
         self.why.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -138,7 +112,8 @@ impl HeldUp {
         *self.why.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
     }
 
-    /// The node is held up no longer.
+    /// The node is held up no longer: for a test that holds a node and
+    /// lets it go. A node that runs is held for as long as it runs.
     pub fn release(&self) {
         *self.why.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
