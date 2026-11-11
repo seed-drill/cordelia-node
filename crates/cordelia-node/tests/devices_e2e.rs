@@ -548,7 +548,7 @@ fn a_node_told_to_stop_gives_an_open_request_one_stream_timeout() {
 
         let mut held = std::net::TcpStream::connect(("127.0.0.1", n.http)).unwrap();
         let head = format!(
-            "POST /api/v1/channels/publish HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{{\"channel\":",
+            "POST /api/v1/sync/map HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: 64\r\n\r\n{{\"channel\":",
             n.token()
         );
         held.write_all(head.as_bytes()).unwrap();

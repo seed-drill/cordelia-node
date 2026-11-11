@@ -911,9 +911,10 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
 /// A device serves none of the Channels API of the older kind (decision
 /// 2026-10-04 §10): it carries no channel of that kind, so there is
 /// nothing to subscribe to, no group, no direct channel and no key to
-/// rotate, before it follows a phrase and after. A relay serves each of
-/// those paths as it did. What a device serves under the same scope is
-/// the local API for the names it holds.
+/// rotate, before it follows a phrase and after. Nor does a relay
+/// (decision 2026-11-10 (older kind), rule 2): of that scope it serves
+/// its identity alone. What a device serves under the same scope is the
+/// local API for the names it holds.
 #[test]
 fn a_device_serves_none_of_the_channels_api_of_the_older_kind() {
     const OLDER: [&str; 14] = [
@@ -941,8 +942,12 @@ fn a_device_serves_none_of_the_channels_api_of_the_older_kind() {
     };
     for path in OLDER {
         assert!(!served(&laptop, path), "{path}, with no phrase");
-        assert!(served(&relay, path), "{path}, on the relay");
+        assert!(!served(&relay, path), "{path}, on the relay");
     }
+    for path in ["publish", "entries", "delete-key"] {
+        assert!(!served(&relay, path), "{path}, on the relay");
+    }
+    assert!(served(&relay, "identity"));
     makes_a_phrase(&laptop, "laptop");
     for path in OLDER {
         assert!(!served(&laptop, path), "{path}, with a phrase");

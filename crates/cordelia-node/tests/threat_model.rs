@@ -1546,8 +1546,7 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
             let s = status(&a);
             let held = at_its_relay(&a)["holds_latest"] == true;
             has_sent_everything(&a)?;
-            (held && s["outbox_waiting"] == 0 && s["outbox_refused"].as_array()?.is_empty())
-                .then_some(())
+            (held && s["outbox_waiting"] == 0).then_some(())
         },
     );
     assert!(relay.pushes_of(&item) > offered_while_refused);
@@ -1908,8 +1907,7 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
 
     // The `messages` object counts what was refused, each message once,
     // and names who fills the channel; nothing of it is in what the level
-    // is worked out from, and no message enters the outbox of the older
-    // kind, which a relay's refusal there would fill.
+    // is worked out from, and nothing waits to be sent.
     let sent = 1 + said_no_room.get();
     let status = wait_for("the status counts every message refused", &[&a], 60, || {
         let status: serde_json::Value =
@@ -1921,7 +1919,6 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
     assert_eq!(messages["filled_by"]["label"], "laptop", "{messages}");
     assert_eq!(messages["filled_by"]["entries"], sent, "{messages}");
     assert_eq!(messages["no_place"], false, "{messages}");
-    assert_eq!(status["outbox_refused"], serde_json::json!([]), "{status}");
     assert_eq!(status["outbox_waiting"], 0, "{status}");
     assert_eq!(how_it_stands(&a), before);
 }

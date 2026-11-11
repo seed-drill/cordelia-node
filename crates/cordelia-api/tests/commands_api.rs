@@ -40,13 +40,9 @@ fn state_of(network: bool) -> (web::Data<AppState>, tempfile::TempDir) {
         sync_errors: AtomicU64::new(0),
         peers_hot: AtomicU64::new(0),
         peers_warm: AtomicU64::new(0),
-        push_tx: None,
         networked: network,
-        announce_tx: None,
         peers: Default::default(),
         relays: Default::default(),
-        outbox_refused: Default::default(),
-        relist: Default::default(),
         sync_control: Default::default(),
         own_channels: Default::default(),
         held: Default::default(),
@@ -1280,7 +1276,8 @@ async fn test_a_node_with_a_database_from_a_later_version_takes_no_request_but_i
 /// of the older kind of channel (decision 2026-10-04 §10): its status,
 /// its identity and its metrics count the names it holds, though its
 /// database holds a channel of the older kind that it is a member of.
-/// The routes of a node that carries that kind count it, as they did.
+/// The routes of a relay count none of it either: they count the
+/// channels it holds (decision 2026-11-10 (older kind), rule 3).
 #[actix_web::test]
 async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
     let (state, _dir) = state_of(false);
@@ -1288,8 +1285,19 @@ async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
         let db = state.db.lock().unwrap();
         let own = state.identity.public_key();
         let group = "grp_550e8400-e29b-41d4-a716-446655440000";
-        cordelia_storage::channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
-        cordelia_storage::channels::add_member(&db, group, &own, "owner").unwrap();
+        db.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                   created_at, updated_at)
+             VALUES (?1, 'group', 'realtime', 'invite_only', ?2, '2026-10-01', '2026-10-01')",
+            rusqlite::params![group, own.as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO channel_members (channel_id, entity_key, role, joined_at)
+             VALUES (?1, ?2, 'owner', '2026-10-01')",
+            rusqlite::params![group, own.as_slice()],
+        )
+        .unwrap();
     }
     let get = |path: &'static str| {
         test::TestRequest::get()
@@ -1297,7 +1305,7 @@ async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
             .insert_header(("Authorization", format!("Bearer {TOKEN}")))
             .to_request()
     };
-    for (device, counted) in [(true, 0), (false, 1)] {
+    for (device, counted) in [(true, 0), (false, 0)] {
         let routes = match device {
             true => cordelia_api::configure_device_routes,
             false => cordelia_api::configure_routes,
@@ -1320,9 +1328,8 @@ async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
             metrics.contains(&format!("cordelia_channels_subscribed {counted}\n")),
             "{device}: {metrics}"
         );
-        assert_eq!(
-            metrics.contains("cordelia_items_total{channel=\"550e8400\"}"),
-            !device,
+        assert!(
+            !metrics.contains("cordelia_items_total"),
             "{device}: {metrics}"
         );
     }
