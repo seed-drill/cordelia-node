@@ -9239,51 +9239,36 @@ mod tests {
             from_an_earlier_version(dir.path())
         );
 
-        // And alpha.19's, whose step 34 does not finish, as on a disk with
-        // too little room (decision 2026-11-10 (older kind), rule 9): a
-        // personal node is held up with the words, and every role and
-        // command says them. The database stays at step 33.
-        let full = dir.path().join("full.db");
+        // And alpha.19's, whose step 34 stops for a reason that is neither
+        // a full disk nor one of I/O (decision 2026-11-10 (older kind), rule
+        // 9): no role is held for it, and none starts; a command says the
+        // same. The database stays at step 33. (A full disk is held: see
+        // first_start_e2e.)
+        let stopped = dir.path().join("stopped.db");
         {
-            let conn = rusqlite::Connection::open(&full).unwrap();
+            let conn = rusqlite::Connection::open(&stopped).unwrap();
             cordelia_storage::schema::init_db_as_alpha_19(&conn).unwrap();
             conn.execute_batch(
                 "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x');
-                 CREATE TRIGGER a_full_disk BEFORE DELETE ON node_meta
-                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+                 CREATE TRIGGER a_stop BEFORE DELETE ON node_meta
+                 BEGIN SELECT RAISE(ABORT, 'stopped here'); END;",
             )
             .unwrap();
         }
-        let says = |said: &str| {
-            for words in [
-                format!("the database at {} could not be brought", full.display()),
-                "schema step 34 did not finish (database or disk is full)".to_string(),
-                "Nothing was changed. The step needs free room on the disk of about the size of \
-                 the database, 1 MB."
-                    .to_string(),
-                "then start the node again: it tries again when it starts.".to_string(),
-            ] {
-                assert!(said.contains(&words), "{words:?} is not in: {said}");
-            }
-        };
-        let (held, why) = open_the_nodes_database(&full, &as_a("personal")).unwrap();
-        assert_eq!(secure_delete(&held), 1);
-        let why = why.unwrap();
-        assert_eq!(why.kind(), "step_failed");
-        says(why.says());
-        for role in ["relay", "bootnode"] {
-            says(
-                &open_the_nodes_database(&full, &as_a(role))
-                    .unwrap_err()
-                    .to_string(),
-            );
-        }
-        says(
-            &open_database(&full, &as_a("personal"))
+        for role in ["personal", "relay", "bootnode"] {
+            let said = open_the_nodes_database(&stopped, &as_a(role))
                 .unwrap_err()
-                .to_string(),
+                .to_string();
+            assert!(said.contains("stopped here"), "{role}: {said}");
+            assert!(!said.contains("free room"), "{role}: {said}");
+        }
+        assert!(
+            open_database(&stopped, &as_a("personal"))
+                .unwrap_err()
+                .to_string()
+                .contains("stopped here")
         );
-        let version: u32 = rusqlite::Connection::open(&full)
+        let version: u32 = rusqlite::Connection::open(&stopped)
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();

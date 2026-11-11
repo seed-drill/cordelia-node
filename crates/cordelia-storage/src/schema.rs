@@ -129,13 +129,23 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
-/// What is said of step `step` that did not finish, with why.
+/// What is said of step `step` that did not finish, with why, where the
+/// disk is full or could not be written (decision 2026-11-10 (older kind),
+/// rule 9): SQLite's `SQLITE_FULL` and `SQLITE_IOERR`, with their extended
+/// codes. A node is held for these until its next start. Any other error,
+/// a busy lock among them, goes on as it is: the node stops, and a service
+/// starts it again.
 fn failed(step: u32, e: StorageError) -> StorageError {
-    let why = match e {
-        StorageError::Sqlite(e) => e.to_string(),
-        e => e.to_string(),
-    };
-    StorageError::StepFailed { step, why }
+    use rusqlite::ErrorCode::{DiskFull, SystemIoFailure};
+    match e {
+        StorageError::Sqlite(rusqlite::Error::SqliteFailure(found, ref said))
+            if matches!(found.code, DiskFull | SystemIoFailure) =>
+        {
+            let why = said.clone().unwrap_or_else(|| found.to_string());
+            StorageError::StepFailed { step, why }
+        }
+        e => e,
+    }
 }
 
 /// The pragmas of every connection to the database: write-ahead logging,
@@ -587,40 +597,74 @@ mod tests {
         );
     }
 
-    /// Make step 34 fail on alpha.19's database at `path`, as a disk with
-    /// too little room would: a trigger that stops its last write.
-    pub(crate) fn step_34_cannot_finish(path: &std::path::Path) {
-        let conn = Connection::open(path).unwrap();
-        init_db_as_alpha_19(&conn).unwrap();
-        conn.execute_batch(
-            "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x');
-             CREATE TRIGGER step_34_cannot_finish BEFORE DELETE ON node_meta
-             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
-        )
-        .unwrap();
-    }
-
-    /// A step that does not finish says which, and why, and changes
-    /// nothing: the database is at the step before, with every table it
-    /// had (decision 2026-11-10 (older kind), rule 9).
+    /// A step that does not finish changes nothing: the database is at
+    /// the step before, with every table it had (decision 2026-11-10
+    /// (older kind), rule 9). Here a trigger stops the step's last write,
+    /// an error that is neither a full disk nor one of I/O: it goes on as
+    /// it is, and is not a step that did not finish for want of room.
     #[test]
     fn a_step_that_does_not_finish_changes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("cordelia.db");
-        step_34_cannot_finish(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            init_db_as_alpha_19(&conn).unwrap();
+            conn.execute_batch(
+                "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x');
+                 CREATE TRIGGER step_34_cannot_finish BEFORE DELETE ON node_meta
+                 BEGIN SELECT RAISE(ABORT, 'stopped'); END;",
+            )
+            .unwrap();
+        }
         let before = definitions(&Connection::open(&path).unwrap());
         let refused = match crate::db::open(&path) {
             Err(e) => e,
             Ok(_) => panic!("the step finished"),
         };
         assert!(
-            matches!(&refused, StorageError::StepFailed { step: 34, why }
-                if why.contains("database or disk is full")),
+            matches!(&refused, StorageError::Sqlite(e) if e.to_string().contains("stopped")),
             "{refused:?}"
         );
         let conn = Connection::open(&path).unwrap();
         assert_eq!(version(&conn), ALPHA_19_VERSION);
         assert_eq!(definitions(&conn), before);
+    }
+
+    /// Only a full disk, or a write or read that failed, is a step that did
+    /// not finish for want of room (rule 9): `SQLITE_FULL` and
+    /// `SQLITE_IOERR`, with their extended codes. A busy lock, and any
+    /// other error, goes on as it is.
+    #[test]
+    fn only_a_full_disk_or_an_io_error_is_a_step_that_did_not_finish() {
+        use rusqlite::ffi;
+        let sqlite = |code: i32| {
+            StorageError::Sqlite(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None))
+        };
+        for code in [ffi::SQLITE_FULL, ffi::SQLITE_IOERR, ffi::SQLITE_IOERR_WRITE] {
+            assert!(
+                matches!(
+                    failed(34, sqlite(code)),
+                    StorageError::StepFailed { step: 34, .. }
+                ),
+                "{code}"
+            );
+        }
+        let full = failed(34, sqlite(ffi::SQLITE_FULL));
+        assert!(full.to_string().contains("database is full"), "{full}");
+        for code in [
+            ffi::SQLITE_BUSY,
+            ffi::SQLITE_LOCKED,
+            ffi::SQLITE_CONSTRAINT_TRIGGER,
+        ] {
+            assert!(
+                matches!(failed(34, sqlite(code)), StorageError::Sqlite(_)),
+                "{code}"
+            );
+        }
+        assert!(matches!(
+            failed(34, StorageError::Migration("x".into())),
+            StorageError::Migration(_)
+        ));
     }
 
     /// A store opened as a personal node opens it has `secure_delete` on

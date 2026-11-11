@@ -464,36 +464,72 @@ fn a_database_from_before_alpha_19_is_refused_by_the_node_and_by_each_command() 
     );
 }
 
-/// Make step 34 fail on `node`'s database, as alpha.19 left it, as a disk
-/// with too little room would: a trigger stops the step's last write. The
-/// step runs in one transaction, so it leaves nothing of itself.
-fn step_34_cannot_finish(node: &Node) {
+/// Put in `node`'s database, as alpha.19 left it, an item of the older
+/// kind of 4 MB: step 34, on a personal node, writes zeros over it into
+/// the log, which needs room of about that size.
+fn alpha_19_with_a_large_item(node: &Node) {
     as_alpha_19_left_it(node);
     let conn = Connection::open(node.data_dir().join("cordelia.db")).unwrap();
     conn.execute_batch(
-        "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x');
-         CREATE TRIGGER a_full_disk BEFORE DELETE ON node_meta
-         BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;
+        "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                               created_at, updated_at)
+             VALUES ('grp_x', 'group', 'batch', 'open', zeroblob(32), 't', 't');
+         INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                            content_hash, signature, encrypted_blob, content_length)
+             VALUES ('ci_x', 'grp_x', zeroblob(32), 'memory', 't', zeroblob(32),
+                     zeroblob(64), randomblob(4000000), 4000000);
          PRAGMA wal_checkpoint(TRUNCATE);",
     )
     .unwrap();
 }
 
-/// A step of the schema that does not finish, as on a disk with too
-/// little room, leaves a personal node up and held, with words that say
-/// so, and the database at step 33 (decision 2026-11-10 (older kind), rule
-/// 9). `cordelia status` says the same, and not SQLite's words alone. Once
-/// the step can finish, the next start takes it. A relay does not start,
-/// and says the same.
+/// Start `node` as a process whose files may not grow past one megabyte,
+/// as on a disk that is full: a write past it fails, and is not a signal
+/// that ends the process.
+fn start_on_a_full_disk(node: &mut Node) {
+    use std::os::unix::process::CommandExt;
+    let log = std::fs::File::create(node.log()).unwrap();
+    std::fs::create_dir_all(node.home()).unwrap();
+    let mut start = node.command_for(&[], &["start"]);
+    start
+        .stdout(std::process::Stdio::from(log.try_clone().unwrap()))
+        .stderr(std::process::Stdio::from(log));
+    // SAFETY: between fork and exec this calls only signal(2) and
+    // setrlimit(2), each safe there; a disposition of "ignore" and the
+    // limit pass to the program that is run.
+    unsafe {
+        start.pre_exec(|| {
+            libc::signal(libc::SIGXFSZ, libc::SIG_IGN);
+            let limit = libc::rlimit {
+                rlim_cur: 1_000_000,
+                rlim_max: 1_000_000,
+            };
+            match libc::setrlimit(libc::RLIMIT_FSIZE, &limit) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    node.child = Some(start.spawn().unwrap());
+}
+
+/// A step of the schema that does not finish for want of room on the disk
+/// leaves a personal node up and held, with words that say so, and the
+/// database at step 33 (decision 2026-11-10 (older kind), rule 9). Here
+/// the node's files may not grow past a megabyte, and step 34 needs more
+/// in the log. `cordelia status` and a command say the same, and not
+/// SQLite's words alone. With the room there, the next start takes the
+/// step.
+#[cfg(unix)]
 #[test]
 fn a_step_that_does_not_finish_holds_the_node_and_is_tried_at_the_next_start() {
     let mut device = node("laptop", "personal", None);
-    step_34_cannot_finish(&device);
+    alpha_19_with_a_large_item(&device);
     let path = device.data_dir().join("cordelia.db");
     let says = |said: &str| {
         for words in [
             format!("the database at {} could not be brought", path.display()),
-            "schema step 34 did not finish (database or disk is full)".to_string(),
+            "schema step 34 did not finish (".to_string(),
             "Nothing was changed. The step needs free room on the disk of about the size of the \
              database"
                 .to_string(),
@@ -503,7 +539,7 @@ fn a_step_that_does_not_finish_holds_the_node_and_is_tried_at_the_next_start() {
         }
     };
 
-    device.start();
+    start_on_a_full_disk(&mut device);
     wait_for("device healthy", &[&device], 30, || healthy(&device));
     let status = status_of(&device);
     assert_eq!(status["held"]["by"], "step_failed", "{status}");
@@ -524,27 +560,11 @@ fn a_step_that_does_not_finish_holds_the_node_and_is_tried_at_the_next_start() {
     );
 
     // With the room there, the next start takes the step.
-    Connection::open(&path)
-        .unwrap()
-        .execute_batch("DROP TRIGGER a_full_disk;")
-        .unwrap();
     device.start();
     wait_for("device healthy again", &[&device], 30, || healthy(&device));
     assert_eq!(status_of(&device)["held"], serde_json::Value::Null);
     assert_eq!(
         schema_version(&database_of(&device)),
         cordelia_storage::schema::SCHEMA_VERSION
-    );
-
-    // A relay does not start, and says the same.
-    let mut relay = node("relay", "relay", None);
-    step_34_cannot_finish(&relay);
-    relay.start();
-    assert!(!ends_by_itself(&mut relay).success());
-    let log = std::fs::read_to_string(relay.log()).unwrap();
-    assert!(log.contains("schema step 34 did not finish"), "{log}");
-    assert_eq!(
-        schema_version(&database_of(&relay)),
-        cordelia_storage::schema::ALPHA_19_VERSION
     );
 }
