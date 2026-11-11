@@ -561,7 +561,8 @@ fn a_second_node_on_the_same_data_directory_says_so_and_changes_nothing() {
 
 /// A relay's database is stepped as any version steps it: it keeps every
 /// older row and each key file, makes no copy, and has no mark (decision
-/// 2026-10-04 §10.1). A relay goes on carrying the older kind.
+/// 2026-10-04 §10.1). It carries none of the older kind (decision
+/// 2026-11-10 (older kind), rule 7).
 #[test]
 fn a_relay_keeps_every_older_row_and_makes_no_copy() {
     let mut relay = node("relay", "relay", None);
@@ -590,7 +591,7 @@ fn a_relay_keeps_every_older_row_and_makes_no_copy() {
 
 /// A relay that is started on a database which a personal node moved on
 /// removes the guard (decision 2026-10-04 §10.1): the guard is a
-/// device's, and a relay takes channels of the older kind.
+/// device's.
 #[test]
 fn a_relay_that_is_started_on_a_devices_database_removes_the_guard() {
     let mut relay = node("relay", "relay", None);

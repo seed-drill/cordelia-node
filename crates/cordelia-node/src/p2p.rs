@@ -13236,14 +13236,15 @@ mod tests {
     }
 
     /// T3. A connection has an allowance, and so does its address: the
-    /// connections from one address share five times what one may send. A
-    /// peer that reconnects, or comes back under another key, does not
-    /// start again from nothing. Going over three times cuts a peer off.
+    /// connections from one address share five times what one may send,
+    /// in requests on the streams of entries and in bytes. A peer that
+    /// reconnects, or comes back under another key, does not start again
+    /// from nothing. Going over three times cuts a peer off.
     #[test]
     fn limits_are_counted_for_a_connection_and_for_its_address() {
         use cordelia_core::protocol::{
-            BAN_THRESHOLD, MAX_CONNECTIONS_PER_IP, PUSH_BYTES_PER_PEER_PER_MINUTE,
-            WRITES_PER_PEER_PER_MINUTE,
+            BAN_THRESHOLD, ENTRY_REQUESTS_PER_PEER_PER_MINUTE, MAX_CONNECTIONS_PER_IP,
+            PUSH_BYTES_PER_PEER_PER_MINUTE,
         };
         use cordelia_network::messages::Protocol;
         let address: std::net::IpAddr = "192.0.2.7".parse().unwrap();
@@ -13251,24 +13252,27 @@ mod tests {
         let peer = |n: u8| NodeId([n; 32]);
 
         // One connection: its own allowance, then refusals, then cut off.
-        for _ in 0..WRITES_PER_PEER_PER_MINUTE {
-            assert_eq!(rates.request(&peer(1), address, Protocol::ItemPush), Ok(()));
+        for _ in 0..ENTRY_REQUESTS_PER_PEER_PER_MINUTE {
+            assert_eq!(
+                rates.request(&peer(1), address, Protocol::EntryPush),
+                Ok(())
+            );
         }
         for breach in 1..=BAN_THRESHOLD {
             let over = rates
-                .request(&peer(1), address, Protocol::ItemPush)
+                .request(&peer(1), address, Protocol::EntryPush)
                 .unwrap_err();
             assert_eq!(over.cut_off, breach == BAN_THRESHOLD, "breach {breach}");
         }
 
         // The same address under new keys: each has its own allowance, until
         // the address's share is used up.
-        let mut allowed = u64::from(WRITES_PER_PEER_PER_MINUTE);
+        let mut allowed = u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE);
         let mut key = 2u8;
         'address: loop {
-            for _ in 0..WRITES_PER_PEER_PER_MINUTE {
+            for _ in 0..ENTRY_REQUESTS_PER_PEER_PER_MINUTE {
                 if rates
-                    .request(&peer(key), address, Protocol::ItemPush)
+                    .request(&peer(key), address, Protocol::EntryPush)
                     .is_err()
                 {
                     break 'address;
@@ -13280,12 +13284,12 @@ mod tests {
         }
         assert_eq!(
             allowed,
-            u64::from(WRITES_PER_PEER_PER_MINUTE) * MAX_CONNECTIONS_PER_IP as u64
+            u64::from(ENTRY_REQUESTS_PER_PEER_PER_MINUTE) * MAX_CONNECTIONS_PER_IP as u64
         );
         // Another address is not affected.
         let elsewhere: std::net::IpAddr = "192.0.2.8".parse().unwrap();
         assert_eq!(
-            rates.request(&peer(9), elsewhere, Protocol::ItemPush),
+            rates.request(&peer(9), elsewhere, Protocol::EntryPush),
             Ok(())
         );
 

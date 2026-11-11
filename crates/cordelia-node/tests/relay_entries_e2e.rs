@@ -1,6 +1,7 @@
 //! End to end, with real processes: a relay that carries channels from
-//! their secrets over real connections, beside the older kind of channel
-//! (decision 2026-10-04 §2.4, §2.5, §4.6).
+//! their secrets over real connections (decision 2026-10-04 §2.4, §2.5,
+//! §4.6), and no channel of the older kind (decision 2026-11-10 (older
+//! kind), rule 7).
 //!
 //! Each test starts a relay of its own on this machine, through the
 //! harness. The test is the client: it connects as any node may, opens
@@ -16,14 +17,14 @@ use std::time::Duration;
 use cordelia_core::protocol::{
     BAN_THRESHOLD, ENTRY_REQUESTS_PER_PEER_PER_MINUTE, ERR_RATE_LIMIT,
     MAX_ENTRY_NAME_AND_VALUE_BYTES, MAX_ITEM_BYTES, MAX_SLOTS_SHOWN_ON_A_CONNECTION,
-    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost,
+    NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, PUSH_BYTES_PER_PEER_PER_MINUTE,
 };
 use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::{derive, proof};
 use cordelia_network::messages::{
-    ChannelProve, EntryPull, EntryPulled, EntryPush, EntryRefused, EntryShow, EntryShowShort, Item,
-    Protocol, PushAck, PushAnswer, PushPayload, RelayChannelsAsk, RelayEntry, RelayPull, RelayPush,
+    ChannelProve, EntryPull, EntryPulled, EntryPush, EntryRefused, EntryShow, EntryShowShort,
+    Protocol, PushAnswer, PushPayload, RelayChannelsAsk, RelayEntry, RelayPull, RelayPush,
     ShowAnswer, WireMessage,
 };
 use cordelia_network::{codec, connection, transport};
@@ -241,81 +242,6 @@ impl Client {
             .await
             .expect("a pull is answered")
     }
-
-    /// An item of the older kind of channel, of `bytes` bytes in
-    /// `channel`, signed by this client, as it travels.
-    fn item(&self, channel: &str, bytes: usize) -> Item {
-        let mut blob = vec![7u8; bytes];
-        let item_id = cordelia_storage::items::generate_item_id();
-        let tag = item_id.as_bytes();
-        blob[..tag.len().min(bytes)].copy_from_slice(&tag[..tag.len().min(bytes)]);
-        let hash = cordelia_crypto::sha256(&blob);
-        let published_at = "2026-10-05T00:00:00Z";
-        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
-            &self.identity.public_key(),
-            channel,
-            &hash,
-            false,
-            &item_id,
-            1,
-            published_at,
-        )
-        .unwrap();
-        Item {
-            item_id,
-            channel_id: channel.into(),
-            item_type: "memory".into(),
-            content_length: blob.len() as u32,
-            encrypted_blob: blob,
-            content_hash: hash.to_vec(),
-            author_id: self.identity.public_key().to_vec(),
-            signature: self.identity.sign(&cbor).to_vec(),
-            key_version: 1,
-            published_at: published_at.into(),
-            is_tombstone: false,
-            parent_id: None,
-            slot: None,
-            rev: None,
-        }
-    }
-
-    /// Every item of the older kind that the relay holds of `channel`,
-    /// as it hands them: the channel is listed from its start, and each
-    /// item listed is fetched, on one stream.
-    async fn items_of(&self, channel: &str) -> Vec<Item> {
-        use cordelia_network::item_sync;
-        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
-        codec::write_protocol_byte(&mut send, Protocol::ItemSync)
-            .await
-            .unwrap();
-        let page = item_sync::send_sync_page(&mut send, &mut recv, channel, 0, 100)
-            .await
-            .expect("the relay lists the channel");
-        let ids: Vec<String> = page.items.into_iter().map(|item| item.item_id).collect();
-        if ids.is_empty() {
-            return Vec::new();
-        }
-        item_sync::send_fetch_request(&mut send, &ids)
-            .await
-            .unwrap();
-        item_sync::read_fetch_response(&mut recv)
-            .await
-            .expect("the relay hands the items it listed")
-    }
-
-    /// Push items of the older kind. `Err` where nothing was answered.
-    async fn push_items(&self, items: Vec<Item>) -> Result<PushAck, String> {
-        match self
-            .ask(
-                Protocol::ItemPush,
-                WireMessage::PushPayload(PushPayload { items }),
-            )
-            .await?
-        {
-            WireMessage::PushAck(ack) => Ok(ack),
-            other => Err(format!("not an answer to a push of items: {other:?}")),
-        }
-    }
 }
 
 /// An entry of channel `c` that `author` made of `said` under `name` at
@@ -388,13 +314,9 @@ fn used_earlier(relay: &Node, c: u16, secs: i64) {
 }
 
 /// What `relay` holds of channels from their secrets, as entries are
-/// counted, and of the older kind, as its items are.
-fn holds(relay: &Node) -> (u64, u64) {
-    let db = store_of(relay);
-    (
-        cordelia_storage::relay::used_bytes(&db).unwrap(),
-        cordelia_storage::items::stored_cost(&db).unwrap(),
-    )
+/// counted.
+fn holds(relay: &Node) -> u64 {
+    cordelia_storage::relay::used_bytes(&store_of(relay)).unwrap()
 }
 
 /// A relay of the test's own, started, that may hold `max_bytes` where
@@ -649,7 +571,7 @@ async fn a_client_with_only_a_channels_id_gets_nothing() {
     // Nothing of all that changed what the relay holds: the one entry.
     let page = holder.pull(1, NO_MARK, 0).await;
     assert_eq!(texts(&page, 1), ["what the file holds"]);
-    assert_eq!(holds(&relay).0, SMALL);
+    assert_eq!(holds(&relay), SMALL);
 }
 
 /// A pull without a proof is answered with nothing, and so is a pull
@@ -747,7 +669,7 @@ async fn shown_an_entry_a_relay_answers_held_taken_or_another() {
     // The relay holds the later one, and nothing else.
     assert!(client.prove(1).await);
     assert_eq!(texts(&client.pull(1, NO_MARK, 0).await, 1), ["a later one"]);
-    assert_eq!(holds(&relay).0, SMALL);
+    assert_eq!(holds(&relay), SMALL);
 }
 
 /// A stranger with one large entry at a relay, who shows a small earlier
@@ -983,15 +905,14 @@ async fn a_short_show_is_only_ever_of_an_entry_the_connection_showed_or_was_hand
     assert!(held(&relay, 30).unwrap().used_at > before + 60 * 60);
 }
 
-/// A relay near its cap for channels from their secrets: it takes no
-/// channel that it does not hold, pushed or shown, and no entry that
-/// makes a channel hold more. A newer revision that is no larger is still
-/// taken, and nothing that it holds is dropped. Its room for the older
-/// kind of channel is another room: an item of that kind is still taken,
-/// and what it holds of one kind is not counted for the other.
+/// A relay near its cap: it takes no channel that it does not hold,
+/// pushed or shown, and no entry that makes a channel hold more. A newer
+/// revision that is no larger is still taken, and nothing that it holds
+/// is dropped. What it says of its room is of the channels from their
+/// secrets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
-    // Room for three small entries, of each kind.
+    // Room for three small entries.
     let relay = relay_started(Some(3 * SMALL));
     let client = client_of(&relay).await.expect("the client connects");
     let first = |c: u16| client.made(c, 5, "notes.md", "a small text").to_wire();
@@ -1003,7 +924,7 @@ async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
             .unwrap(),
         [PushAnswer::Stored, PushAnswer::Stored, PushAnswer::Stored]
     );
-    assert_eq!(holds(&relay), (3 * SMALL, 0));
+    assert_eq!(holds(&relay), 3 * SMALL);
 
     // At its cap: a new channel is refused, pushed and shown, and so is
     // an entry more in a channel that it holds.
@@ -1046,21 +967,12 @@ async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
         assert_eq!(texts(&client.pull(c, NO_MARK, 0).await, c), [text]);
     }
     assert!(!client.prove(4).await);
-    assert_eq!(holds(&relay), (3 * SMALL, 0));
+    assert_eq!(holds(&relay), 3 * SMALL);
 
-    // The older kind has a room of its own, of the same size: with this
-    // kind at its cap, an item of the older kind is taken.
-    let old = "grp_550e8400-e29b-41d4-a716-446655440000";
-    let ack = client.push_items(vec![client.item(old, 64)]).await.unwrap();
-    assert_eq!((ack.stored, ack.refused.len()), (1, 0), "{ack:?}");
-    assert_eq!(holds(&relay), (3 * SMALL, entry_cost(64)));
-    // And what the relay says it has in use, of its cap, is the older
-    // kind's own count.
+    // What the relay says it has in use, of its cap, is this kind's,
+    // against the cap: an operator sees the room of the channels from
+    // their secrets.
     let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
-    assert_eq!(stats["storage_used_bytes"], entry_cost(64), "{stats}");
-    assert_eq!(stats["storage_max_bytes"], 3 * SMALL, "{stats}");
-    // It says this kind's beside it, against the cap of its own: an
-    // operator sees the room of the channels from their secrets.
     assert_eq!(
         stats["entries"],
         serde_json::json!({
@@ -1075,42 +987,21 @@ async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
     let plain = relay.cli(&["stats"]);
     assert!(
         plain.contains(
-            "Storage:          1.1 KB in use of 3.8 KB allowed, by channels of the older kind"
-        ),
-        "{plain}"
-    );
-    assert!(
-        plain.contains(
             "                  3.8 KB in use of 3.8 KB allowed, by channels from their secrets \
              (3 held, 3 entries)"
         ),
         "{plain}"
     );
 
-    // The older kind is filled to its own cap, by its own rule: a write
-    // that takes it over drops its newest channel. This kind's channels
-    // are as they were.
-    let ack = client
-        .push_items(vec![client.item(old, 64), client.item(old, 64)])
-        .await
-        .unwrap();
-    assert_eq!(ack.stored, 2, "{ack:?}");
-    let another = "grp_550e8400-e29b-41d4-a716-446655440001";
-    let ack = client
-        .push_items(vec![client.item(another, 2000)])
-        .await
-        .unwrap();
-    assert_eq!(ack.stored, 0, "{ack:?}");
-    assert_eq!(holds(&relay), (3 * SMALL, 3 * entry_cost(64)));
-    for c in [1, 2, 3] {
-        assert_eq!(client.pull(c, NO_MARK, 0).await.entries.len(), 1, "{c}");
-    }
-    // And still, at this kind's cap, a newer revision is taken.
+    // And still, at its cap, a newer revision is taken.
     let again = client.made(3, 9, "notes.md", "edited again");
     assert_eq!(
         client.push(vec![again.to_wire()]).await.unwrap(),
         [PushAnswer::Stored]
     );
+    for c in [1, 2, 3] {
+        assert_eq!(client.pull(c, NO_MARK, 0).await.entries.len(), 1, "{c}");
+    }
 }
 
 /// One address may make a relay take 256 new channels from their secrets
@@ -1146,7 +1037,7 @@ async fn an_address_may_make_a_relay_take_so_many_new_channels_an_hour() {
         );
     }
     assert_eq!(held(&relay, 256), None);
-    assert_eq!(holds(&relay).0, 256 * SMALL);
+    assert_eq!(holds(&relay), 256 * SMALL);
 
     // An entry in a channel that is held is taken: another name, and a
     // newer revision.
@@ -1298,7 +1189,7 @@ async fn a_connection_that_moves_keeps_the_allowance_of_the_address_it_was_made_
         );
         assert_eq!(held(&relay, c), None);
     }
-    assert_eq!(holds(&relay).0, 256 * SMALL);
+    assert_eq!(holds(&relay), 256 * SMALL);
     // And a connection that is made from the first address meets the
     // same allowance: used up.
     let other = client_of(&relay).await.expect("another client connects");
@@ -1308,11 +1199,10 @@ async fn a_connection_that_moves_keeps_the_allowance_of_the_address_it_was_made_
     );
 }
 
-/// The limits by address are the older kind's, and count both kinds
-/// together: what a connection pushes in a minute, in items and in
-/// entries, is one allowance; what it is handed is bounded as what may be
-/// fetched is; and a peer that pushes over it as many times as cut a peer
-/// off today is cut off, with its address refused for a time.
+/// The limits by address bound what a connection pushes in a minute, and
+/// what it is handed: what it is handed is bounded as what may be
+/// fetched is; and a peer that pushes over its allowance as many times as
+/// cut a peer off is cut off, with its address refused for a time.
 ///
 /// A pull for more than the connection may be handed for now is refused,
 /// with the error of a limit, and is no breach however often it is made:
@@ -1320,46 +1210,35 @@ async fn a_connection_that_moves_keeps_the_allowance_of_the_address_it_was_made_
 /// entry that answers a show is handed all the same to a connection that
 /// has had its bytes for the minute: so a device hears of a change.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_limits_by_address_count_both_kinds_of_channel_together() {
+async fn the_limits_by_address_bound_what_a_connection_pushes_and_is_handed() {
     let relay = relay_started(None);
     let client = client_of(&relay).await.expect("the client connects");
-    let old = "grp_550e8400-e29b-41d4-a716-446655440000";
     let largest = |by: &Client, from: usize, to: usize| -> Vec<Vec<u8>> {
         (from..to)
             .map(|n| largest_by(&by.identity, 1, &format!("{n:04}.md")).to_wire())
             .collect()
     };
 
-    // A megabyte of items of the older kind, and then a megabyte of
-    // entries: together they are what one connection may push in a
-    // minute, less a little.
-    let megabyte: Vec<Item> = (0..15).map(|_| client.item(old, MAX_ITEM_BYTES)).collect();
-    assert_eq!(client.push_items(megabyte).await.unwrap().stored, 15);
-    let entries = largest(&client, 0, 15);
-    let answers = client.push(entries[..13].to_vec()).await.unwrap();
-    assert!(answers.iter().all(|answer| *answer == PushAnswer::Stored));
-    let answers = client.push(entries[13..].to_vec()).await.unwrap();
-    assert_eq!(answers, [PushAnswer::Stored, PushAnswer::Stored]);
     // Thirty of the largest are within what a connection may push in a
     // minute, and thirty-two are not.
     assert_eq!(PUSH_BYTES_PER_PEER_PER_MINUTE / LARGEST, 31);
+    let entries = largest(&client, 0, 30);
+    for push in entries.chunks(10) {
+        let answers = client.push(push.to_vec()).await.unwrap();
+        assert!(answers.iter().all(|answer| *answer == PushAnswer::Stored));
+    }
 
     // Two entries more are over it: the push is refused whole, and
-    // nothing of it is stored. That is the first breach.
-    let two_more = largest(&client, 15, 17);
-    assert!(
-        client.push(two_more).await.is_err(),
-        "entries were taken past what the connection may push with the older kind"
-    );
-    // And so are two items of the older kind: the second breach.
-    let two_items = vec![
-        client.item(old, MAX_ITEM_BYTES),
-        client.item(old, MAX_ITEM_BYTES),
-    ];
-    assert!(client.push_items(two_items).await.is_err());
-    assert_eq!(holds(&relay), (15 * LARGEST, 15 * LARGEST));
-    // What is left of the allowance still takes a push that fits in it,
-    // of either kind.
+    // nothing of it is stored. That is the first breach, and the same
+    // again is the second.
+    for breach in 1..=2 {
+        assert!(
+            client.push(largest(&client, 30, 32)).await.is_err(),
+            "breach {breach}: entries were taken past what the connection may push"
+        );
+    }
+    assert_eq!(holds(&relay), 30 * LARGEST);
+    // What is left of the allowance still takes a push that fits in it.
     assert_eq!(
         client
             .push(vec![
@@ -1369,25 +1248,14 @@ async fn the_limits_by_address_count_both_kinds_of_channel_together() {
             .unwrap(),
         [PushAnswer::Stored]
     );
-    assert_eq!(
-        client
-            .push_items(vec![client.item(old, 64)])
-            .await
-            .unwrap()
-            .stored,
-        1
-    );
 
     // Another connection at the address has an allowance of its own to
     // push with: the channel comes to hold 35 entries of the largest
     // size, which is more than may be fetched in a minute.
     let other = client_of(&relay).await.expect("another client connects");
-    let more = largest(&other, 15, 35);
-    for push in more.chunks(10) {
-        let answers = other.push(push.to_vec()).await.unwrap();
-        assert!(answers.iter().all(|answer| *answer == PushAnswer::Stored));
-    }
-    assert_eq!(holds(&relay).0, 35 * LARGEST + SMALL);
+    let answers = other.push(largest(&other, 30, 35)).await.unwrap();
+    assert!(answers.iter().all(|answer| *answer == PushAnswer::Stored));
+    assert_eq!(holds(&relay), 35 * LARGEST + SMALL);
 
     // The first connection proves the channel and pulls it. It is handed
     // small pages, one entry of the largest size each (decision
@@ -1576,6 +1444,136 @@ async fn a_connection_may_make_so_many_requests_a_minute_on_the_streams_of_entri
         }
         other => panic!("closed for another reason: {other:?}"),
     }
+}
+
+/// An entry of channel `c` under `name`, whose content is twice the
+/// largest there is: `author` and the channel's key each sign it as an
+/// entry is signed, and it is of no size an entry may be. Its bytes on
+/// the wire.
+fn over_the_largest_by(author: &NodeIdentity, c: u16, name: &str) -> Vec<u8> {
+    use cordelia_core::protocol::{LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL};
+    let mut entry = largest_by(author, c, name).into_entry();
+    entry.content = [entry.content.clone(), entry.content].concat();
+    assert_eq!(entry.content.len(), 2 * MAX_ITEM_BYTES);
+    let form = entry.signed_bytes();
+    let under = |label: &[u8]| [label, form.as_slice()].concat();
+    entry.author_signature = author.sign(&under(LABEL_ENTRY_AUTHOR));
+    let channel_key = derive::signing_key(&secret(c)).unwrap();
+    entry.channel_signature = channel_key.sign(&under(LABEL_ENTRY_CHANNEL));
+    entry.to_wire()
+}
+
+/// A relay refuses an entry over the size limit, and its answer to the
+/// push says, of each entry in its order, whether it was stored, and why
+/// it was refused (T3). One push holds an entry of the largest size, one
+/// whose content is twice that and that is signed as an entry is, and a
+/// small one. The relay stores the first and the last, and answers that
+/// the middle one is not signed as an entry must be: its bytes are not an
+/// entry's. Nothing of it is stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_relay_refuses_an_entry_over_the_size_limit_and_says_which() {
+    let relay = relay_started(None);
+    let client = client_of(&relay).await.expect("the client connects");
+    let largest = largest_by(&client.identity, 1, "largest.md");
+    let over = over_the_largest_by(&client.identity, 1, "over.md");
+    let small = client.made(1, 5, "small.md", "a small text");
+    assert_eq!(
+        client
+            .push(vec![largest.to_wire(), over, small.to_wire()])
+            .await
+            .unwrap(),
+        [
+            PushAnswer::Stored,
+            PushAnswer::Refused(EntryRefused::NotSigned),
+            PushAnswer::Stored
+        ]
+    );
+    assert_eq!(holds(&relay), LARGEST + SMALL);
+    assert!(client.prove(1).await);
+    assert_eq!(client.pull(1, NO_MARK, 0).await.entries.len(), 2);
+}
+
+/// Small entries count for what they take (T3). A connection's allowance
+/// counts each entry as its content and what an entry takes beyond it, a
+/// kilobyte: so as many entries of the smallest size (256 bytes) as fit in
+/// two megabytes at that count are stored, and a push of one more is
+/// refused whole. Counted at their content alone, eight times as many
+/// would be taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn small_entries_count_for_what_they_take() {
+    use cordelia_core::protocol::ENTRY_PAGE_MAX_ENTRIES;
+    let relay = relay_started(None);
+    let client = client_of(&relay).await.expect("the client connects");
+    let fit = PUSH_BYTES_PER_PEER_PER_MINUTE / SMALL;
+    assert_eq!(fit, 1638);
+    let small = |n: u64| client.made(1, 5, &format!("{n:04}.md"), "small").to_wire();
+    let entries: Vec<Vec<u8>> = (0..fit).map(small).collect();
+    for push in entries.chunks(ENTRY_PAGE_MAX_ENTRIES as usize) {
+        let answers = client.push(push.to_vec()).await.unwrap();
+        assert!(answers.iter().all(|answer| *answer == PushAnswer::Stored));
+    }
+    assert_eq!(holds(&relay), fit * SMALL);
+    assert!(
+        client.push(vec![small(fit)]).await.is_err(),
+        "a small entry was taken past what the connection may push"
+    );
+    assert_eq!(holds(&relay), fit * SMALL);
+}
+
+/// An address's allowance lasts as long as what was counted against it,
+/// whether or not its connections do (T3). As many connections as one
+/// address may have each push nearly what a connection may in a minute,
+/// and close. A new connection from that address, under a new key, is
+/// refused fifteen entries of the largest size, which its own allowance
+/// would take: the address's is used.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_addresss_allowance_outlasts_its_connections() {
+    use cordelia_core::protocol::MAX_CONNECTIONS_PER_IP;
+    let relay = relay_started(None);
+    let connected = || -> usize {
+        relay
+            .get("/api/v1/peers")
+            .and_then(|v| v["peers"].as_array().map(Vec::len))
+            .unwrap_or(usize::MAX)
+    };
+    let largest = |by: &Client, c: u16, count: usize| -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|n| largest_by(&by.identity, c, &format!("{n:04}.md")).to_wire())
+            .collect()
+    };
+
+    // Thirty entries of the largest size are just under two megabytes:
+    // what one connection may push in a minute.
+    let mut clients = Vec::new();
+    for c in 1..=MAX_CONNECTIONS_PER_IP as u16 {
+        let client = client_of(&relay)
+            .await
+            .unwrap_or_else(|e| panic!("connection {c} was refused: {e}"));
+        for push in largest(&client, c, 30).chunks(10) {
+            let answers = client.push(push.to_vec()).await.unwrap();
+            assert!(answers.iter().all(|answer| *answer == PushAnswer::Stored));
+        }
+        clients.push(client);
+    }
+    assert_eq!(holds(&relay), 30 * MAX_CONNECTIONS_PER_IP as u64 * LARGEST);
+
+    // They all close, and the relay tidies its counts.
+    for client in clients {
+        client.conn.close(0u32.into(), b"done");
+    }
+    wait_for("the relay sees them gone", &[&relay], 30, || {
+        (connected() == 0).then_some(())
+    });
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    // The address comes back under a new key. Its allowance for the minute
+    // is still used.
+    let again = client_of(&relay).await.expect("the address connects again");
+    assert!(
+        again.push(largest(&again, 9, 15)).await.is_err(),
+        "the address had a fresh allowance after connecting again"
+    );
+    assert_eq!(holds(&relay), 30 * MAX_CONNECTIONS_PER_IP as u64 * LARGEST);
 }
 
 /// Two relays that their operator lists together pass the entries of a
@@ -1773,7 +1771,7 @@ async fn a_relay_whose_cap_came_down_drops_its_newest_channels_when_it_starts() 
         );
         client.identity.clone()
     };
-    assert_eq!(holds(&relay).0, 3 * SMALL);
+    assert_eq!(holds(&relay), 3 * SMALL);
 
     // The operator brings the cap down to what two of the three take.
     relay.stop();
@@ -1781,7 +1779,7 @@ async fn a_relay_whose_cap_came_down_drops_its_newest_channels_when_it_starts() 
     relay.start();
     wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
     wait_for("the relay is within its cap", &[&relay], 30, || {
-        (holds(&relay).0 == 2 * SMALL).then_some(())
+        (holds(&relay) == 2 * SMALL).then_some(())
     });
     // The newest went, with its entry. The two it held before it stay.
     assert_eq!(held(&relay, 3), None);
@@ -1804,7 +1802,7 @@ async fn a_relay_whose_cap_came_down_drops_its_newest_channels_when_it_starts() 
             PushAnswer::Stored
         ]
     );
-    assert_eq!(holds(&relay).0, 2 * SMALL);
+    assert_eq!(holds(&relay), 2 * SMALL);
 }
 
 /// A relay drops the channels from their secrets that nobody has used
@@ -1848,7 +1846,7 @@ async fn a_relay_drops_what_nobody_has_used_for_90_days() {
         held(&relay, 1).is_none().then_some(())
     });
     assert!(held(&relay, 2).is_some(), "a channel used 89 days ago went");
-    assert_eq!(holds(&relay).0, SMALL);
+    assert_eq!(holds(&relay), SMALL);
 
     // Its entries went with it: whoever holds its key is handed nothing.
     let client = client_as(identity, &relay)
@@ -2087,107 +2085,6 @@ async fn a_personal_node_answers_none_of_the_streams_of_entries() {
         )
         .unwrap();
     assert_eq!((entries, channels), (0, 0));
-}
-
-/// The older kind of channel still syncs through a relay that carries
-/// the new kind beside it, and that is at its cap for the new kind: what
-/// one node pushes of a channel of the older kind reaches another through
-/// the relay. The older kind's room is counted by its own items, so what
-/// the relay holds of the new kind is no part of it, and neither kind is
-/// refused or dropped for the other.
-///
-/// The two nodes are stand-ins that speak the older streams: a personal
-/// node carries no channel of the older kind (decision 2026-10-04 §10),
-/// and a relay carries it as it did.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_older_kind_syncs_through_a_relay_that_is_full_of_the_new_kind() {
-    // Room for three entries of the largest size, of each kind.
-    let cap = 3 * LARGEST;
-    let relay = relay_started(Some(cap));
-    let client = client_of(&relay).await.expect("the client connects");
-
-    // The new kind is filled to its cap, before the relay holds anything
-    // of the older kind.
-    let large: Vec<Vec<u8>> = (1..=4)
-        .map(|c| largest_by(&client.identity, c, "notes.md").to_wire())
-        .collect();
-    assert_eq!(
-        client.push(large.clone()).await.unwrap(),
-        [
-            PushAnswer::Stored,
-            PushAnswer::Stored,
-            PushAnswer::Stored,
-            PushAnswer::Refused(EntryRefused::NoRoom)
-        ]
-    );
-    assert_eq!(holds(&relay), (cap, 0));
-
-    // Two nodes, and the relay between them. The channel of theirs is
-    // new to the relay, and of the older kind.
-    let group = "grp_550e8400-e29b-41d4-a716-446655440000";
-    let other = client_of(&relay).await.expect("the other client connects");
-
-    // What one pushes reaches the other, through the relay: the other is
-    // listed the item, and is handed it as it was pushed.
-    let from_a = client.item(group, 2_000);
-    assert_eq!(
-        client
-            .push_items(vec![from_a.clone()])
-            .await
-            .unwrap()
-            .stored,
-        1
-    );
-    let handed = other.items_of(group).await;
-    let fetched = handed
-        .into_iter()
-        .find(|item| item.item_id == from_a.item_id)
-        .expect("the other is handed the item");
-    assert_eq!(fetched.encrypted_blob, from_a.encrypted_blob);
-    assert_eq!(fetched.signature, from_a.signature);
-
-    // The relay holds items of the older kind now, counted by what they
-    // are: far less than its cap, though its database holds a cap's
-    // worth of entries beside them.
-    let (new, older) = holds(&relay);
-    assert_eq!(
-        new, cap,
-        "the new kind's room was touched by the older kind"
-    );
-    assert!(older > 0 && older < cap, "{older}");
-    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
-    assert_eq!(stats["storage_used_bytes"], older, "{stats}");
-    assert!(stats["database_bytes"].as_u64().unwrap() > cap, "{stats}");
-
-    // The new kind is as it was: its three channels are held, each with
-    // its entry, and the fourth still finds no room.
-    for c in 1..=3 {
-        assert!(client.prove(c).await, "{c}");
-        let page = client.pull(c, NO_MARK, 0).await;
-        assert_eq!(page.entries.len(), 1, "{c}");
-        assert_eq!(page.entries[0].to_vec(), large[c as usize - 1]);
-    }
-    assert_eq!(
-        client.push(vec![large[3].clone()]).await.unwrap(),
-        [PushAnswer::Refused(EntryRefused::NoRoom)]
-    );
-    // And both kinds still take what they have room for.
-    let newer = client.made(1, 9, "other.md", "a small text");
-    assert_eq!(
-        client.push(vec![newer.to_wire()]).await.unwrap(),
-        [PushAnswer::Refused(EntryRefused::NoRoom)]
-    );
-    let from_b = other.item(group, 2_000);
-    assert_eq!(
-        other.push_items(vec![from_b.clone()]).await.unwrap().stored,
-        1
-    );
-    let back = client.items_of(group).await;
-    assert!(
-        back.iter().any(|item| item.item_id == from_b.item_id),
-        "the first node is not handed what the other pushed"
-    );
-    assert_eq!(holds(&relay).0, cap);
 }
 
 /// The value of the line `name` in `text`, the text of

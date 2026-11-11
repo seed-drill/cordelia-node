@@ -794,6 +794,130 @@ pub fn relay_run_by(bin: PathBuf) -> Node {
     relay
 }
 
+/// A relay made, and not started, by the binary at `bin`: a version
+/// before this one ([`node_run_by`]). A test gives it the relays it lists
+/// before it starts it.
+pub fn relay_made_by(bin: PathBuf) -> Node {
+    node_made("relay-before", "relay", &[], Some(bin))
+}
+
+// ── The older kind of channel (decision 2026-11-10 (older kind), rule 7) ──
+
+/// A channel of the older kind: a group, as a relay of alpha.19 holds one.
+pub const OLDER_GROUP: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
+
+/// Put in the database of `n`, which is made and not running, a channel
+/// of the older kind with one item in it, which the node signed: what a
+/// relay of alpha.19 came to hold, and keeps on this version until a
+/// later step drops it. Returns the item's ID.
+pub fn holds_an_older_channel(n: &Node, channel: &str) -> String {
+    use cordelia_storage::{channels, items};
+    let own = cordelia_crypto::bech32::decode_public_key(&key_of(n)).unwrap();
+    let db = cordelia_storage::db::open(&n.data_dir().join("cordelia.db")).unwrap();
+    channels::ensure_group(&db, channel, None, "realtime", &own).unwrap();
+    channels::add_member(&db, channel, &own, "owner").unwrap();
+    let blob = b"what alpha.19 held of the older kind".to_vec();
+    let item_id = items::generate_item_id();
+    let item = items::NewItem {
+        item_id: &item_id,
+        channel_id: channel,
+        author_id: &own,
+        item_type: "memory",
+        published_at: "2026-11-01T00:00:00Z",
+        parent_id: None,
+        key_version: 1,
+        content_hash: &cordelia_crypto::sha256(&blob),
+        signature: &[7u8; 64],
+        encrypted_blob: &blob,
+        is_tombstone: false,
+        slot: None,
+        rev: None,
+    };
+    assert!(items::insert_item(&db, &item).unwrap());
+    item_id
+}
+
+/// How many items of the older kind the database of `n` holds, read
+/// while the node runs.
+pub fn older_items_held(n: &Node) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(
+        n.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// Half a stream timeout: what "at once" is to a test that waits on a
+/// node's answer or refusal.
+pub fn at_once() -> Duration {
+    Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS / 2)
+}
+
+/// Ask the node at the other end of `conn` what a node of alpha.19 that
+/// carries the older kind asks, on one stream of a sync (0x05): which
+/// channels it holds, and then a page of `channel` from its start. What it
+/// answered to each, or `None` where it refused, or did not answer
+/// [`at_once`].
+pub async fn asks_a_sync_of_the_older_kind(
+    conn: &quinn::Connection,
+    channel: &str,
+) -> Option<(Vec<String>, cordelia_network::messages::SyncResponse)> {
+    use cordelia_network::codec;
+    use cordelia_network::messages::{SyncChannelListRequest, SyncRequest};
+    let asked = async {
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        codec::write_protocol_byte(&mut send, Protocol::ItemSync)
+            .await
+            .ok()?;
+        let list = WireMessage::SyncChannelListRequest(SyncChannelListRequest {});
+        codec::write_frame(&mut send, &list).await.ok()?;
+        let WireMessage::SyncChannelListResponse(listed) =
+            codec::read_frame(&mut recv, Protocol::ItemSync)
+                .await
+                .ok()?
+        else {
+            return None;
+        };
+        let page = WireMessage::SyncRequest(SyncRequest {
+            channel_id: channel.to_string(),
+            since: None,
+            limit: 100,
+            after_seq: Some(0),
+        });
+        codec::write_frame(&mut send, &page).await.ok()?;
+        let WireMessage::SyncResponse(page) = codec::read_frame(&mut recv, Protocol::ItemSync)
+            .await
+            .ok()?
+        else {
+            return None;
+        };
+        let _ = send.finish();
+        Some((listed.channel_ids, page))
+    };
+    tokio::time::timeout(at_once(), asked).await.ok().flatten()
+}
+
+/// Open a stream of `protocol` on `conn`, and send after the protocol byte
+/// a frame of bytes that is no message: whether the node at the other end
+/// stopped the stream [`at_once`]. A node that carries no channel of the
+/// older kind refuses a push (0x06) or an announcement (0x04) before it
+/// reads what follows the byte.
+pub async fn refuses_at_once(conn: &quinn::Connection, protocol: Protocol) -> bool {
+    use cordelia_network::codec;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    codec::write_protocol_byte(&mut send, protocol)
+        .await
+        .unwrap();
+    let _ = codec::write_raw_frame(&mut send, &[0x5a; 64]).await;
+    matches!(
+        tokio::time::timeout(at_once(), send.stopped()).await,
+        Ok(Ok(Some(_)))
+    )
+}
+
 /// The variable that names the binary of the version before: alpha.19,
 /// the one release this version works beside and takes over from
 /// (decision 2026-11-10 (older kind), rules 4 and 10). The tests that run

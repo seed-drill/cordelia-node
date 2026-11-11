@@ -11,9 +11,10 @@ from which each channel of their own is derived; a recovery phrase of twelve
 words removes a device and recovers. Overview: `WHITEPAPER.md` (v3).
 
 There are two kinds of channel in the code: a channel from its secret
-(decision 2026-10-04), which every device uses, and "the older kind" (a
-random ID, a ring of keys, a list of members), which only a relay still
-carries.
+(decision 2026-10-04), which every node uses, and "the older kind" (a
+random ID, a ring of keys, a list of members), which no node carries: a
+node answers what is asked of it with nothing (decision 2026-11-10 (older
+kind), rule 7), and its code goes in that record's later slices.
 
 ## Where things are
 
@@ -35,7 +36,7 @@ Module headers that say `Spec: .../specs/<file>.md` mean `docs/specs/<file>.md` 
 
 ## Decision records
 
-Comments cite a record by its date and section or rule: `decision 2026-10-04 §4.6`, `decision 2026-11-06 (joining), rule 6`. Some add a short name: `(memory)`, `(removal)`, `(joining)`. Where two records share a date and no name is given, the subject says which; a bare `decision 2026-10-24` with a rule above 10 is the removal record, and with a lower rule usually the words of a change. In `docs/decisions/`:
+Comments cite a record by its date and section or rule: `decision 2026-10-04 §4.6`, `decision 2026-11-06 (joining), rule 6`. Some add a short name: `(memory)`, `(removal)`, `(joining)`, `(older kind)`. Where two records share a date and no name is given, the subject says which; a bare `decision 2026-10-24` with a rule above 10 is the removal record, and with a lower rule usually the words of a change. In `docs/decisions/`:
 
 - `2026-09-30-agent-memory-sync.md`: the sync adapter, ties, conflict copies, deletes, the index, local history (§4.5b). Its device and key model is replaced by 2026-10-04.
 - `2026-10-04-a-persons-devices.md`: a person's devices, the phrase, statements, channels from their secrets, a relay's rules, removal, recovery, the upgrade. The most cited.
@@ -52,6 +53,7 @@ Comments cite a record by its date and section or rule: `decision 2026-10-04 §4
 - `2026-10-24-the-words-of-a-change.md`: the words of a change, its waits and its relay lines.
 - `2026-10-25-a-persons-hold-on-messages.md`: a person's hold on messages.
 - `2026-11-06-joining-by-pull-request.md` (joining): `.cordelia/members`, `subscribe` in a clone, the node's read of each list.
+- `2026-11-10-removing-the-older-kind.md` (older kind): no node carries the older kind of channel; one baseline for the schema.
 
 The design today is 2026-10-04 with 2026-09-30, and the later records that add to them. Each record's Status line says what is built and what it amends. `2026-11-05` is accepted but not built. The March records are older and in part superseded, as each says at its head.
 

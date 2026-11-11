@@ -7,9 +7,10 @@
 //! decision 2026-09-30-agent-memory-sync §4.3 to §4.6).
 //!
 //! A device is driven only through the CLI and the local HTTP API, as a
-//! person would drive it. A relay carries the older kind of channel as it
-//! did, and no device holds one (decision 2026-10-04 §10): what a relay
-//! does for that kind is shown with a stand-in that speaks its streams.
+//! person would drive it. No node carries the older kind of channel
+//! (decision 2026-11-10 (older kind), rule 7): a relay and a device answer
+//! what is asked of it with nothing, and beside a relay and a device of
+//! alpha.19 the two kinds of node carry on.
 
 mod common;
 
@@ -668,14 +669,8 @@ fn a_relay_that_is_down_is_shown_and_found_when_it_comes_up() {
 ///   its own to a relay which holds nothing of it sends that relay what it
 ///   holds (decision 2026-10-04 §2.4, §4.6). So a device added afterwards,
 ///   which has only the relay to fetch from, gets all of it.
-/// - The same holds of the older kind of channel, which a relay carries as
-///   it did (decision 2026-10-04 §10) and which no device of this version
-///   holds: there it is the relay that asks whoever connects which
-///   channels it holds, and fetches what it lacks. A stand-in for a device
-///   of that kind shows it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
-    const OLDER: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
+#[test]
+fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
@@ -703,12 +698,6 @@ async fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
     wait_for("b reads what a wrote", &[&relay, &a, &b], 90, || {
         reads(&b, "before-4.md", "before")
     });
-    // And an entry of the older kind, from what stands in for a device
-    // that holds one.
-    let older = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
-    let before = entry_in(&older, OLDER, vec![7; 40]);
-    let ack = push_to(&relay, older.clone(), std::slice::from_ref(&before)).await;
-    assert_eq!(ack.stored, 1, "{ack:?}");
 
     // The relay comes back with nothing. Both devices find it again.
     relay.stop();
@@ -750,30 +739,6 @@ async fn a_relay_that_lost_its_database_carries_on_and_is_filled_again() {
                 .then_some(())
         },
     );
-
-    // Of the older kind the relay fetches again what it lost, from what
-    // stands in for a device that holds it: it asks whoever connects
-    // which channels it holds.
-    let stored = |relay: &Node| -> u64 {
-        serde_json::from_str::<serde_json::Value>(&relay.cli(&["stats", "--json"])).unwrap()
-            ["items_stored"]
-            .as_u64()
-            .unwrap()
-    };
-    assert_eq!(stored(&relay), 0);
-    let (_manager, conn) = client_of(&relay, older).await;
-    serves_the_older_kind(&conn, vec![before]);
-    wait_for(
-        "the relay fetches the entry of the older kind again",
-        &[&relay],
-        90,
-        || (stored(&relay) == 1).then_some(()),
-    );
-    // The relay says that it fetched, and says from which channel only for
-    // debugging.
-    let log = std::fs::read_to_string(relay.log()).unwrap();
-    assert!(log.contains("pull-sync page complete"), "{log}");
-    assert_names_channels_only_for_debugging(&relay, &[OLDER]);
 }
 
 /// The bar's form of `cordelia status` counts every relay that the device
@@ -910,15 +875,8 @@ fn a_device_with_many_small_entries_is_never_refused_by_its_relay() {
 /// its own what it holds, whether or not the relay counts that device
 /// among its hot peers. A device added afterwards, which has only the
 /// relays to fetch from, gets what was written before.
-///
-/// Of the older kind of channel, which a relay carries as it did (decision
-/// 2026-10-04 §10), it is the relay that asks each peer that connects
-/// which channels it holds, and fetches what it lacks, whether or not it
-/// counts that peer among its hot ones: a stand-in for a device of that
-/// kind shows it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn relays_that_list_each_other_are_filled_again_by_their_devices() {
-    const OLDER: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
+#[test]
+fn relays_that_list_each_other_are_filled_again_by_their_devices() {
     let mut r1 = node("relay1", "relay", None);
     let mut r2 = node_with_relays(
         "relay2",
@@ -964,12 +922,6 @@ async fn relays_that_list_each_other_are_filled_again_by_their_devices() {
     wait_for("b reads what a wrote", &[&r1, &r2, &a, &b], 90, || {
         reads(&b, "before-4.md", "before")
     });
-    // And an entry of the older kind, from what stands in for a device
-    // that holds one.
-    let older = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
-    let before = entry_in(&older, OLDER, vec![7; 40]);
-    let ack = push_to(&r1, older.clone(), std::slice::from_ref(&before)).await;
-    assert_eq!(ack.stored, 1, "{ack:?}");
 
     // The devices are away, and both relays come back with nothing. They
     // find each other first, so each has its hot peer before a device
@@ -990,37 +942,6 @@ async fn relays_that_list_each_other_are_filled_again_by_their_devices() {
     wait_for("the relays mesh again", &[&r1, &r2], 120, || {
         meshed(&r1, &r2)
     });
-
-    // Of the older kind, a relay asks whoever connects, hot or not: what
-    // stands in for a device connects to the first relay, is no hot peer
-    // of it, and is asked for what the relay lacks.
-    let stored = |relay: &Node| -> u64 {
-        serde_json::from_str::<serde_json::Value>(&relay.cli(&["stats", "--json"])).unwrap()
-            ["items_stored"]
-            .as_u64()
-            .unwrap()
-    };
-    assert_eq!(stored(&r1), 0);
-    {
-        let older_key = cordelia_crypto::bech32::encode_public_key(&older.public_key()).unwrap();
-        let (_manager, conn) = client_of(&r1, older).await;
-        serves_the_older_kind(&conn, vec![before]);
-        wait_for(
-            "the relay fetches the entry of the older kind again",
-            &[&r1, &r2],
-            90,
-            || (stored(&r1) == 1).then_some(()),
-        );
-        let listed = r1.get("/api/v1/peers").unwrap();
-        let as_a_peer = listed["peers"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|peer| peer["key"] == older_key.as_str())
-            .unwrap_or_else(|| panic!("the relay does not list what stands in: {listed}"));
-        assert_ne!(as_a_peer["state"], "hot", "{listed}");
-        conn.close(0u32.into(), b"done");
-    }
 
     a.start();
     b.start();
@@ -3562,25 +3483,6 @@ fn entry_as_an_earlier_version_wrote_it(n: &Node, channel: &str) -> String {
     entry.item_id
 }
 
-/// A relay names a channel in its log only for debugging. Its log does
-/// hold each of `channels`, which it was told of, and no line that holds
-/// one is of a level above debug: what a relay logs as a matter of course
-/// says how many channels, and not which.
-fn assert_names_channels_only_for_debugging(relay: &Node, channels: &[&str]) {
-    let log = without_colour(&std::fs::read_to_string(relay.log()).unwrap());
-    for channel in channels {
-        let naming: Vec<&str> = log.lines().filter(|l| l.contains(channel)).collect();
-        assert!(!naming.is_empty(), "the relay's log should hold {channel}");
-        for line in naming {
-            let level = line.split_whitespace().nth(1);
-            assert!(
-                matches!(level, Some("DEBUG" | "TRACE")),
-                "the relay's log names a channel above debug: {line}"
-            );
-        }
-    }
-}
-
 /// What a relay must never be told: a swarm channel's ID, which holds an
 /// entity ID, and the entity ID of the node it serves. Nothing the relay
 /// has written to disk holds either: not its log, and not its database,
@@ -3760,17 +3662,8 @@ fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
 /// from a secret, and nothing of a channel of the older kind (decision
 /// 2026-10-04 §10). Nothing that the relay has written to disk holds the
 /// swarm channel's ID, the node's entity ID, or the entry.
-///
-/// A relay carries the older kind of channel as it did, and of the
-/// channels of that kind that it is told of it says how many as a matter
-/// of course, and which only for debugging. A stand-in for a node that
-/// holds a group shows it: it tells the relay of the group in every way a
-/// node of that kind tells a relay of a channel (an announcement, a
-/// request for its entries, and an entry pushed to it).
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
-    use cordelia_network::channel_announce::{announcement, send_channel_joined};
-    use cordelia_network::messages::Protocol;
+#[test]
+fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
     let mut relay = node("relay", "relay", None);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
@@ -3810,53 +3703,6 @@ async fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
     wait_for("nothing is left waiting to be sent", &all, 60, || {
         (c.get("/api/v1/status")?["outbox_waiting"] == 0).then_some(())
     });
-
-    // The relay, of the older kind: what stands in for a node that holds
-    // a group tells the relay of it in each of the three ways.
-    const GROUP: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
-    let older = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
-    let (_manager, conn) = client_of(&relay, older.clone()).await;
-    let (mut send, _recv) = conn.open_bi().await.unwrap();
-    cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ChannelAnnounce)
-        .await
-        .unwrap();
-    send_channel_joined(&mut send, GROUP, &announcement(&older, GROUP))
-        .await
-        .unwrap();
-    let _ = send.finish();
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ItemSync)
-        .await
-        .unwrap();
-    cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, GROUP, 0, 100)
-        .await
-        .expect("the relay answers a request for a channel's entries");
-    let _ = send.finish();
-    let sent = entry_in(&older, GROUP, vec![8; 40]);
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-    let ack = cordelia_network::item_sync::send_push(&mut stream, std::slice::from_ref(&sent))
-        .await
-        .expect("the relay answers the push");
-    assert_eq!(ack.stored, 1, "{ack:?}");
-    // Of the channels it was told of, the relay says how many as a matter
-    // of course, and which only for debugging. (It notes the announcement
-    // and the request a moment after it has answered each.)
-    wait_for("the relay notes what it was told of", &all, 60, || {
-        let log = without_colour(&std::fs::read_to_string(relay.log()).ok()?);
-        let names = |told_by: &str| {
-            log.lines()
-                .any(|line| line.contains(told_by) && line.contains(GROUP))
-        };
-        let counts = log.lines().any(|line| {
-            line.contains("peer announced channels")
-                && line.split_whitespace().nth(1) == Some("INFO")
-        });
-        (counts && names("peer announced channel") && names("served sync request")).then_some(())
-    });
-    assert_names_channels_only_for_debugging(&relay, &[GROUP]);
-    // The relay has still been told nothing that holds a name.
-    assert_told_no_id_that_holds_a_name(&relay, &c, &told);
 }
 
 /// A key file that cannot be removed does not stop the node. A node that
@@ -3960,175 +3806,6 @@ async fn client_of(
     (manager, conn)
 }
 
-/// Hold `items` as a device of the older kind held its channels, and
-/// answer the relay at the other end of `conn` when it asks: which
-/// channels are held, what each lists, and the entries. For as long as
-/// the connection lasts.
-///
-/// A relay carries the older kind of channel as it did, and a device of
-/// this version holds none of it (decision 2026-10-04 §10): what a relay
-/// does for that kind is shown with this, and with [`push_to`].
-fn serves_the_older_kind(conn: &quinn::Connection, items: Vec<cordelia_network::messages::Item>) {
-    use cordelia_network::codec;
-    use cordelia_network::messages::{
-        FetchResponse, ItemHeader, Protocol, SyncChannelListResponse, SyncResponse, WireMessage,
-    };
-    let conn = conn.clone();
-    tokio::spawn(async move {
-        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-            if !matches!(
-                codec::read_protocol_byte(&mut recv).await,
-                Ok(Protocol::ItemSync)
-            ) {
-                continue;
-            }
-            while let Ok(asked) = codec::read_frame(&mut recv, Protocol::ItemSync).await {
-                let answer = match asked {
-                    WireMessage::SyncChannelListRequest(_) => {
-                        let mut channel_ids: Vec<String> =
-                            items.iter().map(|i| i.channel_id.clone()).collect();
-                        channel_ids.sort();
-                        channel_ids.dedup();
-                        WireMessage::SyncChannelListResponse(SyncChannelListResponse {
-                            channel_ids,
-                        })
-                    }
-                    // An entry's place in its channel's list is its place
-                    // among the entries held, from 1.
-                    WireMessage::SyncRequest(req) => {
-                        let after = req.after_seq.unwrap_or(0);
-                        let of: Vec<(u64, &cordelia_network::messages::Item)> = items
-                            .iter()
-                            .filter(|i| i.channel_id == req.channel_id)
-                            .zip(1u64..)
-                            .map(|(i, seq)| (seq, i))
-                            .collect();
-                        let page: Vec<&(u64, &cordelia_network::messages::Item)> = of
-                            .iter()
-                            .filter(|(seq, _)| *seq > after)
-                            .take(req.limit as usize)
-                            .collect();
-                        let last = page.last().map_or(after, |(seq, _)| *seq);
-                        WireMessage::SyncResponse(SyncResponse {
-                            items: page
-                                .iter()
-                                .map(|(_, i)| ItemHeader {
-                                    item_id: i.item_id.clone(),
-                                    channel_id: i.channel_id.clone(),
-                                    item_type: i.item_type.clone(),
-                                    content_hash: i.content_hash.clone(),
-                                    author_id: i.author_id.clone(),
-                                    signature: i.signature.clone(),
-                                    key_version: i.key_version,
-                                    published_at: i.published_at.clone(),
-                                    is_tombstone: i.is_tombstone,
-                                    parent_id: i.parent_id.clone(),
-                                    slot: i.slot.clone(),
-                                    rev: i.rev,
-                                })
-                                .collect(),
-                            has_more: of.last().is_some_and(|(seq, _)| *seq > last),
-                            last_seq: Some(last),
-                        })
-                    }
-                    WireMessage::FetchRequest(req) => WireMessage::FetchResponse(FetchResponse {
-                        items: items
-                            .iter()
-                            .filter(|i| req.item_ids.contains(&i.item_id))
-                            .cloned()
-                            .collect(),
-                    }),
-                    _ => break,
-                };
-                if codec::write_frame(&mut send, &answer).await.is_err() {
-                    break;
-                }
-            }
-        }
-    });
-}
-
-/// Push `items` to `relay` in one push, as a client under `author`'s key.
-/// Returns the relay's answer.
-async fn push_to(
-    relay: &Node,
-    author: Arc<cordelia_crypto::identity::NodeIdentity>,
-    items: &[cordelia_network::messages::Item],
-) -> cordelia_network::messages::PushAck {
-    let (_manager, conn) = client_of(relay, author).await;
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-    cordelia_network::item_sync::send_push(&mut stream, items)
-        .await
-        .expect("the relay answers the push")
-}
-
-/// A relay passes on to the relays it lists what it comes to hold, and
-/// nothing of a channel whose ID may not be told to a peer. Two relays
-/// that list each other; a client pushes to the first an entry of a swarm
-/// channel and an entry of a group, in one push. The second relay is sent
-/// the group's entry, and nothing of the other: nothing it has written to
-/// disk holds that entry's ID, or how a swarm channel's ID begins. Nor did
-/// the first relay store it: a relay stores nothing of such a channel, and
-/// says so to whoever pushed it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_relay_passes_on_nothing_of_a_swarm_channel() {
-    use cordelia_network::messages::{REFUSED_INVALID, Refusal};
-    use cordelia_storage::naming::{SWARM_CHANNEL_PREFIX, swarm_channel_id};
-    let mut r1 = node("relay1", "relay", None);
-    let key_of = |n: &Node| n.cli(&["id"]).trim().to_string();
-    let mut r2 = node_with_relays(
-        "relay2",
-        "relay",
-        &[(format!("localhost:{}", r1.p2p), Some(key_of(&r1)))],
-    );
-    r1.add_relay(&format!("localhost:{}", r2.p2p), Some(&key_of(&r2)));
-    let (r1_key, r2_key) = (key_of(&r1), key_of(&r2));
-    r1.start();
-    wait_for("relay1 healthy", &[&r1], 30, || healthy(&r1));
-    r2.start();
-    let both = [&r1, &r2];
-    wait_for("relay2 healthy", &both, 30, || healthy(&r2));
-    wait_for("the relays mesh", &both, 60, || {
-        (peer_keys(&r1).contains(&r2_key) && peer_keys(&r2).contains(&r1_key)).then_some(())
-    });
-
-    let client = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
-    let held = entry_in(&client, &swarm_channel_id("pushed-canary"), vec![7; 40]);
-    let sent = entry_in(
-        &client,
-        "grp_550e8400-e29b-41d4-a716-446655440000",
-        vec![8; 40],
-    );
-    let ack = push_to(&r1, client, &[held.clone(), sent.clone()]).await;
-
-    // What the second relay was sent, read from the second relay.
-    wait_for(
-        "the second relay is sent the group's entry",
-        &both,
-        90,
-        || (!files_holding(&r2, &sent.item_id).is_empty()).then_some(()),
-    );
-    assert_eq!(files_holding(&r2, &held.item_id), Vec::<PathBuf>::new());
-    assert_eq!(
-        files_holding(&r2, SWARM_CHANNEL_PREFIX),
-        Vec::<PathBuf>::new()
-    );
-
-    // And the first stored the one entry, and refused the other.
-    assert_eq!(ack.stored, 1, "{ack:?}");
-    assert_eq!(
-        ack.refused,
-        vec![Refusal {
-            item_id: held.item_id.clone(),
-            why: REFUSED_INVALID.into(),
-        }],
-        "{ack:?}"
-    );
-    let stats: serde_json::Value = serde_json::from_str(&r1.cli(&["stats", "--json"])).unwrap();
-    assert_eq!(stats["items_stored"], 1, "{stats}");
-}
-
 /// A stand-in for a relay that asks. It answers a device's handshake as a
 /// relay does, and hands the test each connection a device makes to it, so
 /// that the test can ask the device what a relay asks. Whatever the device
@@ -4165,53 +3842,66 @@ fn relay_that_asks() -> (u16, std::sync::mpsc::Receiver<quinn::Connection>) {
     (port, connections)
 }
 
-/// Ask a device over `conn`, as its relay does in one fetch: which
-/// channels it holds, and then for a page of each of `channels`. `None` if
-/// the device did not answer.
-async fn ask_as_its_relay(
+/// What a node of alpha.19 that carries the older kind of channel asks
+/// and sends of it, asked of the node at the other end of `conn` (decision
+/// 2026-11-10 (older kind), rule 7): a sync of `channel` (0x05) is answered
+/// at once with nothing, no channel and nothing in the one asked for; a
+/// push (0x06) and an announcement (0x04), each a frame of raw bytes after
+/// the protocol byte, are refused at once. The connection stays, and the
+/// node says why in its log, for debugging.
+async fn asked_of_the_older_kind_answers_nothing(
+    n: &Node,
     conn: &quinn::Connection,
-    channels: &[&str],
-) -> Option<(Vec<String>, Vec<cordelia_network::messages::SyncResponse>)> {
+    channel: &str,
+) {
     use cordelia_network::messages::Protocol;
-    use cordelia_network::{codec, item_sync};
-    let (mut send, mut recv) = conn.open_bi().await.ok()?;
-    codec::write_protocol_byte(&mut send, Protocol::ItemSync)
-        .await
-        .ok()?;
-    let listed = item_sync::send_channel_list_request(&mut send, &mut recv)
-        .await
-        .ok()?
-        .channel_ids;
-    let mut pages = Vec::new();
-    for channel in channels {
-        pages.push(
-            item_sync::send_sync_page(&mut send, &mut recv, channel, 0, 100)
-                .await
-                .ok()?,
+    let asked = asks_a_sync_of_the_older_kind(conn, channel).await;
+    let nothing = asked
+        .as_ref()
+        .is_some_and(|(listed, page)| listed.is_empty() && page.items.is_empty() && !page.has_more);
+    assert!(
+        nothing,
+        "{} answered a sync of the older kind: {asked:?}",
+        n.name
+    );
+    for older in [Protocol::ItemPush, Protocol::ChannelAnnounce] {
+        assert!(
+            refuses_at_once(conn, older).await,
+            "{} did not refuse a stream of {older:?} at once",
+            n.name
         );
     }
-    let _ = send.finish();
-    Some((listed, pages))
+    assert!(
+        conn.close_reason().is_none(),
+        "{} closed the connection",
+        n.name
+    );
+    wait_for("the node says why", &[n], 30, || {
+        let log = without_colour(&std::fs::read_to_string(n.log()).ok()?);
+        let refused = |stream: &str| {
+            log.lines().any(|line| {
+                line.contains("refused: no node carries a channel of the older kind")
+                    && line.contains(&format!("protocol=\"{stream}\""))
+            })
+        };
+        let answered = log.contains("answered a sync of the older kind with nothing");
+        (answered && refused("item_push") && refused("channel_announce")).then_some(())
+    });
 }
 
 /// A device answers its relay with nothing of a channel whose ID may not
 /// be told to a peer, though it holds the channel and an entry in it (put
 /// there as in the test of what a running node tells its relay). It
-/// answers its relay with nothing of any channel of the older kind: a
-/// device of this version carries none (decision 2026-10-04 §10). The
-/// test is the relay. It asks the device which channels it holds, and for
-/// the swarm channel's entries by its ID; it pushes the device an entry
-/// of that channel; and it announces the channel to it. What it asks is
-/// answered with nothing, as a device that holds no such channel would
-/// answer (decision 2026-10-04 §10.1): no channel, and nothing in the one
-/// asked for. The push and the announcement are refused at once, and for
-/// that reason; nothing of what was pushed is stored. On the same
-/// connection the device does answer its relay on a stream that it
-/// serves.
+/// answers its relay with nothing of any channel of the older kind: no
+/// node of this version carries one (decision 2026-11-10 (older kind),
+/// rule 7). The test is the relay: it asks the device which channels it
+/// holds, and for the swarm channel's entries by its ID, as a device that
+/// holds no such channel would be answered (decision 2026-10-04 §10.1);
+/// and it pushes the device a frame, and announces one, of the older kind,
+/// each refused at once. On the same connection the device does answer
+/// its relay on a stream that it serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
-    use cordelia_network::channel_announce::{announcement, send_channel_joined};
-    use cordelia_network::messages::Protocol;
     use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
     let (port, connections) = relay_that_asks();
     let mut a = node("asked-canary", "personal", Some(port));
@@ -4232,133 +3922,270 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
         while let Ok(newer) = connections.try_recv() {
             conn = newer;
         }
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let asked = async {
-                    let (mut send, mut recv) = conn.open_bi().await.ok()?;
-                    let mut stream = tokio::io::join(&mut recv, &mut send);
-                    cordelia_network::peer_sharing::request_peers(&mut stream, 8)
-                        .await
-                        .ok()
-                };
-                tokio::time::timeout(Duration::from_secs(5), asked)
-                    .await
-                    .ok()
-                    .flatten()
-            })
-        })
+        answers_a_request_for_peers(&conn)
     });
 
-    // Asked which channels it holds, and for the swarm channel's entries
-    // by its ID: it answers at once that it holds none, and that the
-    // channel holds nothing, though its database holds both.
-    let at_once = Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS / 2);
-    let asked = tokio::time::timeout(at_once, ask_as_its_relay(&conn, &[swarm.as_str()])).await;
-    let nothing = match &asked {
-        Ok(Some((listed, pages))) => {
-            listed.is_empty() && pages.len() == 1 && pages[0].items.is_empty() && !pages[0].has_more
-        }
-        _ => false,
-    };
-    assert!(nothing, "the device answered its relay: {asked:?}");
-    // Pushed an entry of the channel: it is not taken.
-    let stranger = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
-    let pushed = entry_in(&stranger, &swarm, vec![7; 40]);
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-    let push = cordelia_network::item_sync::send_push(&mut stream, std::slice::from_ref(&pushed));
-    let ack = tokio::time::timeout(at_once, push).await;
-    assert!(
-        matches!(ack, Ok(Err(_))),
-        "the device answered a push: {ack:?}"
-    );
-    // Told of the channel: the device stops the stream.
-    let (mut send, _recv) = conn.open_bi().await.unwrap();
-    cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ChannelAnnounce)
-        .await
-        .unwrap();
-    let _ = send_channel_joined(&mut send, &swarm, &announcement(&stranger, &swarm)).await;
-    let stopped = tokio::time::timeout(at_once, send.stopped()).await;
-    assert!(
-        matches!(stopped, Ok(Ok(Some(_)))),
-        "the device heard an announcement out: {stopped:?}"
-    );
-    // The two were refused because a device carries no channel of that
-    // kind, and the device says so, for debugging; and it says that it
-    // answered the sync with nothing.
-    let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
-    for stream in ["item_push", "channel_announce"] {
-        let refused = log.lines().any(|line| {
-            line.contains("refused: a personal node carries no channel of the older kind")
-                && line.contains(&format!("protocol=\"{stream}\""))
-        });
-        assert!(refused, "{stream}: {log}");
-    }
-    assert!(
-        log.contains("answered a sync of the older kind with nothing"),
-        "{log}"
-    );
+    asked_of_the_older_kind_answers_nothing(&a, &conn, &swarm).await;
+    assert!(answers_a_request_for_peers(&conn).is_some());
 
-    // Nothing of what was pushed is stored, and the device's database
-    // holds the channel and its own entry all the while. (`cordelia
-    // channels` says nothing of them: on a personal node it lists the
-    // names that the device holds.)
-    assert_eq!(files_holding(&a, &pushed.item_id), Vec::<PathBuf>::new());
+    // The device's database holds the channel and its own entry all the
+    // while. (`cordelia channels` says nothing of them: on a personal node
+    // it lists the names that the device holds.)
     assert_eq!(swarm_channels_held(&a), 1);
     let channels = a.cli(&["channels"]);
     assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
     assert!(!files_holding(&a, &held).is_empty());
 }
 
-/// A relay warns of an announcement that is not valid, and what it names
-/// in the warning is text that the peer chose. A client announces a
-/// channel under a name of thousands of characters that has a line break
-/// in it and what looks like a line of a log after that, with a signature
-/// that is not its own. The relay's warning has the first 64 characters
-/// of the name, with the line break shown as an escape: it is one line, of
-/// ordinary length, and nothing in the relay's log is the line that the
-/// peer wrote.
+/// A relay answers what is asked of the older kind with nothing, as a
+/// device does, though its database holds a channel of that kind with an
+/// item in it, as a relay of alpha.19 left it (decision 2026-11-10 (older
+/// kind), rule 7). A client asks it which channels it holds and for that
+/// channel's entries, and is answered with nothing; it pushes a frame of
+/// the older kind, and announces one, and each is refused at once. Nothing
+/// is stored, and the client is still served on a stream of the relay's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_relay_warns_of_what_a_peer_announced_in_a_few_safe_characters() {
-    use cordelia_network::channel_announce::{announcement, send_channel_joined};
-    use cordelia_network::messages::Protocol;
-    const FORGED: &str = "2026-10-05T00:00:00.000000Z  INFO a line the peer wrote";
+async fn a_relay_answers_nothing_of_the_older_kind_and_takes_none_of_it() {
     let mut relay = node("relay", "relay", None);
+    holds_an_older_channel(&relay, OLDER_GROUP);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-
     let key = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
-    let named = format!("grp_canary\n{FORGED}{}", "x".repeat(5000));
-    // An announcement that does not verify, whose own channel ID has a
-    // line break too: the reason the relay gives holds that one.
-    let mut descriptor = announcement(&key, &format!("grp_inner\n{FORGED}"));
-    descriptor.signature[0] ^= 0xFF;
     let (_manager, conn) = client_of(&relay, key).await;
-    let (mut send, _recv) = conn.open_bi().await.unwrap();
-    cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ChannelAnnounce)
-        .await
-        .unwrap();
-    send_channel_joined(&mut send, &named, &descriptor)
-        .await
-        .unwrap();
-    let _ = send.finish();
-
-    let warned = wait_for("the relay warns of the announcement", &[&relay], 60, || {
-        let log = without_colour(&std::fs::read_to_string(relay.log()).ok()?);
-        log.lines()
-            .find(|line| line.contains("channel-announce: invalid descriptor"))
-            .map(String::from)
+    wait_for("the relay answers the client", &[&relay], 30, || {
+        answers_a_request_for_peers(&conn)
     });
-    assert!(warned.contains("WARN"), "{warned}");
-    assert!(
-        warned.contains(r"channel=grp_canary\n2026-10-05"),
-        "{warned}"
+
+    asked_of_the_older_kind_answers_nothing(&relay, &conn, OLDER_GROUP).await;
+    assert!(answers_a_request_for_peers(&conn).is_some());
+    assert_eq!(older_items_held(&relay), 1);
+}
+
+/// Whether the node at the other end of `conn` answers a request for
+/// peers, within five seconds: a stream that every node serves.
+fn answers_a_request_for_peers(conn: &quinn::Connection) -> Option<()> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let asked = async {
+                let (mut send, mut recv) = conn.open_bi().await.ok()?;
+                let mut stream = tokio::io::join(&mut recv, &mut send);
+                cordelia_network::peer_sharing::request_peers(&mut stream, 8)
+                    .await
+                    .ok()
+                    .map(|_| ())
+            };
+            tokio::time::timeout(Duration::from_secs(5), asked)
+                .await
+                .ok()
+                .flatten()
+        })
+    })
+}
+
+// ── Beside alpha.19 (decision 2026-11-10 (older kind), rules 8, 10) ──
+
+/// `cordelia msg` with `args` on `n`, in its folder `notes`, given `body`
+/// on its input: what it said.
+fn msg_in_notes(n: &Node, args: &[&str], body: &str) -> std::process::Output {
+    use std::io::Write;
+    let mut child = n
+        .command_for(&[], &[&["msg"], args].concat())
+        .current_dir(n.home().join("notes"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let _ = child.stdin.take().unwrap().write_all(body.as_bytes());
+    child.wait_with_output().unwrap()
+}
+
+/// A message sent by `from` to the name `name`, from its folder `notes`,
+/// is read by `to` in its own: through the relays, as each reaches them.
+fn a_message_goes(all: &[&Node], from: &Node, to: &Node, name: &str, body: &str) {
+    let said = wait_for("the message is sent", all, 120, || {
+        let said = msg_in_notes(from, &["send", "--to", name], body);
+        said.status.success().then_some(said)
+    });
+    let sent = String::from_utf8_lossy(&said.stdout).into_owned();
+    let id = sent.split_whitespace().nth(1).unwrap().to_string();
+    let read = wait_for("the message is read", all, 180, || {
+        let said = msg_in_notes(to, &["read", &id], "");
+        said.status.success().then_some(said)
+    });
+    let read = String::from_utf8_lossy(&read.stdout).into_owned();
+    assert!(read.contains(body), "{read}");
+}
+
+/// A relay of the version before (alpha.19, `CORDELIA_TEST_BINARY_BEFORE`)
+/// and a relay of this build list each other by key (decision 2026-11-10
+/// (older kind), rules 8 and 10, test (a)). The relay of alpha.19 holds
+/// more channels of the older kind than a node of this build answers on
+/// one stream (64), made through its own `/api/v1/channels/subscribe`, and
+/// publishes an item in each through its own `/api/v1/channels/publish`,
+/// which its outbox pushes to the relays it lists. A laptop of this build
+/// uses both relays, and a desktop of alpha.19 the relay of this build.
+///
+/// A file and a message go each way between the two devices. What the
+/// relay of alpha.19 asks of the older kind, of the relay of this build and
+/// of the laptop, is answered with nothing, and what it pushes of that kind
+/// is refused: the relay of this build holds none of it. The two relays
+/// stay connected, and neither cuts the other off.
+#[test]
+fn a_relay_of_the_version_before_and_one_of_this_build_list_each_other() {
+    const NOTES: &str = "lab";
+    const CHANNELS: usize = 70;
+    let Some(before) = binary_before() else {
+        return;
+    };
+    // Not this build, told by its bytes (TESTING.md).
+    assert_ne!(
+        std::fs::read(&before).unwrap(),
+        std::fs::read(BIN).unwrap(),
+        "the version before is this build: {}",
+        before.display()
     );
-    assert!(warned.contains(r"grp_inner\n2026-10-05"), "{warned}");
-    assert!(warned.len() < 400, "{} characters: {warned}", warned.len());
-    let log = std::fs::read_to_string(relay.log()).unwrap();
-    assert!(!log.lines().any(|line| line.starts_with(FORGED)), "{log}");
-    assert!(!log.contains(&"x".repeat(100)));
+    let mut older = relay_made_by(before.clone());
+    let mut relay = node("relay", "relay", None);
+    let (older_key, relay_key) = (key_of(&older), key_of(&relay));
+    let (older_at, relay_at) = (
+        format!("127.0.0.1:{}", older.p2p),
+        format!("127.0.0.1:{}", relay.p2p),
+    );
+    older.add_relay(&relay_at, Some(&relay_key));
+    relay.add_relay(&older_at, Some(&older_key));
+    // The relay of alpha.19 asks a device again soon after it is answered.
+    older.relay_ask_again_secs(5);
+    older.start();
+    relay.start();
+    for r in [&older, &relay] {
+        wait_for("relay healthy", &[&older, &relay], 30, || healthy(r));
+    }
+    // Each is the other's hot peer.
+    let hot = |r: &Node, key: &str| {
+        let peers = r.get("/api/v1/peers")?;
+        peers["peers"]
+            .as_array()?
+            .iter()
+            .any(|peer| peer["key"] == key && peer["state"] == "hot")
+            .then_some(())
+    };
+    wait_for("the relays list each other", &[&older, &relay], 90, || {
+        hot(&older, &relay_key)?;
+        hot(&relay, &older_key)
+    });
+
+    let mut laptop = node_with_relays(
+        "laptop",
+        "personal",
+        &[
+            (older_at.clone(), Some(older_key.clone())),
+            (relay_at.clone(), Some(relay_key.clone())),
+        ],
+    );
+    laptop.start();
+    let mut desktop = node_run_by(before, "desktop", relay.p2p);
+    desktop.add_relay(&relay_at, Some(&relay_key));
+    desktop.start();
+    let all = [&older, &relay, &laptop, &desktop];
+    wait_for("laptop healthy", &all, 30, || healthy(&laptop));
+    wait_for("desktop healthy", &all, 30, || healthy(&desktop));
+    wait_for("the laptop reaches both relays", &all, 60, || {
+        (peer_keys(&laptop).len() == 2).then_some(())
+    });
+    wait_for("the desktop reaches its relay", &all, 60, || {
+        has_hot_peer(&desktop)
+    });
+
+    // The channels of the older kind at the relay of alpha.19, each with
+    // an item that its outbox pushes to the relay of this build.
+    for n in 0..CHANNELS {
+        let channel = format!("older-{n:02}");
+        let made = older.post(
+            "/api/v1/channels/subscribe",
+            serde_json::json!({ "channel": channel }),
+        );
+        assert_eq!(made["is_new"], true, "{made}");
+        let published = older.post(
+            "/api/v1/channels/publish",
+            serde_json::json!({ "channel": channel, "content": { "text": "of the older kind" } }),
+        );
+        assert!(published["item_id"].is_string(), "{published}");
+    }
+    assert_eq!(older_items_held(&older), CHANNELS as i64);
+
+    // The two devices are one person's, and each maps its notes folder
+    // under one name.
+    makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    has_applied(&desktop, 1, &all);
+    let memory_of = |n: &Node| {
+        let notes = n.home().join("notes");
+        std::fs::create_dir_all(&notes).unwrap();
+        n.cli(&["sync", "claude", "--dir", &path(&n.home().join(".claude"))]);
+        n.cli(&["sync", "map", &path(&notes), NOTES]);
+        claude_folder(&n.home(), &notes)
+    };
+    let (laptop_memory, desktop_memory) = (memory_of(&laptop), memory_of(&desktop));
+
+    // A file each way.
+    for (from, to, file) in [
+        (&laptop_memory, &desktop_memory, "from-the-laptop.md"),
+        (&desktop_memory, &laptop_memory, "from-the-desktop.md"),
+    ] {
+        let text = format!("{file}: a thought.\n");
+        std::fs::write(from.join(file), &text).unwrap();
+        wait_for("the file reaches the other device", &all, 180, || {
+            (read(&to.join(file))? == text).then_some(())
+        });
+    }
+    // A message each way.
+    a_message_goes(&all, &laptop, &desktop, NOTES, "from the laptop\n");
+    a_message_goes(&all, &desktop, &laptop, NOTES, "from the desktop\n");
+
+    // The relay of alpha.19 asked the relay of this build and the laptop of
+    // the older kind, and each answered with nothing; it pushed its items,
+    // and the relay of this build refused them, and holds none.
+    let says = |n: &Node, what: &str| {
+        let log = std::fs::read_to_string(n.log()).unwrap_or_default();
+        log.lines().filter(|line| line.contains(what)).count()
+    };
+    wait_for(
+        "the relay of this build is asked again and again",
+        &all,
+        90,
+        || (says(&relay, "answered a sync of the older kind with nothing") >= 3).then_some(()),
+    );
+    wait_for("the laptop is asked", &all, 90, || {
+        (says(&laptop, "answered a sync of the older kind with nothing") >= 1).then_some(())
+    });
+    wait_for(
+        "the relay of this build refuses a push of the older kind",
+        &all,
+        90,
+        || {
+            let refused = "refused: no node carries a channel of the older kind";
+            let log = without_colour(&std::fs::read_to_string(relay.log()).ok()?);
+            log.lines()
+                .any(|line| line.contains(refused) && line.contains("protocol=\"item_push\""))
+                .then_some(())
+        },
+    );
+    assert_eq!(older_items_held(&relay), 0);
+    assert_eq!(older_items_held(&laptop), 0);
+
+    // The link stays up: each is still the other's hot peer, and neither
+    // cut the other off.
+    hot(&older, &relay_key).expect("the relay of alpha.19 lost the relay of this build");
+    hot(&relay, &older_key).expect("the relay of this build lost the relay of alpha.19");
+    for r in [&older, &relay] {
+        assert_eq!(
+            says(r, "over its rate limits again and again"),
+            0,
+            "{}",
+            r.name
+        );
+    }
 }
 
 // ── A device's relays and its connections (decision 2026-10-17) ─────

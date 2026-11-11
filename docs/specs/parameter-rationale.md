@@ -143,7 +143,9 @@ permit (8 pushes of 900 KB beside a fetch answer of 900 KB, never in 10
 runs). With the peer's streams within seven eighths, the eighth left is
 always there to read back: every case ended in 10 of 10 runs in both
 directions, each run in a process of its own
-(`a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other`).
+(`a_fetch_and_large_pushes_on_one_connection_do_not_wait_on_each_other`,
+which went with the fetch of the older kind: decision 2026-11-10 (older
+kind), rule 7).
 
 **What it costs an honest peer, at round trips of 200, 300 and 400 ms.**
 Measured for the decision record (its section 2.3): one connection
