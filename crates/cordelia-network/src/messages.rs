@@ -306,9 +306,7 @@ pub struct ItemHeader {
 // and its page is refused.
 
 /// What a header holds in place of a text over its size `most`: a mark of
-/// `most` and one bytes, which the check of an entry's fields before a
-/// fetch refuses ([`cordelia_core::protocol::entry_fields_fit`]). The text
-/// itself is not kept.
+/// `most` and one bytes. The text itself is not kept.
 pub fn over_its_size(most: usize) -> String {
     "#".repeat(most + 1)
 }
@@ -3401,15 +3399,6 @@ mod tests {
             ("its type", MAX_ITEM_TYPE_LEN, |h| &mut h.item_type),
             ("its time", MAX_TIMESTAMP_LEN, |h| &mut h.published_at),
         ];
-        let fits = |h: &ItemHeader| {
-            cordelia_core::protocol::entry_fields_fit(
-                &h.item_id,
-                &h.channel_id,
-                &h.item_type,
-                &h.published_at,
-                h.parent_id.as_deref(),
-            )
-        };
         let read_back = |header: &ItemHeader| {
             let bytes = encode_message(&WireMessage::SyncResponse(SyncResponse {
                 items: vec![
@@ -3439,17 +3428,11 @@ mod tests {
                     over_its_size(most),
                     "{what} past its bound by {past} was kept"
                 );
-                assert!(
-                    !fits(&held),
-                    "{what} past its bound by {past} would be fetched"
-                );
-                assert!(fits(&items[0]) && fits(&items[2]), "{what}");
             }
             let mut one = at_bounds.clone();
             one.parent_id = Some("q".repeat(MAX_ITEM_ID_LEN + past));
             let items = read_back(&one).expect("a long parent: page refused");
             assert_eq!(items[1].parent_id, Some(over_its_size(MAX_ITEM_ID_LEN)));
-            assert!(!fits(&items[1]), "a long parent would be fetched");
         }
         // A text longer than the decoder's buffer is not read at all.
         let mut one = at_bounds.clone();

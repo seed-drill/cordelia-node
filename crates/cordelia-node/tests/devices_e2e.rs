@@ -3347,7 +3347,7 @@ async fn client_of(
     let endpoint = transport::create_endpoint(&key, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
     let mut manager =
-        connection::ConnectionManager::new(key, endpoint, vec![], vec!["personal".into()], port);
+        connection::ConnectionManager::new(key, endpoint, vec!["personal".into()], port);
     let relay_id = manager
         .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
         .await
@@ -3365,13 +3365,8 @@ fn relay_that_asks() -> (u16, std::sync::mpsc::Receiver<quinn::Connection>) {
     let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
-    let manager = connection::ConnectionManager::new(
-        identity,
-        endpoint.clone(),
-        vec![],
-        vec!["relay".into()],
-        port,
-    );
+    let manager =
+        connection::ConnectionManager::new(identity, endpoint.clone(), vec!["relay".into()], port);
     let ctx = manager.connect_context();
     let (made, connections) = std::sync::mpsc::channel();
     tokio::spawn(async move {

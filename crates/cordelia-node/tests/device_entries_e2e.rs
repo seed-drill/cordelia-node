@@ -116,7 +116,6 @@ impl Device {
         let manager = connection::ConnectionManager::new(
             for_transport,
             endpoint,
-            vec![],
             vec!["personal".into()],
             port,
         );
@@ -772,7 +771,6 @@ impl StandIn {
         let manager = connection::ConnectionManager::new(
             identity,
             endpoint.clone(),
-            vec![],
             roles.iter().map(|role| role.to_string()).collect(),
             port,
         );

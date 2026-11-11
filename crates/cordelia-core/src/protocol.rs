@@ -329,26 +329,6 @@ pub const CHURN_FRACTION: f64 = 0.2;
 /// prevents a single good/bad interaction from dominating the score.
 pub const EMA_ALPHA: f64 = 0.1;
 
-/// RTT normalisation denominator in ms. Score formula: 1 / (1 + rtt_ms / DENOM).
-/// Primitive: 100ms is the reference RTT. A 100ms peer scores 0.5x a local peer.
-/// Chosen as typical cross-region latency.
-pub const SCORE_RTT_DENOMINATOR_MS: f64 = 100.0;
-
-/// Default RTT factor when RTT is unknown (no measurement yet).
-/// Derived: equals 1/(1+1) = 0.5; assumes unknown RTT is equivalent to the
-/// reference RTT. Neither penalised nor favoured until measured.
-pub const SCORE_RTT_DEFAULT_FACTOR: f64 = 0.5;
-
-/// Minimum relay contribution factor (floor for non-contributing relays).
-/// Primitive: 10% floor. Even a non-contributing relay keeps minimal score
-/// to avoid thrashing connections; it's still providing connectivity.
-pub const SCORE_CONTRIBUTION_MIN: f64 = 0.1;
-
-/// Maximum relay contribution factor (cap for high-contributing relays).
-/// Primitive: 2x cap. High-contributing relays get a bonus but can't
-/// dominate the score to the point where other factors are irrelevant.
-pub const SCORE_CONTRIBUTION_MAX: f64 = 2.0;
-
 /// Maximum ban duration after escalation: 7 days.
 /// Primitive: absolute calendar-time cap. Even systematic abuse doesn't
 /// result in permanent exclusion; the peer can try again after a week.
@@ -469,44 +449,6 @@ const _: () = assert!(
         + 256
         <= ENTRY_OVERHEAD_BYTES
 );
-
-/// Whether an entry's fields other than its ciphertext are each within the
-/// size they must fit in. With the limit on ciphertext this makes an entry
-/// one size at most, whatever it carries: MAX_ITEM_BYTES and
-/// ENTRY_OVERHEAD_BYTES. The other fields are of fixed size.
-pub fn entry_fields_fit(
-    item_id: &str,
-    channel_id: &str,
-    item_type: &str,
-    published_at: &str,
-    parent_id: Option<&str>,
-) -> bool {
-    entry_field_over(item_id, channel_id, item_type, published_at, parent_id).is_none()
-}
-
-/// The first of an entry's fields that is over the size it must fit in,
-/// by name and with that size in bytes, if any is.
-pub fn entry_field_over(
-    item_id: &str,
-    channel_id: &str,
-    item_type: &str,
-    published_at: &str,
-    parent_id: Option<&str>,
-) -> Option<(&'static str, usize)> {
-    if item_id.len() > MAX_ITEM_ID_LEN {
-        Some(("ID", MAX_ITEM_ID_LEN))
-    } else if channel_id.len() > MAX_CHANNEL_ID_LEN {
-        Some(("channel", MAX_CHANNEL_ID_LEN))
-    } else if item_type.len() > MAX_ITEM_TYPE_LEN {
-        Some(("type", MAX_ITEM_TYPE_LEN))
-    } else if published_at.len() > MAX_TIMESTAMP_LEN {
-        Some(("time", MAX_TIMESTAMP_LEN))
-    } else if parent_id.is_some_and(|parent| parent.len() > MAX_ITEM_ID_LEN) {
-        Some(("parent", MAX_ITEM_ID_LEN))
-    } else {
-        None
-    }
-}
 
 /// Maximum items per batch fetch (demand-model.md §3.1).
 /// Primitive: 100 items per batch; balances throughput against memory

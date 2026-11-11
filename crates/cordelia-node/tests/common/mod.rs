@@ -2215,13 +2215,8 @@ pub fn stand_in_relay() -> StandIn {
     let key = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
-    let manager = connection::ConnectionManager::new(
-        identity,
-        endpoint.clone(),
-        vec![],
-        vec!["relay".into()],
-        port,
-    );
+    let manager =
+        connection::ConnectionManager::new(identity, endpoint.clone(), vec!["relay".into()], port);
     let ctx = manager.connect_context();
     let relay = StandIn {
         port,

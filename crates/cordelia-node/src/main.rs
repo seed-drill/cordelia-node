@@ -2547,7 +2547,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     println!("Cordelia v{version}");
     println!("  Entity:    {}", config.identity.entity_id);
     println!("  Public key: {pk_bech32}");
-    println!("  HTTP API:  http://{listen_addr}/api/v1/channels/");
+    println!("  HTTP API:  http://{listen_addr}/api/v1/channels/identity");
     if config.network.accepts_inbound() {
         println!("  P2P port:  {p2p_port}/UDP");
     } else {
@@ -2657,7 +2657,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let conn_mgr = cordelia_network::connection::ConnectionManager::new(
             identity_arc.clone(),
             endpoint,
-            vec![], // no channel: the handshake says none (decision 2026-11-10 (older kind), rule 7)
             roles,
             advertised_port,
         );

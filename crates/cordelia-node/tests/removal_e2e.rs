@@ -1236,7 +1236,6 @@ impl Client {
         let mut manager = cordelia_network::connection::ConnectionManager::new(
             identity,
             endpoint,
-            vec![],
             vec!["personal".into()],
             port,
         );
@@ -1488,7 +1487,6 @@ impl RelayBefore {
             let manager = connection::ConnectionManager::new(
                 identity,
                 endpoint.clone(),
-                vec![],
                 vec!["relay".into()],
                 port,
             );
@@ -1742,7 +1740,6 @@ impl HeldBackRelay {
             let manager = connection::ConnectionManager::new(
                 identity,
                 endpoint.clone(),
-                vec![],
                 vec!["relay".into(), "heads".into()],
                 port,
             );

@@ -34,12 +34,10 @@ async fn test_two_node_connect_and_handshake() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let channels_a = vec!["ch_shared".into(), "ch_only_a".into()];
-    let channels_b = vec!["ch_shared".into(), "ch_only_b".into()];
     let roles = vec!["personal".into()];
 
-    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, channels_a, roles.clone(), 9474);
-    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, channels_b, roles, 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, roles.clone(), 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, roles, 9474);
 
     // B accepts in background
     let ep_b_accept = mgr_b.endpoint();
@@ -147,10 +145,8 @@ async fn test_two_node_reconnect_after_disconnect() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -200,20 +196,8 @@ async fn test_two_node_full_lifecycle() {
     let b_addr = ep_b.local_addr().unwrap();
 
     // Connect + handshake via ConnectionManager
-    let mut mgr_a = ConnectionManager::new(
-        id_a.clone(),
-        ep_a,
-        vec!["ch_shared".into()],
-        vec!["personal".into()],
-        9474,
-    );
-    let mut mgr_b = ConnectionManager::new(
-        id_b.clone(),
-        ep_b,
-        vec!["ch_shared".into()],
-        vec!["personal".into()],
-        9474,
-    );
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -281,7 +265,6 @@ async fn test_chaos_disconnect_during_handshake() {
     let ctx_b = connection::ConnectContext {
         endpoint: ep_b.clone(),
         public_key: id_b.public_key(),
-        channel_ids: vec![],
         roles: vec!["personal".into()],
         p2p_port: 9474,
         listed: None,
@@ -323,10 +306,8 @@ async fn test_chaos_disconnect_during_sync() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -398,10 +379,8 @@ async fn test_stress_concurrent_streams() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -485,10 +464,8 @@ async fn test_incoming_handshake_timeout() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -586,10 +563,8 @@ async fn test_shutdown_and_wait() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();

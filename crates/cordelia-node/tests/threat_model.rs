@@ -880,7 +880,7 @@ async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
     let mut manager =
-        connection::ConnectionManager::new(identity, endpoint, vec![], vec!["relay".into()], port);
+        connection::ConnectionManager::new(identity, endpoint, vec!["relay".into()], port);
     let relay_id = manager
         .connect_to(relay_addr.parse().unwrap())
         .await
@@ -1615,7 +1615,6 @@ async fn client_as(identity: Arc<NodeIdentity>, relay: &Node) -> Result<Client, 
     let mut manager = connection::ConnectionManager::new(
         identity.clone(),
         endpoint,
-        vec![],
         vec!["personal".into()],
         port,
     );
