@@ -39,10 +39,10 @@
 //! node's read of each list it follows, and what it then does, is
 //! [`members_read`]; what the status says of each, [`repository_status`].
 //!
-//! A personal node serves [`configure_device_routes`]: it carries no
-//! channel of the older kind (decision 2026-10-04 §10). A node of any
-//! other role serves [`configure_routes`], with the Channels API of the
-//! older kind as it was.
+//! A personal node serves [`configure_device_routes`]. A node of any
+//! other role serves [`configure_routes`]: its identity, status and
+//! metrics. No node serves the Channels API of the older kind (decision
+//! 2026-11-10 (older kind), rule 2).
 
 pub mod adding;
 pub(crate) mod arrivals;
@@ -55,7 +55,6 @@ pub mod change;
 pub mod commands;
 pub(crate) mod cut;
 pub use cut::{CutNow, may_have_dropped_links};
-pub mod entries;
 pub mod error;
 pub mod first_start;
 pub mod following;
@@ -96,38 +95,15 @@ pub mod swept;
 pub mod sync;
 pub mod take;
 pub mod types;
-pub mod verify;
 
 use actix_web::web;
 
-/// Configure all Channels API routes on the given scope.
+/// Configure the routes of a node that is not a personal node: a relay or
+/// a bootnode. Of the Channels API it serves its identity alone (decision
+/// 2026-11-10 (older kind), rule 2).
 pub fn configure_routes(cfg: &mut web::ServiceConfig) {
     cfg.service(
-        web::scope("/api/v1/channels")
-            // Named channels
-            .route("/subscribe", web::post().to(handlers::subscribe))
-            .route("/publish", web::post().to(handlers::publish))
-            .route("/listen", web::post().to(handlers::listen))
-            .route("/entries", web::post().to(handlers::entries))
-            .route("/delete-key", web::post().to(handlers::delete_key))
-            .route("/list", web::post().to(handlers::list))
-            .route("/info", web::post().to(handlers::info))
-            .route("/unsubscribe", web::post().to(handlers::unsubscribe))
-            // DM
-            .route("/dm", web::post().to(handlers::dm))
-            .route("/list-dms", web::post().to(handlers::list_dms))
-            // Groups
-            .route("/group", web::post().to(handlers::group_create))
-            .route("/group/invite", web::post().to(handlers::group_invite))
-            .route("/group/remove", web::post().to(handlers::group_remove))
-            .route("/list-groups", web::post().to(handlers::list_groups))
-            // Key management
-            .route("/rotate-psk", web::post().to(handlers::rotate_psk_handler))
-            .route("/delete-item", web::post().to(handlers::delete_item))
-            // Search
-            .route("/search", web::post().to(handlers::search_handler))
-            // Identity
-            .route("/identity", web::post().to(handlers::identity)),
+        web::scope("/api/v1/channels").route("/identity", web::post().to(handlers::identity)),
     );
 
     // Status (GET, authenticated, operations.md §8)

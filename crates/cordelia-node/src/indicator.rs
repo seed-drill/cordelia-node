@@ -31,12 +31,6 @@
 /// (it runs every `cordelia_sync::claude::CYCLE_SECS`).
 pub const STALE_REPORT_SECS: i64 = 60;
 
-/// How many times in a row relays must refuse an item before status asks
-/// for attention. A relay that is briefly unable to store (it is being
-/// restarted, its disk is being cleared) refuses once or twice, and the
-/// item is delivered within seconds.
-pub const REFUSALS_BEFORE_ATTENTION: u64 = 3;
-
 /// What the state is derived from.
 #[derive(Debug, Default, Clone)]
 pub struct Facts {
@@ -52,9 +46,6 @@ pub struct Facts {
     /// What was written here and a relay has not been sent yet: how many
     /// of the device's own channels have something waiting.
     pub outbox_waiting: u64,
-    /// Of those, the ones relays keep refusing ([`REFUSALS_BEFORE_ATTENTION`]
-    /// times in a row or more). They are still offered, now and then.
-    pub outbox_refused: u64,
     /// `cordelia sync claude` is on.
     pub sync_enabled: bool,
     /// Age of the last sync cycle's report, by the wall clock; `None`
@@ -647,10 +638,6 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
                 format!("memory: no relay for {} minutes", secs / 60),
             );
         }
-        if f.outbox_refused > 0 {
-            let n = f.outbox_refused;
-            amber("refused", format!("memory: {n} not taken by a relay"));
-        }
         if f.other_version {
             amber(
                 "other_version",
@@ -861,12 +848,6 @@ pub fn running(f: &mut Facts, live: &serde_json::Value) {
     f.held = live["held"]["by"].as_str().map(str::to_string);
     f.peers_hot = live["peers_hot"].as_u64().unwrap_or(0);
     f.outbox_waiting = live["outbox_waiting"].as_u64().unwrap_or(0);
-    f.outbox_refused = live["outbox_refused"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|r| r["refusals"].as_u64() >= Some(REFUSALS_BEFORE_ATTENTION))
-        .count() as u64;
     f.held_pairs = live["messages"]["held_pairs"].as_u64().unwrap_or(0);
 }
 
@@ -1121,10 +1102,6 @@ fn of_its_folders(f: &Facts) -> (State, String) {
             n => (Offline, format!("memory offline, {n} waiting")),
         };
     }
-    if f.outbox_refused > 0 {
-        let n = f.outbox_refused;
-        return (Attention, format!("memory: {n} not taken by a relay"));
-    }
     if f.outbox_waiting > 0 {
         return (Syncing, format!("memory sending {}", f.outbox_waiting));
     }
@@ -1326,7 +1303,7 @@ mod tests {
     ];
 
     /// Each thing of the amber list, alone, in the list's order.
-    const AMBER: [(Edit, &str, &str); 12] = [
+    const AMBER: [(Edit, &str, &str); 11] = [
         (
             &|f| {
                 f.peers_hot = 0;
@@ -1334,11 +1311,6 @@ mod tests {
             },
             "no_relay",
             "memory: no relay for 6 minutes",
-        ),
-        (
-            &|f| f.outbox_refused = 2,
-            "refused",
-            "memory: 2 not taken by a relay",
         ),
         (
             &|f| f.other_version = true,
@@ -1517,7 +1489,6 @@ mod tests {
         });
         let amber = [
             "no_relay",
-            "refused",
             "other_version",
             "removal_not_applied",
             "added",
@@ -1672,12 +1643,12 @@ mod tests {
 
     /// The warning is first among the amber memory lines (decision
     /// 2026-10-19 §2, rule 3): with the channel past the line, each of the
-    /// twelve lines that the overflow itself can cause is made to hold in
+    /// eleven lines that the overflow itself can cause is made to hold in
     /// turn, and the line shown is the warning each time, with the other
     /// line after it.
     #[test]
     fn the_warning_is_shown_before_every_other_amber_memory_line() {
-        assert_eq!(AMBER.len(), 12);
+        assert_eq!(AMBER.len(), 11);
         let past = channel_of(12 * 1024 * 1024, 0, WORD);
         assert!(past.past_the_line());
         for (edit, what, says) in AMBER {
@@ -1799,16 +1770,6 @@ mod tests {
                 assert_eq!(shown.summary, amber_says, "with {plain_says}");
             }
         }
-        // Offline for two minutes, with entries that relays keep
-        // refusing: amber, and the line says refused, not offline.
-        let offline = with(&|f| {
-            f.peers_hot = 0;
-            f.no_relay_secs = Some(120);
-            f.outbox_refused = 1;
-        });
-        assert_eq!(offline.level, Some(Level::Amber));
-        assert_eq!(offline.summary, "memory: 1 not taken by a relay");
-        assert_eq!(offline.state, State::Offline);
         // A conflict beside no relay for six minutes: red, the conflict.
         let both = with(&|f| {
             f.peers_hot = 0;
@@ -1984,7 +1945,7 @@ mod tests {
             }
             // Amber: each of the five, alone, with the state as it is
             // without it.
-            for (amber, what, says) in &AMBER[3..8] {
+            for (amber, what, says) in &AMBER[2..7] {
                 let without = with(place);
                 let shown = with(&|f| {
                     amber(f);
@@ -2036,7 +1997,7 @@ mod tests {
         // Sync off with a notice stored, errors, conflicts and no relay:
         // nothing of folders holds, and the line says off.
         let off = with(&|f| {
-            for (edit, _, _) in RED.iter().skip(7).chain(&AMBER[..3]).chain(&AMBER[8..]) {
+            for (edit, _, _) in RED.iter().skip(7).chain(&AMBER[..2]).chain(&AMBER[7..]) {
                 edit(f);
             }
             f.sync_enabled = false;
@@ -2178,7 +2139,7 @@ mod tests {
     #[test]
     fn with_nothing_mapped_or_no_report_yet_there_is_no_amber_of_folders() {
         let of_folders = |f: &mut Facts| {
-            for (edit, _, _) in AMBER[..3].iter().chain(&AMBER[8..]) {
+            for (edit, _, _) in AMBER[..2].iter().chain(&AMBER[7..]) {
                 edit(f);
             }
         };
@@ -2208,7 +2169,7 @@ mod tests {
         assert_eq!(no_report.summary, "memory sync starting");
         // Each thing of folders needs all three: with one of them
         // missing, none holds.
-        for (edit, what, _) in AMBER[..3].iter().chain(&AMBER[8..]) {
+        for (edit, what, _) in AMBER[..2].iter().chain(&AMBER[7..]) {
             for missing in [
                 (&|f: &mut Facts| f.mapped = 0) as &dyn Fn(&mut Facts),
                 &|f: &mut Facts| f.report_age_secs = None,
@@ -2324,19 +2285,6 @@ mod tests {
             (error.level, error.state, error.summary.as_str()),
             (Some(Level::Red), State::Attention, "memory sync error")
         );
-        // So is what needs the person and has no level with nothing
-        // mapped: entries that relays keep refusing. The state is
-        // `attention`, nothing holds, and the words are of that, and not
-        // of the phrase.
-        let refused = no_phrase(&|f| {
-            f.mapped = 0;
-            f.outbox_refused = 2;
-        });
-        assert_eq!(
-            (refused.level, refused.state, refused.summary.as_str()),
-            (None, State::Attention, "memory: 2 not taken by a relay")
-        );
-        assert!(refused.holds.is_empty());
         // With nothing mapped and a notice: red, and the line says that
         // folders stopped syncing.
         let notice = with(&|f| {
@@ -2757,10 +2705,6 @@ mod tests {
         });
         assert_eq!(notice, (State::Attention, Some(Level::Red)));
         assert_eq!(
-            of(&|f| f.outbox_refused = 1),
-            (State::Attention, Some(Level::Amber))
-        );
-        assert_eq!(
             of(&|f| f.other_version = true),
             (State::Synced, Some(Level::Amber))
         );
@@ -2779,7 +2723,7 @@ mod tests {
             (State::Offline, Some(Level::Amber))
         );
         // Each thing of a person's devices leaves the state as it was.
-        for (edit, what, _) in &AMBER[3..] {
+        for (edit, what, _) in &AMBER[2..] {
             assert_eq!(of(edit), (State::Synced, Some(Level::Amber)), "{what}");
         }
         // And for every thing of the two lists, the state is what it is
@@ -2906,14 +2850,6 @@ mod tests {
         assert_eq!(
             with(&|f| f.outbox_waiting = 4),
             (State::Syncing, "memory sending 4".into())
-        );
-        // Relays keep refusing one of them: that needs the person.
-        assert_eq!(
-            with(&|f| {
-                f.outbox_waiting = 4;
-                f.outbox_refused = 1;
-            }),
-            (State::Attention, "memory: 1 not taken by a relay".into())
         );
         assert_eq!(
             with(&|f| f.projects_waiting = 1),
@@ -3299,7 +3235,6 @@ mod tests {
                     "uptime_secs": 3_600,
                     "peers_hot": peers,
                     "outbox_waiting": waiting,
-                    "outbox_refused": [],
                     "no_relay_secs": (peers == 0).then_some(4_000),
                 });
                 if let Some(with) = with {
@@ -3412,12 +3347,12 @@ mod tests {
         // hold of agents is still last, amber.
         let all = with(&|f| {
             f.conflicts = vec!["notes.md".into()];
-            f.outbox_refused = 2;
+            f.other_version = true;
             f.held_pairs = 1;
         });
         assert_eq!(all.level, Some(Level::Red));
         assert_eq!(all.summary, "memory: 1 conflict");
-        assert_eq!(whats(&all), ["conflicts", "refused", MESSAGES_HOLD]);
+        assert_eq!(whats(&all), ["conflicts", "other_version", MESSAGES_HOLD]);
         assert_eq!(all.holds.last().unwrap().level, Level::Amber);
     }
 
@@ -3550,7 +3485,7 @@ mod tests {
     #[test]
     fn its_place_is_after_names_carried() {
         let all = with(&|f| {
-            for (edit, _, _) in &AMBER[3..] {
+            for (edit, _, _) in &AMBER[2..] {
                 edit(f);
             }
         });
@@ -3562,7 +3497,7 @@ mod tests {
             "{whats:?}"
         );
         assert!(at("relay_without_latest") < at("names"), "{whats:?}");
-        for (edit, what, says) in &AMBER[3..7] {
+        for (edit, what, says) in &AMBER[2..6] {
             let shown = with(&|f| {
                 lacking(f);
                 edit(f);
@@ -3636,7 +3571,7 @@ mod tests {
         });
         assert_eq!(whats(&none), ["no_relay"]);
         // Last: after every other amber, which it hides nothing of.
-        for (edit, what, says) in &AMBER[..11] {
+        for (edit, what, says) in &AMBER[..10] {
             let shown = with(&|f| {
                 out(f);
                 edit(f);

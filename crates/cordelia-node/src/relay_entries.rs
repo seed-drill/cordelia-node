@@ -77,9 +77,8 @@
 //!
 //! ## The limits
 //!
-//! The limits by address are the ones that the older kind of channel has,
-//! with the same numbers, and the two kinds are counted together
-//! ([`Rates`]):
+//! The limits by address are the ones that the older kind of channel had,
+//! with the same numbers ([`Rates`]):
 //!
 //! - what a peer pushes and shows, against the bytes it may push in a
 //!   minute;
@@ -723,10 +722,8 @@ impl Drop for Pulling<'_> {
 /// What a relay holds, across its connections, for the entries of channels
 /// from their secrets (see the module's documentation).
 pub struct RelayEntries {
-    /// Its room for this kind of channel: a cap of its own, of the size of
-    /// the older kind's, and what each address made it take lately
-    /// (decision 2026-10-04 §2.5). For the one version that carries both
-    /// kinds a relay can hold twice its cap.
+    /// Its room for this kind of channel: its cap, and what each address
+    /// made it take lately (decision 2026-10-04 §2.5).
     room: Mutex<Room>,
     /// The relays that the operator configured.
     relays: RelayAddrs,
@@ -3155,8 +3152,8 @@ mod tests {
     }
 
     /// What a peer shows counts as what it pushes does, and the entry it
-    /// is answered with counts as anything fetched does: each against the
-    /// allowance that the older kind of channel counts against.
+    /// is answered with counts as anything fetched does: each against its
+    /// allowance.
     #[test]
     fn an_entry_shown_counts_as_pushed_and_what_goes_back_as_fetched() {
         let at = relay();
@@ -3185,11 +3182,10 @@ mod tests {
         assert_eq!(at.push_room(2), MINUTE - SMALL);
         assert_eq!(at.fetch_room(2), MINUTE - (4096 + 1024));
 
-        // With the older kind, one allowance. A peer from which the relay
-        // has fetched all but a little of what it may in a minute is
-        // handed the entry all the same, while it is not over yet. It is
-        // counted, and takes the peer over by that entry.
-        lock(&at.rates).fetched(&peer(3), address(3), MINUTE - 5000);
+        // A peer that has been handed all but a little of what it may in a
+        // minute is handed the entry all the same, while it is not over
+        // yet. It is counted, and takes the peer over by that entry.
+        lock(&at.rates).answered(&peer(3), address(3), MINUTE - 5000);
         assert_eq!(at.fetch_room(3), 5000);
         assert_eq!(
             shown(at.show(3, first.to_wire())),
@@ -3217,15 +3213,15 @@ mod tests {
         let lacked = small(8, 1, 5);
         assert_eq!(shown(at.show(3, lacked.to_wire())), ShowAnswer::Taken);
         // With room for it to the byte, it is handed, and none is left.
-        lock(&at.rates).fetched(&peer(4), address(4), MINUTE - 5120);
+        lock(&at.rates).answered(&peer(4), address(4), MINUTE - 5120);
         assert_eq!(
             shown(at.show(4, first.to_wire())),
             ShowAnswer::Another(larger.to_wire())
         );
         assert_eq!(at.fetch_room(4), 0);
 
-        // A peer that has pushed all but a little of what it may, in
-        // items of the older kind, shows an entry: it is not looked at.
+        // A peer that has pushed all but a little of what it may shows an
+        // entry: it is not looked at.
         lock(&at.rates)
             .pushed(&peer(5), address(5), MINUTE - 1000)
             .unwrap();
@@ -4990,19 +4986,19 @@ mod tests {
         // No room at all; room for the answer to a show and nothing
         // beside it; and room, beside that, for less than the smallest
         // entry.
-        lock(&at.rates).fetched(&peer(1), address(1), MINUTE);
+        lock(&at.rates).answered(&peer(1), address(1), MINUTE);
         assert_eq!(at.fetch_room(1), 0);
         assert_eq!(while_held(1), Some(true));
-        lock(&at.rates).fetched(&peer(5), address(5), MINUTE - LARGEST);
+        lock(&at.rates).answered(&peer(5), address(5), MINUTE - LARGEST);
         assert_eq!(at.fetch_room(5), LARGEST);
         assert_eq!(while_held(5), Some(true));
-        lock(&at.rates).fetched(&peer(2), address(2), MINUTE - LARGEST - (SMALL - 1));
+        lock(&at.rates).answered(&peer(2), address(2), MINUTE - LARGEST - (SMALL - 1));
         assert_eq!(while_held(2), Some(true));
         assert_eq!(breaches(&at, 1), (0, 0));
         // Room for the smallest beside it: the store is asked, and the
         // entry handed.
         for n in [3, 4] {
-            lock(&at.rates).fetched(&peer(n), address(n), MINUTE - LARGEST - SMALL);
+            lock(&at.rates).answered(&peer(n), address(n), MINUTE - LARGEST - SMALL);
         }
         assert_eq!(while_held(3), None);
         let handed = page(at.pull(4, 1, &proved, relay::NO_MARK, 0));
@@ -5011,7 +5007,7 @@ mod tests {
         // refused.
         let listed = relay_of(u64::MAX, &[9]);
         listed.hold(&small(1, 1, 5), NOW);
-        lock(&listed.rates).fetched(&peer(9), address(9), MINUTE);
+        lock(&listed.rates).answered(&peer(9), address(9), MINUTE);
         assert_eq!(
             page(listed.pull(9, 1, &proved, relay::NO_MARK, 0))
                 .entries
@@ -5184,13 +5180,12 @@ mod tests {
         );
     }
 
-    /// The bytes that may be fetched in a minute are one allowance for
-    /// both kinds of channel, for a connection and for its address: what
-    /// a relay fetched from a peer of the older kind leaves less to hand
-    /// it of this kind, and an address that has been handed its share is
-    /// handed no more under another key.
+    /// The bytes that may be fetched in a minute are one allowance, for a
+    /// connection and for its address: what a peer was handed already
+    /// leaves less to hand it in a page, and an address that has been
+    /// handed its share is handed no more under another key.
     #[test]
-    fn what_is_handed_is_counted_with_the_older_kind_and_for_the_address() {
+    fn what_is_handed_is_counted_for_the_connection_and_for_the_address() {
         let at = relay();
         for d in 1..=3 {
             at.hold(&small(1, d, 5), NOW);
@@ -5198,17 +5193,16 @@ mod tests {
         at.hold(&largest(2, 1), NOW);
         let proved = having_proved(&[1, 2]);
 
-        // The relay has fetched from this peer, of the older kind, all
-        // but 2000 bytes of what may be handed in pages in a minute:
-        // what may be fetched, less the room for the answer to a show.
-        lock(&at.rates).fetched(&peer(1), address(1), MINUTE - LARGEST - 2000);
+        // This peer has been handed all but 2000 bytes of what may be
+        // handed in pages in a minute: what may be fetched, less the room
+        // for the answer to a show.
+        lock(&at.rates).answered(&peer(1), address(1), MINUTE - LARGEST - 2000);
         // One small entry fits, and is handed. The next does not.
         let one = page(at.pull(1, 1, &proved, relay::NO_MARK, 0));
         assert_eq!(one.entries.len(), 1);
         assert_eq!(at.fetch_room(1), LARGEST + 2000 - SMALL);
         not_now(at.pull(1, 1, &proved, one.mark, one.next));
-        // And what was handed counts where the older kind looks: it is
-        // one count.
+        // And what was handed counts in the one allowance.
         assert_eq!(
             lock(&at.rates).fetch_room(&peer(1), address(1)),
             LARGEST + 2000 - SMALL
@@ -5464,11 +5458,10 @@ mod tests {
     }
 
     /// What a peer pushes counts against the bytes it may push in a
-    /// minute, with the older kind of channel: one allowance for both. A
-    /// push that is over it is refused whole, stores nothing, and is a
-    /// breach.
+    /// minute: one allowance. A push that is over it is refused whole,
+    /// stores nothing, and is a breach.
     #[test]
-    fn what_is_pushed_is_counted_with_the_older_kind_against_one_allowance() {
+    fn what_is_pushed_is_counted_against_one_allowance() {
         let at = relay();
         // Each entry counts as its content and what an entry takes beyond
         // it, and bytes that are no entry's count for all of them.
@@ -5484,9 +5477,9 @@ mod tests {
         pushed(at.push(1, Vec::new()));
         assert_eq!(at.push_room(1), before);
 
-        // A peer that has pushed, in items of the older kind, all but
-        // 2000 bytes of what it may: two small entries are over it. The
-        // push is refused whole, and nothing of it is stored.
+        // A peer that has pushed all but 2000 bytes of what it may: two
+        // small entries are over it. The push is refused whole, and
+        // nothing of it is stored.
         lock(&at.rates)
             .pushed(&peer(2), address(2), MINUTE - 2000)
             .unwrap();
@@ -5497,8 +5490,7 @@ mod tests {
         // One fits in what is left, and is stored.
         assert_eq!(pushed(at.push(2, two[..1].to_vec())), [PushAnswer::Stored]);
         assert_eq!(at.push_room(2), 2000 - SMALL);
-        // And what it pushed of this kind counts where the older kind
-        // looks.
+        // And what it pushed counts in the one allowance.
         assert!(
             lock(&at.rates)
                 .pushed(&peer(2), address(2), 2000 - SMALL + 1)
@@ -6800,13 +6792,15 @@ mod tests {
         assert!(places.get(&peer(8), &channel(1)).is_some());
     }
 
-    /// The room for this kind of channel is its own: what the relay holds
-    /// of the older kind is not counted against it, and is never dropped
-    /// to make room in it.
+    /// The room for this kind of channel is its own: what the relay's
+    /// database still holds of the older kind, as an earlier version left
+    /// it, is not counted against it, and is never dropped to make room in
+    /// it (decision 2026-11-10 (older kind), rule 3).
     #[test]
     fn the_room_for_entries_is_its_own_and_takes_none_of_the_older_kinds() {
         let at = relay_of(2 * SMALL, &[]);
-        // The older kind: a channel with far more than this kind's cap.
+        // The older kind: a channel with far more than this kind's cap, in
+        // plain SQL.
         {
             let db = lock(&at.db);
             db.execute(
@@ -6816,22 +6810,31 @@ mod tests {
                 [],
             )
             .unwrap();
-            let blob = vec![0x5a; 60_000];
-            let item = cordelia_storage::items::NewItem::plain(
-                "ci_old",
-                "old_a",
-                &[1; 32],
-                "memory",
-                "2026-01-01T00:00:00Z",
-                1,
-                &[2; 32],
-                &[3; 64],
-                &blob,
-            );
-            assert!(cordelia_storage::items::insert_item(&db, &item).unwrap());
+            let blob = vec![0x5au8; 60_000];
+            db.execute(
+                "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                    content_hash, signature, encrypted_blob, content_length)
+                 VALUES ('ci_old', 'old_a', ?1, 'memory', '2026-01-01T00:00:00Z', ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    [1u8; 32].as_slice(),
+                    [2u8; 32].as_slice(),
+                    [3u8; 64].as_slice(),
+                    blob.as_slice(),
+                    blob.len() as i64,
+                ],
+            )
+            .unwrap();
         }
-        let older = || cordelia_storage::items::stored_cost(&lock(&at.db)).unwrap();
-        assert_eq!(older(), 60_000 + 1024);
+        let older = || -> i64 {
+            lock(&at.db)
+                .query_row(
+                    "SELECT COALESCE(SUM(content_length), 0) FROM items",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(older(), 60_000);
 
         // This kind is taken up to its own cap, and no further.
         assert_eq!(
@@ -6850,15 +6853,13 @@ mod tests {
             ]
         );
         assert_eq!(at.used(), 2 * SMALL);
-        // And what the relay holds of this kind is no part of what the
-        // older kind's cap is set against.
-        assert_eq!(older(), 60_000 + 1024);
+        assert_eq!(older(), 60_000);
         // Making room, and sweeping, take nothing of the older kind.
         lock(&at.entries.room).max_bytes = SMALL;
         at.entries.make_room(&at.db);
         at.entries.sweep_at(&at.db, NOW + 365 * DAY);
         assert_eq!(at.used(), 0);
-        assert_eq!(older(), 60_000 + 1024);
+        assert_eq!(older(), 60_000);
     }
 
     /// What `relay` holds through the write of its answer to `request`,
@@ -7209,7 +7210,7 @@ mod tests {
             read_as("push", push.len(), "refused_for_rate")
         );
 
-        lock(&at.rates).fetched(&peer(4), address(4), MINUTE);
+        lock(&at.rates).answered(&peer(4), address(4), MINUTE);
         let before = counts_of(&at);
         let back = served(&at, 4, Protocol::EntryPull, &mut having_proved(&[1]), &pull).await;
         assert!(back.is_empty());
@@ -7831,7 +7832,7 @@ mod tests {
         assert!(at.entries.to_pass_on(&at.db, &[peer(9)]).is_empty());
 
         // The device's address has been handed all it may be.
-        lock(&at.rates).fetched(&peer(2), address(2), MINUTE);
+        lock(&at.rates).answered(&peer(2), address(2), MINUTE);
         assert_eq!(at.fetch_room(2), 0);
         assert!(matches!(at.show(2, desktop.to_wire()), Answer::NotNow));
         // It was stored, and waits for relay 9.

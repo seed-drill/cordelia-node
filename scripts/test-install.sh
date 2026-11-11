@@ -87,7 +87,7 @@ case "$1" in
             echo '{ "state": "ok", "summary": "2 relays", "version": "@NEW@", "running": true,'
             echo '  "device": "cordelia_pk1example", "role": "personal",'
             echo "  \"node_version\": \"$(cat "$HOME/.fake/node_version")\", \"uptime_secs\": 12,"
-            echo '  "peers": { "hot": 2, "warm": 0 }, "outbox_waiting": 0, "outbox_refused": 0,'
+            echo '  "peers": { "hot": 2, "warm": 0 }, "outbox_waiting": 0,'
             echo '  "sync": { "enabled": true, "projects": [ { "project": "running", "mapped": true } ] } }'
         else
             echo '{ "state": "ok", "summary": "", "version": "@NEW@", "running": true,'

@@ -12,27 +12,6 @@ use rusqlite::Connection;
 
 use crate::publish::PlannedAgainst;
 
-/// An item to be pushed to hot peers via P2P.
-#[derive(Debug, Clone)]
-pub struct PushItem {
-    pub channel_id: String,
-    pub item_id: String,
-    pub encrypted_blob: Vec<u8>,
-    pub content_hash: Vec<u8>,
-    pub author_id: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub key_version: u32,
-    pub published_at: String,
-    pub item_type: String,
-    pub is_tombstone: bool,
-    pub parent_id: Option<String>,
-    /// Replaceable-item slot and revision (decision 2026-09-30 §4.3).
-    pub slot: Option<Vec<u8>>,
-    pub rev: Option<u64>,
-    /// If set, don't push back to this peer (relay re-push loop prevention).
-    pub exclude_peer: Option<cordelia_core::NodeId>,
-}
-
 /// Shared state accessible from all request handlers.
 pub struct AppState {
     /// The node's one lock on its database: every take is timed, by the
@@ -53,26 +32,16 @@ pub struct AppState {
     pub peers_hot: AtomicU64,
     /// Number of peers in Warm state (updated by governor tick).
     pub peers_warm: AtomicU64,
-    /// Channel for sending items to the P2P layer for push delivery.
-    /// None if P2P is not running (e.g., in tests).
-    pub push_tx: Option<tokio::sync::mpsc::UnboundedSender<PushItem>>,
-    /// Channel for notifying P2P layer of local channel subscriptions.
-    /// Triggers channel-announce (0x04) to hot peers.
-    /// None if P2P is not running (e.g., in tests).
-    pub announce_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Whether P2P runs beside this state: set where the node starts its
+    /// P2P loop, and not in a test that runs none. A node with no network
+    /// reads no relay, and waits for no pass or cycle of its own (decision
+    /// 2026-11-10 (older kind), rule 3).
+    pub networked: bool,
     /// The peers this node is connected to, refreshed on each governor tick.
     pub peers: std::sync::RwLock<Vec<PeerSnapshot>>,
     /// The relays this node was configured with and whether each is
     /// connected, refreshed by the P2P loop.
     pub relays: std::sync::RwLock<Vec<RelaySnapshot>>,
-    /// Items written here that a relay refused to store, refreshed by the
-    /// P2P loop. They stay in the outbox and are offered again.
-    pub outbox_refused: std::sync::RwLock<Vec<RefusedSnapshot>>,
-    /// Channels whose members have changed since the P2P loop last looked.
-    /// A device stores only what a channel's members wrote, so entries by
-    /// a member it had not heard of yet were refused; the loop lists these
-    /// channels again from the start, and fetches what it lacks.
-    pub relist: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Tells the sync adapter when its settings change.
     pub sync_control: SyncControl,
     /// Local history, and the turn its users take.
@@ -1291,16 +1260,6 @@ pub enum CannotGoOn {
     NotApplied { relay: String, why: String },
 }
 
-/// An item of this node's that a relay refused, for status.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefusedSnapshot {
-    pub item_id: String,
-    /// The relay's reason, as a short code ("invalid", "storage").
-    pub why: String,
-    /// How many times in a row it has been refused.
-    pub refusals: u32,
-}
-
 /// What the sync adapter wrote down when it kept a text in a conflict
 /// file, beside a file. The copy is relied on only while the file has
 /// still to take the version the text was kept against, and what was
@@ -1967,12 +1926,9 @@ mod tests {
             sync_errors: Default::default(),
             peers_hot: Default::default(),
             peers_warm: Default::default(),
-            push_tx: None,
-            announce_tx: None,
+            networked: false,
             peers: Default::default(),
             relays: Default::default(),
-            outbox_refused: Default::default(),
-            relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
             held: Default::default(),

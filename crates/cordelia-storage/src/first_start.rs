@@ -108,7 +108,7 @@ pub const OLDER_KEYS: [&str; 4] = [
 const KEYS_FOLDER: &str = "channel-keys";
 
 /// How the name of a key file of an older channel ends: its key, the ring
-/// of its earlier keys, and its slot key (see [`crate::psk`]).
+/// of its earlier keys, and its slot key.
 const KEY_FILE_ENDINGS: [&str; 3] = [".key", ".ring.json", ".slot"];
 
 /// Whatever is in the folder of channel keys under a name that ends as a

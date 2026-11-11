@@ -174,33 +174,31 @@ relay to one core, and so to 6 MiB for its cores.
 what the relay holds and how much it is used, as counts only:
 
 - the database size;
-- **the room of each kind of channel, each against its cap** (`Storage:`,
-  two lines):
+- **the room it holds against its cap** (`Storage:`):
   ```
-  Storage:          2.0 KB in use of 16.0 MB allowed, by channels of the older kind
-                    3.0 MB in use of 16.0 MB allowed, by channels from their secrets (2 held, 1 entry)
+  Storage:          3.0 MB in use of 16.0 MB allowed, by channels from their secrets (2 held, 1 entry)
   ```
-  The second line also says how many channels from their secrets the relay
-  holds, and how many entries. With `--json` the older kind is
-  `storage_used_bytes` and `storage_max_bytes`, and the channels from their
-  secrets are the same two under `entries`, with `channels_held`,
+  The line also says how many channels from their secrets the relay holds,
+  and how many entries. With `--json` they are under `entries`:
+  `storage_used_bytes`, `storage_max_bytes`, `channels_held`,
   `entries_stored` and `content_bytes_stored`;
-- items of the older kind stored, and their encrypted size (`Stored:`);
+- the entries stored, and their encrypted size (`Stored:`), and the
+  channels held (`Channels:`), counted as a device counts them
+  ([decision 2026-11-10](../../docs/decisions/2026-11-10-removing-the-older-kind.md),
+  rule 3);
 - distinct peers seen in the last day and week, relays counted apart;
-- channels of the older kind that received an item in the last day and week.
+- channels in which it stored an entry in the last day and week.
 
 **Storage.** `max_storage_bytes` (under `[node]` in the relay's config; 1
 GiB if not set) is the most a relay holds of channels from their secrets.
-What a relay of 0.2.0-alpha.19 left of the older kind is counted on the
-first line of `Storage:` against a cap of the same size, apart, and does not
-grow: give the data volume room for both, and for the database's own
-overhead.
+What a relay of 0.2.0-alpha.19 left of the older kind is not counted, and
+does not grow: give the data volume room for it as well, and for the
+database's own overhead.
 
 **What is counted.** Each entry counts as its encrypted content and 1 KB,
-for both kinds, and not as the pages of the database. So an entry that
-replaces one of its size changes nothing, and the figure falls when a
-channel is dropped, where the file does not shrink. The two lines of
-`Storage:` in `cordelia stats` are that figure for each kind.
+and not as the pages of the database. So an entry that replaces one of its
+size changes nothing, and the figure falls when a channel is dropped, where
+the file does not shrink. `Storage:` in `cordelia stats` is that figure.
 
 **At a cap, for a channel from its secret,** a relay favours the channels
 it has held longest:
@@ -225,7 +223,7 @@ held for 90 days (decision 2026-10-04 §2.3):
 - a slot in which one device's delete stands beside another device's text
   stays whole, since a relay has no list of who counts: no key's delete
   sweeps away what another key wrote;
-- the channel's room follows, so the second line of `Storage:` falls, and a
+- the channel's room follows, so `Storage:` falls, and a
   channel of which nothing is left is held no more;
 - a delete that a device carries at a change of its person's devices is a
   new entry, in a new channel: its 90 days start again there;
@@ -276,8 +274,9 @@ The schema's steps are run when the relay starts, and change no row that is
 there. A relay makes no copy of its database and takes no step that empties
 what it holds of the older kind: that is what a personal node does at its
 first start on this version, and only a personal node. After the upgrade,
-`Storage:` in `cordelia stats` shows what each kind is counted at, each
-against its cap.
+`Storage:` in `cordelia stats` shows what the channels from their secrets
+are counted at, against the cap: what the relay holds of the older kind is
+no longer counted.
 
 - **A data directory is one node's.** A relay takes a lock on its data
   directory when it starts (a file in it, `node.lock`). A second node that

@@ -982,7 +982,7 @@ pub(crate) enum Waited {
 /// again.) A node with no network has nobody to ask, and nothing is
 /// waited for.
 pub(crate) async fn fetch(state: &AppState, again: bool, deadline: Instant) -> Waited {
-    if state.push_tx.is_none() {
+    if !state.networked {
         return Waited::Done;
     }
     let (mut begun, _) = state.own_channels.whole_passes();
@@ -1020,7 +1020,7 @@ pub(crate) async fn fetch(state: &AppState, again: bool, deadline: Instant) -> W
 /// waited for; nor where sync is off, since no folder syncs.
 async fn cycle(state: &AppState, deadline: Instant) -> Waited {
     let off = !sync_is_on(&db(state)).unwrap_or(false);
-    if state.push_tx.is_none() || off {
+    if !state.networked || off {
         return Waited::Done;
     }
     let (begun, _) = state.sync_control.cycles();
@@ -1200,7 +1200,7 @@ pub async fn change_prepare(
             could_not_fetch.push(format!("{} did not answer", relay.relay));
         }
     }
-    if at.relays.is_empty() && state.push_tx.is_some() {
+    if at.relays.is_empty() && state.networked {
         could_not_fetch.push("no relay was reached".into());
     }
 
@@ -2252,8 +2252,7 @@ exit 0"#,
         let soon = || Instant::now() + Duration::from_millis(400);
         let with_network = |sync_on: bool| {
             let mut state = state_of(Machine::new(1));
-            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            state.push_tx = Some(tx);
+            state.networked = true;
             if sync_on {
                 meta::set(&db(&state), meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
             }
@@ -2262,7 +2261,7 @@ exit 0"#,
         // No network, and sync off: nothing is waited for.
         let mut no_network = state_of(Machine::new(1));
         meta::set(&db(&no_network), meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
-        no_network.push_tx = None;
+        no_network.networked = false;
         assert_eq!(cycle(&no_network, soon()).await, Waited::Done);
         assert_eq!(cycle(&with_network(false), soon()).await, Waited::Done);
 
@@ -2318,8 +2317,7 @@ exit 0"#,
     async fn test_a_pass_that_ended_early_is_asked_for_again_and_then_said() {
         let with_network = || {
             let mut state = state_of(Machine::new(1));
-            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-            state.push_tx = Some(tx);
+            state.networked = true;
             std::sync::Arc::new(state)
         };
         // The node, as its loop does it: at each asking it makes a whole
@@ -2343,7 +2341,7 @@ exit 0"#,
 
         // A node with no network has nobody to ask.
         let mut no_network = state_of(Machine::new(1));
-        no_network.push_tx = None;
+        no_network.networked = false;
         assert_eq!(fetch(&no_network, true, soon()).await, Waited::Done);
         // No pass ends: the time is up.
         let state = with_network();

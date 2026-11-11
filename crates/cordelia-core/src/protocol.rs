@@ -30,8 +30,6 @@
 //!                          \──> CHURN_JITTER_SECS
 //!                          \──> BAN_TRANSIENT_SECS ──> BACKOFF_MAX_SECS
 //!                          \                       \──> BATCH_SYNC_INTERVAL_SECS
-//!                          \──> CHANNEL_RECONCILIATION_INTERVAL_SECS
-//!                          \──> CHANNEL_RESPONDER_OFFSET_SECS
 //!
 //! CHURN_INTERVAL_SECS ──> STALE_THRESHOLD_SECS
 //!                     \──> BAN_IDENTITY_SECS
@@ -515,18 +513,6 @@ pub fn entry_field_over(
 /// pressure and response latency.
 pub const MAX_BATCH_SIZE: usize = 100;
 
-/// Maximum items per listen query (channels-api.md §3).
-/// Primitive: 500 items per query; API pagination limit.
-pub const MAX_LISTEN_LIMIT: u32 = 500;
-
-/// Maximum serialized descriptor size in bytes (network-protocol.md §4.4.6).
-/// Primitive: 512 bytes for channel metadata (name + conditions + signature).
-pub const MAX_DESCRIPTOR_SIZE: usize = 512;
-
-/// Maximum channel name length (network-protocol.md §4.4.6).
-/// Standard: RFC 1035 DNS label length limit.
-pub const MAX_CHANNEL_NAME_LEN: usize = 63;
-
 /// Default max storage per node: 1 GB (configuration.md §3).
 /// Primitive: default storage budget per node; configurable.
 pub const MAX_STORAGE_BYTES: u64 = 1_073_741_824;
@@ -557,10 +543,6 @@ pub const HISTORY_SWEEP_SHARE: u64 = 8;
 /// make, so the relay's total is what bounds storage; this keeps one
 /// channel from being most of it. Rationale: parameter-rationale.md §4.
 pub const MAX_CHANNEL_BYTES_AT_RELAY: u64 = 16 * 1024 * 1024;
-
-/// How many channels one address may make a relay hold for the first time
-/// in an hour. Rationale: parameter-rationale.md §4.
-pub const NEW_CHANNELS_PER_ADDRESS_PER_HOUR: usize = 16;
 
 // ── Connection limits (network-protocol.md §9.1) ────────────────────
 
@@ -614,7 +596,6 @@ const _: () = assert!(SHOW_ANSWER_ROOM_BYTES < PUSH_BYTES_PER_PEER_PER_MINUTE / 
 /// refused.
 pub const OUTBOX_BYTES_PER_MINUTE: u64 = 3 * 512 * 1024;
 const _: () = assert!(OUTBOX_BYTES_PER_MINUTE < PUSH_BYTES_PER_PEER_PER_MINUTE);
-const _: () = assert!(OUTBOX_BATCH_MAX_BYTES as u64 <= OUTBOX_BYTES_PER_MINUTE);
 
 /// How often a personal node flushes its outbox: its own items that no
 /// relay has yet acknowledged, sent as one batched push (decision
@@ -643,12 +624,6 @@ pub const OUTBOX_REFUSED_RETRY_MAX_SECS: u64 = 600;
 /// Rationale: parameter-rationale.md §4.
 pub const RELAY_ASK_AGAIN_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
 
-/// How many times the wait before a relay takes again a channel it dropped
-/// may double. A channel that is dropped again each time it is taken does
-/// not fit: the wait grows from RELAY_ASK_AGAIN_SECS to 32 times that (over
-/// five hours), so that trying it costs less and less.
-pub const RELAY_DROPPED_WAIT_DOUBLINGS: u32 = 5;
-
 /// The most channels a relay asks one peer about in one pass, of those the
 /// peer lists. The list is the peer's to write: without a bound it could
 /// have a relay make a request, and keep a place, for each of any number
@@ -657,20 +632,9 @@ pub const RELAY_DROPPED_WAIT_DOUBLINGS: u32 = 5;
 /// Rationale: parameter-rationale.md §4.
 pub const MAX_CHANNELS_ASKED_OF_A_PEER: usize = 1024;
 
-/// The most one outbox push may cost ([`entry_cost`]): three entries of
-/// the largest size. Well below MAX_MESSAGE_BYTES, so that the message
-/// limit can come down to 256 KB once every node sends batches this small.
-pub const OUTBOX_BATCH_MAX_BYTES: usize = 3 * (MAX_ITEM_BYTES + ENTRY_OVERHEAD_BYTES);
-
-/// Most items in one outbox push. The cost of a push bounds it sooner: a
-/// push of the smallest entries holds fewer than 200.
-pub const OUTBOX_BATCH_MAX_ITEMS: usize = 500;
-
 // Checked at compile time: one push per flush interval stays within a
-// relay's write limit, and a full batch plus framing fits in one message.
+// relay's write limit.
 const _: () = assert!(OUTBOX_FLUSH_INTERVAL_SECS * WRITES_PER_PEER_PER_MINUTE as u64 >= 60);
-const _: () = assert!(OUTBOX_BATCH_MAX_BYTES + 128 * 1024 <= MAX_MESSAGE_BYTES as usize);
-const _: () = assert!(MAX_ITEM_BYTES + ENTRY_OVERHEAD_BYTES <= OUTBOX_BATCH_MAX_BYTES);
 const _: () = assert!(BOOTNODE_RESOLVE_RETRY_SECS < BOOTNODE_RESOLVE_INTERVAL_SECS);
 
 /// Write operations per channel per minute.
@@ -705,45 +669,11 @@ pub const REALTIME_SYNC_INTERVAL_SECS: u64 = 2 * REPUSH_INTERVAL_SECS;
 /// delay; syncing more often wastes bandwidth on low-priority data.
 pub const BATCH_SYNC_INTERVAL_SECS: u64 = BAN_TRANSIENT_SECS;
 
-/// Channel reconciliation interval in seconds (network-protocol.md §4.4.2).
-/// Derived: same cadence as peer discovery. Reconcile channel state
-/// every time we might discover new peers.
-pub const CHANNEL_RECONCILIATION_INTERVAL_SECS: u64 = PEER_SHARE_INTERVAL_SECS;
-
-/// Responder stagger offset for reconciliation in seconds (network-protocol.md §4.4.2).
-/// Derived: half a peer-share cycle. Staggers reconciliation requests
-/// so both sides don't initiate simultaneously.
-pub const CHANNEL_RESPONDER_OFFSET_SECS: u64 = PEER_SHARE_INTERVAL_SECS / 2;
-
 // ── Replication ──────────────────────────────────────────────────────
 
 /// Default sync limit (max headers per response, network-protocol.md §4.5).
 /// Primitive: 100 headers per response; matches MAX_BATCH_SIZE.
 pub const DEFAULT_SYNC_LIMIT: u32 = 100;
-
-/// How many entries a node asks a peer to list in one page, and so fetch
-/// in one request. It starts with the first number. A page's entries come
-/// back in one message, and a hundred large ones do not fit in it, so
-/// when a fetch fails the node asks for the next number down, for that
-/// peer and channel, until it has caught up there:
-///
-/// - 14: fourteen entries of the largest size fit in one message.
-/// - 3: entries written before 0.2.0-alpha.4 could be 256 KB.
-/// - 1: whatever is left.
-///
-/// Without this a channel with more than a message's worth of entries in
-/// one page could never be fetched: the same request failed for ever.
-pub const SYNC_PAGE_STEPS: [u32; 4] = [DEFAULT_SYNC_LIMIT, 14, 3, 1];
-
-// Checked at compile time: fourteen entries of the largest size, with
-// what each takes beyond its ciphertext, fit in one message; so do three
-// old ones.
-const _: () = assert!(14 * (MAX_ITEM_BYTES + ENTRY_OVERHEAD_BYTES) <= MAX_MESSAGE_BYTES as usize);
-const _: () = assert!(3 * (262_144 + ENTRY_OVERHEAD_BYTES) <= MAX_MESSAGE_BYTES as usize);
-
-/// Max items per fetch request (network-protocol.md §4.5).
-/// Primitive: 100 items; matches MAX_BATCH_SIZE.
-pub const MAX_FETCH_ITEMS: usize = 100;
 
 /// Default max peers per peer-sharing response (network-protocol.md §4.3).
 /// Primitive: 20 peers per response; enough for mesh discovery without
@@ -757,8 +687,9 @@ pub const DEFAULT_MAX_PEERS_SHARE: u16 = 20;
 // bound is at least what a node of any version sends. The lists that
 // other constants bound: the peers shared (DEFAULT_MAX_PEERS_SHARE, the
 // most a node asks for), the headers of a page (DEFAULT_SYNC_LIMIT, the
-// same), the IDs of a fetch and the items handed for it (MAX_FETCH_ITEMS),
-// and the descriptors of channels (MAX_CHANNELS_ASKED_OF_A_PEER).
+// same). The lists of a fetch, of a push and of the descriptors of
+// channels went with the older kind (decision 2026-11-10 (older kind),
+// rule 2).
 
 /// The most roles a node may say it has in its handshake
 /// (network-protocol.md §4.1). A node says one: the role it is configured
@@ -772,8 +703,9 @@ pub const MAX_HANDSHAKE_ROLES: u32 = 8;
 pub const MAX_SHARED_PEER_ADDRS: u32 = 8;
 
 /// The length of the shortest ID of a channel of the older kind that a
-/// node makes: `grp_` and a UUID. Every other kind is longer
-/// (channel-naming.md). It is not the shortest a relay stores and lists:
+/// node made: `grp_` and a UUID. Every other kind is longer
+/// ([channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md)).
+/// It is not the shortest a relay stores and lists:
 /// an ID that others sent may be 1 to MAX_CHANNEL_ID_LEN bytes.
 pub const SHORTEST_CHANNEL_ID_LEN: u32 = 40;
 
@@ -787,19 +719,6 @@ pub const SHORTEST_CHANNEL_ID_LEN: u32 = 40;
 /// text and its length. Whoever asks a peer it is held to takes at most
 /// MAX_CHANNELS_ASKED_OF_A_PEER of them in any case.
 pub const MAX_LISTED_CHANNEL_IDS: u32 = MAX_MESSAGE_BYTES / (SHORTEST_CHANNEL_ID_LEN + 2);
-
-/// The most items one push may hold, and the most its answer may list as
-/// refused (network-protocol.md §4.6). A node's outbox pushes at most
-/// OUTBOX_BATCH_MAX_ITEMS, and a version before may have pushed more.
-/// Derived: as many entries of no ciphertext as one peer's allowance for a
-/// minute takes, each counted as what an entry takes beyond its
-/// ciphertext. A push of more is over any limited peer's allowance, and
-/// is refused whole. A relay that passes items on sends them in pushes of
-/// at most this many.
-pub const MAX_PUSHED_ITEMS: usize = (PUSH_BYTES_PER_PEER_PER_MINUTE / entry_cost(0)) as usize;
-
-// Checked at compile time: a node's own pushes are within the bound.
-const _: () = assert!(MAX_PUSHED_ITEMS >= OUTBOX_BATCH_MAX_ITEMS);
 
 /// How long a deleted key's tombstone is kept (decision 2026-09-30 §4.4).
 /// Primitive: 90 days. When a key's newest revision is a tombstone older
@@ -847,36 +766,6 @@ pub const INDEX_LINE_LOOK_GAP_SECS: i64 = 30;
 /// Rationale: parameter-rationale.md §4.
 pub const MAX_REV: u64 = (1 << 53) - 1;
 
-/// The largest membership epoch a channel state may carry: 2^53 - 1, for
-/// the same reason as [`MAX_REV`].
-pub const MAX_EPOCH: u64 = (1 << 53) - 1;
-
-/// How far a channel's membership epoch may move in one state. A state
-/// carries the whole list, so skipping epochs is harmless and happens when
-/// a device was offline, but a member must not be able to jump straight to
-/// [`MAX_EPOCH`] and so stop the list from ever changing again. At this
-/// step that takes 2^33 states. Rationale: parameter-rationale.md §4.
-pub const MAX_EPOCH_STEP: u64 = 1 << 20;
-
-/// How far a channel's key version may move in one state, and the most
-/// keys a state's key ring may hold. A removal moves the version by one.
-/// A device that was away may have missed some, so a state may skip
-/// versions, but never more than this, and never more than its epoch
-/// moved. Without a bound a member could send the largest version there
-/// is, after which no key could follow it and no device could be removed.
-pub const MAX_STATE_KEYS: usize = 1024;
-
-/// How long after a channel state was sent to a member it is offered again,
-/// if the member has not been seen to hold it: this long after the first
-/// time, doubling after each offer, up to STATE_OFFER_RETRY_MAX_SECS.
-/// Rationale: parameter-rationale.md §4.
-pub const STATE_OFFER_RETRY_BASE_SECS: u64 = 60;
-
-/// The longest wait between two offers of the same channel state. A member
-/// that is away for weeks is offered it four times a day, each a push of
-/// one small item that a relay which already has it answers at once.
-pub const STATE_OFFER_RETRY_MAX_SECS: u64 = 6 * 3600;
-
 /// How often nodes collect expired keyed tombstones. Hourly is plenty
 /// against a 90-day retention.
 pub const TOMBSTONE_GC_INTERVAL_SECS: u64 = 3600;
@@ -885,18 +774,6 @@ pub const TOMBSTONE_GC_INTERVAL_SECS: u64 = 3600;
 /// Primitive: 7 days; ensures offline nodes can sync deletions
 /// when they come back online within a week.
 pub const TOMBSTONE_RETENTION_DAYS: u32 = 7;
-
-// ── Seen table (network-protocol.md §7.2) ────────────────────────────
-
-/// Maximum seen table entries (network-protocol.md §7.2).
-/// Primitive: 10,000 items in flight. At 12 items/min per relay,
-/// this covers ~14 hours of unique items before eviction.
-pub const SEEN_TABLE_MAX: usize = 10_000;
-
-/// Seen table TTL in seconds (network-protocol.md §7.2).
-/// Derived: 2x the slowest convergence path (5 hops × 5s repush = 25s).
-/// 10 minutes gives 24x margin for delayed or partitioned relays.
-pub const SEEN_TABLE_TTL_SECS: u64 = 600;
 
 // ── Queue capacities (network-protocol.md §9.4) ─────────────────────
 
@@ -980,17 +857,6 @@ pub const SIGHTING_RETENTION_DAYS: i64 = 8;
 /// also how often names are looked up while a relay that lacks the change
 /// has a name that does not resolve (decision 2026-10-19, rule 3).
 pub const BOOTNODE_RESOLVE_RETRY_SECS: u64 = 30;
-
-// ── PSK exchange reasons (network-protocol.md §4.7) ──────────────────
-
-/// PSK denial: channel not found.
-pub const REASON_NOT_FOUND: &str = "not_found";
-
-/// PSK denial: not authorized for this channel.
-pub const REASON_NOT_AUTHORIZED: &str = "not_authorized";
-
-/// PSK denial: PSK temporarily unavailable.
-pub const REASON_NOT_AVAILABLE: &str = "not_available";
 
 // ── A channel from its secret (decision 2026-10-04) ──────────────────
 
@@ -1760,16 +1626,6 @@ const _: () = assert!(SMALL_WINDOWS_PULL_ENTRIES <= ENTRY_PAGE_MAX_ENTRIES);
 /// full pace at once. A device of this version never needs one (rules 3
 /// and 5).
 pub const LARGE_MESSAGES_AT_ONCE: usize = 4;
-
-/// How many of the older kind's push retries a node runs to one peer at
-/// once (decision 2026-10-22 (memory), rule 9): 4. Each retry is a stream
-/// of its own, and a failed repush of up to `MAX_PUSHED_ITEMS` items would
-/// otherwise open them all at once; against a peer that lets 8 streams be
-/// open, most would wait for a stream, time out and use up their tries.
-/// The others wait for a later round, and are not counted as a try until
-/// they are tried. Derived: half of the streams that a peer that is not a
-/// relay listed by key may have open (QUIC_MAX_BIDI_STREAMS, rule 9).
-pub const PUSH_RETRY_STREAMS_AT_ONCE: usize = QUIC_MAX_BIDI_STREAMS as usize / 2;
 
 /// The most one channel from its secret may hold at a relay (decision
 /// 2026-10-04 §2.5), in bytes as entries are counted ([`entry_cost`]).
@@ -3213,13 +3069,6 @@ mod tests {
         assert_eq!(LARGE_MESSAGES_AT_ONCE, 4);
     }
 
-    /// A node runs at most four push retries to one peer at once (decision
-    /// 2026-10-22 (memory), rule 9).
-    #[test]
-    fn at_most_four_push_retries_run_to_a_peer_at_once() {
-        assert_eq!(PUSH_RETRY_STREAMS_AT_ONCE, 4);
-    }
-
     /// A relay whose own end of a listed relay's connection does not carry
     /// the listed settings asks for one entry a page, a small page at worst
     /// (decision 2026-10-22 (memory), rule 12).
@@ -3406,21 +3255,6 @@ mod tests {
         assert_eq!(MAX_BATCH_SIZE, 100);
     }
 
-    #[test]
-    fn test_max_listen_limit_channels_api_3() {
-        assert_eq!(MAX_LISTEN_LIMIT, 500);
-    }
-
-    #[test]
-    fn test_max_descriptor_size_network_protocol_4_4_6() {
-        assert_eq!(MAX_DESCRIPTOR_SIZE, 512);
-    }
-
-    #[test]
-    fn test_max_channel_name_len_network_protocol_4_4_6() {
-        assert_eq!(MAX_CHANNEL_NAME_LEN, 63);
-    }
-
     // Connection limits (network-protocol.md §9.1)
     #[test]
     fn test_max_inbound_connections_network_protocol_9_1() {
@@ -3477,11 +3311,6 @@ mod tests {
         assert_eq!(PEER_SHARE_INTERVAL_SECS, 300);
     }
 
-    #[test]
-    fn test_channel_reconciliation_interval_network_protocol_4_4_2() {
-        assert_eq!(CHANNEL_RECONCILIATION_INTERVAL_SECS, 300);
-    }
-
     // Replication
     #[test]
     fn test_default_sync_limit_network_protocol_4_5() {
@@ -3501,7 +3330,6 @@ mod tests {
         assert_eq!(MAX_SHARED_PEER_ADDRS, 8);
         assert_eq!(SHORTEST_CHANNEL_ID_LEN, 40);
         assert_eq!(MAX_LISTED_CHANNEL_IDS, 24_966);
-        assert_eq!(MAX_PUSHED_ITEMS, 2048);
         // The shortest ID a node makes is that long.
         assert_eq!(
             format!("grp_{}", "0".repeat(36)).len(),
@@ -3522,25 +3350,6 @@ mod tests {
     fn test_fallback_peers_network_protocol_10() {
         assert_eq!(FALLBACK_PEERS.len(), 2);
         assert!(FALLBACK_PEERS[0].ends_with(":9474"));
-    }
-
-    // PSK exchange (network-protocol.md §4.7)
-    #[test]
-    fn test_psk_reasons_network_protocol_4_7() {
-        assert_eq!(REASON_NOT_FOUND, "not_found");
-        assert_eq!(REASON_NOT_AUTHORIZED, "not_authorized");
-        assert_eq!(REASON_NOT_AVAILABLE, "not_available");
-    }
-
-    // Seen table (network-protocol.md §7.2)
-    #[test]
-    fn test_seen_table_max_network_protocol_7_2() {
-        assert_eq!(SEEN_TABLE_MAX, 10_000);
-    }
-
-    #[test]
-    fn test_seen_table_ttl_network_protocol_7_2() {
-        assert_eq!(SEEN_TABLE_TTL_SECS, 600);
     }
 
     // ── Consistency checks ───────────────────────────────────────────
@@ -3648,19 +3457,6 @@ mod tests {
     #[test]
     fn test_derived_batch_sync_interval() {
         assert_eq!(BATCH_SYNC_INTERVAL_SECS, BAN_TRANSIENT_SECS);
-    }
-
-    #[test]
-    fn test_derived_channel_reconciliation_interval() {
-        assert_eq!(
-            CHANNEL_RECONCILIATION_INTERVAL_SECS,
-            PEER_SHARE_INTERVAL_SECS
-        );
-    }
-
-    #[test]
-    fn test_derived_channel_responder_offset() {
-        assert_eq!(CHANNEL_RESPONDER_OFFSET_SECS, PEER_SHARE_INTERVAL_SECS / 2);
     }
 
     // ── A channel from its secret (decision 2026-10-04) ──────────────
@@ -4391,15 +4187,13 @@ mod tests {
     }
 
     /// A relay's room for channels from their secrets: a channel's cap is
-    /// the older kind's, the allowance of new channels is 256 an hour
-    /// where the older kind's is 16, and what nobody uses goes after 90
-    /// days.
+    /// the older kind's, the allowance of new channels is 256 an hour,
+    /// and what nobody uses goes after 90 days.
     #[test]
     fn test_a_relays_room_decision_2026_10_04_2_5() {
         assert_eq!(MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, 16 * 1024 * 1024);
         assert_eq!(MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, MAX_CHANNEL_BYTES_AT_RELAY);
         assert_eq!(NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR, 256);
-        assert_eq!(NEW_CHANNELS_PER_ADDRESS_PER_HOUR, 16);
         assert_eq!(ENTRY_CHANNEL_UNUSED_DAYS, 90);
         // When a channel was last used is written down at most once an
         // hour: against 90 days, the hour is under a tenth of a percent.

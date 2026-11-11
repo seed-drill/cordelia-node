@@ -953,7 +953,7 @@ fn key_bytes_of(n: &Node) -> [u8; 32] {
 /// the relay listens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
-    use cordelia_storage::{channels, first_start, items, meta};
+    use cordelia_storage::{first_start, meta};
     let relay = stand_in_relay();
     let mut a = node("a", "personal", Some(relay.port));
     let own = key_bytes_of(&a);
@@ -971,25 +971,36 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
         // No mark, and no guard, as such a build left the database.
         assert!(first_start::remove_guard(&db).unwrap());
         meta::remove(&db, meta::FIRST_START).unwrap();
-        channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
-        channels::add_member(&db, group, &own, "owner").unwrap();
-        let blob = b"what an earlier version sealed".to_vec();
-        let item = items::NewItem {
-            item_id: "ci_01JARV8XMHW8G9QZP0000000AA",
-            channel_id: group,
-            author_id: &own,
-            item_type: "memory",
-            published_at: "2026-10-01T00:00:00Z",
-            parent_id: None,
-            key_version: 1,
-            content_hash: &cordelia_crypto::sha256(&blob),
-            signature: &[7u8; 64],
-            encrypted_blob: &blob,
-            is_tombstone: false,
-            slot: None,
-            rev: None,
-        };
-        assert!(items::insert_item(&db, &item).unwrap());
+        // The rows, in plain SQL, as such a build wrote them.
+        db.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                   created_at, updated_at)
+             VALUES (?1, 'group', 'realtime', 'invite_only', ?2, '2026-10-01', '2026-10-01')",
+            rusqlite::params![group, own.as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO channel_members (channel_id, entity_key, role, joined_at)
+             VALUES (?1, ?2, 'owner', '2026-10-01')",
+            rusqlite::params![group, own.as_slice()],
+        )
+        .unwrap();
+        let blob = b"what an earlier version sealed";
+        db.execute(
+            "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                content_hash, signature, encrypted_blob, content_length)
+             VALUES ('ci_01JARV8XMHW8G9QZP0000000AA', ?1, ?2, 'memory',
+                     '2026-10-01T00:00:00Z', ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                group,
+                own.as_slice(),
+                cordelia_crypto::sha256(blob).as_slice(),
+                [7u8; 64].as_slice(),
+                blob.as_slice(),
+                blob.len() as i64,
+            ],
+        )
+        .unwrap();
     }
     // What the older outbox, fetch and announcement would each have gone
     // by: it is there while the node runs.
@@ -1000,9 +1011,13 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
         )
         .unwrap();
         db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let rows = |sql: &str| -> i64 {
+            db.query_row(sql, rusqlite::params![own.as_slice()], |row| row.get(0))
+                .unwrap()
+        };
         (
-            items::outbox_len(&db, &own).unwrap(),
-            channels::list_for_entity(&db, &own).unwrap().len(),
+            rows("SELECT COUNT(*) FROM items WHERE author_id = ?1"),
+            rows("SELECT COUNT(*) FROM channel_members WHERE entity_key = ?1"),
             first_start::mark(&db).unwrap().map(|mark| mark.stepped),
         )
     };
@@ -1546,8 +1561,7 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
             let s = status(&a);
             let held = at_its_relay(&a)["holds_latest"] == true;
             has_sent_everything(&a)?;
-            (held && s["outbox_waiting"] == 0 && s["outbox_refused"].as_array()?.is_empty())
-                .then_some(())
+            (held && s["outbox_waiting"] == 0).then_some(())
         },
     );
     assert!(relay.pushes_of(&item) > offered_while_refused);
@@ -1908,8 +1922,7 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
 
     // The `messages` object counts what was refused, each message once,
     // and names who fills the channel; nothing of it is in what the level
-    // is worked out from, and no message enters the outbox of the older
-    // kind, which a relay's refusal there would fill.
+    // is worked out from, and nothing waits to be sent.
     let sent = 1 + said_no_room.get();
     let status = wait_for("the status counts every message refused", &[&a], 60, || {
         let status: serde_json::Value =
@@ -1921,7 +1934,6 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
     assert_eq!(messages["filled_by"]["label"], "laptop", "{messages}");
     assert_eq!(messages["filled_by"]["entries"], sent, "{messages}");
     assert_eq!(messages["no_place"], false, "{messages}");
-    assert_eq!(status["outbox_refused"], serde_json::json!([]), "{status}");
     assert_eq!(status["outbox_waiting"], 0, "{status}");
     assert_eq!(how_it_stands(&a), before);
 }

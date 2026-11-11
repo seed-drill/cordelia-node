@@ -356,12 +356,9 @@ mod tests {
             sync_errors: Default::default(),
             peers_hot: Default::default(),
             peers_warm: Default::default(),
-            push_tx: None,
-            announce_tx: None,
+            networked: false,
             peers: Default::default(),
             relays: Default::default(),
-            outbox_refused: Default::default(),
-            relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
             held: Default::default(),
@@ -511,31 +508,39 @@ mod tests {
     async fn test_a_devices_status_identity_and_metrics_count_nothing_of_the_older_kind() {
         let state = node();
         // What an earlier version left: a channel of the older kind that
-        // this device is a member of, with an item in it.
+        // this device is a member of, with an item in it, in plain SQL.
         let own = state.identity.public_key();
         {
-            use cordelia_storage::{channels, items};
             let db = state.db.lock().unwrap();
             let group = "grp_550e8400-e29b-41d4-a716-446655440000";
-            channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
-            channels::add_member(&db, group, &own, "owner").unwrap();
-            let item = items::NewItem {
-                item_id: "ci_01JARV8XMHW8G9QZP0000000AA",
-                channel_id: group,
-                author_id: &own,
-                item_type: "memory",
-                published_at: "2026-10-01T00:00:00Z",
-                parent_id: None,
-                key_version: 1,
-                content_hash: &[1u8; 32],
-                signature: &[7u8; 64],
-                encrypted_blob: b"what an earlier version sealed",
-                is_tombstone: false,
-                slot: None,
-                rev: None,
-            };
-            assert!(items::insert_item(&db, &item).unwrap());
-            assert_eq!(channels::list_for_entity(&db, &own).unwrap().len(), 1);
+            db.execute(
+                "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                       created_at, updated_at)
+                 VALUES (?1, 'group', 'realtime', 'invite_only', ?2, '2026-10-01', '2026-10-01')",
+                rusqlite::params![group, own.as_slice()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO channel_members (channel_id, entity_key, role, joined_at)
+                 VALUES (?1, ?2, 'owner', '2026-10-01')",
+                rusqlite::params![group, own.as_slice()],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                    content_hash, signature, encrypted_blob, content_length)
+                 VALUES ('ci_01JARV8XMHW8G9QZP0000000AA', ?1, ?2, 'memory',
+                         '2026-10-01T00:00:00Z', ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    group,
+                    own.as_slice(),
+                    [1u8; 32].as_slice(),
+                    [7u8; 64].as_slice(),
+                    b"what an earlier version sealed".as_slice(),
+                    30i64,
+                ],
+            )
+            .unwrap();
         }
         let everything = |state: &AppState| -> Vec<i64> {
             let db = state.db.lock().unwrap();
@@ -631,20 +636,21 @@ mod tests {
         );
         assert_eq!(everything(&state), before);
 
-        // A node that carries the older kind counts the channels of that
-        // kind, as it did.
-        let (_, older) = answer(crate::handlers::identity(asked(), state.clone()).await).await;
-        assert_eq!(older["channels_subscribed"], 1, "{older}");
+        // A relay counts the channels it holds, of which this node holds
+        // none, and stores what a device stores: nothing of the older kind
+        // either (decision 2026-11-10 (older kind), rule 3).
+        let (_, of_a_relay) = answer(crate::handlers::identity(asked(), state.clone()).await).await;
+        assert_eq!(of_a_relay["channels_subscribed"], 0, "{of_a_relay}");
         let response = crate::handlers::metrics(asked(), state.clone())
             .await
             .unwrap();
         let body = to_bytes(response.into_body()).await.unwrap();
-        let older = String::from_utf8(body.to_vec()).unwrap();
+        let of_a_relay = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!of_a_relay.contains("cordelia_items_total"), "{of_a_relay}");
         assert!(
-            older.contains("cordelia_items_total{channel=\"550e8400\"} 1\n"),
-            "{older}"
+            of_a_relay.contains(&format!("cordelia_items_stored {stored}\n")),
+            "{of_a_relay}"
         );
-        assert!(older.contains("cordelia_items_stored 1\n"), "{older}");
     }
 
     /// What is refused, with nothing written: a device that follows no
@@ -708,9 +714,8 @@ mod tests {
 
     /// The route of the counters takes no lock (decision 2026-10-22
     /// §1.1, rule 3; §7.3): while this test holds the node's lock on its
-    /// database, and the locks of its peers, its relays, the entries a
-    /// relay refused, the channels to list again and whether it is held
-    /// up, a read of the route on another thread returns, with the
+    /// database, and the locks of its peers, its relays and whether it is
+    /// held up, a read of the route on another thread returns, with the
     /// counters.
     #[test]
     fn the_route_of_the_counters_takes_no_lock() {
@@ -718,8 +723,6 @@ mod tests {
         let _db = state.db.lock().unwrap();
         let _peers = state.peers.write().unwrap();
         let _relays = state.relays.write().unwrap();
-        let _refused = state.outbox_refused.write().unwrap();
-        let _relist = state.relist.lock().unwrap();
         let _held = state.held.locked();
         let (tx, rx) = std::sync::mpsc::channel();
         let reading = state.clone();

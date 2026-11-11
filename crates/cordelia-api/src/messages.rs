@@ -4088,13 +4088,13 @@ mod tests {
     #[actix_web::test]
     async fn the_status_of_a_relay_or_of_a_node_held_up_says_nothing_of_messages() {
         let (state, _) = a_node_with_a_message();
-        let status_of = |older_kind: bool| {
+        let status_of = |relay: bool| {
             let state = state.clone();
             async move {
                 let get = TestRequest::get()
                     .insert_header(("Authorization", format!("Bearer {TOKEN}")))
                     .to_http_request();
-                answer(crate::handlers::status_with(state, get, older_kind).await).await
+                answer(crate::handlers::status_with(state, get, relay).await).await
             }
         };
         let (code, said) = status_of(false).await;

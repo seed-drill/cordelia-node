@@ -4533,7 +4533,7 @@ mod tests {
 
         // A machine with no network reaches no relay.
         let mut alone = crate::several::state_of(Machine::new(10));
-        alone.push_tx = None;
+        alone.networked = false;
         let alone = Node {
             state: std::sync::Arc::new(alone),
             relay: Default::default(),

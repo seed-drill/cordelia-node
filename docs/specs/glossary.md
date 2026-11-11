@@ -6,10 +6,13 @@
 
 > **v1 status.** The terms added by v1 are in the last two sections. The
 > personal channel, relay eviction and the economics terms below describe the
-> pre-v1 design. The section "v1 terms (2026-09-30)" is of the
+> pre-v1 design. The sections from "Channels" to "Replication" are of the
+> older kind of channel, which is gone with its routes and its
+> mini-protocols ([decision record of 2026-11-10 (older kind)](../decisions/2026-11-10-removing-the-older-kind.md),
+> rules 1, 2 and 7). The section "v1 terms (2026-09-30)" is of the
 > [decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md):
 > where it speaks of devices, membership and keys it describes the older
-> kind of channel, which a relay carries for one version more. The section
+> kind of channel too. The section
 > "A person's devices" is of the
 > [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md),
 > which replaces that model.
@@ -60,11 +63,11 @@
 
 - **Item**: A published unit of content, encrypted with channel PSK, including metadata, signature, and ciphertext blob.
 - **Publish**: Write an item to a channel via the API. Developer-facing term; internal protocol uses "write".
-- **Listen**: Retrieve items from a channel via cursor-based polling (REST Phase 1, SSE Phase 2).
-- **Item-Push**: Unsolicited sender-initiated item delivery for realtime channels via QUIC.
-- **Item-Sync**: Periodic pull-based synchronisation via hash reconciliation (anti-entropy).
-- **Channel-Announce**: P2P mini-protocol for broadcasting channel descriptor changes.
-- **PSK-Exchange**: P2P request-response mini-protocol for distributing PSKs via ECIES envelope.
+- **Listen**: Retrieve items from a channel via cursor-based polling (REST Phase 1, SSE Phase 2). Gone (decision 2026-11-10 (older kind), rule 2).
+- **Item-Push**: Unsolicited sender-initiated item delivery for realtime channels via QUIC. Gone: every node refuses its stream (decision 2026-11-10 (older kind), rule 7).
+- **Item-Sync**: Periodic pull-based synchronisation via hash reconciliation (anti-entropy). Every node answers it with nothing (decision 2026-11-10 (older kind), rule 7).
+- **Channel-Announce**: P2P mini-protocol for broadcasting channel descriptor changes. Gone: every node refuses its stream (decision 2026-11-10 (older kind), rule 7).
+- **PSK-Exchange**: P2P request-response mini-protocol for distributing PSKs via ECIES envelope. Gone (decision 2026-11-10 (older kind), rule 2).
 - **Tombstone**: Soft-delete marker (`is_tombstone=true`), propagated via replication.
 - **Store-and-forward**: Relay behaviour: receive items, store in LRU cache, re-push to peers.
 - **LRU eviction**: Least-Recently-Used cache policy on relays, triggered at 10GB storage cap.
@@ -101,7 +104,7 @@ The section of the record is given with each. Where a term here has the name
 of one above (personal channel, relay, conflict, slot key), this is what it
 means from this version on.
 
-- **The older kind (of channel)**: The kind the record of 2026-09-30 describes: a random ID, a ring of keys, and a list of members. A relay carries it for one version more; a personal node carries none of it (§10).
+- **The older kind (of channel)**: The kind the record of 2026-09-30 describes: a random ID, a ring of keys, and a list of members. No node carries it: a node answers what an alpha.19 node asks of it with nothing (decision 2026-11-10 (older kind), rules 1 and 7).
 - **Channel from its secret**: A channel is a secret of 32 bytes. Its entry key, its slot key and its signing key are derived from the secret, and its ID is the public half of the signing key, written `cordelia_ch1...` (§2.1).
 - **Person secret**: 32 random bytes, with a number. Every channel of a person's own is derived from it and the channel's name. A device is one of the person's because it holds it. It is never derived from the phrase, and changes only by a statement (§3).
 - **Generation**: The channels derived from one person secret. Person secret number n gives generation n. A device's store holds one generation: the one it has applied (§3, §16).

@@ -114,7 +114,7 @@ pub async fn read_at_relays_from(
     from: &HashMap<String, LeftPlace>,
     until: Instant,
 ) -> Vec<LeftAt> {
-    if state.push_tx.is_none() {
+    if !state.networked {
         return Vec::new();
     }
     let mut read = asks_to_read(state, channel, by.clone(), None, from, until).await;
@@ -220,7 +220,7 @@ async fn made_again(state: &AppState, relays: &[String], until: Instant) -> Vec<
 /// of the session of its connection, where it has one: what a proof for
 /// that connection is made over.
 pub async fn sessions(state: &AppState) -> Vec<(String, Option<[u8; 32]>)> {
-    if state.push_tx.is_none() {
+    if !state.networked {
         return Vec::new();
     }
     let (answer, answered) = tokio::sync::oneshot::channel();
@@ -259,7 +259,7 @@ pub const NEW_CHANNEL_NOT_READ: &str = "the new channel could not be read at a r
 /// - A node with no network has no relay to read, and nothing to wait
 ///   for: what it holds is all there is.
 pub(crate) async fn fetched_whole(state: &AppState, deadline: Instant) -> bool {
-    if state.push_tx.is_none() {
+    if !state.networked {
         return true;
     }
     let connected = sessions(state).await;
@@ -797,7 +797,7 @@ async fn new_channel_read(
         let standing = Standing::to_write(&conn)?;
         Zeroizing::new(derive::own_secret(&standing.secret, name)?)
     };
-    if state.push_tx.is_none() {
+    if !state.networked {
         return Ok((Vec::new(), true));
     }
     let channel = derive::channel_id(&secret)?;
@@ -2357,7 +2357,7 @@ mod tests {
         // that the new channel holds, and it is judged so.
         let (machine, _) = a_machine_that_does_not_hold_the_name();
         let mut state = crate::several::state_of(machine);
-        state.push_tx = None;
+        state.networked = false;
         let found = look_from(&state, LAB, &named).await.unwrap();
         assert_eq!(found["new_read"], true, "{found}");
         assert_eq!(

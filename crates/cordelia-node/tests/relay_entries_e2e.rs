@@ -24,8 +24,8 @@ use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::{derive, proof};
 use cordelia_network::messages::{
     ChannelProve, EntryPull, EntryPulled, EntryPush, EntryRefused, EntryShow, EntryShowShort,
-    Protocol, PushAnswer, PushPayload, RelayChannelsAsk, RelayEntry, RelayPull, RelayPush,
-    ShowAnswer, WireMessage,
+    Protocol, PushAnswer, RelayChannelsAsk, RelayEntry, RelayPull, RelayPush, ShowAnswer,
+    WireMessage,
 };
 use cordelia_network::{codec, connection, transport};
 use cordelia_storage::relay::HeldChannel;
@@ -984,10 +984,17 @@ async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
         }),
         "{stats}"
     );
+    // And it counts its entries as a device does, and its channels as
+    // those it holds (decision 2026-11-10 (older kind), rule 3).
+    assert_eq!(
+        (&stats["channels_subscribed"], &stats["items_stored"]),
+        (&serde_json::json!(3), &serde_json::json!(3)),
+        "{stats}"
+    );
     let plain = relay.cli(&["stats"]);
     assert!(
         plain.contains(
-            "                  3.8 KB in use of 3.8 KB allowed, by channels from their secrets \
+            "Storage:          3.8 KB in use of 3.8 KB allowed, by channels from their secrets \
              (3 held, 3 entries)"
         ),
         "{plain}"
@@ -2031,39 +2038,22 @@ async fn a_personal_node_answers_none_of_the_streams_of_entries() {
     // longer (decision 2026-10-04 §10, §10.1), it answers a sync with
     // nothing, as a device that holds no such channel would: the channel
     // that is asked for holds nothing. It takes no push of that kind.
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    codec::write_protocol_byte(&mut send, Protocol::ItemSync)
-        .await
-        .unwrap();
     let older = "grp_550e8400-e29b-41d4-a716-446655440000";
-    let page = cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, older, 0, 10)
-        .await
-        .expect("a personal node answers a sync of the older kind, with nothing");
+    let asked = asks_a_sync_of_the_older_kind(&conn, older).await;
     assert!(
-        page.items.is_empty() && !page.has_more && page.last_seq.is_none(),
-        "a personal node served a sync of the older kind: {page:?}"
+        asked
+            .as_ref()
+            .is_some_and(|(listed, page)| listed.is_empty()
+                && page.items.is_empty()
+                && !page.has_more
+                && page.last_seq.is_none()),
+        "a personal node served a sync of the older kind: {asked:?}"
     );
-    // The stream of the sync is ended: the device takes up the next
-    // stream once it is through with this one.
-    let _ = send.finish();
-    drop(recv);
     // The push is refused at once, and for what it is: whoever sent it
     // does not wait for an answer that is not coming.
-    let asked = std::time::Instant::now();
-    let pushed = ask_on(
-        &conn,
-        Protocol::ItemPush,
-        WireMessage::PushPayload(PushPayload { items: Vec::new() }),
-    )
-    .await;
     assert!(
-        pushed.is_err(),
-        "a personal node took a push of the older kind: {pushed:?}"
-    );
-    assert!(
-        asked.elapsed() < Duration::from_secs(5),
-        "a push of the older kind was left to wait, and not refused: {:?}",
-        asked.elapsed()
+        refuses_at_once(&conn, Protocol::ItemPush).await,
+        "a personal node took a push of the older kind, or left it to wait"
     );
 
     // The control: on the same connection, the device answers its relay

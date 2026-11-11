@@ -71,13 +71,9 @@ none.
 pass at each relay, one for a waking show, one for a hand-over ask, and
 one for each read a command asks of it (a carry or a recovery): about
 four. A relay to a device: its own fetch, one at a time. Between relays,
-which keep 64 when they list each other by key (rule 12, §13): a pass on,
-a pull, a fetch of the older kind, the older kind's repush, and its push
-retries, at most `PUSH_RETRY_STREAMS_AT_ONCE` to a peer at once (§13). An
-opening that waits for a stream waits at most `STREAM_TIMEOUT_SECS`
-(`open_bi`), and fails as it would on a connection lost. The older kind's
-sync stream holds a connection's inbound loop for a whole fetch, many
-frames, and the streams behind it wait for it, as they did at 64.
+which keep 64 when they list each other by key (rule 12, §13): a pass on
+and a pull. An opening that waits for a stream waits at most `STREAM_TIMEOUT_SECS`
+(`open_bi`), and fails as it would on a connection lost.
 
 **The handshake's stream.** The end that dials holds one of its streams
 for as long as the connection lasts: quinn frees a stream that a peer
@@ -164,7 +160,6 @@ longer than STREAM_TIMEOUT, derived from the times.
 | A device's pass of 10 pages of 128 KiB, dialling by key | 3.64 s | 5.37 s | 7.20 s | about 5.5 s |
 | The same pass, on these windows | 11.2 s | 16.7 s | 22.2 s | about 1.8 s |
 | A device of the version before pushes 896 KiB | 6.03 s | 8.99 s | 12.0 s | about 0.33 s |
-| An older kind's fetch answer of 1 MiB, between relays not listed by key | 6.85 s | 10.2 s | 13.6 s | about 0.29 s |
 | A full page of 896 KiB between relays listed by key | 0.41 s | 0.61 s | 0.80 s | about 4.9 s |
 
 At 200 ms before change F: 0.21 s for the push, 3.23 s for a pass, 0.32 s
@@ -179,9 +174,7 @@ takes about one round trip for each 31.5 KiB: a message of 1 MiB fails
 STREAM_TIMEOUT past round trips of about 0.3 s (it was 1.2 s at a small
 message a stream). That falls on a device of the version before, whose
 pushes of up to 896 KiB fail on every try past about 0.33 s, and need a
-large permit, and on the older kind's fetch answers between relays not
-listed by key, past about 0.29 s, after which the fetcher asks for fewer
-items (`SYNC_PAGE_STEPS`). Between relays listed by key a full page takes
+large permit. Between relays listed by key a full page takes
 under a second (rule 12, §13).
 
 **If you raise them:** each connection can make a node hold more, and W
@@ -207,8 +200,8 @@ message (a page for such a peer is at most `SMALL_PAGE_BYTES` of entries,
 is acknowledged, as two messages did. It is also what an honest peer
 lets the node send: its receive window for the connection
 (QUIC_RECEIVE_WINDOW) is two small messages. A large write (to a relay
-listed by key, which keeps two messages, `QUIC_LISTED_SEND_WINDOW`, §13;
-or the older kind's fetch answer under a permit) goes a window at a
+listed by key, which keeps two messages, `QUIC_LISTED_SEND_WINDOW`, §13)
+goes a window at a
 time, waiting for acknowledgements, within the codec's 10 s.
 
 The node answers the streams that a peer opens one at a time: the
@@ -216,8 +209,7 @@ inbound loop (`handle_peer_streams`) reads a request, answers it, and
 only then takes the next stream. The node's own streams on the same
 connection are separate tasks, and nothing keeps them from overlapping
 with the answer or with each other: between relays, a relay's passes
-(`pass_on`) and pulls (`pull_from_each`); for the older kind, the
-repush flush every five seconds, push retries and peer sharing. They all
+(`pass_on`) and pulls (`pull_from_each`); and peer sharing. They all
 share the one window. A write that finds it full waits for the
 acknowledgements of what was written before it, on whichever stream.
 
@@ -347,12 +339,7 @@ STREAM_TIMEOUT_SECS (§6), differs by stream. On the streams of entries
 answer as a message are all dropped before the write, and what is held
 through it is the answer as it is written: through each wait, the frame
 being read or the answer being written, and nothing else of the stream.
-On a sync of the older kind (`handle_inbound_sync`), a request for items
-is dropped before its answer is written, and the frame is dropped once it
-is decoded; but each answer is held both as a message and encoded through
-its write, and the answer to a page, the node's own headers (some 76 KB
-at their bounds), is still held through the read of the next request.
-The rows above count both. Measured with a counting
+Measured with a counting
 allocator, while the peer does not read the answer
 (`a_request_is_not_held_while_its_answer_is_written`), before and after
 the drops:
@@ -373,48 +360,6 @@ What it leaves out:
   starts, up to the streams the peer lets it open at once
   (QUIC_MAX_BIDI_STREAMS between nodes). What they write is still within
   the one send window above; what they hold in their own memory is not.
-  A repush that fails is queued again as a retry of each item, which
-  starts more of them: at most `PUSH_RETRY_STREAMS_AT_ONCE` to one peer
-  at once (§13).
-- A relay's fetch of the older kind from a peer (`fetch_on`), on a stream
-  it opens itself to each connected peer that is not hot. Beyond its
-  request and the frame it reads, it holds the channels it has still to
-  go through: from a peer that is not a relay it lists, at most
-  MAX_CHANNELS_ASKED_OF_A_PEER of the IDs the peer listed, each of at most
-  MAX_CHANNEL_ID_LEN bytes, 120 KiB with their places in the list, each
-  let go once it has been gone through. While it fetches a page's
-  entries, it holds what it took out of the page and no more: the IDs to
-  fetch (at most MAX_FETCH_ITEMS of at most MAX_ITEM_ID_LEN bytes, 8,800
-  bytes with their places), the place the page ends at, and whether it
-  listed anything and has more. The page itself, up to 100 headers (76 KB
-  at their bounds, above), is dropped before the fetch is sent. The peer
-  can keep each read waiting up to STREAM_TIMEOUT_SECS on its length and
-  as long again on the rest, and a fetch that ended with more to fetch is
-  started again at the next cycle, so what it holds through the waits is
-  what it can hold all the time. Measured with a counting allocator, while
-  the peer keeps the fetch of a page's entries waiting
-  (`test_a_page_is_not_held_while_its_entries_are_fetched`): 8,760 bytes
-  for a page of 100 headers at their bounds, where keeping the page held
-  79,480; and before a header's fields were bounded, a page of about a
-  megabyte, its headers each with a signature of about 10 KB, held
-  1,711,480. And where a peer lists 200 channels of 96-byte IDs and
-  answers each with an empty page, the fetch holds 19,104 bytes less at
-  the last than at the first, the IDs it has let go
-  (`test_each_channel_is_let_go_once_it_has_been_gone_through`).
-  **The frame it reads** (§13, decision 2026-10-22 rule 6): each answer
-  is read by its length, as a request is. Within a small message it is
-  read at once, so through the wait for its rest the fetch holds at most
-  `SMALL_MESSAGE_BYTES`; a longer one, from a peer that is not a relay
-  listed by key, only under a large permit, and while the fetch waits for
-  one it holds nothing of the frame beyond its length. Measured with a
-  counting allocator, while every permit is held and the peer has sent
-  the length of a list of a small message and one byte, and as much of
-  the rest as its pipe takes
-  (`a_long_answer_waits_unread_for_a_permit_and_the_fetch_fails_without_one`):
-  16,412 bytes, the test's pipes, where reading the answer whole, as
-  before, held 155,649: the frame's 147,457 bytes allocated at its
-  length, and the pipes. A large answer read under a permit is in the
-  permits' budget, not the connection's.
 - Quinn's own state for the connection beyond the data of its streams:
   its packets, its crypto buffer (16 KiB) and its tables (the
   connection's own state above is an allowance for it).
@@ -442,7 +387,6 @@ that a peer chose, before and after:
 | Frame | Before: peak, held | After: peak, held |
 |-------|--------------------|-------------------|
 | A map of 512K pairs of zeros, with no name, or its name last | 48 MB, nothing (refused) | 215 bytes, nothing (refused) |
-| A fetch of about 1M empty IDs | 80 MB, 32 MB | 4.6 KB, nothing (refused) |
 | One peer with about 1M empty addresses | 80 MB, 32 MB | 320 bytes, nothing (refused) |
 | About 200K peers, each written as an array | 42 MB, 16 MB | 206 bytes, nothing (refused) |
 | A list of about 1M empty channel IDs | 80 MB, 32 MB | 1.2 MB, 786 KB (the first 24,966 kept) |
@@ -458,26 +402,24 @@ each: of those, the first are kept and the rest passed over.
 | A handshake's roles | `MAX_HANDSHAKE_ROLES` = 8 | A node says one, the role it is configured with; a relay of decision 2026-10-24 (removal) says two, with `RELAY_ROLE_HEADS` (§12.7) |
 | Peers shared | `DEFAULT_MAX_PEERS_SHARE` = 20 | The most a node asks for |
 | Addresses of one peer shared | `MAX_SHARED_PEER_ADDRS` = 8 | A node tells one, where the peer listens |
-| Channel descriptors listed | `MAX_CHANNELS_ASKED_OF_A_PEER` = 1024 | The most channels of a peer a node keeps a place for |
 | Channel IDs listed, the first kept | `MAX_LISTED_CHANNEL_IDS` = 24,966 | Derived: as many IDs of the shortest length a node makes (`grp_` and a UUID, `SHORTEST_CHANNEL_ID_LEN` = 40) as fit in one message. A relay lists a relay it works with every channel it holds, and stores IDs others sent of 1 to 96 bytes, so an honest list can be longer: the rest are passed over, not refused. Whoever asks a peer it is held to takes at most `MAX_CHANNELS_ASKED_OF_A_PEER` of them |
 | Headers of a page | `DEFAULT_SYNC_LIMIT` = 100 | The most a node asks for |
-| IDs of a fetch, items handed for it | `MAX_FETCH_ITEMS` = 100 | A fetch is of the IDs of one page |
-| Items of a push, and those it refused | `MAX_PUSHED_ITEMS` = 2048 | Derived: as many entries of no ciphertext as one peer's allowance for a minute takes (`PUSH_BYTES_PER_PEER_PER_MINUTE`, each at `ENTRY_OVERHEAD_BYTES`). A node's outbox pushes at most `OUTBOX_BATCH_MAX_ITEMS` = 500, and a version before may have pushed more: a push of more than this is over any limited peer's allowance, and is refused whole. A relay passes items on to the relays it is hot with in pushes of at most this many |
 | Entries of a push, a page, or passed on; answers to a push | `ENTRY_PAGE_MAX_ENTRIES` = 100 | As before (§12.7) |
 | Channels a relay tells of | `RELAY_CHANNELS_PAGE_MAX` = 1000 | As before (§12.7) |
 | The texts and bytes of a header of a page | Each its own (below) | At least what a node writes, and what every node since 0.2.0-alpha.5 stores |
 
-**The fields of a header.** A page of the older kind lists up to 100
-headers, and a node holds what it read of them while it fetches their
-entries. Each text and each bytes of a header is read within its size. A
-text is read from the decoder's own buffer and copied only once it fits,
+**The fields of a header.** No node of this version asks for a page of
+the older kind, or fetches what one lists (decision 2026-11-10 (older
+kind), rule 7); the bounds stay where a page is decoded. A page of the
+older kind lists up to 100 headers, and a node held what it read of them
+while it fetched their entries. Each text and each bytes of a header is
+read within its size. A text is read from the decoder's own buffer and copied only once it fits,
 so one that is over its size costs nothing. A header with a text over its
 size is refused where it is read: the text is not kept, and the header
 holds in its place a mark of one byte over the size, which the check of
 an entry's fields before a fetch refuses, so the entry is never fetched.
 Where the text is its ID, type, time or parent, the rest of its page is
-gone through (a relay gets past what it will not store,
-`t03_a_relay_gets_past_what_it_will_not_store`). Where it is its channel,
+gone through. Where it is its channel,
 the mark is no channel's ID, so a fetch held to what it asked for (from a
 peer that is not a relay it lists) finds a header of another channel: the
 page is not the one asked for and the pass fails, as it did before the
@@ -485,9 +427,7 @@ bound, when the long ID was no more the channel asked for. Bytes of
 another size than their own refuse the page, and so does a text or bytes
 longer than the decoder's buffer (4,096 bytes), which is not read at all.
 Every node since 0.2.0-alpha.5 refuses to store an entry with a field
-over its size (§4, `entry_overhead_bytes`), and a node checks an entry's
-signature before it stores it (`check_item`), which needs its hash,
-author, signature and slot of exactly their size. A page lists what a
+over its size (§4, `entry_overhead_bytes`). A page lists what a
 node stored, so no node of those versions lists a header past these
 bounds. A relay of an earlier version may have stored what a peer sent it
 whatever its fields; where it still holds such an entry, the page that
@@ -514,14 +454,6 @@ bytes. A page of 100 headers with every field at its bound is 60,959
 bytes and holds 76,320 once read, and one whose headers each have a type
 of 4,000 bytes, 457,859 bytes, holds 76,420 (`PAGE_OF_HEADERS_MOST`, the
 bound the test holds both to, is 93,600).
-
-An item that is fetched or pushed (`Item`) has the same fields, and they
-are not bounded where it is read. What it holds is its own bytes, which
-its ciphertext may make up to a message in any case (a push of one item
-of nearly 1 MB, above), and an item with a field over its size is refused
-item by item where it is checked, with the sender told which and why
-(REFUSED_TOO_LARGE, REFUSED_INVALID): refused where it is read, the whole
-push would be refused and nothing said of the rest.
 
 ---
 
@@ -794,32 +726,26 @@ a relay, and a channel can hold about 16,000.
 plus CBOR overhead. 1MB allows batch fetch of up to 4 items at maximum
 size, or 100+ typical items in a single FetchResponse.
 
-### max_rev = 2^53 - 1, max_epoch = 2^53 - 1
+### max_rev = 2^53 - 1
 
-**Rationale:** A keyed item's revision and a channel state's epoch are
-counters that the writer sets. Unbounded, they are stored in a signed 64-bit
-column: a value near the top overflows on the next increment, and one above
-it wraps. Either way the name, or the member list, could never be written
-again. The bound is checked wherever an item or a state is verified, so a
-larger value is neither stored nor passed on.
+max_epoch went with the older kind's channel states (decision 2026-11-10 (older kind)).
+
+**Rationale:** A keyed item's revision is a counter that the writer sets.
+Unbounded, it is stored in a signed 64-bit column: a value near the top
+overflows on the next increment, and one above it wraps. Either way the
+name could never be written again. The bound is checked wherever an item
+is verified, so a larger value is neither stored nor passed on.
 
 **Derivation:** 2^53 - 1 is the largest integer that is exact both in a
 signed 64-bit column and as a JSON number, so the API can carry it. At one
 revision a second it lasts 285 million years.
 
 In a channel from its secret a revision has the same bound, and is read as
-a band and a count (§12.1). There is no epoch there.
+a band and a count (§12.1).
 
 ### max_epoch_step = 2^20
 
-**Rationale:** A state carries the whole member list, so a device that was
-away can skip the epochs it missed. But a member who could jump straight to
-max_epoch would freeze the list for everyone: no later state could be newer.
-So one state may move the epoch by at most this much.
-
-**Derivation:** No device misses a million changes to a channel's members.
-Reaching max_epoch at this step takes 2^33 states, each of which every other
-member has to receive and apply first.
+Gone, with the older kind's channel states (decision 2026-11-10 (older kind)).
 
 ### outbox_flush_interval = 2s
 
@@ -833,42 +759,15 @@ Checked at compile time in protocol.rs.
 
 ### state_offer_retry_base = 60s, state_offer_retry_max = 6h
 
-**Rationale:** A channel state (a change to a channel's members or keys)
-is offered again to a member that has not been seen to hold it: this long
-after it was first sent, doubling after each offer, up to the maximum.
-
-**Derivation:** A state travels through a relay, and the member fetches
-every 10 seconds and answers within the next 10. A minute is well past the
-time an answer normally takes, so the first repeat is not wasted. A member
-that is away is offered the state 4 times a day at the maximum: each is a
-push of one small item, which a relay that still holds it answers at once.
-Six hours bounds how long a member that has just come back waits if its
-relay lost the state while it was away.
+Gone, with the older kind's channel states (decision 2026-11-10 (older kind)).
 
 ### max_state_keys = 1024
 
-**Rationale:** The most keys a channel state carries, and the furthest a
-state may move a channel's key version. A removal adds one key and moves
-the version by one.
-
-**Derivation:** No person removes a thousand devices. The bound exists so
-that a hostile payload cannot make a node allocate without limit, and so
-that no member can send a key version so large that none could follow it.
-A ring that reaches the bound sends its newest keys, so that a removal can
-always be sent.
+Gone, with the older kind's channel states (decision 2026-11-10 (older kind)).
 
 ### sync_page_steps = 100, 14, 3, 1
 
-**Rationale:** How many entries a node asks a peer to list in one page,
-and so fetch in one request. The answer to a fetch is one message. A
-hundred entries of the largest size are six times what a message holds, so
-when a fetch fails the node asks for the next number down, for that peer
-and channel, and goes back to 100 once it has caught up there.
-
-**Derivation:** 14 entries of 64 KB, with a kilobyte of header each, fit in
-one 1 MB message (checked at compile time). 3 covers entries written
-before 0.2.0-alpha.4, which could be 256 KB. 1 always fits. Most pages
-hold small entries and never leave 100.
+Gone, with the older kind's fetch (decision 2026-11-10 (older kind)).
 
 ### push_bytes_per_peer_per_minute = 2MB, outbox_bytes_per_minute = 1.5MB
 
@@ -892,22 +791,17 @@ most 10MB a minute.
 
 **Rationale:** A relay's total storage is its operator's setting
 (max_storage_bytes, 1GB by default). Within it, one channel may hold only
-so much, and one address may make the relay hold only so many channels it
-did not hold before. A channel costs nothing to make, so without the
-second a single address could make a relay hold any number of them.
+so much.
 
 **Derivation:** After two days of use one of our devices holds 49KB across
 five channels, and our whole skills folder is 4MB: 16MB is several times
-the largest channel we expect. A person with a dozen projects makes a
-dozen channels the first time they sync; 16 an hour covers that. One
-address can then make a relay take at most 256MB an hour, so filling the
-default 1GB takes it four hours, or several addresses.
+the largest channel we expect.
 
-These two are of the older kind of channel. A channel from its secret has
-a cap of the same size and an allowance of its own, 256 an hour (§12.7),
-and each kind is counted against a cap of its own: a relay's
-`max_storage_bytes` bounds each, so for the one version that carries both
-a relay can hold twice that.
+It stays, with its name and value, as the root of the cap of a channel
+from its secret, `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` (§12.7; decision
+2026-11-10 (older kind), rule 2). new_channels_per_address_per_hour went
+with the older kind; a channel from its secret has an allowance of its
+own, 256 an hour (§12.7).
 
 ### relay_ask_again_secs = 600
 
@@ -916,9 +810,7 @@ are. It asks each peer connected to it which channels it holds and fetches
 what it lacks: its hot peers every sync cycle (as a rule, the relays it
 lists), and every other peer when it connects and then this often after it
 has fetched all the peer holds. The same wait passes before a relay takes
-again a channel it dropped to make room, and doubles each time the channel
-is dropped again (relay_dropped_wait_doublings = 5, so up to 32 times):
-a channel that is dropped each time it is taken does not fit.
+again a channel it dropped to make room.
 
 **Derivation:** A device sends what it writes as it writes it, so asking is
 only for what the relay lost, dropped or had no room for. Ten minutes is
@@ -953,6 +845,10 @@ pass.
 
 **Derivation:** A person's device holds tens of channels. One that holds
 more than this is asked about a different part of them each time.
+
+It stays, with its name and value, as the root of
+`MAX_CHANNELS_PROVED_ON_A_CONNECTION` (decision 2026-11-10 (older kind),
+rule 2): the asking it bounded went with the older kind.
 
 What a relay keeps for a peer is bounded too. It keeps a place in a
 peer's list, and a page size, for at most this many channels of a peer
@@ -992,14 +888,13 @@ few retries, seconds apart, cover the passing kind. For the lasting kind,
 one small push every ten minutes costs nothing, and delivers the item
 within ten minutes of the reason going away.
 
+It stays, with its name and value, as the root of `RELAY_ASK_AGAIN_SECS`,
+`NO_ROOM_STANDS_SECS` and `FIRST_START_RETRY_MAX_SECS` (decision 2026-11-10
+(older kind), rule 2): the older outbox went.
+
 ### outbox_batch_max_bytes = 195KB, outbox_batch_max_items = 500
 
-**Rationale:** One outbox push costs at most what three entries of the
-largest size cost (195KB with entry_overhead_bytes). That is far inside
-max_message_bytes today (checked at compile time), and is small enough
-that max_message_bytes can come down to 256KB once every node sends
-batches this small. Since each entry counts for at least a kilobyte, a
-push holds fewer than 200 entries, and the item bound is not reached.
+Gone, with the older outbox (decision 2026-11-10 (older kind)).
 
 ---
 
@@ -2033,8 +1928,7 @@ times and a count: a thousand of them are well within one message.
 #### MAX_ENTRY_CHANNEL_BYTES_AT_RELAY = 16 MB
 
 **Derivation:** What a channel of the older kind may hold,
-`MAX_CHANNEL_BYTES_AT_RELAY` (§4). The two kinds are counted apart, each
-against a cap of its own.
+`MAX_CHANNEL_BYTES_AT_RELAY` (§4).
 
 **What it costs:** an entry is padded to a power of two, so a name with
 more than about half of a channel's cap in text may not fit (decision §10).
@@ -2104,7 +1998,7 @@ aside.
 relay hold for the first time in an hour. After a removal every channel of
 a person's own is new: the personal channel, and one for each name. So is
 a pair channel, each time a device is added. At 16 an hour, which is what
-the older kind allows, a person with thirty names would wait two hours for
+the older kind allowed, a person with thirty names would wait two hours for
 the last of them, and a home with three devices shares one address. At 256
 a home of several people, each with tens of names, moves within the hour.
 
@@ -2292,14 +2186,15 @@ that is carried at a statement is a new entry, and starts again.
 
 **The timer:** a relay and a device each look once in
 `TOMBSTONE_GC_INTERVAL_SECS`, an hour, which is plenty against 90 days. It
-is one timer, and one length of time, for both kinds of channel.
+is one timer, and one length of time, for a relay and a device.
 
 #### ENTRY_OFFER_INTERVAL_SECS = 5, RELAY_ENTRY_PULL_INTERVAL_SECS = 10
 
 **Derivation:** A relay passes the entries it took on to the relays it
-works with as often as it passes on items of the older kind
-(`REPUSH_INTERVAL_SECS`). It asks each of them which channels it holds, and
-pulls what it lacks, as often as a node fetches items of the older kind
+works with as often as it passed on items of the older kind
+(`REPUSH_INTERVAL_SECS`, which stays as the root: decision 2026-11-10
+(older kind), rule 2). It asks each of them which channels it holds, and
+pulls what it lacks, as often as a node fetched items of the older kind
 from its hot peers (`REALTIME_SYNC_INTERVAL_SECS`).
 
 #### RELAY_ENTRY_PULL_PAGES = 10, RELAY_CHANNEL_PAGES_PER_PASS = 10
@@ -2826,7 +2721,7 @@ it is less than the first wait.
 **Rationale:** How long a node that finds the lock on its data directory
 held tries it again, every few milliseconds, before it says that another
 node is running there and stops (decision §10.1). A command that opens the
-database itself (`stats`, `channels`, `status`, `init`, `swarm-init`) asks
+database itself (`stats`, `channels`, `status`, `init`) asks
 the lock by taking it, and lets go of it at once: it holds it for a few
 microseconds. Without a wait, a node started by hand in that moment would
 stop, and one under its service would be started again only after the
@@ -3399,7 +3294,7 @@ rule 10 part (GRO off) is in §1 above. Its first slice added the small
 message and the large permits; its second, the small pages and the reads
 that follow them (rule 3); its third, the relay's own fetch, whose answers
 are read by their length (rule 6); its fourth, QUIC's windows and streams
-(rules 8, 9, 11 and 12), with the push retries' bound before them.
+(rules 8, 9, 11 and 12).
 
 ### SMALL_PAGE_BYTES = 131,072 (128 KiB)
 
@@ -3470,26 +3365,9 @@ at a time, from before its large frame is read until its answer is
 written, at most about 20 s (10 s to read the payload and 10 s for the
 write), and let go before the stream waits for its next frame. Who needs
 one: devices of the version before, whose pushes are up to
-`ENTRY_PAGE_MAX_BYTES` (896 KiB), the older kind's larger pushes, and the
-older kind's fetch answers over `SMALL_PAGE_BYTES`, for which the permit
-is taken before the items are loaded (rule 3), and the answers to a
-relay's own fetch from a peer that is not a relay listed by key that are
-over a small message (rule 6): an honest peer's list of every channel it
-holds, past about 1,500 of them, and the entries of a page fetched from
-a relay it does not list by key, whose answer is up to a message. That
-fetch asks as it did, up to 100 headers a page and the entries of a page
-in one request, since a header carries no size to fit a request to; it fails where no permit comes within
-`STREAM_TIMEOUT_SECS`, refusing the stream with
-`ERR_LARGE_MESSAGE_LATER`, and the peer is asked again a rate window
-later, as after any failed fetch. That holds for a list too, from any
-peer: a relay configured by address alone, which is not held to what it
-lists, used to go on with the node's own channels where its list could
-not be read, but a list with no permit has its stream refused, so nothing
-more can be asked on it. There is no budget of its own over the
-relay's fetches: a peer can keep its fetch going for as long as it likes,
-so a few peers would hold every permit of one; there is one fetch from
-each peer at a time. A device of this version never needs a permit
-(rules 3 and 5).
+`ENTRY_PAGE_MAX_BYTES` (896 KiB). The older kind's pushes and fetches
+that needed one went with it (decision 2026-11-10 (older kind)). A device
+of this version never needs a permit (rules 3 and 5).
 
 **Chosen as four:** a relay at R1 carries few devices of the version
 before, and each sends a large message only when a batch has built up;
@@ -3518,26 +3396,7 @@ sends the batch again later. Nothing else in its handling changes.
 
 ### PUSH_RETRY_STREAMS_AT_ONCE = 4
 
-**Rationale:** the older kind's push retries open a stream for each item
-(`PushRetries` in `p2p.rs`), and after a failed repush of up to
-`MAX_PUSHED_ITEMS` items they would open them all at once (rule 9). Against
-a peer that lets 8 streams be open, most of them would wait for a stream,
-time out after `STREAM_TIMEOUT_SECS` and use up their `PUSH_RETRY_MAX`
-tries. So a node runs at most 4 to one peer at once. The others wait in the
-retry queue for a later round (every 2 s), and are not counted as a try
-until they are tried; the backoff of 2, 4 and 8 s between an item's tries
-is unchanged. What is still lost to the retries the older kind's fetch
-brings later, as before.
-
-**Derivation:** half of the 8 streams a peer that is not a relay listed by
-key may have open (`QUIC_MAX_BIDI_STREAMS`), so that the retries leave
-room for the node's other streams on the connection: a pass, a pull, a
-fetch of the older kind and the repush.
-
-**If you raise it to the streams' count:** the retries take every stream a
-peer allows, and the node's other streams on that connection wait for them.
-**If you lower it to one:** a repush of many items drains one item a round
-trip, which the backoff and the pull make up for, more slowly.
+Gone, with the older kind's push retries (decision 2026-11-10 (older kind)).
 
 ### SMALL_WINDOWS_PULL_ENTRIES = 1
 
@@ -3591,8 +3450,7 @@ asks for `SMALL_WINDOWS_PULL_ENTRIES` (1) entry a page, and every relay
 passes entries on a small page to a message (`to_pass_on`), since it
 cannot see the other end's windows. A relay serves a listed relay the
 full page it asks for. The streams stay 64 for what runs at once between
-relays: a pass, a pull, the older kind's fetch, its repush and its push
-retries.
+relays: a pass and a pull.
 
 **How a connection gets them.** Quinn takes a connection's transport
 settings when it is made, in both directions, and has no setter for a
