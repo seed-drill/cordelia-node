@@ -11,12 +11,25 @@ use crate::state::AppState;
 /// Verify the bearer token from the Authorization header.
 ///
 /// A request with the node's token is then refused where the node is
-/// held up and does not answer it ([`crate::first_start::
-/// refuse_while_held`], decision 2026-10-04 §10.1): every handler comes
-/// through here before it does anything.
+/// held up and does not answer it ([`refuse_while_held`]): every handler
+/// comes through here before it does anything.
 pub fn check_bearer(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
     check_token(req, state)?;
-    crate::first_start::refuse_while_held(req, state)
+    refuse_while_held(req, state)
+}
+
+/// Refuse a request that a node which is held up does not answer, with
+/// why it is held up (decision 2026-10-04 §10.1; decision 2026-11-10
+/// (older kind), rule 6). Held up by a database from a later version or
+/// from before alpha.19, a node answers every `GET` and nothing else:
+/// what it would read is not its database, and it writes nothing there.
+pub fn refuse_while_held(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
+    match state.held.why() {
+        Some(held) if req.method() != actix_web::http::Method::GET => {
+            Err(ApiError::Held(held.says().to_string()))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Verify the bearer token from the Authorization header, and nothing

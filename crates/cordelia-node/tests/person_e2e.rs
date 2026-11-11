@@ -141,9 +141,6 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     let json: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
     assert_eq!(json["person"]["state"], "no_phrase");
     assert_eq!(json["person"]["short"], "no recovery phrase yet");
-    // It is a new install: it took this version with nothing that an
-    // earlier one held.
-    assert_eq!(json["sync"]["moved_on"], false, "{json}");
     let says = json["person"]["says"][0].as_str().unwrap();
     assert!(says.starts_with("no recovery phrase yet:"), "{json}");
     assert_eq!(
@@ -4615,7 +4612,7 @@ fn a_command_of_a_phrase_shows_no_word_where_the_node_is_held_up() {
 /// command but `status` and `off`, `restore`, `history drop`, `init
 /// --new-key`, and each command of a person's devices but `devices` with
 /// no act. Turning sync off is sent to any node. `cordelia status`,
-/// `cordelia sync status` (its `--seen` included), `cordelia devices`
+/// `cordelia sync status`, `cordelia devices`
 /// and `cordelia history` still answer beside such a node, with the
 /// note. And a look that says
 /// nothing of where the device stands is no look of this version: it is
@@ -4714,12 +4711,10 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
         assert_eq!(another.asked().len(), before, "{args:?} asked the node");
     }
 
-    // What only shows is answered, with the note: `cordelia sync
-    // status` with the act that puts its notice away among them.
-    let shows: [&[&str]; 6] = [
+    // What only shows is answered, with the note.
+    let shows: [&[&str]; 5] = [
         &["status"],
         &["sync", "status"],
-        &["sync", "status", "--seen"],
         &["devices"],
         &["history"],
         &["history", "notes"],

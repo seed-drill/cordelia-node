@@ -3334,38 +3334,6 @@ fn without_colour(log: &str) -> String {
     plain
 }
 
-/// A key file that cannot be removed does not stop the node. A personal
-/// node that ran an earlier version holds a channel of the older kind,
-/// and removes the key files of the older channels after its first start
-/// on this version (decision 2026-10-04 §10.1); where a slot key would be
-/// there is a directory, which cannot be removed as a file is. The node
-/// starts, and warns once that one could not be removed: how many, and
-/// not which.
-#[test]
-fn a_key_file_that_cannot_be_removed_does_not_stop_the_node() {
-    let mut a = node("stuck-canary", "personal", None);
-    holds_an_older_channel(&a, OLDER_GROUP);
-    let stuck = a
-        .data_dir()
-        .join("channel-keys")
-        .join(format!("{OLDER_GROUP}.slot"));
-    std::fs::create_dir_all(&stuck).unwrap();
-
-    a.start();
-    wait_for("node healthy", &[&a], 30, || healthy(&a));
-
-    assert!(stuck.is_dir());
-    let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
-    let warned: Vec<&str> = log
-        .lines()
-        .filter(|line| line.contains("could not remove every key file"))
-        .collect();
-    assert_eq!(warned.len(), 1, "{log}");
-    for said in ["WARN", "key_files=1", "of the older channels"] {
-        assert!(warned[0].contains(said), "{}", warned[0]);
-    }
-}
-
 /// Connect to `relay` as any node may, under `key`. The connection lasts
 /// as long as what is returned is kept.
 async fn client_of(

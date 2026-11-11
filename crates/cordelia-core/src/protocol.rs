@@ -2056,27 +2056,6 @@ const _: () = assert!(PERSONAL_CHANNEL_WARN_BYTES < MAX_ENTRY_CHANNEL_BYTES_AT_R
 /// as an entry's text. What is cut is marked as cut.
 pub const FILE_NAME_SHOWN_CHARS: usize = 120;
 
-/// How long a personal node waits before it tries its first start on
-/// this version again, after a try that failed (decision 2026-10-04
-/// §10.1): the sync cycle's five seconds after the first, and twice as
-/// long after each further one, up to FIRST_START_RETRY_MAX_SECS. A
-/// start that cannot succeed (no room for the copy, no leave to write)
-/// does not write its copy again every five seconds.
-pub const FIRST_START_RETRY_BASE_SECS: u64 = 5;
-
-/// The longest that a personal node waits between two tries at its first
-/// start on this version (decision 2026-10-04 §10.1): ten minutes, the
-/// longest wait before anything a relay refused is offered again
-/// (OUTBOX_REFUSED_RETRY_MAX_SECS). A person who has made room is not
-/// kept waiting for longer than that, and need not restart the node.
-pub const FIRST_START_RETRY_MAX_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
-
-/// How much before its wait has passed a try at the first start is still
-/// made (decision 2026-10-04 §10.1): one second. A try is made when a
-/// sync cycle would have run, and the first wait is a cycle long: without
-/// this, the timer's own jitter would put every try off by a whole cycle.
-pub const FIRST_START_RETRY_SLACK_SECS: u64 = 1;
-
 /// How long a node that finds the lock on its data directory held tries
 /// it again before it says that another node is running there (decision
 /// 2026-10-04 §10.1): half a second. A command that opens the database
@@ -3929,15 +3908,10 @@ mod tests {
         const { assert!(OUT_OF_REACH_SECS > BACKOFF_BASE_SECS) };
     }
 
-    /// The waits between the tries at a first start that keeps failing
-    /// (decision 2026-10-04 §10.1): from five seconds to ten minutes.
+    /// The wait for the lock on a data directory (decision 2026-10-04
+    /// §10.1): half a second.
     #[test]
-    fn test_the_tries_at_a_first_start_back_off_decision_2026_10_04_10_1() {
-        assert_eq!(FIRST_START_RETRY_BASE_SECS, 5);
-        assert_eq!(FIRST_START_RETRY_MAX_SECS, 600);
-        assert_eq!(FIRST_START_RETRY_MAX_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS);
-        assert_eq!(FIRST_START_RETRY_SLACK_SECS, 1);
-        const { assert!(FIRST_START_RETRY_SLACK_SECS < FIRST_START_RETRY_BASE_SECS) };
+    fn test_the_wait_for_the_lock_on_a_data_directory_decision_2026_10_04_10_1() {
         assert_eq!(NODE_LOCK_WAIT_MS, 500);
     }
 

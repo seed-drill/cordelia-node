@@ -9,7 +9,6 @@ pub mod at_relays;
 pub mod atomic;
 pub mod db;
 pub mod entries;
-pub mod first_start;
 pub mod follows;
 pub mod history;
 pub mod index_lines;

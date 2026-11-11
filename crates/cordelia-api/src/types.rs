@@ -134,19 +134,6 @@ pub struct SyncStatusResponse {
     /// it runs no cycle and no pass until it is so no longer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub held: Option<String>,
-    /// Whether this device took this version with what an earlier one
-    /// held: the step of its first start was made here (decision
-    /// 2026-10-04 §10.1). With no phrase, such a device is "not added
-    /// yet".
-    pub moved_on: bool,
-    /// What a device whose stored scope was on is told, while it is
-    /// stored (decision 2026-10-04 §10.1): the folders that stopped
-    /// syncing when only mapped folders came to sync, each with whether
-    /// `cordelia sync map` would sync it now. It is there with sync on
-    /// and with it off, until a person says that it has been seen
-    /// (`POST /api/v1/sync/seen`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notice: Option<crate::found::NoticeShown>,
     /// What a mapping carried for the name that the device came to sync
     /// by it (decision 2026-10-04 §7.3): only in the answer to the
     /// request that mapped the folder, and only where a carry was made.
