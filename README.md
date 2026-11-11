@@ -409,7 +409,9 @@ too, and prints each new `channel` line: put it in the list the same way.
   its relays, the keys and the labels. None of that lets them read or
   write in the channel.
 - A member can still hand the channel to a device that is not on the
-  list, with `cordelia share`.
+  list, with `cordelia share`. Such a device shows no amber: an amber
+  comes only from a list this device reads, so whoever shared it vouches
+  for it.
 - A list names at most 64 devices. A device follows at most 16
   repositories, and a channel follows one repository.
 
