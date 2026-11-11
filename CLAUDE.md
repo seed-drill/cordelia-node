@@ -10,11 +10,11 @@ key per device, AES-256-GCM per channel. A person's devices share one secret,
 from which each channel of their own is derived; a recovery phrase of twelve
 words removes a device and recovers. Overview: `WHITEPAPER.md` (v3).
 
-There are two kinds of channel in the code: a channel from its secret
-(decision 2026-10-04), which every node uses, and "the older kind" (a
-random ID, a ring of keys, a list of members), which no node carries: a
-node answers what is asked of it with nothing (decision 2026-11-10 (older
-kind), rule 7), and its code goes in that record's later slices.
+There is one kind of channel in the code: a channel from its secret
+(decision 2026-10-04). "The older kind" (a random ID, a ring of keys, a
+list of members) is gone: a node answers what an alpha.19 node asks of it
+with nothing (decision 2026-11-10 (older kind), rule 7), and its tables
+and first start go in that record's last slice.
 
 ## Where things are
 

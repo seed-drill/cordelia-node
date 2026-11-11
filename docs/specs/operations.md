@@ -191,15 +191,17 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 > once the first start on this version is done: the keys of a device's
 > channels are derived from the person secret, which is in the database.
 > After an upgrade it also holds `before-<version>/` (mode 0700), the copy of
-> §10.5. A relay keeps `channel-keys/` for the older kind.
+> §10.5. A relay of an earlier version kept `channel-keys/` for the older
+> kind, which no node of this version reads (decision 2026-11-10 (older
+> kind), rule 2).
 >
 > **The data directory itself is mode 0700, and `config.toml` in it 0600.**
-> `cordelia init`, `cordelia swarm-init` and the install script make them
-> so. One that is there already is set to 0700, with the configuration file
-> in it to 0600, only where others than its owner and its group can read,
-> write or enter it: by `init`, the install script and a node that starts,
-> and each says so, the node once in its log. A directory shared with its
-> group on purpose is left as it is (configuration.md §5.4).
+> `cordelia init` and the install script make them so. One that is there
+> already is set to 0700, with the configuration file in it to 0600, only
+> where others than its owner and its group can read, write or enter it:
+> by `init`, the install script and a node that starts, and each says so,
+> the node once in its log. A directory shared with its group on purpose
+> is left as it is (configuration.md §5.4).
 
 ### 2.4 Idempotency
 
@@ -364,7 +366,7 @@ Phase 4: device management UI, selective revocation via key rotation.
 > | `cordelia sync carry <name> --from [<label or six words>]` | Take what a removed device signed there, in the generations that this device left. `--from` is given once for each device, which it names by its label or by the first six words of its key's fingerprint, in quotes. With no device after it, it lists the removed keys that signed there, takes nothing and asks nothing: a key whose versions the new channel holds already, all of them, is marked "already brought back". Before its second yes it says that the text which a version replaces is kept beside the file as a conflict copy, and that the status shows a conflict until that copy is deleted | With a device named: twice a yes at most, and then the phrase |
 > | `cordelia sync carry <name> --phrase` | Read the generations whose secret this device never held, and take what your devices that count signed there. `--from` and `--phrase` together are refused | Yes, and the phrase |
 > | `cordelia history [<name or folder>] [--removed] [--since <time>]`, `cordelia history show <id>`, `cordelia history drop`, `cordelia restore <id>...` | Local history: the versions that sync replaced or removed here, printing one, removing kept versions, and putting versions back | |
-> | `cordelia peers`, `cordelia channels`, `cordelia stats` | Connected peers; the names this device holds (on a node of another role, the channels of the older kind in which its own key is a member); what the node stores, as counts | |
+> | `cordelia peers`, `cordelia channels`, `cordelia stats` | Connected peers; the names this device holds (on a relay, how many channels it holds); what the node stores, as counts | |
 >
 > - **A command that asks at a terminal refuses when its input is not one,**
 >   before it asks or does anything. A yes is the word `yes`.
@@ -390,9 +392,9 @@ Phase 4: device management UI, selective revocation via key rotation.
 > - **A command that opens the database itself asks the data directory's
 >   lock first,** the one a node holds for as long as it runs (§10.5), and
 >   asks the port only where the lock tells nothing (below): opening runs
->   the schema's steps, and would step the database under the node. Where a node holds the lock, `cordelia
->   swarm-init`, and `cordelia init` where it makes the database or is given
->   `--force`, open nothing and name the command that stops the node;
+>   the schema's steps, and would step the database under the node. Where a
+>   node holds the lock, `cordelia init`, where it makes the database or is
+>   given `--force`, opens nothing and names the command that stops the node;
 >   `cordelia stats`, `cordelia channels` and what `cordelia status` says of
 >   what is stored read the database for reading only, with no step run,
 >   and only where it is at their own schema version: at another the node
@@ -510,8 +512,8 @@ JSON output (`--json`):
 >   (`cordelia devices --clear`) or a statement lists it, as a renewal does
 >   (`cordelia renew`); a device that has said it left.
 > - **Amber, of folders,** with sync on, something mapped and a report of a
->   cycle: no relay connected for more than five minutes; entries that relays
->   keep refusing; a running node that is not the version the command is; a
+>   cycle: no relay connected for more than five minutes; a running node
+>   that is not the version the command is; a
 >   relay that has been connected for more than five minutes and does not
 >   hold the latest change; a relay that has refused something for room, or
 >   for the address's allowance, in the last twenty minutes; names that a
@@ -578,30 +580,29 @@ System channels (prefixed `__`) are hidden by default. Use `--all` to include th
 > **v1 status.** On a personal node `cordelia channels` lists the names that
 > the device holds, each with how many entries it stores of the name's
 > channel and when it stored the last. A device holds a name once it follows
-> a recovery phrase and a folder is mapped to it.
+> a recovery phrase and a folder is mapped to it. On a relay it says how
+> many channels the relay holds (decision 2026-11-10 (older kind), rule 3).
 
 ### 4.6 `cordelia stats`
 
 > **v1 status.** `cordelia stats` prints counts only: the database's size;
-> what is stored and its encrypted size (entries of its own channels on a
-> personal node, items of the older kind on a relay); the names held, or the
-> channels subscribed; the distinct peers seen in the last day and week; and
-> the channels active in the last day and week. **On a relay it also prints
-> the room of each kind of channel, each against its cap,** which is
-> `max_storage_bytes` for both (decision 2026-10-04 §2.5):
+> the entries stored and their encrypted size, counted on a relay as a
+> device counts them (decision 2026-11-10 (older kind), rule 3); the names
+> held, or the channels a relay holds; the distinct peers seen in the last
+> day and week; and the channels active in the last day and week. **On a
+> relay it also prints its room against its cap,** `max_storage_bytes`
+> (decision 2026-10-04 §2.5):
 >
 > ```
-> Storage:          <in use> in use of <allowed> allowed, by channels of the older kind
->                   <in use> in use of <allowed> allowed, by channels from their secrets (<n> held, <m> entries)
+> Storage:          <in use> in use of <allowed> allowed, by channels from their secrets (<n> held, <m> entries)
 > ```
 >
-> The first line is what the items of the older kind are counted at (each
-> its content and 1 KB); the second is what the entries of the channels from
-> their secrets are counted at, with how many such channels the relay holds
-> and how many entries. Neither kind is counted against the other's cap.
-> `--json` gives the same for tools: `storage_used_bytes` and
-> `storage_max_bytes` for the older kind, and under `entries` the same two
-> with `channels_held`, `entries_stored` and `content_bytes_stored`.
+> That is what the entries of the channels from their secrets are counted
+> at, with how many such channels the relay holds and how many entries.
+> `--json` gives the same for tools: `storage_max_bytes`, and under
+> `entries` `storage_used_bytes` and `storage_max_bytes` with
+> `channels_held`, `entries_stored` and `content_bytes_stored`. The room of
+> the older kind is gone with it.
 
 ```
 $ cordelia stats

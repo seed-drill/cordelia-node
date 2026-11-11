@@ -6,7 +6,7 @@
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Supersedes**: cordelia-core/docs/design/encryption-specification.md (pre-pivot, reference only)
 **References**: `docs/reference/encryption-test-vectors.md` (test vectors remain valid)
-**Depends on**: specs/channel-naming.md (§4.2 system channels), specs/network-protocol.md (§4.4 Channel-Announce, §4.7 PSK-Exchange)
+**Depends on**: [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) (§4.2 system channels), specs/network-protocol.md (§4.4 Channel-Announce, §4.7 PSK-Exchange)
 
 > **v1 status (2026-09-30).** The primitives stand: key types (§2), Bech32
 > (§3), the ECIES construction (§4), item encryption (§5) and signing (§11).
@@ -450,7 +450,7 @@ The PSK is stored locally and distributed to subscribers via ECIES envelope.
 **DM channel:**
 ```
 1. Initiator generates channel PSK
-2. Channel ID = "dm_" + hex(SHA-256("cordelia:dm:" || sort([initiator_pk, peer_pk])))  -- deterministic, domain-separated (channel-naming.md §4.2)
+2. Channel ID = "dm_" + hex(SHA-256("cordelia:dm:" || sort([initiator_pk, peer_pk])))  -- deterministic, domain-separated ([channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) §4.2)
 3. Initiator wraps PSK in ECIES envelope for peer's X25519 public key
 4. Envelope stored as a channel item (the peer retrieves it via replication)
 5. Both parties derive the same channel ID independently
@@ -1036,7 +1036,7 @@ Steps (in order):
    b. Channel name: "__personal"  (double underscore = system channel, not user-creatable)
    c. Channel ID: hex(SHA-256("cordelia:channel:__personal:" + hex(ed25519_pubkey)))
       - Domain-separated, entity-specific (each entity's personal channel has a unique ID)
-      - Personal channel ID derivation per channel-naming.md §2.1 (canonical reference).
+      - Personal channel ID derivation per [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) §2.1 (canonical reference).
    d. Store PSK at ~/.cordelia/channel-keys/<channel_id>.key (mode 0600)
    e. Create channel descriptor (signed by identity key):
       - access: "invite_only"

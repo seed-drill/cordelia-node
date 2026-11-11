@@ -26,14 +26,16 @@
 >   never stored anywhere. What a device follows, the person secret and the
 >   statement it has applied are in the node's database (data-formats.md
 >   §10.3), and the device's own key is in `identity.key`.
-> - **A personal node carries no channel of the older kind.** `push_policy`
->   (§2.3) and `[replication]` (§2.5) are settings of that kind, and change
->   nothing that a personal node does with its own channels. Those are
->   fetched every 10 seconds and sent every 2, which are constants of
->   `protocol.rs` and not settings.
-> - **A relay's `max_storage_bytes` bounds each kind of channel apart**
->   (§2.2), and **a relay that lists another by `key` works together with
->   it** (§2.3).
+> - **No node carries a channel of the older kind** (decision 2026-11-10
+>   (older kind), rule 1). `push_policy` (§2.3) and `[replication]` (§2.5)
+>   are settings of that kind, and change nothing that a node does with the
+>   channels from their secrets. Those are fetched every 10 seconds and sent
+>   every 2, which are constants of `protocol.rs` and not settings.
+> - **`[swarm]` and `network.trusted_peers` are no longer read** (rule 2):
+>   a configuration that still sets them loads, and they change nothing.
+> - **A relay's `max_storage_bytes` bounds what it holds of the channels
+>   from their secrets** (§2.2), and **a relay that lists another by `key`
+>   works together with it** (§2.3).
 > - **The data directory of a personal node** also holds, after its first
 >   start on this version, a folder `before-<version>`: a copy of the
 >   database and of the key files of the older channels, as they were
@@ -93,7 +95,7 @@ Core node settings: ports, storage location, storage quota.
 | `http_port` | integer | `9473` | 1-65535 | REST API port (TCP, localhost only). | operations.md SS5.1 |
 | `p2p_port` | integer | `9474` | 1-65535 | P2P transport port (UDP, QUIC). | operations.md SS5.1 |
 | `data_dir` | string | `"~/.cordelia"` | Valid directory path | Base data directory. Tilde expanded at startup. Created automatically if it does not exist (with mode 0700); one that is there is set to 0700 only where others than its owner and its group can read, write or enter it (§5.4). | operations.md SS5.1 |
-| `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | The most a relay may hold of each kind of channel. The older kind and the channels from their secrets are each counted against a cap of this size, so for the one version that carries both a relay can hold twice this. Each is counted by what its entries are counted at (an entry's content and 1 KB), and not by the database's pages. At a cap a relay takes no channel of that kind which it does not already hold; over it, it drops the channels of that kind that it has held for the shortest time (decision 2026-09-30 §4.6; decision 2026-10-04 §2.5). It is read when the node starts. Not applied on a personal node. | operations.md SS5.1 |
+| `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | The most a relay may hold of the channels from their secrets. It is counted by what their entries are counted at (an entry's content and 1 KB), and not by the database's pages. At its cap a relay takes no channel which it does not already hold; over it, it drops the channels that it has held for the shortest time (decision 2026-09-30 §4.6; decision 2026-10-04 §2.5). What its database still holds of the older kind is not counted (decision 2026-11-10 (older kind), rule 3). It is read when the node starts. Not applied on a personal node. | operations.md SS5.1 |
 
 ### 2.3 `[network]`
 
@@ -102,7 +104,7 @@ P2P networking: listen address, node role, push policy, bootnode addresses, DNS 
 | Parameter | Type | Default | Valid Values | Description | Source |
 |-----------|------|---------|--------------|-------------|--------|
 | `listen_addr` | string | `"0.0.0.0:9474"` | `<ip>:<port>` | P2P listen address (UDP, QUIC). | operations.md SS5.1, network-protocol.md SS12.2 |
-| `listen` | boolean | unset | `true`, `false` | Whether to accept inbound connections. Unset: every role listens except `personal`, which only dials out and opens no listening socket (it still listens if it has `trusted_peers`). Set `true` on a personal node that others dial directly, such as a swarm lead. | decision 2026-09-30 §4.6 |
+| `listen` | boolean | unset | `true`, `false` | Whether to accept inbound connections. Unset: every role listens except `personal`, which only dials out and opens no listening socket. A personal node told to listen still turns away every inbound connection: the trusted peers and swarm that it listened for are gone (decision 2026-11-10 (older kind), rule 2). | decision 2026-09-30 §4.6 |
 | `role` | string | `"personal"` | `"personal"`, `"bootnode"`, `"relay"` | Node role. Affects governor targets, push behaviour, and relay/bootstrap duties. A personal node never becomes a relay by default -- operators must set this explicitly. **Any other value is refused when the configuration is loaded**, with a line that names the roles this version takes. | network-protocol.md SS8, SS12.2; decision 2026-10-17 §5 |
 | `push_policy` | string | `"subscribers_only"` | `"subscribers_only"`, `"pull_only"` | Push behaviour for personal nodes. `subscribers_only`: push items to hot peers subscribed to the channel. `pull_only`: never push; peers must pull via Item-Sync. Trade-off: `pull_only` increases latency (bounded by `replication.sync_interval_realtime_secs`). | network-protocol.md SS8.1.1, SS12.2 |
 | `dns_discovery` | string | `""` | any | **No longer used (2026-10-02).** A node learns of no relay from DNS: its relays are the ones it is configured with. The setting is still read, so that older configurations load. | decision 2026-09-30 §4.6 |
@@ -423,7 +425,7 @@ Environment variables override `config.toml` values. All use the `CORDELIA_` pre
 | `CORDELIA_LISTEN_ADDR` | `network.listen_addr` | `0.0.0.0:9474` | operations.md SS5.2 |
 | `CORDELIA_BIND_ADDRESS` | `api.bind_address` | `127.0.0.1` | operations.md SS5.2 |
 
-No variable sets the relays (`network.bootnodes`) or the role: those are read from the file alone. Which file that is can be set: the binary takes `CORDELIA_CONFIG` for the path of the configuration, where `--config` is not given. The node also reads `CORDELIA_SWARM_INDEX`, `CORDELIA_LEAD_IDENTITY_PATH` and `CORDELIA_LEAD_ENTITY_ID`, for the swarm settings from before v1.
+No variable sets the relays (`network.bootnodes`) or the role: those are read from the file alone. Which file that is can be set: the binary takes `CORDELIA_CONFIG` for the path of the configuration, where `--config` is not given. `CORDELIA_SWARM_INDEX`, `CORDELIA_LEAD_IDENTITY_PATH` and `CORDELIA_LEAD_ENTITY_ID`, for the swarm settings from before v1, are no longer read (decision 2026-11-10 (older kind), rule 2).
 
 See SS4.2 for SDK-specific variables (`CORDELIA_TOKEN`).
 
@@ -510,8 +512,8 @@ These are hard invariants enforced at startup (operations.md SS5.4, network-prot
 > of the person's. The copy folder `before-<version>` is mode 0700, and each
 > file in it 0600.
 >
-> **The data directory is its owner's alone.** `cordelia init`, `cordelia
-> swarm-init` and the install script make it with mode 0700, and the
+> **The data directory is its owner's alone.** `cordelia init` and the
+> install script make it with mode 0700, and the
 > configuration file that `init` writes is 0600; the install script sets the
 > one in a directory that it makes 0600 as well. **A directory that is there
 > already is set to 0700 only where others than its owner and its group can

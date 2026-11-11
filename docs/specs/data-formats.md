@@ -5,16 +5,17 @@
 **Date**: 2026-03-12
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Implements**: Storage layer for WP2, WP3, WP4, WP8
-**Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md, [specs/search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md), specs/identity.md
+**Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, [specs/channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md), [specs/search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md), specs/identity.md
 
 > **v1 status.** The schema is at version 18. There are two kinds of channel
 > in it, and each has tables of its own:
 >
 > - **The older kind** (a random ID, a ring of keys, a list of members): §3
->   and §4 below, with steps 4 to 10. **These are a relay's tables.** A relay
->   carries the older kind for one version more. A personal node empties them
->   at its first start on this version, after a copy (§12), and writes none of
->   them again.
+>   below, with steps 4 to 10. **No node reads or writes these tables**
+>   (decision 2026-11-10 (older kind), rule 1): the code of that kind is gone,
+>   and the tables stay in the schema until step 34 drops them (rule 5). A
+>   personal node empties them at its first start on this version, after a
+>   copy (§12).
 > - **A channel from its secret** (the
 >   [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md)):
 >   §9 to §11 below, with steps 11 to 18. A device's own channels are all of
@@ -188,12 +189,12 @@
 > version than the program's own is refused, and nothing in it is changed
 > (§5.2).
 >
-> PSK envelope items (§4) are replaced by sealed channel states, items of type
-> `invite` in inbox channels (decision 2026-09-30 §4.1). The search index
-> (`search-indexing.md`, now in [`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md)) is built
-> from what is published through the Channels API of the older kind, and v1
-> does not use it. A personal node serves none of that API, and the step of
-> §12 empties the index.
+> PSK envelope items (§4), and the sealed channel states that replaced them,
+> are gone with the older kind (decision 2026-11-10 (older kind)). The
+> search index (`search-indexing.md`, now in [`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md))
+> was built from what was published through the Channels API of the older
+> kind, and v1 does not use it. No node serves that API (decision
+> 2026-11-10 (older kind), rule 2), and the step of §12 empties the index.
 
 ---
 
@@ -202,9 +203,7 @@
 This spec defines the SQLite schema and internal data structures that sit between the Channels API (developer-facing) and the wire protocol (network-facing). It is the authoritative reference for:
 
 - SQLite table definitions (DDL)
-- PSK envelope item structure (special-case items not encrypted with channel PSK)
 - Schema migration framework
-- Column-to-API field mappings
 
 The specs that describe *what* happens (channels-api.md, ecies-envelope-encryption.md) depend on this spec for *how* data is stored.
 
@@ -229,8 +228,10 @@ The node checks `PRAGMA user_version` on startup and applies pending migrations 
 ## 3. Core Tables
 
 > **v1 status.** §3.1 to §3.5 are the tables of the older kind of channel.
-> A relay and a bootnode hold them. On a personal node they are empty from its
-> first start on this version (§12), and a trigger refuses a new row in
+> No node reads or writes them (decision 2026-11-10 (older kind), rule 1):
+> what a relay of an earlier version held stays, unread, until step 34
+> drops them (rule 5). On a personal node they are empty from its first
+> start on this version (§12), and a trigger refuses a new row in
 > `channels` (§11.3). The tables of a channel from its secret are in §10.
 
 ### 3.1 channels
@@ -256,24 +257,10 @@ CREATE UNIQUE INDEX idx_channels_name ON channels(channel_name)
     WHERE channel_name IS NOT NULL AND channel_type = 'named';
 ```
 
-**Relay auto-creation:** When a relay node receives an Item-Push for a `channel_id` not present in its `channels` table, it MUST insert a minimal row before storing the item:
-
-```sql
-INSERT OR IGNORE INTO channels
-    (channel_id, channel_type, mode, access, creator_id, created_at, updated_at)
-VALUES (?1, 'named', 'realtime', 'open', X'00', datetime('now'), datetime('now'));
-```
-
-This satisfies the foreign key constraint on `items.channel_id` without requiring the relay to subscribe. The `creator_id = X'00'` (null key) distinguishes relay-created rows from user-subscribed channels.
-
-**Phase 1 (transparent relay):** Relays store all received items and auto-create channel rows as above.
-
-**Phase 2+ (lazy storage, network-protocol.md §7.2):** Relays only store items for channels that at least one hot peer has announced interest in via Channel-Announce (§4.4). Items for channels with no local interest are forwarded but not persisted. The auto-creation INSERT is conditional on routing table membership.
-
 **Notes:**
 - `channel_name` is unique only for named channels. DMs and groups may have NULL or non-unique labels.
 - `psk_hash` is `SHA-256(psk)`, not the PSK itself. Used for descriptor verification (network-protocol.md §4.4.6). NULL means this node has observed the channel via Channel-Announce but does not hold the PSK (not subscribed).
-- `descriptor` stores the full signed CBOR descriptor for forwarding to new peers. Updated on rotation.
+- `descriptor` stores the full signed CBOR descriptor.
 
 ### 3.2 channel_members
 
@@ -322,7 +309,6 @@ CREATE TABLE channel_keys (
 **Relationship to filesystem PSK files:**
 - `~/.cordelia/channel-keys/<channel_id>.key` files (ecies-envelope-encryption.md §6.3) are the primary PSK store, used at runtime for fast access.
 - The `channel_keys` table is the durable store, used for recovery if key files are deleted but the database and personal PSK survive.
-- On startup, the node reconciles: if a `.key` file is missing but a `channel_keys` row exists, decrypt and restore the file. If a `.key` file exists but no row, encrypt and insert.
 
 ### 3.4 items
 
@@ -356,8 +342,6 @@ CREATE INDEX idx_items_content_hash      ON items(content_hash);
 - `received_at` is local-only. Not signed. Not replicated. Used for local diagnostics and GC.
 - `key_version = 0` is reserved for items not encrypted with the channel PSK. See §4.
 
-**Deduplication:** On insert, check for an existing item with the same `channel_id`, `content_hash` and `author_id`. If found, skip. This handles replication convergence where the same item arrives from multiple peers. The author is part of the check so that a copy of an item under another key cannot keep the item itself out (decision 2026-09-30 §4.3).
-
 ### 3.5 dm_peers
 
 Maps DM channel IDs to the peer's public key for efficient lookup.
@@ -369,103 +353,12 @@ CREATE TABLE dm_peers (
 );
 ```
 
-**Notes:**
-- Populated when a DM is created or when a `psk_envelope` item is received for a `dm_` channel.
-- Used by `POST /api/v1/channels/list-dms` to return the `peer` field without scanning items.
 
 ---
 
 ## 4. PSK Envelope Items
 
-> **v1 status.** Of the older kind of channel, as §3 is. Nothing here is the
-> form of an entry in a channel from its secret: that is §9.
-
-PSK envelopes are channel items with `item_type = "psk_envelope"` that carry an ECIES-wrapped PSK for a specific recipient. They require special handling because the recipient does not yet hold the channel PSK, so the item content cannot be encrypted with it.
-
-### 4.1 Storage Convention
-
-PSK envelope items use `key_version = 0` to signal that `encrypted_blob` is **not** encrypted with the channel PSK. Instead, the blob contains a self-authenticated ECIES envelope plus recipient metadata.
-
-```
-key_version = 0  →  encrypted_blob is NOT AES-encrypted with channel PSK.
-                     Content is a CBOR structure defined in §4.2.
-key_version >= 1 →  encrypted_blob is AES-256-GCM encrypted with the PSK
-                     at that version (normal items, ecies-envelope-encryption.md §5).
-```
-
-### 4.2 PSK Envelope Blob Format
-
-The `encrypted_blob` for `item_type = "psk_envelope"` is CBOR-encoded (deterministic, RFC 8949 §4.2.1):
-
-```cbor
-{
-  "envelope":       h'<92 bytes>',     -- ECIES envelope (ecies-envelope-encryption.md §4.4)
-  "key_version":    <integer>,         -- PSK version being distributed (>= 1)
-  "recipient_xpk":  h'<32 bytes>'     -- recipient's X25519 public key
-}
-```
-
-| Field | Type | Size | Description |
-|-------|------|------|-------------|
-| `envelope` | CBOR byte string | 92 bytes | ECIES binary envelope: `eph_pk (32) \|\| iv (12) \|\| ct (32) \|\| tag (16)` |
-| `key_version` | CBOR unsigned integer | 1-3 bytes | The PSK version this envelope distributes. Matches the `key_version` the recipient should use to decrypt subsequent items. |
-| `recipient_xpk` | CBOR byte string | 32 bytes | X25519 public key of the intended recipient. Allows nodes to quickly check if an envelope is addressed to them without attempting ECIES decryption. |
-
-**Total blob size:** CBOR overhead (~15 bytes) + 92 + 4 + 32 = ~143 bytes.
-
-### 4.3 Processing Flow
-
-**On item arrival** (publish or replication):
-
-```
-1. Read item_type from plaintext metadata
-2. If item_type != "psk_envelope": normal flow (decrypt with channel PSK at key_version)
-3. If item_type == "psk_envelope":
-   a. Decode encrypted_blob as CBOR (§4.2)
-   b. Compare recipient_xpk with local X25519 public key
-   c. If no match: store item as-is (may be for another subscriber on this node, or relay)
-   d. If match:
-      i.   Decrypt ECIES envelope with local X25519 private key (ecies-envelope-encryption.md §4.3)
-      ii.  Extract 32-byte PSK
-      iii. Store PSK at ~/.cordelia/channel-keys/<channel_id>.key
-      iv.  Insert/update channel_keys table row (encrypted with personal PSK)
-      v.   If key_version > local channel key_version: update channels.key_version
-      vi.  Log info: "Received PSK for channel {channel_name} (key_version {v})"
-```
-
-**On publish** (creating a PSK envelope):
-
-```
-1. Look up recipient's X25519 public key
-2. Encrypt channel PSK using ECIES envelope (ecies-envelope-encryption.md §4.2)
-3. Encode CBOR blob per §4.2 (envelope, key_version, recipient_xpk)
-4. Set item fields:
-   - item_type = "psk_envelope"
-   - key_version = 0                     (signals: not PSK-encrypted)
-   - author_id = local Ed25519 public key
-   - content_hash = SHA-256(cbor_blob)
-5. Sign metadata envelope (ecies-envelope-encryption.md §11.7)
-6. Store and replicate as normal item
-```
-
-### 4.4 Signature Verification
-
-PSK envelope items are signed by the author like all other items. The CBOR metadata envelope (§11.7 of ecies-envelope-encryption.md) includes `key_version = 0`. Peers verify the signature over this metadata envelope. The `encrypted_blob` (CBOR PSK envelope) is bound via `content_hash`.
-
-### 4.5 Security Properties
-
-| Property | Status |
-|----------|--------|
-| Confidentiality | ECIES envelope: only the recipient's X25519 private key can decrypt |
-| Recipient privacy | `recipient_xpk` is visible in plaintext CBOR. Accepted: relays can see who receives PSK envelopes. The X25519 key is pseudonymous (derived from Ed25519 identity). |
-| Authenticity | Author signs the item metadata. ECIES GCM tag authenticates the envelope. |
-| Replay | Deduplication by content_hash prevents duplicate processing. Replayed envelopes produce the same PSK — no harm. |
-
-### 4.6 Visibility Rules
-
-PSK envelope items are **not returned by the listen endpoint** (channels-api.md §3.3). They are internal to the node. The node processes them silently on arrival.
-
-Specifically, the listen query filters: `WHERE item_type NOT IN ('psk_envelope', 'kv', 'attestation', 'descriptor', 'probe') AND is_tombstone = 0`.
+Gone, with the older kind of channel (decision 2026-11-10 (older kind)): no node makes, reads or verifies a PSK envelope. What a database still holds of one is a row of `items` (§3.4).
 
 ---
 
@@ -535,81 +428,13 @@ If a future migration requires destructive changes, the release notes MUST state
 
 ## 6. Column-to-API Field Mapping
 
-How SQLite columns map to REST API response fields (channels-api.md) and SDK types (sdk-api-reference.md).
-
-### 6.1 Items
-
-| SQLite Column | REST API Field | SDK Field | Notes |
-|---------------|---------------|-----------|-------|
-| `item_id` | `item_id` | `itemId` | |
-| `channel_id` | (resolved to `channel` name) | `channel` | API returns channel name, not ID |
-| `author_id` | `author` | `author` | BLOB → Bech32 (`cordelia_pk1...`) |
-| `item_type` | `item_type` | `itemType` | |
-| `published_at` | `published_at` | `publishedAt` | |
-| `is_tombstone` | (filtered out) | (filtered out) | Tombstones excluded from listen/search |
-| `parent_id` | `parent_id` | `parentId` | NULL → `null` in JSON |
-| `key_version` | (not exposed) | (not exposed) | Internal encryption metadata |
-| `content_hash` | (not exposed) | (not exposed) | Internal deduplication |
-| `signature` | (not exposed) | (not exposed) | Verified server-side, result in `signature_valid` |
-| `encrypted_blob` | (decrypted → `content` + `metadata`) | `content` + `metadata` | Decrypt, parse JSON, split |
-| `content_length` | (not exposed) | (not exposed) | Internal only |
-
-### 6.2 Channels
-
-| SQLite Column | REST API Field | SDK Field | Notes |
-|---------------|---------------|-----------|-------|
-| `channel_id` | `channel_id` | `channelId` | |
-| `channel_name` | `channel` | `channel` | |
-| `mode` | `mode` | `mode` | |
-| `access` | `access` | `access` | |
-| `creator_id` | `owner` (in info endpoint) | `owner` | BLOB → Bech32 |
-| `key_version` | (not exposed) | (not exposed) | |
-| `created_at` | `created_at` | `createdAt` | |
-
-### 6.3 Signature Verification
-
-The `signature_valid` field in listen/search responses is computed at query time:
-
-```
-1. Load item row
-2. Reconstruct CBOR metadata envelope from stored fields
-3. Verify Ed25519 signature (item.signature) against author_id public key
-4. Return boolean result as signature_valid
-```
-
-If verification fails (corrupted item, key mismatch), the item is still returned with `signature_valid: false`. The SDK/application decides how to handle unverified items.
+Gone, with the older kind's routes (decision 2026-11-10 (older kind), rule 2): no route serves a row of `items` or `channels`.
 
 ---
 
 ## 7. Item Content Serialisation
 
-### 7.1 Normal Items (key_version >= 1)
-
-The `encrypted_blob` column stores: `iv (12) || ciphertext (variable) || auth_tag (16)`.
-
-The plaintext (before encryption) is a JSON object:
-
-```json
-{
-  "content": <any>,
-  "metadata": <object | null>
-}
-```
-
-The `content` and `metadata` fields from the API request (channels-api.md §3.2) are wrapped into this JSON envelope, serialised to UTF-8 bytes, then encrypted with the channel PSK.
-
-On decryption, the node parses this JSON and splits `content` and `metadata` into separate response fields.
-
-### 7.2 PSK Envelope Items (key_version = 0)
-
-See §4. The `encrypted_blob` column stores a CBOR structure containing the ECIES envelope, key_version, and recipient X25519 public key.
-
-### 7.3 System Items
-
-Items with node-internal `item_type` values (`kv`, `attestation`, `descriptor`, `probe`) follow the normal encryption path (key_version >= 1). Their content is JSON, same as user items. The difference is:
-- They are created by the node, not via the API.
-- They are filtered from listen/search responses (§4.6).
-- Their content schemas are type-specific (e.g., `kv` items have `{"key": "...", "value": ...}`).
+Gone, with the older kind of channel (decision 2026-11-10 (older kind)): no node seals, opens or signs an item. An entry of a channel from its secret is in §9.2.
 
 ---
 
@@ -1769,7 +1594,7 @@ The four `person.*` keys that a device writes under a phrase, and
 |---|---|
 | `item_seq` | The arrival order of `items` (v5) |
 | `entry_seq` | The order in which this node stored its `entries` (v11) |
-| `item_count`, `item_bytes` | How many rows `items` holds, and the bytes of their content together (v13). Three triggers on `items` keep them, in the write that changes a row. A relay's cap for the older kind of channel is set against these, with 1 KB for each item, and not against the database's pages, which hold the table of entries too (decision §2.5, §16) |
+| `item_count`, `item_bytes` | How many rows `items` holds, and the bytes of their content together (v13). Three triggers on `items` keep them, in the write that changes a row |
 
 The counters stay at a personal node's first start: `item_seq` and
 `entry_seq` keep their values, and `item_count` and `item_bytes` come to 0
@@ -1785,8 +1610,7 @@ nothing to step, its words say which version marked it, and that no copy
 was made. A version from before this one makes a channel at every start;
 started on this database by mistake, it stops there with those words, and
 has changed nothing before it. A relay or a bootnode that is started on a
-database which a personal node stepped removes the trigger: a node of that
-role goes on taking channels of the older kind.
+database which a personal node stepped removes the trigger.
 
 ---
 
@@ -1883,11 +1707,11 @@ operations.md §10.5.
 | Document | What It Defines |
 |----------|----------------|
 | specs/ecies-envelope-encryption.md | ECIES envelope format (§4.4), item encryption (§5), key ring (§6.4), CBOR signing (§11) |
-| specs/channels-api.md | REST API endpoints, item_type values (§3.2), error codes |
-| specs/channel-naming.md | Channel ID derivation (§4), prefix disambiguation (§5) |
+| specs/channels-api.md | REST API endpoints, error codes |
+| [specs/channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) | Channel ID derivation (§4), prefix disambiguation (§5), of the older kind |
 | [specs/search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) | FTS5 + sqlite-vec DDL (§2), indexing pipeline |
 | specs/identity.md | Key types, entity ID format |
-| specs/network-protocol.md | ChannelDescriptor CBOR format (§4.4.6), PSK-Exchange (§4.7), the streams of entries (§4.9) |
+| specs/network-protocol.md | The streams of entries (§4.9) |
 | decisions/2026-10-04-a-persons-devices.md | A channel from its secret, the statement, the change entry, adding, removing and recovery: what §9 to §12 are the forms of |
 | reference/step4-test-vectors.json | Vectors for the derivations of §9.1 |
 
