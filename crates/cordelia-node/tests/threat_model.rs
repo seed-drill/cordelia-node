@@ -940,24 +940,15 @@ fn key_bytes_of(n: &Node) -> [u8; 32] {
     cordelia_crypto::bech32::decode_public_key(&key_of(n)).expect("a node prints its key")
 }
 
-/// A device says nothing to its relay of a channel of the older kind,
-/// though its database holds one (decision 2026-10-04 §10): a personal
-/// node carries no channel of that kind. Its store is given a group
-/// channel that it is a member of, with an item of its own that no relay
-/// has taken, as a build from before the first start on this version
-/// left them: on a device that follows a phrase, in a database with no
-/// mark, whose start writes the mark and steps nothing (§10.1). So the
-/// rows are there while the node runs. It follows a phrase, so it does
-/// talk to its relay: of its own channels, on the streams of entries. It
-/// announces no channel, asks for none, and pushes no item, however long
-/// the relay listens.
+/// A device says nothing to its relay of a channel of the older kind
+/// (decision 2026-11-10 (older kind), rule 7): no node carries one. It
+/// follows a phrase, so it does talk to its relay: of its own channels,
+/// on the streams of entries. Started again, it announces no channel,
+/// asks for none, and pushes no item, however long the relay listens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
-    use cordelia_storage::{first_start, meta};
     let relay = stand_in_relay();
     let mut a = node("a", "personal", Some(relay.port));
-    let own = key_bytes_of(&a);
-    let group = "grp_550e8400-e29b-41d4-a716-446655440000";
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
@@ -966,62 +957,6 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
         (!relay.heard().is_empty()).then_some(())
     });
     a.stop();
-    {
-        let db = cordelia_storage::db::open(&a.data_dir().join("cordelia.db")).unwrap();
-        // No mark, and no guard, as such a build left the database.
-        assert!(first_start::remove_guard(&db).unwrap());
-        meta::remove(&db, meta::FIRST_START).unwrap();
-        // The rows, in plain SQL, as such a build wrote them.
-        db.execute(
-            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                                   created_at, updated_at)
-             VALUES (?1, 'group', 'realtime', 'invite_only', ?2, '2026-10-01', '2026-10-01')",
-            rusqlite::params![group, own.as_slice()],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO channel_members (channel_id, entity_key, role, joined_at)
-             VALUES (?1, ?2, 'owner', '2026-10-01')",
-            rusqlite::params![group, own.as_slice()],
-        )
-        .unwrap();
-        let blob = b"what an earlier version sealed";
-        db.execute(
-            "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
-                                content_hash, signature, encrypted_blob, content_length)
-             VALUES ('ci_01JARV8XMHW8G9QZP0000000AA', ?1, ?2, 'memory',
-                     '2026-10-01T00:00:00Z', ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                group,
-                own.as_slice(),
-                cordelia_crypto::sha256(blob).as_slice(),
-                [7u8; 64].as_slice(),
-                blob.as_slice(),
-                blob.len() as i64,
-            ],
-        )
-        .unwrap();
-    }
-    // What the older outbox, fetch and announcement would each have gone
-    // by: it is there while the node runs.
-    let held = |a: &Node| {
-        let db = rusqlite::Connection::open_with_flags(
-            a.data_dir().join("cordelia.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
-        let rows = |sql: &str| -> i64 {
-            db.query_row(sql, rusqlite::params![own.as_slice()], |row| row.get(0))
-                .unwrap()
-        };
-        (
-            rows("SELECT COUNT(*) FROM items WHERE author_id = ?1"),
-            rows("SELECT COUNT(*) FROM channel_members WHERE entity_key = ?1"),
-            first_start::mark(&db).unwrap().map(|mark| mark.stepped),
-        )
-    };
-    assert_eq!(held(&a), (1, 1, None));
     let before = relay.streams.lock().unwrap().len();
     a.start();
     wait_for("node healthy again", &[&a], 30, || healthy(&a));
@@ -1031,8 +966,6 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
     wait_for("the device talks to its relay again", &[&a], 60, || {
         (relay.streams.lock().unwrap().len() > before).then_some(())
     });
-    // The start wrote the mark, and stepped nothing: the rows are there.
-    assert_eq!(held(&a), (1, 1, Some(false)));
 
     // Long enough for each of the three: an announcement goes when a
     // peer is promoted and when a node connects, a fetch is made every
@@ -1050,13 +983,11 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
             "the device opened a stream of {older:?} to its relay"
         );
     }
-    // And it does not count the item as waiting to be sent: what waits
-    // is of its own channels alone.
+    // What waits to be sent is of its own channels alone.
     wait_for("nothing waits to be sent", &[&a], 60, || {
         let status = a.get("/api/v1/status")?;
         (status["outbox_waiting"] == 0).then_some(())
     });
-    assert_eq!(held(&a), (1, 1, Some(false)));
 }
 
 /// T2. A stranger who knows a channel's ID and has seen one of its entries
@@ -1777,8 +1708,7 @@ async fn t03_an_address_is_turned_away_once_it_has_its_share_of_connections() {
 /// it asks again at its usual pace; refused, it would take that for a
 /// failure and ask again within the minute. So each is asked three times,
 /// on three streams of one connection, and answers each at once: no
-/// channel, and nothing in the channel asked for, though the relay's
-/// database holds that channel with an item in it. The connection stays.
+/// channel, and nothing in the channel asked for. The connection stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_node_answers_each_request_of_the_older_kind_with_nothing() {
     let asks_three_times = |conn: quinn::Connection, who: &'static str| async move {
@@ -1805,14 +1735,13 @@ async fn a_node_answers_each_request_of_the_older_kind_with_nothing() {
     let conn = asker.connections.lock().unwrap().last().cloned();
     asks_three_times(conn.expect("the device connected"), "the device").await;
 
-    // A relay that holds a channel of the older kind, asked by a client.
+    // A relay, asked by a client.
     let mut relay = node("relay", "relay", None);
-    holds_an_older_channel(&relay, OLDER_GROUP);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
     let client = client_of(&relay).await.expect("the client connects");
     asks_three_times(client.conn.clone(), "the relay").await;
-    assert_eq!(older_items_held(&relay), 1);
+    assert_eq!(older_items_held(&relay), 0);
     // And it says so, for debugging, once for each stream: it was asked
     // three times, and answered three.
     wait_for(

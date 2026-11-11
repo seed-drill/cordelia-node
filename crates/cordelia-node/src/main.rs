@@ -6381,9 +6381,9 @@ mod tests {
     use super::*;
 
     /// On a personal node `cordelia channels` says the names that the
-    /// device holds, each with what it stores of the name's channel, and
-    /// nothing of the older kind of channel (decision 2026-10-04 §10):
-    /// with none held, it says how one comes to be held.
+    /// device holds, each with what it stores of the name's channel
+    /// (decision 2026-10-04 §10): with none held, it says how one comes to
+    /// be held.
     #[test]
     fn test_channels_on_a_device_lists_the_names_it_holds() {
         let conn = cordelia_storage::db::open_in_memory().unwrap();
@@ -6398,15 +6398,6 @@ mod tests {
         cordelia_api::person::first_statement(&conn, &identity, &phrase, "desktop", now).unwrap();
         cordelia_api::person::hold_name(&conn, "team", now).unwrap();
         cordelia_api::person::hold_name(&conn, "lab", now).unwrap();
-        // A channel of the older kind in the same database is not listed.
-        conn.execute(
-            "INSERT INTO channels (channel_id, channel_name, channel_type, mode, access,
-                                   creator_id, created_at, updated_at)
-             VALUES ('older', 'older', 'named', 'realtime', 'open', X'AA', '2026-10-01',
-                     '2026-10-01')",
-            [],
-        )
-        .unwrap();
         let listed = names_held(&conn).unwrap();
         assert_eq!(listed.len(), 3, "{listed:?}");
         assert!(listed[0].starts_with("NAME"), "{listed:?}");
@@ -6415,7 +6406,6 @@ mod tests {
             "{listed:?}"
         );
         assert!(listed[2].starts_with("team "), "{listed:?}");
-        assert!(!listed.join("\n").contains("older"), "{listed:?}");
         // What it stores of a name's channel is counted.
         let team = cordelia_storage::person::channel_of_name(&conn, "team")
             .unwrap()
@@ -8262,7 +8252,7 @@ mod tests {
     /// and keeps no lock.
     #[test]
     fn test_a_command_asks_the_lock_on_the_data_directory() {
-        use cordelia_storage::schema::{RELEASED_SCHEMA_VERSION, SCHEMA_VERSION};
+        use cordelia_storage::schema::{ALPHA_19_VERSION, SCHEMA_VERSION};
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.node.data_dir = dir.path().display().to_string();
@@ -8322,8 +8312,11 @@ mod tests {
         assert!(!dir.path().join(NODE_LOCK).exists());
         assert!(refuse_beside_its_node(&config).is_ok());
 
-        // A node holds the lock, over a database in the released form.
-        drop(cordelia_storage::first_start::released::database(&database).unwrap());
+        // A node holds the lock, over a database as alpha.19 left it.
+        cordelia_storage::schema::init_db_as_alpha_19(
+            &rusqlite::Connection::open(&database).unwrap(),
+        )
+        .unwrap();
         let held = lock_data_dir(dir.path())
             .unwrap()
             .expect("the lock is taken");
@@ -8337,12 +8330,12 @@ mod tests {
             refused,
             not_read_beside_another_version(
                 dir.path(),
-                RELEASED_SCHEMA_VERSION,
+                ALPHA_19_VERSION,
                 SCHEMA_VERSION,
                 std::env::consts::OS
             )
         );
-        assert_eq!(version(), RELEASED_SCHEMA_VERSION, "nothing was stepped");
+        assert_eq!(version(), ALPHA_19_VERSION, "nothing was stepped");
         // Asking took nothing: the node still holds it.
         assert_eq!(lock_of(dir.path()), DirLock::Held);
 
@@ -9840,12 +9833,12 @@ mod tests {
 
     /// The node sets `secure_delete` on a personal node's store before
     /// the schema's steps run (decision 2026-10-09 §7.1, D10), where it
-    /// starts and where a command opens the store itself: a store of an
-    /// old step whose table the next step rewrites holds its text once
-    /// afterwards, and a relay's twice, the copy and what was freed.
+    /// starts and where a command opens the store itself: alpha.19's store,
+    /// whose older tables step 34 drops, holds nothing of what they held
+    /// afterwards, and a relay's holds it once, in pages that are free.
     #[test]
     fn a_personal_nodes_store_of_an_old_step_is_stepped_with_secure_delete_on() {
-        let words = "a descriptor of puffin-juniper-sextant";
+        let words = "an item of puffin-juniper-sextant";
         let dir = tempfile::tempdir().unwrap();
         let as_a = |role: &str| {
             let mut config = Config::default();
@@ -9855,11 +9848,18 @@ mod tests {
         let old_store = |name: &str| -> std::path::PathBuf {
             let path = dir.path().join(name);
             let conn = rusqlite::Connection::open(&path).unwrap();
-            cordelia_storage::schema::at_version_3(&conn).unwrap();
-            conn.execute(
+            cordelia_storage::schema::init_db_as_alpha_19(&conn).unwrap();
+            conn.execute_batch(
                 "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                                       descriptor, created_at, updated_at)
-                 VALUES ('c', 'group', 'batch', 'open', zeroblob(32), ?1, 't', 't')",
+                                       created_at, updated_at)
+                 VALUES ('c', 'group', 'batch', 'open', zeroblob(32), 't', 't')",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                    content_hash, signature, encrypted_blob, content_length)
+                 VALUES ('i', 'c', zeroblob(32), 'memory', 't', zeroblob(32), zeroblob(64),
+                         ?1, 32)",
                 [words.as_bytes()],
             )
             .unwrap();
@@ -9873,7 +9873,7 @@ mod tests {
                 .filter(|at| *at == words.as_bytes())
                 .count()
         };
-        for (role, times) in [("personal", 1), ("relay", 2)] {
+        for (role, times) in [("personal", 0), ("relay", 1)] {
             let path = old_store(&format!("{role}-started.db"));
             let (started, later) = open_the_nodes_database(&path, &as_a(role)).unwrap();
             assert_eq!((held(&started, &path), later), (times, None), "{role}");

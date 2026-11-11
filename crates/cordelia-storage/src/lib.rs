@@ -49,15 +49,13 @@ pub enum StorageError {
     )]
     LaterVersion { found: u32, own: u32 },
 
-    /// The database was left by a build that no release made, at schema
-    /// version `found`, a step that this version numbers otherwise: the
-    /// shared channels' build at its steps 21 to 26 (27 to 32 here), or the
-    /// removal build at its steps 27 and 28 while its rule 27 stood. This
-    /// version would read it wrong, and refuses it. Nothing of it was
-    /// changed.
+    /// The database is from a Cordelia before 0.2.0-alpha.19 (decision
+    /// 2026-11-10 (older kind), rule 6): at schema step `found`, 1 to 32,
+    /// or at no step with something in it. This version takes over only
+    /// alpha.19's, and changed nothing of it.
     #[error(
-        "the database is at schema version {found} of a build that no release made, whose steps \
-         this version of Cordelia numbers otherwise: it is refused, and nothing was changed"
+        "the database is at schema step {found}, from a Cordelia before 0.2.0-alpha.19: this \
+         version cannot open it, and changed nothing"
     )]
-    NumberedOtherwise { found: u32 },
+    EarlierVersion { found: u32 },
 }
