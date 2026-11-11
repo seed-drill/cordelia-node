@@ -501,6 +501,7 @@ pub(crate) fn state_of(machine: Machine) -> crate::state::AppState {
         peers_hot: Default::default(),
         peers_warm: Default::default(),
         push_tx: None,
+        networked: false,
         announce_tx: None,
         peers: Default::default(),
         relays: Default::default(),
@@ -637,7 +638,7 @@ impl Node {
     /// channel.
     pub(crate) fn of(machine: Machine) -> Self {
         let mut state = state_of(machine);
-        state.push_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        state.networked = true;
         let state = Arc::new(state);
         let relay: AtTheRelay = Default::default();
         let asked: Asked = Default::default();

@@ -7521,6 +7521,7 @@ mod tests {
             peers_hot: Default::default(),
             peers_warm: Default::default(),
             push_tx: None,
+            networked: false,
             announce_tx: None,
             peers: Default::default(),
             relays: Default::default(),

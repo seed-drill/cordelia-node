@@ -44,6 +44,7 @@ fn test_after_start_a_read_under_the_lock_checks_nothing_again() {
         peers_hot: AtomicU64::new(0),
         peers_warm: AtomicU64::new(0),
         push_tx: None,
+        networked: false,
         announce_tx: None,
         peers: Default::default(),
         relays: Default::default(),

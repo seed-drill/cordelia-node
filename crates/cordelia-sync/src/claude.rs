@@ -2887,6 +2887,7 @@ mod tests {
             peers_hot: std::sync::atomic::AtomicU64::new(0),
             peers_warm: std::sync::atomic::AtomicU64::new(0),
             push_tx: None,
+            networked: false,
             announce_tx: None,
             peers: Default::default(),
             relays: Default::default(),

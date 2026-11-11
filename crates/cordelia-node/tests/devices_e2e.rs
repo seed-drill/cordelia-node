@@ -415,6 +415,28 @@ fn a_node_started_before_its_relay_reaches_it_by_name_once_it_is_up() {
     assert!(said.as_object().unwrap().contains_key("no_relay_secs"));
 }
 
+/// A node that runs P2P has a network (decision 2026-11-10 (older kind),
+/// rule 3): asked for the sessions of its relays, it names the one it is
+/// connected to, with the session of that connection. A node with no
+/// network, as a test builds one that runs no P2P, names none at once
+/// (`commands_api.rs`, `test_a_carry_by_command_holds_the_name_and_reads_
+/// each_generation_that_was_left`).
+#[test]
+fn a_node_that_runs_p2p_has_a_network() {
+    let relay = relay_started();
+    let laptop = device_started("laptop", &relay);
+    let session = wait_for(
+        "the laptop names its relay's session",
+        &[&relay, &laptop],
+        60,
+        || {
+            let said = laptop.post("/api/v1/carry/sessions", serde_json::json!({}));
+            said["sessions"][0]["session"].as_str().map(str::to_string)
+        },
+    );
+    assert_eq!(session.len(), 64, "{session}");
+}
+
 /// The peers `n` is connected to, by key.
 fn peer_keys(n: &Node) -> Vec<String> {
     let Some(v) = n.get("/api/v1/peers") else {

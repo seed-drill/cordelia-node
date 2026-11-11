@@ -36,6 +36,7 @@ fn node() -> Node {
         peers_hot: AtomicU64::new(0),
         peers_warm: AtomicU64::new(0),
         push_tx: None,
+        networked: false,
         announce_tx: None,
         peers: Default::default(),
         relays: Default::default(),

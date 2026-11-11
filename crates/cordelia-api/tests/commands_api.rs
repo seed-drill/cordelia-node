@@ -30,7 +30,6 @@ const WORDS: &str = "legal winner thank year wave sausage worth useful legal win
 /// nothing waits for one.
 fn state_of(network: bool) -> (web::Data<AppState>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let push_tx = network.then(|| tokio::sync::mpsc::unbounded_channel().0);
     let state = web::Data::new(AppState {
         load: Default::default(),
         db: cordelia_core::lock::TimedLock::new(cordelia_storage::db::open_in_memory().unwrap()),
@@ -41,7 +40,8 @@ fn state_of(network: bool) -> (web::Data<AppState>, tempfile::TempDir) {
         sync_errors: AtomicU64::new(0),
         peers_hot: AtomicU64::new(0),
         peers_warm: AtomicU64::new(0),
-        push_tx,
+        push_tx: None,
+        networked: network,
         announce_tx: None,
         peers: Default::default(),
         relays: Default::default(),

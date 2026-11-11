@@ -2686,6 +2686,8 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         peers_hot: std::sync::atomic::AtomicU64::new(0),
         peers_warm: std::sync::atomic::AtomicU64::new(0),
         push_tx: Some(push_tx),
+        // The P2P loop is started below, with this state.
+        networked: true,
         announce_tx: Some(announce_tx),
         peers: Default::default(),
         relays: Default::default(),

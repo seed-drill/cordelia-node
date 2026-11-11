@@ -56,6 +56,11 @@ pub struct AppState {
     /// Channel for sending items to the P2P layer for push delivery.
     /// None if P2P is not running (e.g., in tests).
     pub push_tx: Option<tokio::sync::mpsc::UnboundedSender<PushItem>>,
+    /// Whether P2P runs beside this state: set where the node starts its
+    /// P2P loop, and not in a test that runs none. A node with no network
+    /// reads no relay, and waits for no pass or cycle of its own (decision
+    /// 2026-11-10 (older kind), rule 3).
+    pub networked: bool,
     /// Channel for notifying P2P layer of local channel subscriptions.
     /// Triggers channel-announce (0x04) to hot peers.
     /// None if P2P is not running (e.g., in tests).
@@ -1968,6 +1973,7 @@ mod tests {
             peers_hot: Default::default(),
             peers_warm: Default::default(),
             push_tx: None,
+            networked: false,
             announce_tx: None,
             peers: Default::default(),
             relays: Default::default(),
