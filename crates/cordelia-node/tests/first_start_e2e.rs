@@ -463,3 +463,88 @@ fn a_database_from_before_alpha_19_is_refused_by_the_node_and_by_each_command() 
         database
     );
 }
+
+/// Make step 34 fail on `node`'s database, as alpha.19 left it, as a disk
+/// with too little room would: a trigger stops the step's last write. The
+/// step runs in one transaction, so it leaves nothing of itself.
+fn step_34_cannot_finish(node: &Node) {
+    as_alpha_19_left_it(node);
+    let conn = Connection::open(node.data_dir().join("cordelia.db")).unwrap();
+    conn.execute_batch(
+        "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x');
+         CREATE TRIGGER a_full_disk BEFORE DELETE ON node_meta
+         BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+    )
+    .unwrap();
+}
+
+/// A step of the schema that does not finish, as on a disk with too
+/// little room, leaves a personal node up and held, with words that say
+/// so, and the database at step 33 (decision 2026-11-10 (older kind), rule
+/// 9). `cordelia status` says the same, and not SQLite's words alone. Once
+/// the step can finish, the next start takes it. A relay does not start,
+/// and says the same.
+#[test]
+fn a_step_that_does_not_finish_holds_the_node_and_is_tried_at_the_next_start() {
+    let mut device = node("laptop", "personal", None);
+    step_34_cannot_finish(&device);
+    let path = device.data_dir().join("cordelia.db");
+    let says = |said: &str| {
+        for words in [
+            format!("the database at {} could not be brought", path.display()),
+            "schema step 34 did not finish (database or disk is full)".to_string(),
+            "Nothing was changed. The step needs free room on the disk of about the size of the \
+             database"
+                .to_string(),
+            "then start the node again: it tries again when it starts.".to_string(),
+        ] {
+            assert!(said.contains(&words), "{words:?} is not in:\n{said}");
+        }
+    };
+
+    device.start();
+    wait_for("device healthy", &[&device], 30, || healthy(&device));
+    let status = status_of(&device);
+    assert_eq!(status["held"]["by"], "step_failed", "{status}");
+    says(status["held"]["why"].as_str().unwrap());
+    held_up_is_red(
+        &device,
+        "memory not syncing: a step of the database did not finish",
+    );
+    let said = device.cli(&["status"]);
+    says(&said);
+    assert!(said.contains("Not read:"), "{said}");
+    says(&device.refused(&["stats"]));
+    says(&std::fs::read_to_string(device.log()).unwrap());
+    device.stop();
+    assert_eq!(
+        schema_version(&database_of(&device)),
+        cordelia_storage::schema::ALPHA_19_VERSION
+    );
+
+    // With the room there, the next start takes the step.
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TRIGGER a_full_disk;")
+        .unwrap();
+    device.start();
+    wait_for("device healthy again", &[&device], 30, || healthy(&device));
+    assert_eq!(status_of(&device)["held"], serde_json::Value::Null);
+    assert_eq!(
+        schema_version(&database_of(&device)),
+        cordelia_storage::schema::SCHEMA_VERSION
+    );
+
+    // A relay does not start, and says the same.
+    let mut relay = node("relay", "relay", None);
+    step_34_cannot_finish(&relay);
+    relay.start();
+    assert!(!ends_by_itself(&mut relay).success());
+    let log = std::fs::read_to_string(relay.log()).unwrap();
+    assert!(log.contains("schema step 34 did not finish"), "{log}");
+    assert_eq!(
+        schema_version(&database_of(&relay)),
+        cordelia_storage::schema::ALPHA_19_VERSION
+    );
+}

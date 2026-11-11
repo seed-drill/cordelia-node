@@ -275,8 +275,11 @@ schema (step 34) drops what it held of the older kind, in one transaction,
 and the log says how long it took. The database file keeps its size:
 SQLite uses the room again. A relay of an earlier release does not start
 on this version: it says so, and changes nothing. Upgrade it to
-0.2.0-alpha.19 first (`CORDELIA_VERSION=v0.2.0-alpha.19`), start it once,
-then upgrade it to this version.
+0.2.0-alpha.19 first (`CORDELIA_VERSION=v0.2.0-alpha.19` and its
+`CORDELIA_SHA256`, which the Dockerfile needs both of), start it once, then
+upgrade it to this version. The step needs free room on the data volume of
+about the size of the database: without it, the relay changes nothing,
+says so, and stops.
 
 - **A data directory is one node's.** A relay takes a lock on its data
   directory when it starts (a file in it, `node.lock`). A second node that

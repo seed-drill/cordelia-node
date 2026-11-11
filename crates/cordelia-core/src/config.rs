@@ -10,9 +10,11 @@ use crate::CordeliaError;
 
 /// Top-level configuration (mirrors config.toml structure).
 ///
-/// A configuration that still sets `[swarm]` or `network.trusted_peers`,
-/// of the older kind of channel, loads: the keys are not read (decision
-/// 2026-11-10 (older kind), rule 2).
+/// A configuration that still sets `[swarm]`, `network.trusted_peers`,
+/// `network.push_policy`, `governor.ema_alpha`, `governor.dial_policy` or
+/// the keys of `[replication]` but `relay_ask_again_secs` loads: nothing
+/// reads them, and they are not kept (decision 2026-11-10 (older kind),
+/// rule 2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -52,7 +54,6 @@ pub struct NodeConfig {
 pub struct NetworkConfig {
     pub listen_addr: String,
     pub role: String,
-    pub push_policy: String,
     /// No longer used: a node learns of no relay from DNS. Kept so that
     /// configurations that set it still load.
     pub dns_discovery: String,
@@ -123,7 +124,6 @@ pub struct GovernorConfig {
     pub hysteresis_secs: u32,
     pub keepalive_timeout_secs: u32,
     pub stale_threshold_secs: u32,
-    pub ema_alpha: f64,
     pub max_connection_retries: u32,
     pub clear_failure_delay_secs: u32,
 }
@@ -131,10 +131,6 @@ pub struct GovernorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReplicationConfig {
-    pub sync_interval_realtime_secs: u32,
-    pub sync_interval_batch_secs: u32,
-    pub tombstone_retention_days: u32,
-    pub max_batch_size: u32,
     /// How long a relay waits before it asks a device again which channels
     /// it holds, and before it takes again a channel it dropped.
     pub relay_ask_again_secs: u64,
@@ -327,7 +323,6 @@ impl Default for NetworkConfig {
         Self {
             listen_addr: format!("0.0.0.0:{}", protocol::P2P_PORT),
             role: "personal".into(),
-            push_policy: "subscribers_only".into(),
             dns_discovery: String::new(),
             bootnodes: protocol::FALLBACK_PEERS
                 .iter()
@@ -360,7 +355,6 @@ impl Default for GovernorConfig {
             hysteresis_secs: protocol::HYSTERESIS_SECS as u32,
             keepalive_timeout_secs: protocol::DEAD_TIMEOUT_SECS as u32,
             stale_threshold_secs: protocol::STALE_THRESHOLD_SECS as u32,
-            ema_alpha: protocol::EMA_ALPHA,
             max_connection_retries: protocol::MAX_CONNECTION_RETRIES,
             clear_failure_delay_secs: protocol::CLEAR_FAILURE_DELAY_SECS as u32,
         }
@@ -370,10 +364,6 @@ impl Default for GovernorConfig {
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
-            sync_interval_realtime_secs: protocol::REALTIME_SYNC_INTERVAL_SECS as u32,
-            sync_interval_batch_secs: protocol::BATCH_SYNC_INTERVAL_SECS as u32,
-            tombstone_retention_days: protocol::TOMBSTONE_RETENTION_DAYS,
-            max_batch_size: protocol::MAX_BATCH_SIZE as u32,
             relay_ask_again_secs: protocol::RELAY_ASK_AGAIN_SECS,
         }
     }
@@ -808,16 +798,22 @@ http_port = 8080
 
     /// A configuration that `cordelia swarm-init` wrote, or that sets
     /// trusted peers, both of the older kind of channel, still loads
-    /// (decision 2026-11-10 (older kind), rule 2): the keys are not read,
-    /// and what is saved again holds neither.
+    /// (decision 2026-11-10 (older kind), rule 2), and so does one with
+    /// the other keys that nothing reads: `push_policy`, `ema_alpha`,
+    /// `dial_policy` and the four of `[replication]`. What is saved again
+    /// holds none of them, and keeps `relay_ask_again_secs`.
     #[test]
     fn an_old_configuration_with_a_swarm_and_trusted_peers_still_loads() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[network]\nrole = \"personal\"\n\
+            "[network]\nrole = \"personal\"\npush_policy = \"pull_only\"\n\
              [[network.trusted_peers]]\npublic_key = \"cordelia_pk1x\"\n\
+             [governor]\nema_alpha = 0.3\ndial_policy = \"trusted_only\"\n\
+             [replication]\nsync_interval_realtime_secs = 20\n\
+             sync_interval_batch_secs = 600\ntombstone_retention_days = 3\n\
+             max_batch_size = 50\nrelay_ask_again_secs = 120\n\
              [swarm]\nswarm_index = 7\nlead_identity_path = \"/tmp/lead/identity.key\"\n\
              lead_entity_id = \"lead_a1b2\"\n",
         )
@@ -825,10 +821,22 @@ http_port = 8080
         let config = Config::load(&path).unwrap();
         assert_eq!(config.network.role, "personal");
         assert!(!config.network.accepts_inbound());
+        assert_eq!(config.replication.relay_ask_again_secs, 120);
         config.save(&path).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(!saved.contains("swarm"), "{saved}");
-        assert!(!saved.contains("trusted_peers"), "{saved}");
+        for gone in [
+            "swarm",
+            "trusted_peers",
+            "push_policy",
+            "ema_alpha",
+            "dial_policy",
+            "sync_interval",
+            "tombstone_retention_days",
+            "max_batch_size",
+        ] {
+            assert!(!saved.contains(gone), "{gone}: {saved}");
+        }
+        assert!(saved.contains("relay_ask_again_secs = 120"), "{saved}");
     }
 
     #[test]

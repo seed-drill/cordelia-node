@@ -678,8 +678,9 @@ never held, comes in only under **a word that the phrase signed:**
   can tell a node of another version; `uptime_secs`; `peers_hot` and
   `peers_warm`; `channels_subscribed` (the names a device holds, or the
   channels a relay holds); `sync_errors`; `outbox_waiting`; `held`, which
-  is null, or by what the node is held up (`by`: `later_database`, or
-  `earlier_database` for a database from before 0.2.0-alpha.19) and why
+  is null, or by what the node is held up (`by`: `later_database`;
+  `earlier_database` for a database from before 0.2.0-alpha.19; or
+  `step_failed` for a step of the schema that did not finish) and why
   (`why`); `no_relay_secs`, for
   how long no relay has been connected, by the node's own clock, or null
   while one is; and, on a personal node that stands applied and is not

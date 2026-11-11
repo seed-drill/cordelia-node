@@ -20,8 +20,9 @@ pub fn check_bearer(req: &HttpRequest, state: &AppState) -> Result<(), ApiError>
 
 /// Refuse a request that a node which is held up does not answer, with
 /// why it is held up (decision 2026-10-04 §10.1; decision 2026-11-10
-/// (older kind), rule 6). Held up by a database from a later version or
-/// from before alpha.19, a node answers every `GET` and nothing else:
+/// (older kind), rules 6 and 9). Held up by its database, from a later
+/// version or from before alpha.19, or by a step of it that did not
+/// finish, a node answers every `GET` and nothing else:
 /// what it would read is not its database, and it writes nothing there.
 pub fn refuse_while_held(req: &HttpRequest, state: &AppState) -> Result<(), ApiError> {
     match state.held.why() {

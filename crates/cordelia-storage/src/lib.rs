@@ -57,4 +57,11 @@ pub enum StorageError {
          version cannot open it, and changed nothing"
     )]
     EarlierVersion { found: u32 },
+
+    /// A step of the schema did not finish: SQLite's words for why, the
+    /// commonest a disk too full for it (decision 2026-11-10 (older kind),
+    /// rule 9). The step runs in one transaction, so nothing of it was
+    /// kept: the database is at the step before.
+    #[error("schema step {step} did not finish ({why}); nothing was changed")]
+    StepFailed { step: u32, why: String },
 }

@@ -113,19 +113,29 @@ pub fn init_db(conn: &Connection) -> Result<(), StorageError> {
     let current = version_of(conn)?;
     if current < ALPHA_19_VERSION {
         tracing::info!("making a new database: alpha.19's schema, then the steps after it");
-        migrate_in_one(conn, BASELINE, ALPHA_19_VERSION)?;
+        migrate_in_one(conn, BASELINE, ALPHA_19_VERSION)
+            .map_err(|e| failed(ALPHA_19_VERSION, e))?;
     }
     if current < 34 {
         // Timed, so that the step can be timed on a copy of a relay's
         // database before a release (decision 2026-11-10 (older kind), §8).
         let began = Instant::now();
-        migrate_in_one(conn, STEP_34, 34)?;
+        migrate_in_one(conn, STEP_34, 34).map_err(|e| failed(34, e))?;
         tracing::info!(
             ms = u64::try_from(began.elapsed().as_millis()).unwrap_or(u64::MAX),
             "applied schema step 34 (the older kind of channel dropped)"
         );
     }
     Ok(())
+}
+
+/// What is said of step `step` that did not finish, with why.
+fn failed(step: u32, e: StorageError) -> StorageError {
+    let why = match e {
+        StorageError::Sqlite(e) => e.to_string(),
+        e => e.to_string(),
+    };
+    StorageError::StepFailed { step, why }
 }
 
 /// The pragmas of every connection to the database: write-ahead logging,
@@ -152,12 +162,18 @@ fn refuse_a_later_version(conn: &Connection, own: u32) -> Result<(), StorageErro
 /// (older kind), rules 4 and 6): one at steps 1 to 32, or at no step with
 /// anything in it. Only alpha.19's, at step 33, is taken over, and a new
 /// one made: a file with nothing in it, at no step, is new.
+///
+/// The version and whether the file holds anything are read in one
+/// statement, so in one snapshot: another process that makes a new file
+/// at the same moment is seen whole, or not at all.
 fn refuse_an_earlier_version(conn: &Connection) -> Result<(), StorageError> {
-    let found = version_of(conn)?;
+    let (found, holds_something): (u32, bool) = conn.query_row(
+        "SELECT user_version, EXISTS (SELECT 1 FROM sqlite_master) FROM pragma_user_version",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
     let earlier = match found {
-        0 => conn.query_row("SELECT EXISTS (SELECT 1 FROM sqlite_master)", [], |row| {
-            row.get(0)
-        })?,
+        0 => holds_something,
         found => found < ALPHA_19_VERSION,
     };
     if earlier {
@@ -569,6 +585,42 @@ mod tests {
             version(&crate::db::open(&alpha_19).unwrap()),
             SCHEMA_VERSION
         );
+    }
+
+    /// Make step 34 fail on alpha.19's database at `path`, as a disk with
+    /// too little room would: a trigger that stops its last write.
+    pub(crate) fn step_34_cannot_finish(path: &std::path::Path) {
+        let conn = Connection::open(path).unwrap();
+        init_db_as_alpha_19(&conn).unwrap();
+        conn.execute_batch(
+            "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x');
+             CREATE TRIGGER step_34_cannot_finish BEFORE DELETE ON node_meta
+             BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+        )
+        .unwrap();
+    }
+
+    /// A step that does not finish says which, and why, and changes
+    /// nothing: the database is at the step before, with every table it
+    /// had (decision 2026-11-10 (older kind), rule 9).
+    #[test]
+    fn a_step_that_does_not_finish_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cordelia.db");
+        step_34_cannot_finish(&path);
+        let before = definitions(&Connection::open(&path).unwrap());
+        let refused = match crate::db::open(&path) {
+            Err(e) => e,
+            Ok(_) => panic!("the step finished"),
+        };
+        assert!(
+            matches!(&refused, StorageError::StepFailed { step: 34, why }
+                if why.contains("database or disk is full")),
+            "{refused:?}"
+        );
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(version(&conn), ALPHA_19_VERSION);
+        assert_eq!(definitions(&conn), before);
     }
 
     /// A store opened as a personal node opens it has `secure_delete` on

@@ -4554,16 +4554,16 @@ fn a_command_that_changes_anything_refuses_a_node_whose_version_it_cannot_learn(
 /// stands first, and shows no word and asks for none where the node is
 /// held up (decision 2026-10-04 §10.1): it says why the node is, and has
 /// asked the node for nothing but how it stands. Here the node is behind
-/// a stand-in that says it is held up for its first start.
+/// a stand-in that says it is held up by a database from before alpha.19.
 #[test]
 fn a_command_of_a_phrase_shows_no_word_where_the_node_is_held_up() {
     let mut laptop = node("laptop", "personal", None);
     laptop.start();
     wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
-    let why = "the first start on this version is not done: no room for the copy";
+    let why = "This database is from a Cordelia before 0.2.0-alpha.19.";
     let held = Answers::in_the_place_of(&laptop, move |path, answer| {
         if path == "/api/v1/status" {
-            answer["held"] = json!({ "by": "first_start", "why": why });
+            answer["held"] = json!({ "by": "earlier_database", "why": why });
         }
     });
     let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();

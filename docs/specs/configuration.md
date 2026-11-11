@@ -26,11 +26,14 @@
 >   never stored anywhere. What a device follows, the person secret and the
 >   statement it has applied are in the node's database (data-formats.md
 >   §10.3), and the device's own key is in `identity.key`.
-> - **`push_policy` (§2.3) and every key of `[replication]` (§2.5) but
->   `relay_ask_again_secs` are no longer read** (decision 2026-11-10 (older
->   kind), rule 2): a configuration that still sets them loads, and they
->   change nothing. A device fetches its channels every 10 seconds and sends
->   every 2, which are constants of `protocol.rs` and not settings.
+> - **Keys that nothing reads are gone:** `network.push_policy`,
+>   `governor.ema_alpha`, `governor.dial_policy`, and every key of
+>   `[replication]` but `relay_ask_again_secs` (decision 2026-11-10 (older
+>   kind), rule 2). A configuration that still sets them loads, and they
+>   change nothing; a configuration saved again leaves them out. A device
+>   fetches its channels every 10 seconds and sends every 2, which are
+>   constants of `protocol.rs` and not settings. A personal node dials
+>   relays only, and every other role any peer: the role sets it.
 > - **`[swarm]` and `network.trusted_peers` are no longer read** (rule 2):
 >   a configuration that still sets them loads, and they change nothing.
 > - **A relay's `max_storage_bytes` bounds what it holds of the channels
@@ -99,14 +102,13 @@ Core node settings: ports, storage location, storage quota.
 
 ### 2.3 `[network]`
 
-P2P networking: listen address, node role, push policy, bootnode addresses, DNS discovery.
+P2P networking: listen address, node role, bootnode addresses, DNS discovery.
 
 | Parameter | Type | Default | Valid Values | Description | Source |
 |-----------|------|---------|--------------|-------------|--------|
 | `listen_addr` | string | `"0.0.0.0:9474"` | `<ip>:<port>` | P2P listen address (UDP, QUIC). | operations.md SS5.1, network-protocol.md SS12.2 |
 | `listen` | boolean | unset | `true`, `false` | Whether to accept inbound connections. Unset: every role listens except `personal`, which only dials out and opens no listening socket. A personal node told to listen still turns away every inbound connection: the trusted peers and swarm that it listened for are gone (decision 2026-11-10 (older kind), rule 2). | decision 2026-09-30 §4.6 |
 | `role` | string | `"personal"` | `"personal"`, `"bootnode"`, `"relay"` | Node role. Affects governor targets, push behaviour, and relay/bootstrap duties. A personal node never becomes a relay by default -- operators must set this explicitly. **Any other value is refused when the configuration is loaded**, with a line that names the roles this version takes. | network-protocol.md SS8, SS12.2; decision 2026-10-17 §5 |
-| `push_policy` | string | `"subscribers_only"` | any | **No longer read** (decision 2026-11-10 (older kind), rule 2): it set how items were pushed. A configuration that sets it loads. | -- |
 | `dns_discovery` | string | `""` | any | **No longer used (2026-10-02).** A node learns of no relay from DNS: its relays are the ones it is configured with. The setting is still read, so that older configurations load. | decision 2026-09-30 §4.6 |
 
 **Port precedence:** If both `node.p2p_port` and `network.listen_addr` are set, the port in `listen_addr` MUST match `p2p_port`. If they disagree, the node logs an error and refuses to start. If only `node.p2p_port` is set, `listen_addr` defaults to `0.0.0.0:<p2p_port>`. If only `listen_addr` is set, `p2p_port` is derived from it. This ensures a single source of truth for the P2P port.
@@ -145,7 +147,6 @@ Defaults match the Personal Node profile (network-protocol.md SS8.6). Override f
 | `warm_min` | integer | `3` | >= `hot_min` | Minimum warm peers. Below this, connect cold peers. | SS5.3, SS8.6 |
 | `warm_max` | integer | `10` | >= `warm_min` | Maximum warm+hot peers. | SS5.3, SS8.6 |
 | `cold_max` | integer | `50` | >= `warm_max` | Maximum cold (known, not connected) peers. | SS5.3, SS8.6 |
-| `dial_policy` | string | `"all"` | any | **Not read.** A personal node dials relays only, and every other role any peer: the role sets it. `trusted_only` is gone with the trusted peers (decision 2026-11-10 (older kind), rule 2). | SS5.3 |
 | `tick_interval_secs` | integer | `10` | >= 1 | Governor tick interval. Each tick evaluates promotions, demotions, and churn. | SS5.4, SS12.2 |
 | `churn_interval_secs` | integer | `3600` | > 0 | Base churn interval. Warm peers swapped with cold to prevent topology ossification. A personal node never closes, by churn, its connection to a relay it is set up with. | SS5.4, SS12.2; decision 2026-10-17 §2 |
 | `churn_jitter_secs` | integer | `300` | >= 0 | Random jitter added to churn interval (0 to this value). Prevents correlated churn across nodes. | SS5.4, SS12.2 |
@@ -154,7 +155,6 @@ Defaults match the Personal Node profile (network-protocol.md SS8.6). Override f
 | `hysteresis_secs` | integer | `90` | >= `tick_interval_secs` | Cooldown after demotion before re-promotion. | SS5.4, SS12.2 |
 | `keepalive_timeout_secs` | integer | `90` | >= 60 | Dead detection threshold. No keepalive for this duration triggers demotion. | SS5.4, SS12.2 |
 | `stale_threshold_secs` | integer | `1800` | > 0 | No items for this duration = priority demotion during Hot overflow. | SS5.4, SS12.2 |
-| `ema_alpha` | float | `0.1` | (0.0, 1.0] | **Read by nothing:** the governor scores no peer, and excess demotion orders by staleness alone (decision 2026-11-10 (older kind), rule 2). A configuration that sets it loads. | SS5.5 |
 | `max_connection_retries` | integer | `5` | >= 1 | Stop connecting after this many consecutive failures. | SS5.4, SS12.2 |
 | `clear_failure_delay_secs` | integer | `120` | > 0 | Clear failure count after being Hot for this long. | SS5.4, SS12.2 |
 
@@ -162,19 +162,14 @@ Defaults match the Personal Node profile (network-protocol.md SS8.6). Override f
 
 ### 2.5 `[replication]`
 
-A relay's wait before it asks a device again. The other keys set the Item-Sync protocol, which no node runs: they are no longer read (decision 2026-11-10 (older kind), rule 2), and a configuration that sets them loads.
+A relay's wait before it asks a device again. The keys that set the Item-Sync protocol, which no node runs, are gone (decision 2026-11-10 (older kind), rule 2): a configuration that still sets them loads.
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
-| `sync_interval_realtime_secs` | integer | `10` | any | **No longer read.** | -- |
-| `sync_interval_batch_secs` | integer | `900` | any | **No longer read.** | -- |
-| `tombstone_retention_days` | integer | `7` | any | **No longer read.** | -- |
-| `max_batch_size` | integer | `100` | any | **No longer read.** | -- |
 | `relay_ask_again_secs` | integer | `600` | 1-86400 (a value outside is taken as the nearest) | Relays only. How long a relay waits before it asks a device again which channels it holds, and before it takes again a channel it dropped to make room. | parameter-rationale.md SS4 |
 
 > **v1 status.** The defaults are those of `ReplicationConfig` in
-> `crates/cordelia-core/src/config.rs`. Of this section a node acts on
-> `relay_ask_again_secs` alone. A device's pull runs every
+> `crates/cordelia-core/src/config.rs`. A device's pull runs every
 > `REALTIME_SYNC_INTERVAL_SECS` (10 seconds), a constant of `protocol.rs`.
 
 ### 2.6 `[limits]`
@@ -327,7 +322,6 @@ hot_min_relays = 1                         # Minimum relay peers in hot set
 warm_min = 3                               # Below this, connect cold peers
 warm_max = 10                              # Maximum warm+hot peers
 cold_max = 50                              # Maximum known peer addresses
-dial_policy = "all"                        # Not read: the role sets it
 tick_interval_secs = 10                    # Governor tick interval
 churn_interval_secs = 3600                 # Base churn interval (1 hour)
 churn_jitter_secs = 300                    # Random jitter on churn interval
@@ -336,7 +330,6 @@ min_warm_tenure_secs = 300                 # Minimum warm time before Hot promot
 hysteresis_secs = 90                       # Cooldown after demotion
 keepalive_timeout_secs = 90                # Dead detection threshold
 stale_threshold_secs = 1800                # No items for 30 min = priority demotion
-ema_alpha = 0.1                            # Read by nothing: no peer is scored
 max_connection_retries = 5                 # Stop connecting after this many failures
 clear_failure_delay_secs = 120             # Clear failure count after being Hot for this long
 

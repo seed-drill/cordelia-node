@@ -555,7 +555,7 @@ The design of a person's devices in this paper (the person secret, the
 recovery phrase, statements, and channels from their secrets) is the one the
 code has. **There is one kind of channel, the channel from its secret:** no
 node carries the channels of the design before it, and a node answers what
-a node of `v0.2.0-alpha.19` asks of them with nothing. The next version
+a node of `v0.2.0-alpha.19` asks of them with nothing. `v0.2.0-alpha.20`
 takes over a device's or a relay's data from `v0.2.0-alpha.19` only; one
 from an earlier release is refused, and nothing of it is changed (decision
 record of 2026-11-10, older kind).

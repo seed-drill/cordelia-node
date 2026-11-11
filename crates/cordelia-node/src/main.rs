@@ -1169,6 +1169,28 @@ fn from_an_earlier_version(data_dir: &std::path::Path) -> String {
     )
 }
 
+/// What is said where a step of the schema did not finish (decision
+/// 2026-11-10 (older kind), rule 9): that nothing was changed, and that
+/// the step needs free room of about the size of the database, which is
+/// what it most often lacked. The node tries again when it next starts.
+fn a_step_did_not_finish(db_path: &std::path::Path, step: u32, why: &str) -> String {
+    let bytes: u64 = ["", "-wal"]
+        .iter()
+        .filter_map(|ending| {
+            let file = format!("{}{ending}", db_path.display());
+            std::fs::metadata(file).ok().map(|found| found.len())
+        })
+        .sum();
+    format!(
+        "the database at {} could not be brought to this version: schema step {step} did not \
+         finish ({why}). Nothing was changed. The step needs free room on the disk of about \
+         the size of the database, {} MB. Make that room, then start the node again: it tries \
+         again when it starts.",
+        db_path.display(),
+        bytes.div_ceil(1_000_000).max(1),
+    )
+}
+
 /// The data directory that holds the database at `db_path`.
 fn data_dir_of(db_path: &std::path::Path) -> &std::path::Path {
     db_path.parent().unwrap_or(db_path)
@@ -1194,19 +1216,24 @@ fn open_database(
         Err(StorageError::EarlierVersion { .. }) => {
             anyhow::bail!("{}", from_an_earlier_version(data_dir_of(db_path)))
         }
+        Err(StorageError::StepFailed { step, why }) => {
+            anyhow::bail!("{}", a_step_did_not_finish(db_path, step, &why))
+        }
         Err(e) => Err(e.into()),
     }
 }
 
 /// Open the database as the node opens it when it starts (decision
 /// 2026-10-04 §10.1). One from a later version is refused, and so is one
-/// from before alpha.19 (decision 2026-11-10 (older kind), rule 6): a
-/// personal node then stays up, over a database of its own in memory,
-/// held, with why (the second of what is returned); a node of any other
-/// role does not start without its database, and says why. The log names
-/// the step an earlier one is at. The connection is set as a node of the
-/// role that `config` gives keeps it, before the schema's steps run
-/// ([`keeps_secure_delete`]); a relay's has the automatic checkpoint off,
+/// from before alpha.19 (decision 2026-11-10 (older kind), rule 6), and
+/// one whose schema step did not finish is left at the step before (rule
+/// 9): a personal node then stays up, over a database of its own in
+/// memory, held, with why (the second of what is returned), and tries the
+/// step again when it next starts; a node of any other role does not
+/// start without its database, and says why. The log says why once, and
+/// names the step an earlier database is at. The connection is set as a
+/// node of the role that `config` gives keeps it, before the schema's
+/// steps run ([`keeps_secure_delete`]); a relay's has the automatic checkpoint off,
 /// for it checkpoints on a timer of its own in a take of its lock of kind
 /// Checkpoint (issue #224; [`relay_entries::kept_by`], the same test that
 /// gives the node the relay's part that runs it).
@@ -1236,12 +1263,16 @@ fn open_the_nodes_database(
                     Held::LaterDatabase(from_a_later_version(db_path, found, own))
                 }
                 cordelia_storage::StorageError::EarlierVersion { found } => {
-                    let why = from_an_earlier_version(data_dir_of(db_path));
-                    tracing::error!("the database is at schema step {found}: {why}");
-                    Held::EarlierDatabase(why)
+                    tracing::error!("the database is at schema step {found}");
+                    Held::EarlierDatabase(from_an_earlier_version(data_dir_of(db_path)))
+                }
+                cordelia_storage::StorageError::StepFailed { step, why } => {
+                    Held::StepFailed(a_step_did_not_finish(db_path, step, &why))
                 }
                 e => return Err(e.into()),
             };
+            // Said once, here, for every role.
+            tracing::error!("{}", held.says());
             if role != "personal" {
                 anyhow::bail!("{}", held.says());
             }
@@ -2605,10 +2636,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // (removal), rule 12; decision 2026-11-10 (older kind), rule 9).
     let held = open_held.is_some();
     match open_held {
-        Some(why) => {
-            tracing::error!("{}", why.says());
-            state.held.hold(why);
-        }
+        Some(why) => state.held.hold(why),
         None if personal => judge_kept_at_start(&state),
         None => {}
     }
@@ -4303,6 +4331,23 @@ fn another_version_with_no_lock(config: &Config, lock: DirLock, known: Known) ->
     version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
 }
 
+/// Why the node at the configuration's port is held up, where it is held
+/// by a step of its schema that did not finish (decision 2026-11-10 (older
+/// kind), rule 9): what it says, asked once, or as it answered already.
+fn held_by_a_step(config: &Config, known: Known) -> Option<String> {
+    let asked;
+    let node = match known {
+        Known::Ask => {
+            asked = local_api(config, false, "/api/v1/status", VERSION_ASKED_FOR).ok()?;
+            &asked
+        }
+        Known::Answered(node) => node,
+        Known::NotAsked => return None,
+    };
+    let held = &node["held"];
+    (held["by"] == "step_failed").then(|| held["why"].as_str().map(str::to_string))?
+}
+
 /// What a command knows already of the node at its configuration's port,
 /// where the lock tells nothing ([`another_version_with_no_lock`]).
 #[derive(Debug, Clone, Copy)]
@@ -4430,10 +4475,15 @@ fn open_to_read_knowing(config: &Config, known: Known) -> anyhow::Result<rusqlit
     }
     // A node of this version holds a database from before alpha.19 as it
     // found it (decision 2026-11-10 (older kind), rule 6).
-    if (1..cordelia_storage::schema::ALPHA_19_VERSION).contains(&found) {
+    if found < cordelia_storage::schema::ALPHA_19_VERSION {
         anyhow::bail!("{}", from_an_earlier_version(&data_dir));
     }
     if found != own {
+        // A node of this version whose step did not finish holds it at
+        // the step before, and says so (rule 9): the command says the same.
+        if let Some(why) = held_by_a_step(config, known) {
+            anyhow::bail!("{why}");
+        }
         anyhow::bail!(
             "{}",
             not_read_beside_another_version(&data_dir, found, own, std::env::consts::OS)
@@ -7089,8 +7139,8 @@ mod tests {
         assert!(refuse_by_how_it_stands(&stands(serde_json::Value::Null)).is_ok());
         assert!(refuse_by_how_it_stands(&Ok(serde_json::json!({ "version": own }))).is_ok());
 
-        let why = "the first start on this version is not done: no room";
-        let held = stands(serde_json::json!({ "by": "first_start", "why": why }));
+        let why = "This database is from a Cordelia before 0.2.0-alpha.19.";
+        let held = stands(serde_json::json!({ "by": "earlier_database", "why": why }));
         let refused = refuse_by_how_it_stands(&held).unwrap_err().to_string();
         assert!(refused.starts_with(&format!("{why}\n")), "{refused}");
         assert!(
@@ -7105,7 +7155,7 @@ mod tests {
         // The version comes first.
         let another = Ok(serde_json::json!({
             "version": "0.0.0-another",
-            "held": { "by": "first_start", "why": why },
+            "held": { "by": "earlier_database", "why": why },
         }));
         let refused = refuse_by_how_it_stands(&another).unwrap_err().to_string();
         assert!(
@@ -9188,6 +9238,56 @@ mod tests {
                 .to_string(),
             from_an_earlier_version(dir.path())
         );
+
+        // And alpha.19's, whose step 34 does not finish, as on a disk with
+        // too little room (decision 2026-11-10 (older kind), rule 9): a
+        // personal node is held up with the words, and every role and
+        // command says them. The database stays at step 33.
+        let full = dir.path().join("full.db");
+        {
+            let conn = rusqlite::Connection::open(&full).unwrap();
+            cordelia_storage::schema::init_db_as_alpha_19(&conn).unwrap();
+            conn.execute_batch(
+                "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x');
+                 CREATE TRIGGER a_full_disk BEFORE DELETE ON node_meta
+                 BEGIN SELECT RAISE(ABORT, 'database or disk is full'); END;",
+            )
+            .unwrap();
+        }
+        let says = |said: &str| {
+            for words in [
+                format!("the database at {} could not be brought", full.display()),
+                "schema step 34 did not finish (database or disk is full)".to_string(),
+                "Nothing was changed. The step needs free room on the disk of about the size of \
+                 the database, 1 MB."
+                    .to_string(),
+                "then start the node again: it tries again when it starts.".to_string(),
+            ] {
+                assert!(said.contains(&words), "{words:?} is not in: {said}");
+            }
+        };
+        let (held, why) = open_the_nodes_database(&full, &as_a("personal")).unwrap();
+        assert_eq!(secure_delete(&held), 1);
+        let why = why.unwrap();
+        assert_eq!(why.kind(), "step_failed");
+        says(why.says());
+        for role in ["relay", "bootnode"] {
+            says(
+                &open_the_nodes_database(&full, &as_a(role))
+                    .unwrap_err()
+                    .to_string(),
+            );
+        }
+        says(
+            &open_database(&full, &as_a("personal"))
+                .unwrap_err()
+                .to_string(),
+        );
+        let version: u32 = rusqlite::Connection::open(&full)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, cordelia_storage::schema::ALPHA_19_VERSION);
     }
 
     /// The connection a relay's node runs on has SQLite's automatic

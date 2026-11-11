@@ -324,11 +324,6 @@ pub const BAN_THRESHOLD: u32 = 3;
 /// Primitive: rotate 20% per cycle; gradual turnover without disrupting connectivity.
 pub const CHURN_FRACTION: f64 = 0.2;
 
-/// Exponential moving average alpha for peer scoring (parameter-rationale.md §3).
-/// Primitive: 10% weight on current score, 90% on history. Slow-moving average
-/// prevents a single good/bad interaction from dominating the score.
-pub const EMA_ALPHA: f64 = 0.1;
-
 /// Maximum ban duration after escalation: 7 days.
 /// Primitive: absolute calendar-time cap. Even systematic abuse doesn't
 /// result in permanent exclusion; the peer can try again after a week.
@@ -3116,11 +3111,6 @@ mod tests {
     #[test]
     fn test_churn_fraction_parameter_rationale_3() {
         assert!((CHURN_FRACTION - 0.2).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_ema_alpha_parameter_rationale_3() {
-        assert!((EMA_ALPHA - 0.1).abs() < f64::EPSILON);
     }
 
     // Backoff (parameter-rationale.md §3)

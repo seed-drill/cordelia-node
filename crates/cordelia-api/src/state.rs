@@ -55,7 +55,7 @@ pub struct AppState {
 }
 
 /// Why a node is held up (decision 2026-10-04 §10.1; decision 2026-11-10
-/// (older kind), rule 6). Either way the node runs over a database of its
+/// (older kind), rules 6 and 9). Either way the node runs over a database of its
 /// own in memory, and nothing of the one on disk is read or changed, for
 /// as long as it runs. It says why, in words for a person.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,13 +66,17 @@ pub enum Held {
     /// Its database is from a Cordelia before alpha.19, which this version
     /// does not take over: it says so, with the ways on.
     EarlierDatabase(String),
+    /// A step of its database's schema did not finish, the commonest for
+    /// want of room on the disk (decision 2026-11-10 (older kind), rule 9):
+    /// nothing was changed, and it tries again when it next starts.
+    StepFailed(String),
 }
 
 impl Held {
     /// Why the node is held up, in words for a person.
     pub fn says(&self) -> &str {
         match self {
-            Held::LaterDatabase(why) | Held::EarlierDatabase(why) => why,
+            Held::LaterDatabase(why) | Held::EarlierDatabase(why) | Held::StepFailed(why) => why,
         }
     }
 
@@ -81,6 +85,7 @@ impl Held {
         match self {
             Held::LaterDatabase(_) => "later_database",
             Held::EarlierDatabase(_) => "earlier_database",
+            Held::StepFailed(_) => "step_failed",
         }
     }
 }

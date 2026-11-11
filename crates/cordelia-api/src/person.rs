@@ -27,7 +27,7 @@
 //! (decision 2026-10-24 (removal), rule 1). One function decides what a
 //! change is to it ([`decide`], rule 8), whether it is shown one
 //! ([`shown`]), handed one at `cordelia accept`, or judges what it kept at
-//! its first start on this version ([`judge_kept`], rule 12). It does
+//! every start that is not held ([`judge_kept`], rule 12). It does
 //! exactly one thing with it:
 //!
 //! - it is one the device keeps, or it is behind one: nothing;
@@ -1505,8 +1505,8 @@ fn keeps_set_aside(conn: &Connection, entry: &CheckedEntry) -> Result<bool, Pers
 
 /// Rule 8 of decision 2026-10-24 (removal): one function decides what a
 /// change of the phrase's is to this device, each time it is shown one
-/// that it does not keep, is handed one at `cordelia accept`, and at its
-/// first start on this version (rule 12). `held` is what the device holds,
+/// that it does not keep, is handed one at `cordelia accept`, and at every
+/// start where step 22 marked it to judge (rule 12). `held` is what the device holds,
 /// in state applied or closed; `entry` is the change's entry, checked and
 /// opened to `statement`; `apply` applies it, where step 4 says to, and is
 /// asked nothing else. `by_a_record` is whether the caller brings a record
@@ -2150,8 +2150,9 @@ pub fn know_what_is_shown(
     })
 }
 
-/// At its first start on the version that keeps every head, a device
-/// judges what it kept (decision 2026-10-24 (removal), rule 12): it notes
+/// At every start that is not held (decision 2026-11-10 (older kind), rule
+/// 9), a device judges what it kept (decision 2026-10-24 (removal), rule
+/// 12), where step 22 marked it: it notes
 /// the time of each change entry it keeps, and a device in a fork applies
 /// rule 8 to the entry it kept apart, which step 22 set aside. It moves,
 /// goes on, or stays closed: an entry of the version before has no

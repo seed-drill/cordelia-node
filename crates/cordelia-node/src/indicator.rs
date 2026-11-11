@@ -73,7 +73,8 @@ pub struct Facts {
     pub folders: usize,
     /// What the node is held up by, as it says it, where it is (decision
     /// 2026-10-04 §10.1): `later_database` where its database is from a
-    /// later version, or `earlier_database` where it is from a Cordelia
+    /// later version, `step_failed` where a step of its schema did not
+    /// finish, or `earlier_database` where it is from a Cordelia
     /// before alpha.19 (decision 2026-11-10 (older kind), rule 6). It runs
     /// no cycle and no pass meanwhile.
     pub held: Option<String>,
@@ -447,6 +448,8 @@ fn held_says(by: &str) -> &'static str {
         "later_database" => "memory not syncing: the database is from a later version",
         // Decision 2026-11-10 (older kind), rule 6.
         "earlier_database" => "memory not syncing: the database is from before 0.2.0-alpha.19",
+        // Rule 9 of the same record.
+        "step_failed" => "memory not syncing: a step of the database did not finish",
         _ => "memory not syncing: the node is held up",
     }
 }

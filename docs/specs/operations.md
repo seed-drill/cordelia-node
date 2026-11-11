@@ -654,7 +654,6 @@ max_storage_bytes = 1073741824         # 1 GB default local storage limit
 [network]
 listen_addr = "0.0.0.0:9474"          # P2P listen address (UDP, QUIC)
 role = "personal"                      # "personal" | "bootnode" | "relay" | "keeper"
-push_policy = "subscribers_only"       # "subscribers_only" | "pull_only" (personal nodes only)
 bootnodes = [
     "boot1.cordelia.seeddrill.ai:9474",
     "boot2.cordelia.seeddrill.ai:9474",

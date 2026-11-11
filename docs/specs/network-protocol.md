@@ -1247,7 +1247,7 @@ This prevents Sybil attacks: an attacker connecting many identities can only get
 > **v1 status.** The governor scores no peer: excess demotion orders by
 > staleness alone (§5.4 step 5). The score below was items delivered, which
 > was always 0 once no node carried the older kind, and it is gone, with
-> `ema_alpha` read by nothing (decision 2026-11-10 (older kind), rule 2).
+> its key `ema_alpha` (decision 2026-11-10 (older kind), rule 2).
 > What follows is the design before.
 
 ```
@@ -1484,7 +1484,7 @@ The user's local node. Runs as a daemon on the user's machine. Its job is reliab
 #### 8.2.1 Push Policy
 
 Gone (decision 2026-11-10 (older kind), rule 2): no node pushes an item of
-the older kind. `push_policy` is not read.
+the older kind. The key `push_policy` is gone; a configuration that sets it loads.
 
 #### 8.2.2 Personal Area Network (Agent Swarm)
 
@@ -1854,7 +1854,6 @@ public_key = "cordelia_pk1..."             # Ed25519 public key (Bech32, read-on
 listen_addr = "0.0.0.0:9474"              # P2P listen address
 api_addr = "127.0.0.1:9473"               # REST API listen address (127.0.0.1 or ::1 only, see below)
 role = "personal"                           # "personal" | "bootnode" | "relay" | "keeper"
-push_policy = "subscribers_only"           # "subscribers_only" | "pull_only" (personal nodes only, §8.1.1)
 bootstrap_timeout_secs = 10              # Per-bootnode connection timeout during bootstrap
 # All stream I/O uses STREAM_TIMEOUT (10s) at the codec layer.
 # One timeout, one layer. See parameter-rationale.md §6 and protocol.rs.
@@ -1879,7 +1878,6 @@ hot_min_relays = 1                     # Minimum relay peers in hot set (§5.3)
 warm_min = 3                           # Below this, connect cold peers
 warm_max = 10                          # Maximum warm+hot peers
 cold_max = 50                          # Maximum known peer addresses (discovery breadth)
-dial_policy = "all"                    # Set by the role, not read (§5.3)
 tick_interval_secs = 10                # Governor tick frequency
 churn_interval_secs = 3600             # Base churn interval (1 hour)
 churn_jitter_secs = 300                # Random jitter added to churn interval (0-300s)
@@ -1888,7 +1886,6 @@ min_warm_tenure_secs = 300             # Minimum time as Warm before Hot promoti
 hysteresis_secs = 90                   # Cooldown after demotion before re-promotion
 keepalive_timeout_secs = 90            # Dead detection threshold
 stale_threshold_secs = 1800            # 30 min no items → priority demotion
-ema_alpha = 0.1                        # Read by nothing: no peer is scored (§5.5)
 max_connection_retries = 5             # Stop connecting to a peer after this many consecutive failures
 clear_failure_delay_secs = 120         # Clear failure count after being Hot for this long
 ```
@@ -1899,10 +1896,7 @@ See §8.6 for role-specific profiles (Bootnode, Relay, Secret Keeper).
 
 ```toml
 [replication]
-sync_interval_realtime_secs = 10           # Phase 1 default (fast convergence). Production: 60s.
-sync_interval_batch_secs = 900
-tombstone_retention_days = 7
-max_batch_size = 100
+relay_ask_again_secs = 600                 # Relays only
 ```
 
 ### 12.4 Rate Limiting Section
