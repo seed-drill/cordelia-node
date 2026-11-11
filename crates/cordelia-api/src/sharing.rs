@@ -590,9 +590,10 @@ pub fn counted(n: u64, noun: &str) -> String {
 }
 
 /// The lines of §5.4 for the shared channel `channel`, filed as `name`:
-/// which keys have written there, and which came since this device last
-/// wrote there, or for `send`, since the folder whose agent is `agent`
-/// last wrote there, by what it saw itself. Never who reads it.
+/// which keys came to write there since this device last wrote there, or
+/// for `send`, since the folder whose agent is `agent` last wrote there, by
+/// what it saw itself; nothing where none came, or where that last write
+/// is not known. Never who reads it, and never a device of the person's.
 pub fn who_wrote(
     conn: &Connection,
     held: &Held,
@@ -625,57 +626,41 @@ pub fn who_wrote(
             .map(|stored| stored.stored_at)
             .max(),
     };
-    let since = last.unwrap_or(row.first_held);
-    let labels: Vec<[u8; 32]> = lists::holds(conn)?
-        .labels
-        .iter()
-        .filter(|(act, _)| act.item.label.is_some())
-        .map(|(act, _)| act.item.key)
-        .collect();
-    let keys = kept::keys(conn, row.id)?;
-    let wrote: Vec<&kept::Key> = keys
-        .iter()
-        .filter(|key| key.first_held.is_some() && key.key != *own)
-        .collect();
-    let labelled = wrote.iter().filter(|key| labels.contains(&key.key)).count();
-    let mut changes = Vec::new();
-    for key in &keys {
-        if key.key == *own {
-            continue;
+    let mut lines = Vec::new();
+    // Where the last write is not known, every key held since this device
+    // first held the channel would be said as new: nothing is said.
+    if let Some(since) = last {
+        let own_devices = crate::person::who_counts(conn)?.devices_held();
+        let mut changes = Vec::new();
+        for key in kept::keys(conn, row.id)? {
+            if key.key == *own || own_devices.holds(&key.key) {
+                continue;
+            }
+            if let Some(first) = key.first_held.filter(|first| *first > since) {
+                changes.push(format!(
+                    "  new: {}, first held on this device on {}",
+                    sender_form(conn, held, own, &key.key)?,
+                    date_of(first)
+                ));
+            }
+            if let Some(first) = key.first_refused.filter(|first| *first > since) {
+                changes.push(format!(
+                    "  refused for room: {}, first refused on this device on {}, key {}",
+                    sender_form(conn, held, own, &key.key)?,
+                    date_of(first),
+                    encode_public_key(&key.key)?
+                ));
+            }
         }
-        if let Some(first) = key.first_held.filter(|first| *first > since) {
-            changes.push(format!(
-                "  new: {}, first held on this device on {}",
-                sender_form(conn, held, own, &key.key)?,
-                date_of(first)
+        if !changes.is_empty() {
+            lines.push(format!(
+                "New in \"{}\" since {}:",
+                crate::messages::cleaned(name),
+                date_of(since)
             ));
-        }
-        if let Some(first) = key.first_refused.filter(|first| *first > since) {
-            changes.push(format!(
-                "  refused for room: {}, first refused on this device on {}, key {}",
-                sender_form(conn, held, own, &key.key)?,
-                date_of(first),
-                encode_public_key(&key.key)?
-            ));
+            lines.extend(changes);
         }
     }
-    let counted = format!(
-        "{}, {labelled} of them labelled by you",
-        counted(wrote.len() as u64, "key")
-    );
-    let unseen = "Anyone a member handed the channel to reads it too, unseen.";
-    let shown = crate::messages::cleaned(name);
-    let mut lines = vec![match changes.is_empty() {
-        true => format!(
-            "Keys that wrote here, in \"{shown}\": unchanged since {}: {counted}. {unseen}",
-            date_of(since)
-        ),
-        false => format!(
-            "Keys that wrote here, in \"{shown}\": {counted}. {unseen} New since {}:",
-            date_of(since)
-        ),
-    }];
-    lines.extend(changes);
     lines.extend(crate::shared_anew::after_who_wrote(
         conn, held, own, channel, name,
     )?);

@@ -2235,7 +2235,7 @@ pub(crate) fn after_who_wrote(
     }
     for key in not_moved_yet(conn, own, channel)? {
         lines.push(format!(
-            "  not moved yet: {}",
+            "not moved yet: {}",
             sender_form(conn, held, own, &key)?
         ));
     }

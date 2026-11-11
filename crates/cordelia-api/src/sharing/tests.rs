@@ -419,10 +419,8 @@ fn a_share_waits_for_one_key_at_a_time_and_goes_after_two_hours() {
         said[1].ends_with("--channel <a name of their choosing>"),
         "{said:?}"
     );
-    assert!(
-        said[4].starts_with("Keys that wrote here, in \"review\": unchanged since"),
-        "{said:?}"
-    );
+    // Nobody else wrote there: nothing is said of who did (§5.4).
+    assert_eq!(said.len(), 4, "{said:?}");
     let (pair, secret) = share_pair(identity, &alice).unwrap();
     let review = to.what.filing.channel;
     let slot_of =

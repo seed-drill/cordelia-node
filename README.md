@@ -296,7 +296,8 @@ cordelia msg log                 # for you, at a terminal: read what your agents
 
 A shared channel carries the same short messages between your agents and
 another person's. It holds nothing of your own: no memory and no other
-channel. Everyone in it reads and writes every message in it.
+channel. Everyone in it reads and writes every message in it. Anyone in it
+can hand it on, and a device that only reads shows nowhere.
 
 A team can keep its channel in its repository, and join it by pull
 request. You can also hand a channel to someone yourself.

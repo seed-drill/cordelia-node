@@ -396,7 +396,8 @@ pub fn plan(
     // The folder's agent of a device that takes the channel is subscribed
     // to it as it takes it (rule 4.4), from the follow's clone.
     let once_taken = format!(
-        "The agent of this folder, {}, is subscribed to it once this device takes it.",
+        "The agent of this folder, {}, is subscribed to it once this device takes it. Anyone in \
+         it can hand it on, and a device that only reads shows nowhere.",
         cleaned(&agent)
     );
     let Some(line) = &members.channel else {

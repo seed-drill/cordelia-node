@@ -79,7 +79,7 @@ bob@laptop$ cordelia subscribe
    - whether this device's key is on the list.
 3. **Then one of these:**
    - **The person holds the channel the list names:** it follows the repository and subscribes this folder's agent.
-   - **They do not, and the list names this device:** it follows the repository and waits to be handed the channel (rule 4). The yes says: `This follows <identity>. A member's device hands you its channel once it reads the list. cordelia status shows how it goes.`
+   - **They do not, and the list names this device:** it follows the repository and waits to be handed the channel (rule 4). The yes says: `This follows <identity>. A member's device hands you its channel once it reads the list. cordelia status shows how it goes.` and `The agent of this folder, <agent>, is subscribed to it once this device takes it. Anyone in it can hand it on, and a device that only reads shows nowhere.` No yes is asked when it is taken, so this is where the person is told who else can read it (11 November 2026, issue #338).
    - **The list does not name this device:** `Your key is not on the list of <identity> at <commit>. Add it with a pull request, then run this again.` Nothing is done.
    - **The person dropped that channel:** it says so and does nothing, as `accept --channel` refuses today (§3.4 there): `You dropped channel <words>, and a dropped channel is not taken again.` A drop keeps no name, so the channel is said by its four words.
 4. **`cordelia subscribe --new`** makes the channel for the team, once, at the person's relays, as `shared new` does. It is filed under the repository's `owner/name`. It prints the line to add, and the person's own keys and labels:

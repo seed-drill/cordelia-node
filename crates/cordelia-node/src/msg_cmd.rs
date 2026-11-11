@@ -1618,8 +1618,9 @@ pub fn send(config_path: &str, flags: &SendFlags) -> anyhow::Result<()> {
 }
 
 /// What `send --channel` prints on success (decision 2026-10-10 §5.2,
-/// §5.4): the message's ID and the channel, and then which keys have
-/// written there, as a change; never who reads it.
+/// §5.4): the message's ID and the channel, and then which keys came to
+/// write there since this folder last did, where any came; never who reads
+/// it.
 pub fn shared_sent_says(answer: &Value) -> String {
     let mut out = format!(
         "Sent {} to the shared channel \"{}\".\n",
