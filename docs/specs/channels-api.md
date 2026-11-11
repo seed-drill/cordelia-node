@@ -776,11 +776,14 @@ never held, comes in only under **a word that the phrase signed:**
     its fields are in decision 2026-10-10 §9. Its `repositories` is each
     repository this device follows (decision 2026-11-06 (joining), rule
     7): `identity`, `name`, `held`, `channel` and `words`; `read`, when the
-    list was read, at which commit, from the clone, and when the clone was
-    fetched; `members`, each with `label`, `key`, `words` and `in` (null
-    where this device does not hold the channel); the unread counts; and
-    `lines`, each with a `word`, what it `says`, whether it is `amber`,
-    and a channel `line` to put in the list, where it says to. A line whose
+    list was read, at which commit, from the clone, when the clone was
+    fetched, and `next`, when the node next reads it (null where no timer
+    of the node's reads it); `members`, each with `label`, `key`, `words`
+    and `in` (null where this device does not hold the channel); the
+    unread counts; `lines`, each with a `word`, what it `says`, whether it
+    is `amber`, and a channel `line` to put in the list, where it says to;
+    and `in_step`, true where nothing waits on the list, which plain
+    `cordelia status` then says in one line. A line whose
     word is `joined`, the keys new on the list at one commit (decision
     2026-11-06 (joining), rule 4.5, as the person ruled on 10 November),
     also gives that `commit`, whole, and `devices`, each with `label`,

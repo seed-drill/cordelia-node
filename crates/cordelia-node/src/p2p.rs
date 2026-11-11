@@ -1353,6 +1353,11 @@ pub async fn p2p_loop(
             // select loop: git may take seconds, and each read writes
             // under the db lock.
             _ = members_interval.tick(), if device_entries.is_some() => {
+                // When the next tick reads them, for the status: a status
+                // that shows a wait says when (#323).
+                state
+                    .own_channels
+                    .members_read_next(std::time::Instant::now() + members_read);
                 if let Some(device) = device_entries.clone() {
                     tokio::task::spawn_blocking(move || device.read_members());
                 }

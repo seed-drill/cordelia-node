@@ -143,9 +143,11 @@ fn add_device_accept_and_sync_through_a_relay() {
     wait_for("a connected to the relay", &all, 60, || has_hot_peer(&a));
     wait_for("b connected to the relay", &all, 60, || has_hot_peer(&b));
 
-    // `cordelia status` reports the running node's connections.
-    let status = a.cli(&["status"]);
+    // `cordelia status -v` reports the running node's connections; the
+    // plain status says no peers where all is well (issue #338).
+    let status = a.cli(&["status", "-v"]);
     assert!(status.contains("Running:   yes"), "{status}");
+    assert!(!a.cli(&["status"]).contains("Peers:"));
     let hot: u64 = status
         .lines()
         .find_map(|l| l.trim().strip_prefix("Peers:"))
@@ -1040,7 +1042,7 @@ fn a_personal_node_listens_on_nothing() {
     wait_for("connected to the relay", &[&relay, &a], 60, || {
         has_hot_peer(&a)
     });
-    let status = a.cli(&["status"]);
+    let status = a.cli(&["status", "-v"]);
     assert!(status.contains("outbound only"), "{status}");
     let log = std::fs::read_to_string(a.log()).unwrap();
     assert!(log.contains("dials out only"), "{}", a.log_tail());

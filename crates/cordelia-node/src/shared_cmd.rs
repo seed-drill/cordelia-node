@@ -434,9 +434,10 @@ pub fn show(config_path: &str, keys: bool, verbose: bool) -> anyhow::Result<()> 
     if !repositories.is_empty() {
         lines.push("Repositories this device follows:".into());
     }
+    let now = chrono::Utc::now().timestamp();
     for repository in repositories {
         lines.extend(
-            repository_lines(repository, verbose, true)
+            repository_lines(repository, verbose, true, now)
                 .into_iter()
                 .map(|line| format!("  {line}")),
         );
@@ -448,16 +449,22 @@ pub fn show(config_path: &str, keys: bool, verbose: bool) -> anyhow::Result<()> 
 }
 
 /// The lines of one repository this device follows (decision 2026-11-06
-/// (joining), rule 7), as the node gave it: first the repository and the
-/// name its channel is filed under; then, each indented, when and from
-/// where its list was read, the members by the list's labels, each in or
-/// not yet where this device can see it, what waits unread, and each line
-/// of rules 4 to 6, an amber one after the line's amber mark, with any
-/// channel line it says to put in the list under it. The members, and the
-/// keys new on the list (rule 4.5), are each said with `every`, and else
-/// the first [`MEMBERS_LABELS_SHOWN`] and how many more. The fingerprint
-/// words show only with `verbose` (#228).
-pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<String> {
+/// (joining), rule 7), as the node gave it, at `now`: first the repository
+/// and the name its channel is filed under; then, each indented, when and
+/// from where its list was read, and when the next read is, the members by
+/// the list's labels, each in or not yet where this device can see it,
+/// what waits unread, and each line of rules 4 to 6, an amber one after
+/// the line's amber mark, with any channel line it says to put in the list
+/// under it. The members, and the keys new on the list (rule 4.5), are each
+/// said with `every`, and else the first [`MEMBERS_LABELS_SHOWN`] and how
+/// many more. The fingerprint words show only with `verbose` (#228).
+///
+/// **A repository the node says is in step is one line** in the plain
+/// status, neither `verbose` nor `every` ([`in_step_line`], issue #338).
+pub fn repository_lines(repository: &Value, verbose: bool, every: bool, now: i64) -> Vec<String> {
+    if !verbose && !every && repository["in_step"] == true {
+        return vec![in_step_line(repository)];
+    }
     let mut head = format!(
         "{}, for {}",
         text(repository, "identity"),
@@ -467,9 +474,16 @@ pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<S
         head.push_str(&format!(" (channel {words})"));
     }
     let mut lines = vec![head];
-    match repository["read"]["says"].as_str() {
-        Some(says) => lines.push(format!("  {says}")),
-        None => lines.push("  The list has not been read yet.".into()),
+    let next = repository["read"]["next"]
+        .as_str()
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok());
+    match (repository["read"]["says"].as_str(), next) {
+        (Some(says), Some(next)) => lines.push(format!(
+            "  {says} {}",
+            cordelia_api::repository_status::next_read_line(next.timestamp() - now)
+        )),
+        (Some(says), None) => lines.push(format!("  {says}")),
+        (None, _) => lines.push("  The list has not been read yet.".into()),
     }
     let all: Vec<&Value> = list(repository, "members").collect();
     let shown = match every {
@@ -524,6 +538,31 @@ pub fn repository_lines(repository: &Value, verbose: bool, every: bool) -> Vec<S
         }
     }
     lines
+}
+
+/// The one line of a repository in step (decision 2026-11-06 (joining),
+/// rule 7): the repository, the name its channel is filed under, and how
+/// many members, all in where this device sees that they are; and what
+/// waits unread, where any does.
+fn in_step_line(repository: &Value) -> String {
+    let members: Vec<&Value> = list(repository, "members").collect();
+    let mut line = format!(
+        "{}, for {}: {}",
+        text(repository, "identity"),
+        text(repository, "name"),
+        cordelia_api::sharing::counted(members.len() as u64, "member")
+    );
+    if !members.is_empty() && members.iter().all(|member| member["in"] == true) {
+        line.push_str(", all in");
+    }
+    let unread = |field: &str| repository[field].as_u64().unwrap_or(0);
+    let (by_you, by_an_agent) = (unread("unread_by_a_person"), unread("unread_by_an_agent"));
+    if repository["held"] == true && by_you + by_an_agent > 0 {
+        line.push_str(&format!(
+            "; {by_you} unread by you, {by_an_agent} by an agent"
+        ));
+    }
+    line
 }
 
 /// What `cordelia shared seen` says where its input is not a terminal.
@@ -971,6 +1010,9 @@ mod tests {
         );
     }
 
+    /// The time these tests' lines are said at: 2026-11-11T12:00:00Z.
+    const NOW: i64 = 1_794_398_400;
+
     /// Each repository this device follows is said with its read, its
     /// members by the list's labels, what waits unread and its lines, an
     /// amber one after "To know:" with the channel line it says to put
@@ -999,7 +1041,7 @@ mod tests {
                   "amber": true, "line": "channel 00 cordelia_pk1x without 0" },
             ],
         });
-        let lines = repository_lines(&repository, false, false);
+        let lines = repository_lines(&repository, false, false, NOW);
         assert_eq!(
             lines,
             [
@@ -1019,7 +1061,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("a b c d") || line.contains("one two"))
         );
-        let verbose = repository_lines(&repository, true, false);
+        let verbose = repository_lines(&repository, true, false, NOW);
         assert_eq!(
             verbose[0],
             "example.org/team/project, for team/project (channel a b c d)"
@@ -1035,7 +1077,7 @@ mod tests {
         for member in joiner["members"].as_array_mut().unwrap() {
             member["in"] = json!(null);
         }
-        let lines = repository_lines(&joiner, false, false);
+        let lines = repository_lines(&joiner, false, false, NOW);
         assert_eq!(lines[1], "  The list has not been read yet.");
         assert_eq!(lines[2], "  Members: alice-laptop, bob-desktop.");
         assert!(!lines.iter().any(|line| line.starts_with("  Unread")));
@@ -1046,11 +1088,11 @@ mod tests {
             .map(|n| json!({ "label": format!("m{n}"), "in": null }))
             .collect();
         assert_eq!(
-            repository_lines(&many, false, false)[2],
+            repository_lines(&many, false, false, NOW)[2],
             "  Members: m1, m2, m3, m4, m5, m6, and 3 more."
         );
         assert_eq!(
-            repository_lines(&many, false, true)[2],
+            repository_lines(&many, false, true, NOW)[2],
             "  Members: m1, m2, m3, m4, m5, m6, m7, m8, m9."
         );
         // The keys new on the list at a commit (rule 4.5): the status says
@@ -1068,15 +1110,64 @@ mod tests {
             "devices": labels.iter().map(|label| json!({ "label": label })).collect::<Vec<_>>(),
         }]);
         assert_eq!(
-            repository_lines(&many, false, false)[3],
+            repository_lines(&many, false, false, NOW)[3],
             "  ◆ New on the list of team/project at cccccccccccc: m1, m2, m3, m4, m5, m6 and 2 \
              more"
         );
         assert_eq!(
-            repository_lines(&many, false, true)[3],
+            repository_lines(&many, false, true, NOW)[3],
             "  ◆ New on the list of team/project at cccccccccccc: m1, m2, m3, m4, m5, m6, m7 and \
              m8"
         );
+
+        // In step (issue #338): the plain status says one line, with what
+        // waits unread where any does; `-v` and `shared list` say every
+        // line. The read's line ends with when the next read is, where the
+        // node says it (#323 item 1).
+        let mut in_step = repository.clone();
+        in_step["in_step"] = json!(true);
+        in_step["lines"] = json!([]);
+        in_step["members"][1]["in"] = json!(true);
+        in_step["read"]["next"] = json!("2026-11-11T12:02:20Z");
+        let read = "  List of example.org/team/project read from your clone, fetched 2 hours ago. \
+                    Read 5 minutes ago, at commit aaaa. Next read in about 2 minutes.";
+        assert_eq!(
+            repository_lines(&in_step, false, false, NOW),
+            [
+                "example.org/team/project, for team/project: 2 members, all in; 2 unread by you, \
+                 1 by an agent"
+            ]
+        );
+        let mut quiet = in_step.clone();
+        quiet["unread_by_a_person"] = json!(0);
+        quiet["unread_by_an_agent"] = json!(0);
+        assert_eq!(
+            repository_lines(&quiet, false, false, NOW),
+            ["example.org/team/project, for team/project: 2 members, all in"]
+        );
+        for (verbose, every) in [(true, false), (false, true)] {
+            let lines = repository_lines(&quiet, verbose, every, NOW);
+            assert_eq!(lines.len(), 4, "{lines:?}");
+            assert_eq!(lines[1], read);
+        }
+        // Not in step: every line, and the read's says when the next is.
+        let mut waits = quiet.clone();
+        waits["in_step"] = json!(false);
+        waits["members"][1]["in"] = json!(false);
+        assert_eq!(
+            repository_lines(&waits, false, false, NOW),
+            [
+                "example.org/team/project, for team/project",
+                read,
+                "  Members: alice-laptop (in), bob-desktop (not yet).",
+                "  Unread: 0 by you, 0 by an agent."
+            ]
+        );
+        // A node that says nothing of it, as alpha.19 did not, shows every
+        // line, as before.
+        let mut older = quiet.clone();
+        older.as_object_mut().unwrap().remove("in_step");
+        assert_eq!(repository_lines(&older, false, false, NOW).len(), 4);
     }
 
     /// `cordelia unsubscribe` takes a name, as before, or none, in a clone,

@@ -101,7 +101,7 @@ bob@laptop$ cordelia subscribe
 
 - **From the clone, read only.** It reads `refs/remotes/<remote>/<branch>`, the default branch as the person's own git last fetched it. `<branch>` is the one that `refs/remotes/<remote>/HEAD` names, and the remote must still have an address that names the identity. Where that ref is missing, as after a default branch is renamed, the status says to run `git remote set-head <remote> --auto`. It reads the file with `git cat-file blob`, and never touches the working tree, a local branch, the clone's refs or its files.
 - **When.** Every ten minutes (`MEMBERS_READ_INTERVAL_SECS`), at the node's start, and when a person follows, the node reads each clone it follows.
-- **The list is as fresh as the clone,** for a public repository as for a private one. It comes from the person's own `git fetch` or `git pull`. The status says how old it is: `list of <identity> read from your clone, fetched 2 hours ago`, or that the age is not known. So a join waits until a member's clone has the merged list: a member runs `git pull` there.
+- **The list is as fresh as the clone,** for a public repository as for a private one. It comes from the person's own `git fetch` or `git pull`. The status says how old it is: `list of <identity> read from your clone, fetched 2 hours ago`, or that the age is not known. Where something waits on the list, the line ends with when the node next reads it: `Next read in about 2 minutes.` (#323). So a join waits until a member's clone has the merged list: a member runs `git pull` there.
 - **Nothing of the person's reaches git, so nothing can ask.** Every git command the node runs, reads of the clone included, runs in a cleared environment:
   - only `PATH` is kept, and the variables of a proxy and of a company's own certificate authority (`HTTPS_PROXY`, `https_proxy`, `NO_PROXY`, `no_proxy`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `GIT_SSL_CAINFO`), which never ask;
   - `HOME` and `XDG_CONFIG_HOME` are an empty folder of the node's, so no global setting is read, on any version of git;
@@ -182,7 +182,7 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 | A member who moved | `The list names the channel you moved from. The device that made it anew shows its new channel line: put that line in .cordelia/members.` |
 | An offer read in the named channel | `<name> was made anew by <label>: nothing is handed over until the list names the new channel.` |
 | The gate of rule 1 | amber, rule 4.7's line, once, on a device that holds the channel: `<label> is on the list of <name> but was left out of it: delete its line in a pull request, or wait for that device to write in the channel`. Nothing is handed over until then. |
-| The list, from the clone | rule 3's line, with how old it is |
+| The list, from the clone | rule 3's line, with how old it is and when the next read is |
 | A list naming a channel that another follow names | `The list of <identity> names <name>, which this device follows from <other identity>: run cordelia subscribe in a clone of the one it should follow.` |
 | This device follows no list of the channel | `This device follows no repository whose channel is <name>.` Said by `cordelia shared seen <name>`. Only a device that follows a repository knows that a channel is its, and another device's follows are its own. |
 | The channel line changed | amber, as a key new on the list is: `The list of <identity> names a new channel for <name> at <commit>.` Cleared by `cordelia shared seen <name>`. |
@@ -195,6 +195,8 @@ For each repository channel:
 - **the members, by the list's labels,** each in or not yet;
 - **what waits:** messages unread by the person and by an agent;
 - **any line of rules 4 to 6.**
+
+**A repository in step is one line** (made terser on 11 November 2026, on the person's ruling, issue #338). In step means: the last read counted, no line of rules 4 to 6 stands, and no member is not yet in. Nothing then waits on the list, and the plain status says `<identity>, for <name>: 2 members, all in`, with what waits unread where any does: `; 2 unread by you, 1 by an agent`. Otherwise it shows each line above, and the read's line ends with when the next read is (rule 3). `-v` and `cordelia shared list` show every line, the next read with the read. The node works out whether a repository is in step, and `--json` gives it as `in_step`, and the next read as `read.next`.
 
 The notices of rules 4.5 to 4.7 show only on devices that follow the repository. Rule 1's gate shows as rule 4.7's line, once, on a device that holds the channel: a joiner cannot see who is in it, and shows nothing of it. Commits show by their first twelve characters (`MEMBERS_COMMIT_SHOWN_CHARS`), and the plain status names the first six members (`MEMBERS_LABELS_SHOWN`) and how many more, and so does each line of keys new on the list; `--json` gives the whole commit, every member and every key new on the list. The fingerprint words show only with `-v` (#228).
 

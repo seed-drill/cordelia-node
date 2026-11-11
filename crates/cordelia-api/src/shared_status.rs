@@ -218,8 +218,14 @@ pub fn status_of(
                 ))
             })
             .collect();
-        let repositories =
-            crate::repository_status::views(conn, identity, beside.own_relays, Some(&unread), now);
+        let repositories = crate::repository_status::views(
+            conn,
+            identity,
+            beside.own_relays,
+            Some(&unread),
+            beside.said.next_read(now),
+            now,
+        );
 
         Ok(Some(json!({
             "channels": channels,

@@ -88,9 +88,10 @@ enum Commands {
     },
     /// Show this device and the state of its memory sync
     ///
-    /// With no flag it prints this device's key and settings, whether the
-    /// node is running, its peers, the state of memory sync and of your
-    /// devices, and each repository this device follows.
+    /// With no flag it prints one line for each area when all is well:
+    /// whether the node is running, memory sync, your devices, and each
+    /// repository this device follows. It shows more when something waits
+    /// or is wrong. -v shows the rest.
     Status {
         /// Print one short line for a status bar, such as Claude Code's
         /// status line
@@ -103,8 +104,9 @@ enum Commands {
         /// Omarchy bar
         #[arg(long, conflicts_with_all = ["line", "json"])]
         waybar: bool,
-        /// Also show the fingerprint words of each repository's channel and
-        /// of each key on its list
+        /// Also show this device's key, storage and settings, its peers,
+        /// and every line of each repository it follows, with the
+        /// fingerprint words of its channel and of each key on its list
         #[arg(short = 'v', long)]
         verbose: bool,
     },
@@ -1920,12 +1922,17 @@ fn cmd_status(
     let pk = identity.public_key();
     let pk_bech32 = encode_public_key(&pk)?;
 
-    println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
-    println!();
-    println!("Identity:");
-    println!("  Entity ID:  {}", config.identity.entity_id);
-    println!("  Public key: {pk_bech32}");
-    println!("  Data dir:   {}", data_dir.display());
+    // The plain status says one line for each area when all is well: the
+    // node, memory, the devices and each repository followed. What waits
+    // or is wrong shows in full; `-v` shows the rest (issue #338).
+    if verbose {
+        println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
+        println!();
+        println!("Identity:");
+        println!("  Entity ID:  {}", config.identity.entity_id);
+        println!("  Public key: {pk_bech32}");
+        println!("  Data dir:   {}", data_dir.display());
+    }
 
     // DB stats
     let db_path = data_dir.join("cordelia.db");
@@ -1944,12 +1951,16 @@ fn cmd_status(
     let opened = db_path
         .exists()
         .then(|| open_to_read_knowing(&config, known));
+    // A database not read is said in the plain status too.
+    let not_read = matches!(&opened, Some(Err(_)));
     if let Some(Err(why)) = &opened {
-        println!();
+        if verbose {
+            println!();
+        }
         println!("Storage:");
         println!("  Not read:  {why}");
     }
-    if let Some(Ok(conn)) = opened {
+    if verbose && let Some(Ok(conn)) = opened {
         let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
         println!();
@@ -1967,95 +1978,47 @@ fn cmd_status(
         println!("  DB size:   {} KB", db_size / 1024);
     }
 
-    println!();
-    println!("Config:");
-    println!("  HTTP port: {}", config.node.http_port);
-    if config.network.accepts_inbound() {
-        println!("  P2P port:  {}", config.node.p2p_port);
-    } else {
-        println!("  P2P:       outbound only (no listening port)");
+    if verbose {
+        println!();
+        println!("Config:");
+        println!("  HTTP port: {}", config.node.http_port);
+        if config.network.accepts_inbound() {
+            println!("  P2P port:  {}", config.node.p2p_port);
+        } else {
+            println!("  P2P:       outbound only (no listening port)");
+        }
+        println!("  Role:      {}", config.network.role);
     }
-    println!("  Role:      {}", config.network.role);
 
-    println!();
-    println!("Node:");
+    // The node's lines are headed where another section shows above them.
+    if verbose || not_read {
+        println!();
+        println!("Node:");
+    }
     match &status.live {
         Some(live) => {
-            let n = |k: &str| live[k].as_u64().unwrap_or(0);
-            println!("  Running:   yes, up {}", format_uptime(n("uptime_secs")));
-            if let Some(note) = version_note(live["version"].as_str(), env!("CARGO_PKG_VERSION")) {
-                println!("  Version:   {note}");
-            }
-            println!(
-                "  Peers:     {} hot, {} warm",
-                n("peers_hot"),
-                n("peers_warm")
+            // What this device says of itself and its person's devices
+            // (decision 2026-10-04 §5.1, §5.2, §8).
+            let person = match config.network.role == "personal" {
+                true => {
+                    let timeout = std::time::Duration::from_secs(3);
+                    let asked_again =
+                        || local_api(&config, true, "/api/v1/devices/list", timeout).ok();
+                    status.person.clone().or_else(asked_again)
+                }
+                false => None,
+            };
+            let now = chrono::Utc::now().timestamp();
+            let lines = node_lines(
+                &status,
+                live,
+                &config.network.role,
+                person.as_ref(),
+                verbose,
+                now,
             );
-            println!("  Sync errors: {}", n("sync_errors"));
-            // A node that is held up says why (decision 2026-10-04
-            // §10.1).
-            if let Some(why) = status.held() {
-                println!("  Held up:   {why}");
-            }
-            if config.network.role == "personal" {
-                // The hold of a shared channel is said on a line of its
-                // own, `Shared:`, and not under `Memory:` (decision
-                // 2026-10-10 §9; the words of a change, rule 5): what
-                // `Memory:` says is worked out without it.
-                let (memory, shared) = memory_and_shared(&status.facts);
-                println!("{}", memory_line(&memory.summary));
-                for more in memory
-                    .holds
-                    .iter()
-                    .filter(|holds| holds.says != memory.summary)
-                    .map(indicator::Holds::detail)
-                {
-                    println!("    also:     {more}");
-                }
-                if let Some(shared) = shared {
-                    println!("{}", shared_line(&shared.says));
-                }
-                for c in &status.facts.conflicts {
-                    println!("    conflict: {c}");
-                }
-                for e in &status.facts.errors {
-                    println!("    error:    {e}");
-                }
-                // What this device says of itself and its person's
-                // devices (decision 2026-10-04 §5.1, §5.2, §8).
-                let timeout = std::time::Duration::from_secs(3);
-                let asked_again = || local_api(&config, true, "/api/v1/devices/list", timeout).ok();
-                if let Some(person) = status.person.clone().or_else(asked_again) {
-                    let (short, says) = person_cmd::status_lines(&person);
-                    println!("  Devices:   {short}");
-                    for line in says {
-                        println!("    {line}");
-                    }
-                }
-                // What is said of messages, together: agents held for
-                // their person, then each bound a person set for a pair
-                // that is in force, and is not the usual hold (decision
-                // 2026-10-25, rule 4).
-                if let Some(held) = messages_held(&status.facts) {
-                    println!("{}", messages_line(&held.says));
-                }
-                let now = chrono::Utc::now().timestamp();
-                for line in msg_cmd::status_bound_lines(&live["messages"], now) {
-                    println!("{line}");
-                }
-                // Last, each repository this device follows, with its
-                // lines, its ambers among them (decision 2026-11-06
-                // (joining), rule 7).
-                for repository in person_cmd::list(&live["shared"], "repositories") {
-                    let lines = shared_cmd::repository_lines(repository, verbose, false);
-                    for (n, line) in lines.iter().enumerate() {
-                        let line = history_cmd::printable(line);
-                        match n {
-                            0 => println!("  Following: {line}"),
-                            _ => println!("  {line}"),
-                        }
-                    }
-                }
+            for line in lines {
+                println!("{line}");
             }
         }
         // A node whose address is refused is not asked, and is not known
@@ -2067,6 +2030,102 @@ fn cmd_status(
     }
 
     Ok(())
+}
+
+/// The lines of `cordelia status` of a node that runs, as it answered
+/// (`live`), with what this device holds of its person, at `now`. With
+/// `verbose`, every line. Plain, one line for each area when all is well
+/// (issue #338): whether it runs, memory, the devices, and each repository
+/// followed in one line where it is in step. What waits or is wrong shows
+/// in full: another version, sync errors, a hold, memory's other holds,
+/// a shared channel's, conflicts and errors, what is said of the devices,
+/// of messages, and each repository not in step. A relay keeps its peers.
+fn node_lines(
+    status: &GatheredStatus,
+    live: &serde_json::Value,
+    role: &str,
+    person: Option<&serde_json::Value>,
+    verbose: bool,
+    now: i64,
+) -> Vec<String> {
+    let n = |k: &str| live[k].as_u64().unwrap_or(0);
+    let mut lines = vec![format!(
+        "  Running:   yes, up {}",
+        format_uptime(n("uptime_secs"))
+    )];
+    if let Some(note) = version_note(live["version"].as_str(), env!("CARGO_PKG_VERSION")) {
+        lines.push(format!("  Version:   {note}"));
+    }
+    if verbose || role != "personal" {
+        lines.push(format!(
+            "  Peers:     {} hot, {} warm",
+            n("peers_hot"),
+            n("peers_warm")
+        ));
+    }
+    if verbose || n("sync_errors") > 0 {
+        lines.push(format!("  Sync errors: {}", n("sync_errors")));
+    }
+    // A node that is held up says why (decision 2026-10-04 §10.1).
+    if let Some(why) = status.held() {
+        lines.push(format!("  Held up:   {why}"));
+    }
+    if role != "personal" {
+        return lines;
+    }
+    // The hold of a shared channel is said on a line of its own,
+    // `Shared:`, and not under `Memory:` (decision 2026-10-10 §9; the
+    // words of a change, rule 5): what `Memory:` says is worked out
+    // without it.
+    let (memory, shared) = memory_and_shared(&status.facts);
+    lines.push(memory_line(&memory.summary));
+    for more in memory
+        .holds
+        .iter()
+        .filter(|holds| holds.says != memory.summary)
+        .map(indicator::Holds::detail)
+    {
+        lines.push(format!("    also:     {more}"));
+    }
+    if let Some(shared) = shared {
+        lines.push(shared_line(&shared.says));
+    }
+    for c in &status.facts.conflicts {
+        lines.push(format!("    conflict: {c}"));
+    }
+    for e in &status.facts.errors {
+        lines.push(format!("    error:    {e}"));
+    }
+    // What this device says of itself and its person's devices (decision
+    // 2026-10-04 §5.1, §5.2, §8).
+    if let Some(person) = person {
+        let (short, says) = person_cmd::status_lines(person);
+        lines.push(format!("  Devices:   {short}"));
+        for line in says {
+            lines.push(format!("    {line}"));
+        }
+    }
+    // What is said of messages, together: agents held for their person,
+    // then each bound a person set for a pair that is in force, and is not
+    // the usual hold (decision 2026-10-25, rule 4).
+    if let Some(held) = messages_held(&status.facts) {
+        lines.push(messages_line(&held.says));
+    }
+    lines.extend(msg_cmd::status_bound_lines(&live["messages"], now));
+    // Last, each repository this device follows, with its lines, its
+    // ambers among them (decision 2026-11-06 (joining), rule 7): one line
+    // where it is in step.
+    for repository in person_cmd::list(&live["shared"], "repositories") {
+        let said = shared_cmd::repository_lines(repository, verbose, false, now);
+        for (n, line) in said.iter().enumerate() {
+            let line = history_cmd::printable(line);
+            match n {
+                0 => lines.push(format!("  Following: {line}")),
+                _ => lines.push(format!("  {line}")),
+            }
+        }
+    }
+    lines
 }
 
 /// The line of `cordelia status` where the node is not running, on the
@@ -8878,6 +8937,163 @@ mod tests {
         // With none, there is no `Shared:` line.
         f.devices.removed_holds_shared = 0;
         assert!(memory_and_shared(&f).1.is_none());
+    }
+
+    /// **The plain status says one line for each area when all is well**
+    /// (issue #338): the node, memory, the devices, and each repository
+    /// followed, in step, in one line. `-v` shows the rest: the peers, the
+    /// sync errors at nought, and every line of each repository. What
+    /// waits or is wrong still shows in the plain form, in full: a
+    /// repository with an amber line, with its read and when the next read
+    /// is (#323 item 1); sync errors; a memory amber. A relay keeps its
+    /// peers.
+    #[test]
+    fn the_plain_status_says_one_line_for_each_area_when_all_is_well() {
+        use serde_json::{Value, json};
+        let facts = indicator::Facts {
+            initialised: true,
+            running: true,
+            role: "personal".into(),
+            stands: "applied".into(),
+            peers_hot: 2,
+            sync_enabled: true,
+            report_age_secs: Some(3),
+            folders: 1,
+            mapped: 1,
+            ..Default::default()
+        };
+        let read = "List of example.org/team/project read from your clone, fetched 2 hours \
+                    ago. Read 5 minutes ago, at commit 9f2c1a7b3d4e.";
+        let repository = json!({
+            "identity": "example.org/team/project", "name": "team/project", "held": true,
+            "words": "a b c d",
+            "read": { "says": read, "next": "2026-11-11T12:02:20Z" },
+            "members": [
+                { "label": "alice-laptop", "words": "one two three four five six", "in": true },
+                { "label": "bob-desktop", "words": "six five four three two one", "in": true },
+            ],
+            "unread_by_a_person": 0, "unread_by_an_agent": 0,
+            "lines": [], "in_step": true,
+        });
+        let live = |repository: &Value| {
+            json!({
+                "uptime_secs": 7380, "version": env!("CARGO_PKG_VERSION"),
+                "peers_hot": 2, "peers_warm": 0, "sync_errors": 0, "held": null,
+                "shared": { "repositories": [repository] },
+            })
+        };
+        let person = json!({ "devices": [{ "key": "a" }, { "key": "b" }], "change": 4 });
+        let lines_of = |facts: &indicator::Facts, live: &Value, role: &str, verbose: bool| {
+            let status = GatheredStatus {
+                facts: facts.clone(),
+                device: None,
+                live: Some(live.clone()),
+                sync: None,
+                not_asked: None,
+                person: Some(person.clone()),
+            };
+            let person = (role == "personal").then_some(&person);
+            // 2026-11-11T12:00:00Z.
+            node_lines(&status, live, role, person, verbose, 1_794_398_400)
+        };
+        let well = live(&repository);
+        assert_eq!(
+            lines_of(&facts, &well, "personal", false),
+            [
+                "  Running:   yes, up 2h 03m",
+                "  Memory:    synced",
+                "  Devices:   2 devices under a recovery phrase (change 4)",
+                "  Following: example.org/team/project, for team/project: 2 members, all in",
+            ]
+        );
+        let next = format!("    {read} Next read in about 2 minutes.");
+        assert_eq!(
+            lines_of(&facts, &well, "personal", true),
+            [
+                "  Running:   yes, up 2h 03m",
+                "  Peers:     2 hot, 0 warm",
+                "  Sync errors: 0",
+                "  Memory:    synced",
+                "  Devices:   2 devices under a recovery phrase (change 4)",
+                "  Following: example.org/team/project, for team/project (channel a b c d)",
+                &next,
+                "    Members: alice-laptop (in) [one two three four five six], bob-desktop (in) \
+                 [six five four three two one].",
+                "    Unread: 0 by you, 0 by an agent.",
+            ]
+        );
+
+        // One amber: a key new on the list. The repository shows in full,
+        // its read ending in when the next read is.
+        let mut amber = repository.clone();
+        amber["in_step"] = json!(false);
+        amber["lines"] = json!([{
+            "word": "joined", "amber": true, "line": null,
+            "says": "New on the list of team/project at 9f2c1a7b3d4e: bob-desktop",
+        }]);
+        let waits = live(&amber);
+        let mut f = facts.clone();
+        indicator::shared(&mut f.devices, &waits["shared"], 1_794_398_400);
+        assert_eq!(indicator::shown(&f).level, Some(indicator::Level::Amber));
+        assert_eq!(
+            lines_of(&f, &waits, "personal", false)[3..],
+            [
+                "  Following: example.org/team/project, for team/project",
+                &next,
+                "    Members: alice-laptop (in), bob-desktop (in).",
+                "    Unread: 0 by you, 0 by an agent.",
+                "    ◆ New on the list of team/project at 9f2c1a7b3d4e: bob-desktop",
+            ]
+        );
+
+        // Sync errors and a hold show where there are any, and memory's
+        // holds, the devices' lines and each repository as they are.
+        let mut wrong = well.clone();
+        wrong["sync_errors"] = json!(3);
+        wrong["held"] = json!({ "by": "later_database", "why": "the database is newer" });
+        let mut f = facts.clone();
+        f.devices.said_left = 1;
+        f.conflicts = vec!["notes.md".into()];
+        let mut told = person.clone();
+        told["says"] = json!(["new device: desktop"]);
+        let status = GatheredStatus {
+            facts: f,
+            device: None,
+            live: Some(wrong.clone()),
+            sync: None,
+            not_asked: None,
+            person: Some(told.clone()),
+        };
+        assert_eq!(
+            node_lines(
+                &status,
+                &wrong,
+                "personal",
+                Some(&told),
+                false,
+                1_794_398_400
+            ),
+            [
+                "  Running:   yes, up 2h 03m",
+                "  Sync errors: 3",
+                "  Held up:   the database is newer",
+                "  Memory:    1 conflict",
+                "    also:     To know: a device has left",
+                "    conflict: notes.md",
+                "  Devices:   2 devices under a recovery phrase (change 4)",
+                "    new device: desktop",
+                "  Following: example.org/team/project, for team/project: 2 members, all in",
+            ]
+        );
+        // A relay keeps its peers, and has nothing else to say.
+        let relay = indicator::Facts {
+            role: "relay".into(),
+            ..facts.clone()
+        };
+        assert_eq!(
+            lines_of(&relay, &well, "relay", false),
+            ["  Running:   yes, up 2h 03m", "  Peers:     2 hot, 0 warm"]
+        );
     }
 
     /// The hold of agents held for their person is said on a line of its

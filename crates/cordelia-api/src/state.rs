@@ -250,10 +250,16 @@ pub struct OwnChannels {
 }
 
 /// What the shared pass said since the node started, for the status's
-/// `shared` object (decision 2026-10-10 §9). Kept in memory: each is said
-/// again at the next pass that meets it.
+/// `shared` object (decision 2026-10-10 §9), and when the node's timer
+/// next reads the lists of the repositories it follows. Kept in memory:
+/// each is said again at the next pass that meets it.
 #[derive(Debug, Default, Clone)]
 pub struct SharedSaid {
+    /// When the node's timer next reads the list of each repository it
+    /// follows (decision 2026-11-06 (joining), rule 3): set at each tick,
+    /// and never where no timer reads them, as on a node with no network.
+    /// By the clock the timer runs on, not the time of day.
+    pub members_read_due: Option<Instant>,
     /// For each shared channel, by its ID: how many entries the door did
     /// not store, as no honest member writes them (§2.3, rule 3).
     pub not_stored: std::collections::HashMap<[u8; 32], u64>,
@@ -264,6 +270,17 @@ pub struct SharedSaid {
     /// Each shared channel and relay where the channel was not proved at
     /// the latest pass: no room for more proofs on the connection (§8.4).
     pub no_proof_room: std::collections::HashSet<([u8; 32], [u8; 32])>,
+}
+
+impl SharedSaid {
+    /// When the node's timer next reads the lists it follows, by the
+    /// node's clock, where `now` is its time: `None` where no timer reads
+    /// them. A read that is due and not yet begun is due `now`.
+    pub fn next_read(&self, now: i64) -> Option<i64> {
+        let due = self.members_read_due?;
+        let secs = due.saturating_duration_since(Instant::now()).as_secs();
+        Some(now.saturating_add(secs as i64))
+    }
 }
 
 /// How a channel's key is proved to a relay, through the door for a carry.
@@ -639,6 +656,14 @@ impl OwnChannels {
             .shared_recovered
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = said;
+    }
+
+    /// The node's timer reads the lists of the repositories it follows
+    /// now, and next at `due` (decision 2026-11-06 (joining), rule 3). A
+    /// read asked by a follow moves no timer, and so not this.
+    pub fn members_read_next(&self, due: Instant) {
+        let mut said = self.shared_said.lock().unwrap_or_else(|e| e.into_inner());
+        said.members_read_due = Some(due);
     }
 
     /// The door did not store `n` entries of the shared channel `channel`,
