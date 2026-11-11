@@ -49,11 +49,11 @@ case "$1" in
         touch "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/identity.key"
         touch "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/config.toml"
         chmod 664 "${CORDELIA_DATA_DIR:-$HOME/.cordelia}/config.toml"
-        # Its last line, as the real one's: run by a script it says
-        # nothing of how the node is started.
+        # As the real one: run by a script it says nothing, and run by a
+        # person it says how the node is started.
         case " $* " in
-            *" --non-interactive "*) echo "Node is ready." ;;
-            *) echo 'Node is ready. Run `cordelia start` to begin.' ;;
+            *" --non-interactive "*) ;;
+            *) echo 'Made this device'"'"'s key and database in ~/.cordelia. Run `cordelia start` to begin.' ;;
         esac
         ;;
     status)
@@ -307,17 +307,18 @@ has_not() {
     esac
 }
 
-# The closing words of a first install, in their order: the one command
-# that starts the node as the service ($1), the three ways on for a
-# machine that follows no recovery phrase, each with its command, and
-# the two commands of memory sync. Nothing that the script printed says
-# `cordelia start`, or names pairing.
+# The closing words of a first install, in their order, and nothing
+# after them but the line for a program: the one command that starts
+# the node as the service ($1), the three ways on for a machine that
+# follows no recovery phrase, each with its command, and the two commands
+# of memory sync; then, since this run added Cordelia to PATH, to open a
+# new terminal. Nothing that the script printed says `cordelia start`, or
+# names pairing.
 first_install_says() {
     want=$(cat << WORDS
 Next steps:
   $1
                         # run the node as a background service
-
 Then one of these three:
   cordelia phrase       # this is your first machine: make a phrase here
   cordelia id           # another machine has the phrase: add this one from it.
@@ -325,18 +326,18 @@ Then one of these three:
                         #   prints the cordelia accept to run here
   cordelia recover      # every device that has the phrase is lost: recover
                         #   here with it. Do not make a new phrase first
-
 Then:
   cordelia sync claude  # turn on memory sync: lists what it found
   cordelia sync map <folder>
                         # sync Claude Code's memory for that folder
 
 Open a new terminal first if 'cordelia' is not found.
+
+cordelia-install: installed=$NEW running=none restart=not-needed
 WORDS
 )
     check "the closing words" \
-        "$(sed -n '/^Next steps:/,/^Open a new terminal/p' "$HOME_DIR/.fake/out")" "$want"
-    has "Node is ready."
+        "$(sed -n '/^Next steps:/,$p' "$HOME_DIR/.fake/out")" "$want"
     has_not "cordelia start"
     has_not "to pair"
 }
@@ -763,11 +764,12 @@ setup() { touch "$HOME/.fake/no_user_session"; }
 run "a-first-install-with-no-systemd-user-session"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 check "the first of the next steps" \
-    "$(sed -n '/^Next steps:/,/^$/p' "$HOME_DIR/.fake/out")" \
+    "$(sed -n '/^Next steps:/,/^Then one of these three:/p' "$HOME_DIR/.fake/out")" \
     "Next steps:
   cordelia start
                         # run the node yourself: you have no systemd user session here.
-                        # It runs until you close that terminal"
+                        # It runs until you close that terminal
+Then one of these three:"
 has "You have no systemd user session here, so the service cannot start."
 has "Then one of these three:"
 has "  cordelia sync claude  # turn on memory sync: lists what it found"
@@ -784,7 +786,9 @@ run "a-first-install-on-a-mac" FAKE_OS=Darwin
 expect "installed=$NEW running=none restart=not-needed" 0 0
 first_install_says "launchctl load $HOME_DIR/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
 check "calls to launchctl that change anything" "$(cat "$HOME_DIR/.fake/calls")" ""
-has "  Stop:   launchctl unload $HOME_DIR/Library/LaunchAgents/ai.seeddrill.cordelia.plist"
+# The service's own commands are not listed: the next steps say the one
+# to run.
+has_not "  Stop:"
 
 if [ "$FAILED" -ne 0 ]; then
     exit 1
