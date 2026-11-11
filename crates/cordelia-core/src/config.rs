@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 use crate::CordeliaError;
 
 /// Top-level configuration (mirrors config.toml structure).
+///
+/// A configuration that still sets `[swarm]`, `network.trusted_peers`,
+/// `network.push_policy`, `governor.ema_alpha`, `governor.dial_policy` or
+/// the keys of `[replication]` but `relay_ask_again_secs` loads: nothing
+/// reads them, and they are not kept (decision 2026-11-10 (older kind),
+/// rule 2).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -25,7 +31,6 @@ pub struct Config {
     pub members: MembersConfig,
     pub api: ApiConfig,
     pub logging: LoggingConfig,
-    pub swarm: SwarmConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -49,24 +54,17 @@ pub struct NodeConfig {
 pub struct NetworkConfig {
     pub listen_addr: String,
     pub role: String,
-    pub push_policy: String,
     /// No longer used: a node learns of no relay from DNS. Kept so that
     /// configurations that set it still load.
     pub dns_discovery: String,
     #[serde(default)]
     pub bootnodes: Vec<BootnodeConfig>,
-    /// Trusted peers for Personal Area Network (§8.2.2).
-    /// Swarm nodes use dial_policy=trusted_only and connect only to these peers.
-    /// Lead nodes accept inbound from these peers (exception to outbound-only).
-    #[serde(default)]
-    pub trusted_peers: Vec<TrustedPeerConfig>,
     /// Allow private/RFC-1918 addresses in peer sharing (for Docker/test envs).
     #[serde(default)]
     pub allow_private_addresses: bool,
     /// Whether to accept inbound connections. Unset, a personal node does
     /// not, and has no listening socket (decision 2026-09-30 §4.6); every
-    /// other role does. Set it on a personal node that others dial
-    /// directly, such as a swarm lead.
+    /// other role does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub listen: Option<bool>,
 }
@@ -92,11 +90,9 @@ impl NetworkConfig {
     }
 
     /// Whether this node listens for inbound connections. A personal node
-    /// only dials out, unless it is told to listen or has trusted peers
-    /// (§8.2.2), which may dial it.
+    /// only dials out, unless it is told to listen.
     pub fn accepts_inbound(&self) -> bool {
-        self.listen
-            .unwrap_or(self.role != "personal" || !self.trusted_peers.is_empty())
+        self.listen.unwrap_or(self.role != "personal")
     }
 }
 
@@ -109,15 +105,6 @@ pub struct BootnodeConfig {
     /// compiled in and need not be given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
-}
-
-/// Trusted peer for Personal Area Network (§8.2.2).
-/// Swarm nodes connect only to trusted peers. Lead nodes accept
-/// inbound from trusted peers (exception to outbound-only rule).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TrustedPeerConfig {
-    /// Ed25519 public key in Bech32 format (cordelia_pk1...).
-    pub public_key: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,7 +124,6 @@ pub struct GovernorConfig {
     pub hysteresis_secs: u32,
     pub keepalive_timeout_secs: u32,
     pub stale_threshold_secs: u32,
-    pub ema_alpha: f64,
     pub max_connection_retries: u32,
     pub clear_failure_delay_secs: u32,
 }
@@ -145,10 +131,6 @@ pub struct GovernorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReplicationConfig {
-    pub sync_interval_realtime_secs: u32,
-    pub sync_interval_batch_secs: u32,
-    pub tombstone_retention_days: u32,
-    pub max_batch_size: u32,
     /// How long a relay waits before it asks a device again which channels
     /// it holds, and before it takes again a channel it dropped.
     pub relay_ask_again_secs: u64,
@@ -319,21 +301,6 @@ pub struct LoggingConfig {
     pub output: String,
 }
 
-/// Swarm / Personal Area Network configuration (§8.2.2).
-///
-/// Set by `cordelia swarm-init` for child nodes. Lead nodes leave this empty.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SwarmConfig {
-    /// HKDF derivation index for this swarm node's identity.
-    /// None means this is not a swarm child node.
-    pub swarm_index: Option<u32>,
-    /// Path to the lead node's identity.key (used for derivation verification).
-    pub lead_identity_path: Option<String>,
-    /// Entity ID of the lead node (used for persistent swarm channel name).
-    pub lead_entity_id: Option<String>,
-}
-
 // ── Defaults (configuration.md §3, sourced from protocol.rs) ───────
 
 use crate::protocol;
@@ -356,7 +323,6 @@ impl Default for NetworkConfig {
         Self {
             listen_addr: format!("0.0.0.0:{}", protocol::P2P_PORT),
             role: "personal".into(),
-            push_policy: "subscribers_only".into(),
             dns_discovery: String::new(),
             bootnodes: protocol::FALLBACK_PEERS
                 .iter()
@@ -366,7 +332,6 @@ impl Default for NetworkConfig {
                     key: Some((*key).into()),
                 })
                 .collect(),
-            trusted_peers: Vec::new(),
             allow_private_addresses: false,
             listen: None,
         }
@@ -390,7 +355,6 @@ impl Default for GovernorConfig {
             hysteresis_secs: protocol::HYSTERESIS_SECS as u32,
             keepalive_timeout_secs: protocol::DEAD_TIMEOUT_SECS as u32,
             stale_threshold_secs: protocol::STALE_THRESHOLD_SECS as u32,
-            ema_alpha: protocol::EMA_ALPHA,
             max_connection_retries: protocol::MAX_CONNECTION_RETRIES,
             clear_failure_delay_secs: protocol::CLEAR_FAILURE_DELAY_SECS as u32,
         }
@@ -400,10 +364,6 @@ impl Default for GovernorConfig {
 impl Default for ReplicationConfig {
     fn default() -> Self {
         Self {
-            sync_interval_realtime_secs: protocol::REALTIME_SYNC_INTERVAL_SECS as u32,
-            sync_interval_batch_secs: protocol::BATCH_SYNC_INTERVAL_SECS as u32,
-            tombstone_retention_days: protocol::TOMBSTONE_RETENTION_DAYS,
-            max_batch_size: protocol::MAX_BATCH_SIZE as u32,
             relay_ask_again_secs: protocol::RELAY_ASK_AGAIN_SECS,
         }
     }
@@ -513,17 +473,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("CORDELIA_BIND_ADDRESS") {
             self.api.bind_address = v;
-        }
-        if let Ok(v) = std::env::var("CORDELIA_SWARM_INDEX")
-            && let Ok(idx) = v.parse()
-        {
-            self.swarm.swarm_index = Some(idx);
-        }
-        if let Ok(v) = std::env::var("CORDELIA_LEAD_IDENTITY_PATH") {
-            self.swarm.lead_identity_path = Some(v);
-        }
-        if let Ok(v) = std::env::var("CORDELIA_LEAD_ENTITY_ID") {
-            self.swarm.lead_entity_id = Some(v);
         }
     }
 
@@ -771,14 +720,11 @@ http_port = 8080
         for role in ["relay", "bootnode"] {
             assert!(with(&format!("[network]\nrole = \"{role}\"\n")), "{role}");
         }
-        // A personal node listens when told to, or when it has trusted
-        // peers, which may dial it.
+        // A personal node listens when told to. Trusted peers, of the
+        // older kind, are no longer read: with them it still does not.
         assert!(with("[network]\nlisten = true\n"));
-        assert!(with(
-            "[[network.trusted_peers]]\npublic_key = \"cordelia_pk1x\"\n"
-        ));
         assert!(!with(
-            "[network]\nlisten = false\n[[network.trusted_peers]]\npublic_key = \"cordelia_pk1x\"\n"
+            "[[network.trusted_peers]]\npublic_key = \"cordelia_pk1x\"\n"
         ));
         // And any role can be kept from listening.
         assert!(!with("[network]\nrole = \"relay\"\nlisten = false\n"));
@@ -850,51 +796,47 @@ http_port = 8080
         assert_eq!(config.node.http_port, protocol::HTTP_PORT);
     }
 
+    /// A configuration that `cordelia swarm-init` wrote, or that sets
+    /// trusted peers, both of the older kind of channel, still loads
+    /// (decision 2026-11-10 (older kind), rule 2), and so does one with
+    /// the other keys that nothing reads: `push_policy`, `ema_alpha`,
+    /// `dial_policy` and the four of `[replication]`. What is saved again
+    /// holds none of them, and keeps `relay_ask_again_secs`.
     #[test]
-    fn test_swarm_config_defaults_to_none() {
-        let config = Config::default();
-        assert!(config.swarm.swarm_index.is_none());
-        assert!(config.swarm.lead_identity_path.is_none());
-        assert!(config.swarm.lead_entity_id.is_none());
-    }
-
-    #[test]
-    fn test_swarm_config_round_trip() {
-        let partial = r#"
-[swarm]
-swarm_index = 7
-lead_identity_path = "/tmp/lead/identity.key"
-lead_entity_id = "lead_a1b2"
-"#;
-        let config: Config = toml::from_str(partial).unwrap();
-        assert_eq!(config.swarm.swarm_index, Some(7));
-        assert_eq!(
-            config.swarm.lead_identity_path.as_deref(),
-            Some("/tmp/lead/identity.key")
-        );
-        assert_eq!(config.swarm.lead_entity_id.as_deref(), Some("lead_a1b2"));
-
-        // Round-trip
-        let serialized = toml::to_string_pretty(&config).unwrap();
-        let reparsed: Config = toml::from_str(&serialized).unwrap();
-        assert_eq!(reparsed.swarm.swarm_index, Some(7));
-    }
-
-    #[test]
-    fn test_swarm_config_env_override() {
-        let mut config = Config::default();
-        // SAFETY: test-only, single-threaded test
-        unsafe {
-            std::env::set_var("CORDELIA_SWARM_INDEX", "3");
-            std::env::set_var("CORDELIA_LEAD_ENTITY_ID", "lead_test");
+    fn an_old_configuration_with_a_swarm_and_trusted_peers_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[network]\nrole = \"personal\"\npush_policy = \"pull_only\"\n\
+             [[network.trusted_peers]]\npublic_key = \"cordelia_pk1x\"\n\
+             [governor]\nema_alpha = 0.3\ndial_policy = \"trusted_only\"\n\
+             [replication]\nsync_interval_realtime_secs = 20\n\
+             sync_interval_batch_secs = 600\ntombstone_retention_days = 3\n\
+             max_batch_size = 50\nrelay_ask_again_secs = 120\n\
+             [swarm]\nswarm_index = 7\nlead_identity_path = \"/tmp/lead/identity.key\"\n\
+             lead_entity_id = \"lead_a1b2\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.network.role, "personal");
+        assert!(!config.network.accepts_inbound());
+        assert_eq!(config.replication.relay_ask_again_secs, 120);
+        config.save(&path).unwrap();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        for gone in [
+            "swarm",
+            "trusted_peers",
+            "push_policy",
+            "ema_alpha",
+            "dial_policy",
+            "sync_interval",
+            "tombstone_retention_days",
+            "max_batch_size",
+        ] {
+            assert!(!saved.contains(gone), "{gone}: {saved}");
         }
-        config.apply_env_overrides();
-        assert_eq!(config.swarm.swarm_index, Some(3));
-        assert_eq!(config.swarm.lead_entity_id.as_deref(), Some("lead_test"));
-        unsafe {
-            std::env::remove_var("CORDELIA_SWARM_INDEX");
-            std::env::remove_var("CORDELIA_LEAD_ENTITY_ID");
-        }
+        assert!(saved.contains("relay_ask_again_secs = 120"), "{saved}");
     }
 
     #[test]

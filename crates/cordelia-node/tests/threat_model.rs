@@ -9,7 +9,7 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use cordelia_crypto::entry::Entry;
 use cordelia_crypto::identity::NodeIdentity;
@@ -843,13 +843,12 @@ async fn t19_a_device_tells_no_relay_of_its_other_relays() {
 
 /// T19. Being a relay is a property of configuration. A stranger that
 /// connects to a relay and says it is a relay is treated as an ordinary
-/// peer: the relay does not tell it which channels it holds, of either
-/// kind.
+/// peer: the relay does not tell it which channels it holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
     use cordelia_crypto::entry::{Inside, Value};
-    use cordelia_network::messages::{EntryPush, PushAnswer, RelayChannelsAsk};
-    use cordelia_network::{codec, connection, item_sync, transport};
+    use cordelia_network::messages::{EntryPush, PeerShareRequest, PushAnswer, RelayChannelsAsk};
+    use cordelia_network::{connection, transport};
 
     let mut relay = node("relay", "relay", None);
     relay.start();
@@ -857,12 +856,9 @@ async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
     let relay_addr = format!("127.0.0.1:{}", relay.p2p);
     let all = [&relay];
 
-    // A client gives the relay something to hold, of each kind of
-    // channel: an item of the older kind, and an entry of a channel from
-    // its secret.
+    // A client gives the relay something to hold: an entry of a channel
+    // from its secret.
     let holder = client_of(&relay).await.expect("the holder connects");
-    let ack = holder.push(&[holder.entry(64)]).await.unwrap();
-    assert_eq!(ack.stored, 1, "{ack:?}");
     let inside = Inside {
         name: "idea.md".into(),
         value: Value::Text("A thought.\n".into()),
@@ -876,8 +872,6 @@ async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
         WireMessage::EntryPushed(pushed) => assert_eq!(pushed.answers, [PushAnswer::Stored]),
         other => panic!("not an answer to a push: {other:?}"),
     }
-    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
-    assert_eq!(stats["items_stored"], 1, "{stats}");
     assert_eq!(entries_by(&relay, &holder.identity.public_key()), 1);
 
     // The stranger: its own key, and "relay" in its handshake.
@@ -886,35 +880,25 @@ async fn t19_a_stranger_that_says_it_is_a_relay_is_not_treated_as_one() {
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
     let mut manager =
-        connection::ConnectionManager::new(identity, endpoint, vec![], vec!["relay".into()], port);
+        connection::ConnectionManager::new(identity, endpoint, vec!["relay".into()], port);
     let relay_id = manager
         .connect_to(relay_addr.parse().unwrap())
         .await
         .expect("the stranger connects, as any node may");
     let conn = manager.get_connection(&relay_id).unwrap().clone();
-
-    // It asks which channels the relay holds, as one relay asks another.
-    let listed = wait_for("the relay answers the stranger", &all, 30, || {
+    // The control: the relay answers it on a stream that any peer may use.
+    wait_for("the relay answers the stranger", &all, 30, || {
+        let ask = WireMessage::PeerShareRequest(PeerShareRequest { max_peers: 8 });
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let (mut send, mut recv) = conn.open_bi().await.ok()?;
-                codec::write_protocol_byte(&mut send, Protocol::ItemSync)
-                    .await
-                    .ok()?;
-                item_sync::send_channel_list_request(&mut send, &mut recv)
-                    .await
-                    .ok()
-            })
+            tokio::runtime::Handle::current()
+                .block_on(ask_on(&conn, Protocol::PeerSharing, ask))
+                .ok()
         })
     });
-    assert!(
-        listed.channel_ids.is_empty(),
-        "the relay told a stranger which channels it holds: {:?}",
-        listed.channel_ids
-    );
-    // And as a relay asks one that it works with, for the channels from
-    // their secrets: that is answered to nobody but a relay that the
-    // operator lists by key.
+
+    // It asks which channels the relay holds, as a relay asks one that it
+    // works with: that is answered to nobody but a relay that the operator
+    // lists by key.
     let ask = WireMessage::RelayChannelsAsk(RelayChannelsAsk {
         after: [0; 32],
         limit: 100,
@@ -956,24 +940,15 @@ fn key_bytes_of(n: &Node) -> [u8; 32] {
     cordelia_crypto::bech32::decode_public_key(&key_of(n)).expect("a node prints its key")
 }
 
-/// A device says nothing to its relay of a channel of the older kind,
-/// though its database holds one (decision 2026-10-04 §10): a personal
-/// node carries no channel of that kind. Its store is given a group
-/// channel that it is a member of, with an item of its own that no relay
-/// has taken, as a build from before the first start on this version
-/// left them: on a device that follows a phrase, in a database with no
-/// mark, whose start writes the mark and steps nothing (§10.1). So the
-/// rows are there while the node runs. It follows a phrase, so it does
-/// talk to its relay: of its own channels, on the streams of entries. It
-/// announces no channel, asks for none, and pushes no item, however long
-/// the relay listens.
+/// A device says nothing to its relay of a channel of the older kind
+/// (decision 2026-11-10 (older kind), rule 7): no node carries one. It
+/// follows a phrase, so it does talk to its relay: of its own channels,
+/// on the streams of entries. Started again, it announces no channel,
+/// asks for none, and pushes no item, however long the relay listens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
-    use cordelia_storage::{channels, first_start, items, meta};
     let relay = stand_in_relay();
     let mut a = node("a", "personal", Some(relay.port));
-    let own = key_bytes_of(&a);
-    let group = "grp_550e8400-e29b-41d4-a716-446655440000";
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
@@ -982,47 +957,6 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
         (!relay.heard().is_empty()).then_some(())
     });
     a.stop();
-    {
-        let db = cordelia_storage::db::open(&a.data_dir().join("cordelia.db")).unwrap();
-        // No mark, and no guard, as such a build left the database.
-        assert!(first_start::remove_guard(&db).unwrap());
-        meta::remove(&db, meta::FIRST_START).unwrap();
-        channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
-        channels::add_member(&db, group, &own, "owner").unwrap();
-        let blob = b"what an earlier version sealed".to_vec();
-        let item = items::NewItem {
-            item_id: "ci_01JARV8XMHW8G9QZP0000000AA",
-            channel_id: group,
-            author_id: &own,
-            item_type: "memory",
-            published_at: "2026-10-01T00:00:00Z",
-            parent_id: None,
-            key_version: 1,
-            content_hash: &cordelia_crypto::sha256(&blob),
-            signature: &[7u8; 64],
-            encrypted_blob: &blob,
-            is_tombstone: false,
-            slot: None,
-            rev: None,
-        };
-        assert!(items::insert_item(&db, &item).unwrap());
-    }
-    // What the older outbox, fetch and announcement would each have gone
-    // by: it is there while the node runs.
-    let held = |a: &Node| {
-        let db = rusqlite::Connection::open_with_flags(
-            a.data_dir().join("cordelia.db"),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )
-        .unwrap();
-        db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
-        (
-            items::outbox_len(&db, &own).unwrap(),
-            channels::list_for_entity(&db, &own).unwrap().len(),
-            first_start::mark(&db).unwrap().map(|mark| mark.stepped),
-        )
-    };
-    assert_eq!(held(&a), (1, 1, None));
     let before = relay.streams.lock().unwrap().len();
     a.start();
     wait_for("node healthy again", &[&a], 30, || healthy(&a));
@@ -1032,8 +966,6 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
     wait_for("the device talks to its relay again", &[&a], 60, || {
         (relay.streams.lock().unwrap().len() > before).then_some(())
     });
-    // The start wrote the mark, and stepped nothing: the rows are there.
-    assert_eq!(held(&a), (1, 1, Some(false)));
 
     // Long enough for each of the three: an announcement goes when a
     // peer is promoted and when a node connects, a fetch is made every
@@ -1051,13 +983,11 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
             "the device opened a stream of {older:?} to its relay"
         );
     }
-    // And it does not count the item as waiting to be sent: what waits
-    // is of its own channels alone.
+    // What waits to be sent is of its own channels alone.
     wait_for("nothing waits to be sent", &[&a], 60, || {
         let status = a.get("/api/v1/status")?;
         (status["outbox_waiting"] == 0).then_some(())
     });
-    assert_eq!(held(&a), (1, 1, Some(false)));
 }
 
 /// T2. A stranger who knows a channel's ID and has seen one of its entries
@@ -1562,8 +1492,7 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
             let s = status(&a);
             let held = at_its_relay(&a)["holds_latest"] == true;
             has_sent_everything(&a)?;
-            (held && s["outbox_waiting"] == 0 && s["outbox_refused"].as_array()?.is_empty())
-                .then_some(())
+            (held && s["outbox_waiting"] == 0).then_some(())
         },
     );
     assert!(relay.pushes_of(&item) > offered_while_refused);
@@ -1665,133 +1594,6 @@ fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
     assert!(!said.contains("has not applied change 2 yet"), "{said}");
 }
 
-/// T3. A relay refuses an entry over the size limit. A client pushes two
-/// entries, one of the largest size there is and one a byte larger. The
-/// relay stores the first, refuses the second, and says which and why.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_relay_refuses_an_entry_over_the_size_limit() {
-    use cordelia_core::protocol::MAX_ITEM_BYTES;
-    use cordelia_network::messages::{Item, REFUSED_TOO_LARGE};
-    use cordelia_network::{connection, item_sync, transport};
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-
-    let client = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
-    let channel = "grp_550e8400-e29b-41d4-a716-446655440000";
-    let entry = |bytes: usize| -> Item {
-        let blob = vec![7u8; bytes];
-        let hash = cordelia_crypto::sha256(&blob);
-        let item_id = cordelia_storage::items::generate_item_id();
-        let published_at = "2026-10-02T00:00:00Z";
-        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
-            &client.public_key(),
-            channel,
-            &hash,
-            false,
-            &item_id,
-            1,
-            published_at,
-        )
-        .unwrap();
-        Item {
-            item_id,
-            channel_id: channel.into(),
-            item_type: "memory".into(),
-            content_length: blob.len() as u32,
-            encrypted_blob: blob,
-            content_hash: hash.to_vec(),
-            author_id: client.public_key().to_vec(),
-            signature: client.sign(&cbor).to_vec(),
-            key_version: 1,
-            published_at: published_at.into(),
-            is_tombstone: false,
-            parent_id: None,
-            slot: None,
-            rev: None,
-        }
-    };
-    let (largest, over) = (entry(MAX_ITEM_BYTES), entry(MAX_ITEM_BYTES + 1));
-
-    let endpoint = transport::create_endpoint(&client, "127.0.0.1:0".parse().unwrap()).unwrap();
-    let port = endpoint.local_addr().unwrap().port();
-    let mut manager = connection::ConnectionManager::new(
-        client.clone(),
-        endpoint,
-        vec![],
-        vec!["personal".into()],
-        port,
-    );
-    let relay_id = manager
-        .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
-        .await
-        .expect("the client connects");
-    let conn = manager.get_connection(&relay_id).unwrap().clone();
-    let (mut send, mut recv) = conn.open_bi().await.unwrap();
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-    let ack = item_sync::send_push(&mut stream, &[largest.clone(), over.clone()])
-        .await
-        .unwrap();
-
-    assert_eq!(ack.stored, 1, "{ack:?}");
-    assert_eq!(ack.refused.len(), 1, "{ack:?}");
-    assert_eq!(ack.refused[0].item_id, over.item_id, "{ack:?}");
-    assert_eq!(ack.refused[0].why, REFUSED_TOO_LARGE, "{ack:?}");
-    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
-    assert_eq!(stats["items_stored"], 1, "{stats}");
-}
-
-/// What a client holds as a device holds its channels, how its answers may
-/// depart from an honest device's, and what the relay has asked it.
-#[derive(Clone, Default)]
-struct Held {
-    /// The entries held. A test may add to them while the relay is
-    /// connected.
-    items: Arc<Mutex<Vec<cordelia_network::messages::Item>>>,
-    /// What it answers when asked which channels it holds, if not the
-    /// channels of the entries held.
-    lists: Option<Vec<String>>,
-    /// Entries nobody asked for, added to each answer to a fetch.
-    unasked: Vec<cordelia_network::messages::Item>,
-    /// Answer a request for a page with every entry of the channel,
-    /// whatever size of page was asked for.
-    ignores_page_size: bool,
-    /// Each time it is asked which channels it holds, answer with this
-    /// many names made up for the occasion, never the same twice. And
-    /// answer each request for a page of one with an empty page that says
-    /// there is more.
-    makes_up_names: usize,
-    /// What the relay asked, one for each time it asked what is held.
-    passes: Arc<Mutex<Vec<Pass>>>,
-}
-
-/// What a relay asked in one pass over what a client holds.
-#[derive(Clone, Default)]
-struct Pass {
-    /// The channel of each request for a list of entries.
-    listed: Vec<String>,
-    /// The size of page asked for, with each request for a list.
-    limits: Vec<u32>,
-    /// How many requests for entries.
-    fetches: usize,
-    /// The entries asked for, by ID, in the order asked.
-    asked: Vec<String>,
-}
-
-impl Held {
-    fn of(items: Vec<cordelia_network::messages::Item>) -> Self {
-        Self {
-            items: Arc::new(Mutex::new(items)),
-            ..Self::default()
-        }
-    }
-
-    fn passes(&self) -> Vec<Pass> {
-        self.passes.lock().unwrap().clone()
-    }
-}
-
 /// A client of a relay that is not a node: it connects as any node may, and
 /// pushes whatever the test gives it.
 struct Client {
@@ -1813,7 +1615,6 @@ async fn client_as(identity: Arc<NodeIdentity>, relay: &Node) -> Result<Client, 
     let mut manager = connection::ConnectionManager::new(
         identity.clone(),
         endpoint,
-        vec![],
         vec!["personal".into()],
         port,
     );
@@ -1850,253 +1651,6 @@ impl Client {
     async fn ask(&self, protocol: Protocol, request: WireMessage) -> Result<WireMessage, String> {
         ask_on(&self.conn, protocol, request).await
     }
-
-    /// An entry of `bytes` bytes, signed by this client, as it travels.
-    fn entry(&self, bytes: usize) -> cordelia_network::messages::Item {
-        // Distinct content for each entry.
-        let mut blob = vec![7u8; bytes];
-        let tag = cordelia_storage::items::generate_item_id();
-        let tag = tag.as_bytes();
-        blob[..tag.len().min(bytes)].copy_from_slice(&tag[..tag.len().min(bytes)]);
-        self.entry_of(blob)
-    }
-
-    /// Close the connection, as a device that goes away does.
-    async fn close(self) {
-        self.conn.close(0u32.into(), b"done");
-        // Long enough for the relay to be told.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-
-    /// An entry with this ciphertext, signed by this client.
-    fn entry_of(&self, blob: Vec<u8>) -> cordelia_network::messages::Item {
-        let channel = "grp_550e8400-e29b-41d4-a716-446655440000";
-        let item_id = cordelia_storage::items::generate_item_id();
-        let hash = cordelia_crypto::sha256(&blob);
-        let published_at = "2026-10-02T00:00:00Z";
-        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
-            &self.identity.public_key(),
-            channel,
-            &hash,
-            false,
-            &item_id,
-            1,
-            published_at,
-        )
-        .unwrap();
-        cordelia_network::messages::Item {
-            item_id,
-            channel_id: channel.into(),
-            item_type: "memory".into(),
-            content_length: blob.len() as u32,
-            encrypted_blob: blob,
-            content_hash: hash.to_vec(),
-            author_id: self.identity.public_key().to_vec(),
-            signature: self.identity.sign(&cbor).to_vec(),
-            key_version: 1,
-            published_at: published_at.into(),
-            is_tombstone: false,
-            parent_id: None,
-            slot: None,
-            rev: None,
-        }
-    }
-
-    /// Push `items` in one push. `Err` if the relay did not answer it.
-    async fn push(
-        &self,
-        items: &[cordelia_network::messages::Item],
-    ) -> Result<cordelia_network::messages::PushAck, String> {
-        let (mut send, mut recv) = self.conn.open_bi().await.map_err(|e| e.to_string())?;
-        let mut stream = tokio::io::join(&mut recv, &mut send);
-        cordelia_network::item_sync::send_push(&mut stream, items)
-            .await
-            .map_err(|e| e.to_string())
-    }
-}
-
-/// T3. A peer that keeps going over its rate is cut off, and its address is
-/// refused for a time. A client pushes as fast as it can: what is within
-/// the rate is stored, the next pushes are refused at once, and at the
-/// third the relay closes the connection. The client cannot come back,
-/// under the same key or a new one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_peer_over_its_rate_is_cut_off_and_refused_for_a_time() {
-    use cordelia_core::protocol::{BAN_THRESHOLD, ERR_RATE_LIMIT, WRITES_PER_PEER_PER_MINUTE};
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let client = client_of(&relay).await.expect("the client connects");
-
-    let mut stored = 0;
-    let mut refused = 0;
-    for _ in 0..WRITES_PER_PEER_PER_MINUTE + BAN_THRESHOLD {
-        match client.push(&[client.entry(64)]).await {
-            Ok(ack) => stored += ack.stored,
-            Err(_) => refused += 1,
-        }
-    }
-    assert_eq!(
-        stored, WRITES_PER_PEER_PER_MINUTE,
-        "what is within the rate is stored"
-    );
-    assert_eq!(refused, BAN_THRESHOLD, "the rest is refused");
-
-    // The relay closed the connection, and says why.
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(10), client.conn.closed())
-        .await
-        .expect("the relay did not close the connection");
-    match closed {
-        quinn::ConnectionError::ApplicationClosed(close) => {
-            assert_eq!(
-                close.error_code,
-                quinn::VarInt::from_u32(ERR_RATE_LIMIT),
-                "{close:?}"
-            );
-        }
-        other => panic!("closed for another reason: {other:?}"),
-    }
-    // It is not let back in: not under a new key either, since it is the
-    // address that is refused.
-    assert!(
-        client_of(&relay).await.is_err(),
-        "the address was let back in"
-    );
-    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
-    assert_eq!(stats["items_stored"], WRITES_PER_PEER_PER_MINUTE, "{stats}");
-}
-
-/// T3. A connection may push two megabytes of entries a minute. A third
-/// megabyte is refused, and nothing of it is stored.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_connection_may_push_two_megabytes_a_minute() {
-    use cordelia_core::protocol::MAX_ITEM_BYTES;
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let client = client_of(&relay).await.expect("the client connects");
-
-    // Fifteen entries of the largest size: 960 KB a push.
-    let megabyte = || -> Vec<_> { (0..15).map(|_| client.entry(MAX_ITEM_BYTES)).collect() };
-    assert_eq!(client.push(&megabyte()).await.unwrap().stored, 15);
-    assert_eq!(client.push(&megabyte()).await.unwrap().stored, 15);
-    assert!(
-        client.push(&megabyte()).await.is_err(),
-        "a third megabyte was taken"
-    );
-    // A small push still fits in what is left of the allowance.
-    assert_eq!(client.push(&[client.entry(64)]).await.unwrap().stored, 1);
-    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
-    assert_eq!(stats["items_stored"], 31, "{stats}");
-}
-
-/// T3. Small entries count for what they take. A connection's allowance
-/// counts each entry as its ciphertext and what an entry takes beyond it, a
-/// kilobyte. So fifteen kilobytes of ciphertext, in entries of eight bytes,
-/// use most of two megabytes, and the next push is refused.
-///
-/// The entries go in two pushes, so that a slow machine has time to check
-/// each one's signatures before the push times out.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_small_entries_count_for_what_they_take() {
-    use cordelia_core::protocol::{PUSH_BYTES_PER_PEER_PER_MINUTE, entry_cost};
-    const SMALL: usize = 8;
-    const HALF: u64 = 950;
-    const FIRST: u64 = 2 * HALF;
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let client = client_of(&relay).await.expect("the client connects");
-    let stored = || -> u64 {
-        serde_json::from_str::<serde_json::Value>(&relay.cli(&["stats", "--json"])).unwrap()
-            ["items_stored"]
-            .as_u64()
-            .unwrap()
-    };
-    let small = |from: u64, count: u64| -> Vec<_> {
-        (from..from + count)
-            .map(|n| client.entry_of(n.to_be_bytes().to_vec()))
-            .collect()
-    };
-
-    // What the first push costs is within the allowance; with the second
-    // it would be over.
-    assert!(FIRST * entry_cost(SMALL) <= PUSH_BYTES_PER_PEER_PER_MINUTE);
-    assert!((FIRST + 200) * entry_cost(SMALL) > PUSH_BYTES_PER_PEER_PER_MINUTE);
-
-    for half in 0..2 {
-        let ack = client.push(&small(half * HALF, HALF)).await.unwrap();
-        assert_eq!(u64::from(ack.stored), HALF, "{ack:?}");
-    }
-    assert!(
-        client.push(&small(FIRST, 200)).await.is_err(),
-        "small entries were taken past the allowance"
-    );
-    assert_eq!(stored(), FIRST);
-    // What is left of the allowance still takes a push that fits in it.
-    let ack = client.push(&small(FIRST, 100)).await.unwrap();
-    assert_eq!(ack.stored, 100, "{ack:?}");
-}
-
-/// T3. An address's allowance lasts as long as what was counted against it,
-/// whether or not its connections do. Five connections from one address
-/// push what the address may in a minute, and close. A new connection from
-/// that address, under a new key, is refused another megabyte.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_an_addresss_allowance_outlasts_its_connections() {
-    use cordelia_core::protocol::{MAX_CONNECTIONS_PER_IP, MAX_ITEM_BYTES};
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let connected = || -> usize {
-        relay
-            .get("/api/v1/peers")
-            .and_then(|v| v["peers"].as_array().map(Vec::len))
-            .unwrap_or(usize::MAX)
-    };
-
-    // Fifteen entries of the largest size are just under a megabyte, and
-    // two such pushes are what one connection may send in a minute.
-    let megabyte =
-        |client: &Client| -> Vec<_> { (0..15).map(|_| client.entry(MAX_ITEM_BYTES)).collect() };
-    let mut clients = Vec::new();
-    for n in 0..MAX_CONNECTIONS_PER_IP {
-        let client = client_of(&relay)
-            .await
-            .unwrap_or_else(|e| panic!("connection {n} was refused: {e}"));
-        for push in 0..2 {
-            let ack = client.push(&megabyte(&client)).await.unwrap();
-            assert_eq!(ack.stored, 15, "connection {n}, push {push}: {ack:?}");
-        }
-        clients.push(client);
-    }
-
-    // They all close, and the relay tidies its counts.
-    for client in clients {
-        client.close().await;
-    }
-    wait_for("the relay sees them gone", &[&relay], 30, || {
-        (connected() == 0).then_some(())
-    });
-    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-
-    // The address comes back under a new key. Its allowance for the minute
-    // is still used.
-    let again = client_of(&relay).await.expect("the address connects again");
-    assert!(
-        again.push(&megabyte(&again)).await.is_err(),
-        "the address had a fresh allowance after connecting again"
-    );
-    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
-    assert_eq!(
-        stats["items_stored"],
-        30 * MAX_CONNECTIONS_PER_IP,
-        "{stats}"
-    );
 }
 
 /// T3. An address has its share of connections, and the next one is turned
@@ -2145,898 +1699,59 @@ async fn t03_an_address_is_turned_away_once_it_has_its_share_of_connections() {
     drop(again);
 }
 
-impl Client {
-    /// An entry of `bytes` bytes in `channel`, signed by this client.
-    fn entry_in(&self, channel: &str, bytes: usize) -> cordelia_network::messages::Item {
-        self.resigned_in(self.entry(bytes), channel)
-    }
-
-    /// `item` moved to `channel` and signed again by this client.
-    fn resigned_in(
-        &self,
-        mut item: cordelia_network::messages::Item,
-        channel: &str,
-    ) -> cordelia_network::messages::Item {
-        let hash: [u8; 32] = item.content_hash.clone().try_into().unwrap();
-        let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
-            &self.identity.public_key(),
-            channel,
-            &hash,
-            false,
-            &item.item_id,
-            1,
-            &item.published_at,
-        )
-        .unwrap();
-        item.channel_id = channel.into();
-        item.signature = self.identity.sign(&cbor).to_vec();
-        item
-    }
-
-    /// An entry under a name: `slot` at revision `rev`, of `bytes` bytes,
-    /// in `channel`, signed by this client. A later revision replaces an
-    /// earlier one of the same slot.
-    fn keyed_in(
-        &self,
-        channel: &str,
-        slot: [u8; 32],
-        rev: u64,
-        bytes: usize,
-    ) -> cordelia_network::messages::Item {
-        let mut item = self.entry(bytes);
-        let hash: [u8; 32] = item.content_hash.clone().try_into().unwrap();
-        let cbor = cordelia_crypto::signing::ItemMetadata {
-            author_id: &self.identity.public_key(),
-            channel_id: channel,
-            content_hash: &hash,
-            is_tombstone: false,
-            item_id: &item.item_id,
-            key_version: 1,
-            published_at: &item.published_at,
-            slot: Some(&slot),
-            rev: Some(rev),
-        }
-        .encode()
-        .unwrap();
-        item.channel_id = channel.into();
-        item.slot = Some(slot.to_vec());
-        item.rev = Some(rev);
-        item.signature = self.identity.sign(&cbor).to_vec();
-        item
-    }
-
-    /// Hold entries as a device holds its channels, and answer the relay
-    /// when it asks: which channels, what each lists, and the entries.
-    /// `held` says what is held and how the answers may depart from what an
-    /// honest device gives, and records what the relay asked.
-    fn serve(&self, held: Held) {
-        use cordelia_network::codec;
-        use cordelia_network::messages::{
-            FetchResponse, ItemHeader, SyncChannelListResponse, SyncResponse,
-        };
-        let conn = self.conn.clone();
-        tokio::spawn(async move {
-            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                if !matches!(
-                    codec::read_protocol_byte(&mut recv).await,
-                    Ok(Protocol::ItemSync)
-                ) {
-                    continue;
-                }
-                let mut pass = Pass::default();
-                while let Ok(msg) = codec::read_frame(&mut recv, Protocol::ItemSync).await {
-                    let items = held.items.lock().unwrap().clone();
-                    let answer = match msg {
-                        WireMessage::SyncChannelListRequest(_) if held.makes_up_names > 0 => {
-                            let passes = held.passes.lock().unwrap().len();
-                            WireMessage::SyncChannelListResponse(SyncChannelListResponse {
-                                channel_ids: (0..held.makes_up_names)
-                                    .map(|n| format!("grp_made-up-{passes:06}-{n:06}"))
-                                    .collect(),
-                            })
-                        }
-                        WireMessage::SyncRequest(req) if held.makes_up_names > 0 => {
-                            pass.listed.push(req.channel_id.clone());
-                            pass.limits.push(req.limit);
-                            WireMessage::SyncResponse(SyncResponse {
-                                items: Vec::new(),
-                                has_more: true,
-                                last_seq: Some(req.after_seq.unwrap_or(0) + 1),
-                            })
-                        }
-                        WireMessage::SyncChannelListRequest(_) => {
-                            let channel_ids = held.lists.clone().unwrap_or_else(|| {
-                                let ids: BTreeSet<String> =
-                                    items.iter().map(|i| i.channel_id.clone()).collect();
-                                ids.into_iter().collect()
-                            });
-                            WireMessage::SyncChannelListResponse(SyncChannelListResponse {
-                                channel_ids,
-                            })
-                        }
-                        // An entry's place in its channel's list is its
-                        // place among the entries held, from 1.
-                        WireMessage::SyncRequest(req) => {
-                            pass.listed.push(req.channel_id.clone());
-                            pass.limits.push(req.limit);
-                            let after = req.after_seq.unwrap_or(0);
-                            let of: Vec<(u64, &cordelia_network::messages::Item)> = items
-                                .iter()
-                                .filter(|i| i.channel_id == req.channel_id)
-                                .zip(1u64..)
-                                .map(|(i, seq)| (seq, i))
-                                .collect();
-                            let most = if held.ignores_page_size {
-                                usize::MAX
-                            } else {
-                                req.limit as usize
-                            };
-                            let page: Vec<&(u64, &cordelia_network::messages::Item)> = of
-                                .iter()
-                                .filter(|(seq, _)| *seq > after)
-                                .take(most)
-                                .collect();
-                            let last = page.last().map_or(after, |(seq, _)| *seq);
-                            WireMessage::SyncResponse(SyncResponse {
-                                items: page
-                                    .iter()
-                                    .map(|(_, i)| ItemHeader {
-                                        item_id: i.item_id.clone(),
-                                        channel_id: i.channel_id.clone(),
-                                        item_type: i.item_type.clone(),
-                                        content_hash: i.content_hash.clone(),
-                                        author_id: i.author_id.clone(),
-                                        signature: i.signature.clone(),
-                                        key_version: i.key_version,
-                                        published_at: i.published_at.clone(),
-                                        is_tombstone: i.is_tombstone,
-                                        parent_id: i.parent_id.clone(),
-                                        slot: i.slot.clone(),
-                                        rev: i.rev,
-                                    })
-                                    .collect(),
-                                has_more: of.last().is_some_and(|(seq, _)| *seq > last),
-                                last_seq: Some(last),
-                            })
-                        }
-                        WireMessage::FetchRequest(req) => {
-                            pass.fetches += 1;
-                            pass.asked.extend(req.item_ids.iter().cloned());
-                            let mut answer: Vec<_> = items
-                                .iter()
-                                .filter(|i| req.item_ids.contains(&i.item_id))
-                                .cloned()
-                                .collect();
-                            answer.extend(held.unasked.iter().cloned());
-                            WireMessage::FetchResponse(FetchResponse { items: answer })
-                        }
-                        _ => break,
-                    };
-                    if codec::write_frame(&mut send, &answer).await.is_err() {
-                        break;
-                    }
-                }
-                held.passes.lock().unwrap().push(pass);
-            }
-        });
-    }
-
-    /// How many entries of `channel` the relay lists.
-    async fn listed(&self, channel: &str) -> usize {
-        let (mut send, mut recv) = self.conn.open_bi().await.unwrap();
-        cordelia_network::codec::write_protocol_byte(&mut send, Protocol::ItemSync)
-            .await
-            .unwrap();
-        cordelia_network::item_sync::send_sync_page(&mut send, &mut recv, channel, 0, 100)
-            .await
-            .map(|page| page.items.len())
-            .unwrap_or(0)
-    }
-}
-
-/// T3. A relay has a storage cap, and keeps what it held first. A client
-/// fills a relay with channels. Once it is full, a new channel is refused.
-/// The first channel can still be written to, and room is made for it by
-/// dropping the newest: everything the first channel held is still there.
+/// A node answers each request of the older kind with nothing, as a device
+/// that holds no channel of that kind would (decision 2026-10-04 §10.1;
+/// decision 2026-11-10 (older kind), rule 7): a device and a relay alike.
+/// A relay of alpha.19 asks each of its devices, and each relay it lists,
+/// which channels it holds, and for a page of each that it holds. Answered,
+/// it asks again at its usual pace; refused, it would take that for a
+/// failure and ask again within the minute. So each is asked three times,
+/// on three streams of one connection, and answers each at once: no
+/// channel, and nothing in the channel asked for. The connection stays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_full_relay_keeps_what_it_held_first() {
-    use cordelia_core::protocol::MAX_ITEM_BYTES;
-    use cordelia_network::messages::REFUSED_FULL;
-    let channel = |n: usize| format!("grp_550e8400-e29b-41d4-a716-{n:012}");
-    let stats = |relay: &Node| -> serde_json::Value {
-        serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap()
+async fn a_node_answers_each_request_of_the_older_kind_with_nothing() {
+    let asks_three_times = |conn: quinn::Connection, who: &'static str| async move {
+        for time in 1..=3 {
+            let answered = asks_a_sync_of_the_older_kind(&conn, OLDER_GROUP).await;
+            let Some((listed, page)) = answered else {
+                panic!("{who} did not answer request {time} of the older kind at once");
+            };
+            assert!(listed.is_empty(), "{who} listed {listed:?}");
+            assert!(
+                page.items.is_empty() && !page.has_more,
+                "{who} served a page of the older kind: {page:?}"
+            );
+        }
+        assert!(conn.close_reason().is_none(), "{who} closed the connection");
     };
 
-    let relay = node("relay", "relay", None);
-    let cap = 1_000_000;
-    relay.max_storage_bytes(cap);
-    let mut relay = relay;
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    assert_eq!(stats(&relay)["storage_max_bytes"], cap);
-    let client = client_of(&relay).await.expect("the client connects");
+    // A device, asked by what stands in for its relay.
+    let asker = stand_in_relay();
+    let mut a = node("a", "personal", Some(asker.port));
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
+    wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
+    let conn = asker.connections.lock().unwrap().last().cloned();
+    asks_three_times(conn.expect("the device connected"), "the device").await;
 
-    // The first channel, then newer ones, two entries each, until the
-    // relay refuses one for lack of room.
-    let two = |ch: &str| {
-        vec![
-            client.entry_in(ch, MAX_ITEM_BYTES),
-            client.entry_in(ch, MAX_ITEM_BYTES),
-        ]
-    };
-    assert_eq!(client.push(&two(&channel(0))).await.unwrap().stored, 2);
-    let mut newer = Vec::new();
-    loop {
-        let next = channel(newer.len() + 1);
-        let ack = client.push(&two(&next)).await.unwrap();
-        if ack.stored == 2 {
-            newer.push(next);
-            assert!(newer.len() < 12, "the relay is never full");
-            continue;
-        }
-        assert!(!ack.refused.is_empty(), "{ack:?}");
-        assert!(ack.refused.iter().all(|r| r.why == REFUSED_FULL), "{ack:?}");
-        break;
-    }
-    assert!(newer.len() >= 2, "{}", newer.len());
-    assert!(stats(&relay)["storage_used_bytes"].as_u64().unwrap() <= cap);
-    assert_eq!(client.listed(&channel(newer.len() + 1)).await, 0);
-
-    // The first channel is written to again. The relay takes it, stays
-    // within its cap, and has dropped the newest channel to do so; the
-    // first channel holds everything it was sent.
-    let ack = client.push(&two(&channel(0))).await.unwrap();
-    assert_eq!(ack.stored, 2, "{ack:?}");
-    assert!(stats(&relay)["storage_used_bytes"].as_u64().unwrap() <= cap);
-    assert_eq!(client.listed(&channel(0)).await, 4);
-    assert_eq!(
-        client.listed(newer.last().unwrap()).await,
-        0,
-        "the newest was kept"
-    );
-    assert_eq!(
-        client.listed(&newer[0]).await,
-        2,
-        "an older channel was dropped"
-    );
-}
-
-/// What a relay's database holds, from `cordelia stats`: how many entries,
-/// and their bytes.
-fn relay_holds(relay: &Node) -> (u64, u64) {
-    let stats: serde_json::Value = serde_json::from_str(&relay.cli(&["stats", "--json"])).unwrap();
-    (
-        stats["items_stored"].as_u64().unwrap(),
-        stats["content_bytes_stored"].as_u64().unwrap(),
-    )
-}
-
-/// T3. What a relay fetches from a peer is bounded as what the peer may
-/// push is, and a fetch stores only what was asked for. A device holds
-/// three megabytes of entries that its relay lacks. The relay has another
-/// peer as its hot peer, as two relays that list each other have, so the
-/// device is not one of its hot peers.
-///
-/// The relay asks the device all the same when the device connects, takes
-/// no more than a connection may push in a minute, and takes the rest once
-/// the minute has passed. The device adds entries that were not asked for
-/// to every answer; the relay stores none of them.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_relay_fetches_from_a_peer_no_faster_than_the_peer_may_push() {
-    use cordelia_core::protocol::PUSH_BYTES_PER_PEER_PER_MINUTE;
-    const ENTRY: usize = 30_000;
-    const ENTRIES: usize = 100;
-    let total = (ENTRY * ENTRIES) as u64;
-
+    // A relay, asked by a client.
     let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    // The relay's one hot place goes to the first peer that connects.
-    let mut first = node("first", "personal", Some(relay.p2p));
-    first.start();
-    wait_for("first healthy", &[&relay, &first], 30, || healthy(&first));
-    wait_for("first connected", &[&relay, &first], 60, || {
-        has_hot_peer(&first)
-    });
-    assert_eq!(relay_holds(&relay), (0, 0));
-
-    let device = client_of(&relay).await.expect("the device connects");
-    let channel = "grp_550e8400-e29b-41d4-a716-446655440077";
-    let held = Held {
-        // Five entries of another size that are never listed.
-        unasked: (0..5).map(|_| device.entry_in(channel, 2_000)).collect(),
-        ..Held::of(
-            (0..ENTRIES)
-                .map(|_| device.entry_in(channel, ENTRY))
-                .collect(),
-        )
-    };
-    device.serve(held);
-
-    // The relay asks the device, and takes what a connection may push in a
-    // minute, and no more for now.
-    wait_for("the relay fetches from the device", &[&relay], 40, || {
-        (relay_holds(&relay).1 > 0).then_some(())
-    });
-    let mut most = 0;
-    for _ in 0..20 {
-        let (entries, bytes) = relay_holds(&relay);
-        // Only what was asked for is stored: every entry is one of those
-        // the device listed.
-        assert_eq!(bytes, entries * ENTRY as u64, "an entry nobody asked for");
-        most = most.max(bytes);
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    }
-    assert!(
-        most <= PUSH_BYTES_PER_PEER_PER_MINUTE,
-        "the relay fetched {most} bytes within the minute"
-    );
-    assert!(most < total, "{most}");
-
-    // Once the minute has passed it takes the rest.
-    wait_for("the relay fetches the rest", &[&relay], 150, || {
-        (relay_holds(&relay) == (ENTRIES as u64, total)).then_some(())
-    });
-}
-
-/// T3. Nothing is lost when a relay drops a channel to make room. A relay
-/// holds an older channel and a newer one, which it fetched from a device.
-/// The older one grows, and the relay drops the newer one. While there is
-/// no room, the relay tries the newer channel again and drops it again.
-/// Then the older one shrinks. The relay asks the device again, lists the
-/// newer channel from the start, and holds all of it again.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_channel_a_relay_dropped_comes_back_when_there_is_room() {
-    const LARGE: usize = 60_000;
-    let channel = |n: usize| format!("grp_550e8400-e29b-41d4-a716-{n:012}");
-    let (older, newer) = (channel(0), channel(1));
-    let name = |n: u8| [n; 32];
-
-    let relay = node("relay", "relay", None);
-    relay.max_storage_bytes(1_000_000);
-    relay.relay_ask_again_secs(3);
-    let mut relay = relay;
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
     let client = client_of(&relay).await.expect("the client connects");
-
-    // The older channel, written under names so that it can shrink later.
-    let ack = client
-        .push(&[client.keyed_in(&older, name(0), 1, LARGE)])
-        .await
-        .unwrap();
-    assert_eq!(ack.stored, 1, "{ack:?}");
-
-    // The newer channel is held by the client as a device holds one: more
-    // small entries than one page lists, then a few large ones. So it
-    // takes the relay two pages to list it, and the large ones come in the
-    // second. The relay asks, and fetches it.
-    const SMALL: u64 = 120;
-    const HELD: u64 = SMALL + 8;
-    client.serve(Held::of(
-        (0..HELD)
-            .map(|n| client.entry_in(&newer, if n < SMALL { 100 } else { 11_000 }))
-            .collect(),
-    ));
-    wait_for("the relay fetches the newer channel", &[&relay], 40, || {
-        (relay_holds(&relay).0 == 1 + HELD).then_some(())
-    });
-
-    // The older channel grows until the relay has dropped the newer one.
-    let mut names = 1u8;
-    loop {
-        let ack = client
-            .push(&[client.keyed_in(&older, name(names), 1, LARGE)])
-            .await
-            .unwrap();
-        assert_eq!(ack.stored, 1, "{ack:?}");
-        names += 1;
-        if relay_holds(&relay).0 == u64::from(names) {
-            break;
-        }
-        assert!(names < 20, "the relay never dropped the newer channel");
-    }
-    assert_eq!(client.listed(&newer).await, 0);
-
-    // There is room for the newer channel's first page and not for all
-    // of it. The relay tries it again, and drops it again when the large
-    // entries of the second page do not fit: by then its place had moved
-    // past the first page.
-    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-
-    // The older channel shrinks: each name gets a small entry in place of
-    // its large one.
-    for n in 0..names {
-        let ack = client
-            .push(&[client.keyed_in(&older, name(n), 2, 1_000)])
-            .await
-            .unwrap();
-        assert_eq!(ack.stored, 1, "{ack:?}");
-    }
-
-    // The relay asks the device again, and the newer channel is back, whole.
-    wait_for("the newer channel is back", &[&relay], 90, || {
-        (relay_holds(&relay).0 == u64::from(names) + HELD).then_some(())
-    });
-    assert_eq!(client.listed(&older).await, usize::from(names));
-}
-
-/// T3. What a peer lists is the peer's to write, so a relay bounds it. One
-/// peer says it holds three thousand channels: the relay asks about so many
-/// and no more in one pass. Another lists a few channels and one with an ID
-/// far longer than a channel's can be: the relay asks about the few, and
-/// never about the long one. (Among three thousand the long one would be
-/// asked about only by chance.)
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_relay_asks_a_peer_about_only_so_many_channels() {
-    use cordelia_core::protocol::{MAX_CHANNEL_ID_LEN, MAX_CHANNELS_ASKED_OF_A_PEER};
-    const FEW: usize = 10;
-    let channel = |n: usize| format!("grp_550e8400-e29b-41d4-a716-{n:012}");
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-
-    let many = client_of(&relay).await.expect("the first peer connects");
-    let held_many = Held {
-        lists: Some((0..3000).map(channel).collect()),
-        ..Held::default()
-    };
-    many.serve(held_many.clone());
-    let pass = wait_for("the relay asks the first peer", &[&relay], 60, || {
-        held_many.passes().into_iter().next()
-    });
-    assert_eq!(pass.listed.len(), MAX_CHANNELS_ASKED_OF_A_PEER);
-
-    let few = client_of(&relay).await.expect("the second peer connects");
-    let mut lists: Vec<String> = (0..FEW).map(channel).collect();
-    lists.push("x".repeat(50_000));
-    let held_few = Held {
-        lists: Some(lists),
-        ..Held::default()
-    };
-    few.serve(held_few.clone());
-    let pass = wait_for("the relay asks the second peer", &[&relay], 60, || {
-        held_few.passes().into_iter().next()
-    });
-    assert!(
-        pass.listed.iter().all(|id| id.len() <= MAX_CHANNEL_ID_LEN),
-        "the relay asked about a channel with an ID no channel has"
-    );
-    assert_eq!(pass.listed.len(), FEW);
-}
-
-/// What a relay's log says it keeps for its peers (places in their lists,
-/// and page sizes), at each cycle.
-fn places_kept(relay: &Node) -> Vec<u64> {
-    let log = std::fs::read_to_string(relay.log()).unwrap_or_default();
-    // The log has colour codes around each field's name.
-    let mut plain = String::with_capacity(log.len());
-    let mut chars = log.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for c in chars.by_ref() {
-                if c == 'm' {
-                    break;
-                }
-            }
-        } else {
-            plain.push(c);
-        }
-    }
-    plain
-        .lines()
-        .filter(|line| line.contains("pull-sync cycle"))
-        .filter_map(|line| {
-            line.split_whitespace()
-                .find_map(|field| field.strip_prefix("places="))
-                .and_then(|n| n.parse().ok())
-        })
-        .collect()
-}
-
-/// T3. A relay keeps nothing for names a peer makes up. A peer says it
-/// holds a thousand channels, different ones each time it is asked, and
-/// answers each request with an empty page that says there is more. The
-/// relay asks about each name once, and keeps a place in none of them:
-/// nothing is kept where a peer lists nothing.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_relay_keeps_nothing_for_names_a_peer_makes_up() {
-    use cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER;
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let peer = client_of(&relay).await.expect("the peer connects");
-    let held = Held {
-        makes_up_names: MAX_CHANNELS_ASKED_OF_A_PEER,
-        ..Held::default()
-    };
-    peer.serve(held.clone());
-
-    wait_for("the relay asks the peer three times", &[&relay], 90, || {
-        (held.passes().len() >= 3).then_some(())
-    });
-    for (n, pass) in held.passes().iter().enumerate() {
-        // Once about each name: an empty page is the end, whatever it says.
-        assert_eq!(pass.listed.len(), MAX_CHANNELS_ASKED_OF_A_PEER, "pass {n}");
-        assert_eq!(pass.fetches, 0, "pass {n}");
-    }
-    let kept = places_kept(&relay);
-    assert!(kept.len() >= 3, "{kept:?}");
-    assert!(
-        kept.iter().all(|places| *places == 0),
-        "the relay kept places for names a peer made up: {kept:?}"
-    );
-    assert_eq!(relay_holds(&relay), (0, 0));
-}
-
-/// T3. A relay gets past what it will not store. A device holds a channel
-/// that begins with more than a page of entries the relay refuses (their
-/// signatures are not good), then one whose header shows a field over its
-/// size, then entries that are as they should be. It holds a second channel
-/// with nothing in it that the relay takes.
-///
-/// The relay ends up with every entry that is as it should be. It asks for
-/// each of the others once, not once a page or once a pass, and never for
-/// the one whose header shows it will be refused.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_relay_gets_past_what_it_will_not_store() {
-    use cordelia_core::protocol::MAX_ITEM_TYPE_LEN;
-    const REFUSED: usize = 120;
-    const GOOD: usize = 30;
-    let mixed = "grp_550e8400-e29b-41d4-a716-000000000001";
-    let refused_only = "grp_550e8400-e29b-41d4-a716-000000000002";
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let device = client_of(&relay).await.expect("the device connects");
-
-    let not_good = |channel: &str| {
-        let mut item = device.entry_in(channel, 100);
-        item.signature[0] ^= 1;
-        item
-    };
-    let mut long_type = device.entry_in(mixed, 100);
-    long_type.item_type = "x".repeat(MAX_ITEM_TYPE_LEN + 1);
-    let mut items: Vec<_> = (0..REFUSED).map(|_| not_good(mixed)).collect();
-    items.push(long_type.clone());
-    items.extend((0..GOOD).map(|_| device.entry_in(mixed, 100)));
-    items.extend((0..REFUSED + GOOD).map(|_| not_good(refused_only)));
-    let held = Held::of(items);
-    device.serve(held.clone());
-
-    wait_for("the relay asks the device twice", &[&relay], 90, || {
-        (held.passes().len() >= 2).then_some(())
-    });
-    let passes = held.passes();
-    assert_eq!(
-        relay_holds(&relay).0,
-        GOOD as u64,
-        "the relay did not get past what it will not store"
-    );
-    let asked: Vec<&String> = passes.iter().flat_map(|pass| &pass.asked).collect();
-    assert!(
-        !asked.contains(&&long_type.item_id),
-        "asked for an entry whose header shows it will be refused"
-    );
-    let distinct: BTreeSet<&String> = asked.iter().copied().collect();
-    assert_eq!(
-        (asked.len(), distinct.len()),
-        (2 * (REFUSED + GOOD), 2 * (REFUSED + GOOD)),
-        "each entry is asked for once"
-    );
-    assert!(
-        passes[1].asked.is_empty(),
-        "asked again for {} entries it had been through",
-        passes[1].asked.len()
-    );
-}
-
-/// T3. A relay keeps only so many places for one peer. A peer lists more
-/// channels than a relay asks about in one pass, each with an entry the
-/// relay fetches and refuses, so that there is a place to keep in each.
-/// Over three passes the relay asks about more channels than it may keep
-/// places for, and keeps no more than it may.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_relay_keeps_only_so_many_places_for_a_peer() {
-    use cordelia_core::protocol::MAX_CHANNELS_ASKED_OF_A_PEER;
-    const CHANNELS: usize = MAX_CHANNELS_ASKED_OF_A_PEER + 200;
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let peer = client_of(&relay).await.expect("the peer connects");
-    let held = Held::of(
-        (0..CHANNELS)
-            .map(|n| {
-                let mut item = peer.entry_in(&format!("grp_550e8400-e29b-41d4-a716-{n:012}"), 8);
-                item.signature[0] ^= 1;
-                item
-            })
-            .collect(),
-    );
-    peer.serve(held.clone());
-
+    asks_three_times(client.conn.clone(), "the relay").await;
+    assert_eq!(older_items_held(&relay), 0);
+    // And it says so, for debugging, once for each stream: it was asked
+    // three times, and answered three.
     wait_for(
-        "the relay asks the peer three times",
+        "the relay says it answered with nothing",
         &[&relay],
-        180,
-        || (held.passes().len() >= 3).then_some(()),
-    );
-    let passes = held.passes();
-    let asked_about: BTreeSet<&String> = passes.iter().flat_map(|pass| &pass.listed).collect();
-    assert!(
-        asked_about.len() > MAX_CHANNELS_ASKED_OF_A_PEER,
-        "asked about {} channels",
-        asked_about.len()
-    );
-    let kept = places_kept(&relay);
-    assert_eq!(
-        kept.iter().max(),
-        Some(&(MAX_CHANNELS_ASKED_OF_A_PEER as u64)),
-        "{kept:?}"
-    );
-    assert_eq!(relay_holds(&relay), (0, 0));
-
-    // Once the peer has gone, what was kept for it is forgotten. (Another
-    // peer stays, so that the relay goes on saying what it keeps.)
-    let stays = client_of(&relay).await.expect("another peer connects");
-    stays.serve(Held::default());
-    peer.close().await;
-    wait_for(
-        "the relay forgets the places it kept",
-        &[&relay],
-        90,
-        || (places_kept(&relay).last() == Some(&0)).then_some(()),
-    );
-}
-
-/// A relay that asked a device for fewer entries at a time, because a page
-/// of them did not fit in one message, asks for whole pages again once it
-/// has caught up with that channel.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_relay_asks_for_whole_pages_again_once_caught_up() {
-    use cordelia_core::protocol::SYNC_PAGE_STEPS;
-    let large = "grp_550e8400-e29b-41d4-a716-000000000001";
-
-    let mut relay = node("relay", "relay", None);
-    relay.relay_ask_again_secs(2);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let device = client_of(&relay).await.expect("the device connects");
-    // Thirty entries that are more than a megabyte together: the first
-    // request for them cannot be answered, and the relay asks for fewer.
-    let held = Held::of((0..30).map(|_| device.entry_in(large, 40_000)).collect());
-    device.serve(held.clone());
-    wait_for("the relay holds the channel", &[&relay], 120, || {
-        (relay_holds(&relay).0 == 30).then_some(())
-    });
-    let asked_fewer = held
-        .passes()
-        .iter()
-        .flat_map(|pass| pass.limits.clone())
-        .any(|limit| limit < SYNC_PAGE_STEPS[0]);
-    assert!(asked_fewer, "the relay never asked for fewer");
-
-    // The device comes to hold a few more, small ones, once what the relay
-    // fetched has left the minute it counts against the device: until then
-    // the relay asks for fewer for that reason. It asks for them a whole
-    // page at a time.
-    tokio::time::sleep(std::time::Duration::from_secs(
-        cordelia_core::protocol::RATE_WINDOW_SECS + 1,
-    ))
-    .await;
-    let before = held.passes().len();
-    held.items
-        .lock()
-        .unwrap()
-        .extend((0..5).map(|_| device.entry_in(large, 100)));
-    wait_for("the relay holds the new entries", &[&relay], 60, || {
-        (relay_holds(&relay).0 == 35).then_some(())
-    });
-    let later: Vec<u32> = held.passes()[before..]
-        .iter()
-        .flat_map(|pass| pass.limits.clone())
-        .collect();
-    assert!(!later.is_empty());
-    assert!(
-        later.iter().all(|limit| *limit == SYNC_PAGE_STEPS[0]),
-        "asked for {later:?} after it had caught up"
-    );
-}
-
-/// T3. A relay does not fetch what it has no room for. A device holds
-/// twenty channels, and one address may make a relay hold sixteen new
-/// channels in an hour. The relay fetches sixteen. For the other four it
-/// asks for nothing, in that pass or the next.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_relay_does_not_fetch_what_it_has_no_room_for() {
-    use cordelia_core::protocol::NEW_CHANNELS_PER_ADDRESS_PER_HOUR;
-    const CHANNELS: usize = 20;
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let device = client_of(&relay).await.expect("the device connects");
-    let held = Held::of(
-        (0..CHANNELS)
-            .map(|n| device.entry_in(&format!("grp_550e8400-e29b-41d4-a716-{n:012}"), 100))
-            .collect(),
-    );
-    device.serve(held.clone());
-
-    wait_for("the relay asks the device twice", &[&relay], 60, || {
-        (held.passes().len() >= 2).then_some(())
-    });
-    let passes = held.passes();
-    assert_eq!(
-        relay_holds(&relay).0,
-        NEW_CHANNELS_PER_ADDRESS_PER_HOUR as u64
-    );
-    // One request for entries for each channel it took, and none since.
-    assert_eq!(passes[0].fetches, NEW_CHANNELS_PER_ADDRESS_PER_HOUR);
-    assert_eq!(passes[0].listed.len(), NEW_CHANNELS_PER_ADDRESS_PER_HOUR);
-    assert_eq!(passes[1].fetches, 0);
-    assert_eq!(passes[1].listed.len(), NEW_CHANNELS_PER_ADDRESS_PER_HOUR);
-}
-
-/// A relay that asks a device for what it lacks gets all of it without
-/// long waits, though it asks a device again only every ten minutes. Two
-/// devices, neither one of the relay's hot peers:
-///
-/// - one holds a channel whose entries do not fit in one message at the
-///   size of page the relay first asks for;
-/// - one holds a channel with more entries than one pass takes.
-///
-/// Each time, the relay comes back at the next cycle for the rest.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_relay_fetches_all_a_device_holds_without_long_waits() {
-    const LARGE: usize = 30;
-    const SMALL: usize = 1100;
-    let large = "grp_550e8400-e29b-41d4-a716-000000000001";
-    let long = "grp_550e8400-e29b-41d4-a716-000000000002";
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    // The relay's one hot place goes to the first peer that connects.
-    let mut first = node("first", "personal", Some(relay.p2p));
-    first.start();
-    wait_for("first healthy", &[&relay, &first], 30, || healthy(&first));
-    wait_for("first connected", &[&relay, &first], 60, || {
-        has_hot_peer(&first)
-    });
-
-    // Thirty entries that are more than a megabyte together: the first
-    // request for them cannot be answered, and the relay asks for fewer.
-    let device = client_of(&relay).await.expect("the device connects");
-    device.serve(Held::of(
-        (0..LARGE).map(|_| device.entry_in(large, 40_000)).collect(),
-    ));
-    wait_for("the relay holds the large entries", &[&relay], 45, || {
-        (relay_holds(&relay).0 == LARGE as u64).then_some(())
-    });
-
-    // Eleven hundred small entries: more than the ten pages one pass takes.
-    let other = client_of(&relay).await.expect("the other device connects");
-    other.serve(Held::of(
-        (0..SMALL as u64)
-            .map(|n| other.resigned_in(other.entry_of(n.to_be_bytes().to_vec()), long))
-            .collect(),
-    ));
-    wait_for(
-        "the relay holds the long channel too",
-        &[&relay],
-        50,
-        || (relay_holds(&relay).0 == (LARGE + SMALL) as u64).then_some(()),
-    );
-}
-
-/// A relay asks a device again every so often, without the device
-/// connecting again: an entry the device comes to hold later is fetched.
-/// The device is not one of the relay's hot peers.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_relay_asks_a_device_again_every_so_often() {
-    let channel = "grp_550e8400-e29b-41d4-a716-000000000003";
-    let relay = node("relay", "relay", None);
-    relay.relay_ask_again_secs(5);
-    let mut relay = relay;
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let mut first = node("first", "personal", Some(relay.p2p));
-    first.start();
-    wait_for("first healthy", &[&relay, &first], 30, || healthy(&first));
-    wait_for("first connected", &[&relay, &first], 60, || {
-        has_hot_peer(&first)
-    });
-
-    let device = client_of(&relay).await.expect("the device connects");
-    let held = Held::of(vec![device.entry_in(channel, 1_000)]);
-    device.serve(held.clone());
-    wait_for(
-        "the relay fetches what the device holds",
-        &[&relay],
-        40,
-        || (relay_holds(&relay).0 == 1).then_some(()),
-    );
-
-    // The device comes to hold one more. The relay asks again, and has it.
-    held.items
-        .lock()
-        .unwrap()
-        .push(device.entry_in(channel, 1_000));
-    wait_for(
-        "the relay asks again and fetches the new entry",
-        &[&relay],
-        40,
-        || (relay_holds(&relay).0 == 2).then_some(()),
-    );
-}
-
-/// T3. A peer that answers a request for a page with more than the page
-/// asked for is not fetched from: the size of a page is how a relay keeps
-/// what it takes within the peer's allowance.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn t03_a_page_longer_than_the_one_asked_for_is_not_taken() {
-    let channel = "grp_550e8400-e29b-41d4-a716-000000000004";
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let peer = client_of(&relay).await.expect("the peer connects");
-
-    // More entries than the largest page a relay asks for.
-    let entries = 3 * cordelia_core::protocol::DEFAULT_SYNC_LIMIT / 2;
-    let held = Held {
-        ignores_page_size: true,
-        ..Held::of((0..entries).map(|_| peer.entry_in(channel, 100)).collect())
-    };
-    peer.serve(held.clone());
-    wait_for("the relay asks the peer", &[&relay], 60, || {
-        (!held.passes().is_empty()).then_some(())
-    });
-    let pass = &held.passes()[0];
-    assert_eq!(pass.listed, vec![channel.to_string()]);
-    assert_eq!(
-        pass.fetches, 0,
-        "the relay fetched from a page it did not ask for"
-    );
-    assert_eq!(relay_holds(&relay), (0, 0));
-}
-
-/// A device answers its relay's request of the older kind with nothing,
-/// as a device that holds no channel of that kind would (decision
-/// 2026-10-04 §10.1). A relay asks each of its devices which channels it
-/// holds: answered, it asks again at its usual pace, which this relay is
-/// set up to make short. A device that refused the request would be asked
-/// again only a minute later, as a peer that failed to answer is.
-#[test]
-fn a_device_answers_its_relays_request_of_the_older_kind_with_nothing() {
-    let mut relay = node("relay", "relay", None);
-    relay.relay_ask_again_secs(1);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let a = device_started("a", &relay);
-
-    let answered = || {
-        let log = std::fs::read_to_string(a.log()).unwrap_or_default();
-        log.matches("answered a sync of the older kind with nothing")
-            .count()
-    };
-    // Asked, answered, and asked again within the relay's own pace: three
-    // times in well under the minute that a failure would cost.
-    let began = std::time::Instant::now();
-    wait_for(
-        "the relay asks its device again and again",
-        &[&relay, &a],
-        50,
-        || (answered() >= 3).then_some(()),
-    );
-    assert!(
-        began.elapsed() < std::time::Duration::from_secs(55),
-        "{:?}",
-        began.elapsed()
+        30,
+        || {
+            let log = std::fs::read_to_string(relay.log()).ok()?;
+            let answered = log.matches("answered a sync of the older kind with nothing");
+            (answered.count() == 3).then_some(())
+        },
     );
 }
 
@@ -3135,8 +1850,7 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
 
     // The `messages` object counts what was refused, each message once,
     // and names who fills the channel; nothing of it is in what the level
-    // is worked out from, and no message enters the outbox of the older
-    // kind, which a relay's refusal there would fill.
+    // is worked out from, and nothing waits to be sent.
     let sent = 1 + said_no_room.get();
     let status = wait_for("the status counts every message refused", &[&a], 60, || {
         let status: serde_json::Value =
@@ -3148,7 +1862,6 @@ async fn a_message_that_a_relay_refuses_for_room_leaves_the_level_and_the_line()
     assert_eq!(messages["filled_by"]["label"], "laptop", "{messages}");
     assert_eq!(messages["filled_by"]["entries"], sent, "{messages}");
     assert_eq!(messages["no_place"], false, "{messages}");
-    assert_eq!(status["outbox_refused"], serde_json::json!([]), "{status}");
     assert_eq!(status["outbox_waiting"], 0, "{status}");
     assert_eq!(how_it_stands(&a), before);
 }

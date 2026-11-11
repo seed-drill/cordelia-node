@@ -29,8 +29,7 @@ use cordelia_core::protocol::{
 };
 use cordelia_network::codec::{decode_message, encode_message};
 use cordelia_network::messages::{
-    EntryPulled, Item, ItemHeader, Protocol, PushPayload, SyncChannelListResponse, SyncResponse,
-    WireMessage,
+    EntryPulled, ItemHeader, Protocol, SyncChannelListResponse, SyncResponse, WireMessage,
 };
 
 // ── A counting allocator, by thread ─────────────────────────────────
@@ -417,22 +416,6 @@ const PAGE_OF_HEADERS_MOST: usize = DEFAULT_SYNC_LIMIT as usize
 
 /// The largest frames that nodes send: read, and held.
 fn largest_frames() -> Vec<Frame> {
-    let item = Item {
-        item_id: "ci_x".into(),
-        channel_id: "grp_00000000-0000-4000-8000-000000000000".into(),
-        item_type: "memory".into(),
-        encrypted_blob: vec![0xb0; MAX_MESSAGE_BYTES as usize - 2048],
-        content_hash: vec![0xb1; 32],
-        content_length: 0,
-        author_id: vec![0xb2; 32],
-        signature: vec![0xb3; 64],
-        key_version: 1,
-        published_at: "2026-10-22T10:00:01Z".into(),
-        is_tombstone: false,
-        parent_id: None,
-        slot: None,
-        rev: None,
-    };
     let page = EntryPulled {
         entries: vec![
             serde_bytes::ByteBuf::from(vec![0x5e; MAX_ENTRY_WIRE_BYTES]);
@@ -443,13 +426,6 @@ fn largest_frames() -> Vec<Frame> {
         mark: [1; 8],
     };
     vec![
-        Frame {
-            what: "a push of one item of nearly 1 MB",
-            on: vec![Protocol::ItemPush],
-            bytes: encode_message(&WireMessage::PushPayload(PushPayload { items: vec![item] }))
-                .unwrap(),
-            read: true,
-        },
         Frame {
             what: "a page of 100 headers, each at its bounds",
             on: vec![Protocol::ItemSync],

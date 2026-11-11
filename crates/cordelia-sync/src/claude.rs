@@ -669,12 +669,7 @@ impl ClaudeAdapter {
                 return report;
             }
         };
-        // A device that took this version with what an earlier one held
-        // is not added yet, and says so (decision 2026-10-04 §10.1).
-        let moved_on = lock(state)
-            .and_then(|db| cordelia_api::look::moved_on(&db))
-            .unwrap_or(false);
-        report.publishes_nothing = publishes_nothing(stands, moved_on);
+        report.publishes_nothing = publishes_nothing(stands);
 
         // What to sync: the declared mappings, and nothing else (decision
         // 2026-10-04 §10.1).
@@ -935,13 +930,11 @@ fn stored_personal_channel(state: &AppState) -> Option<PersonalChannel> {
 
 /// Why a device that stands so publishes nothing and takes nothing into
 /// its folders (decision 2026-10-04 §4.3, §4.5, §5.2), or `None` for one
-/// that has applied a statement and syncs. `moved_on` is whether the
-/// device took this version with what an earlier one held: with no
-/// phrase it is then not added yet (§10.1).
-fn publishes_nothing(stands: Stands, moved_on: bool) -> Option<String> {
+/// that has applied a statement and syncs.
+fn publishes_nothing(stands: Stands) -> Option<String> {
     let why = match stands {
         Stands::Applied => return None,
-        Stands::NoPhrase => cordelia_api::look::no_phrase_says(moved_on).1,
+        Stands::NoPhrase => cordelia_api::look::NO_PHRASE,
         // Closed, stored as a fork was (decision 2026-10-24 (removal),
         // rule 10).
         Stands::Stopped(State::Fork) => {
@@ -2886,12 +2879,9 @@ mod tests {
             sync_errors: std::sync::atomic::AtomicU64::new(0),
             peers_hot: std::sync::atomic::AtomicU64::new(0),
             peers_warm: std::sync::atomic::AtomicU64::new(0),
-            push_tx: None,
-            announce_tx: None,
+            networked: false,
             peers: Default::default(),
             relays: Default::default(),
-            outbox_refused: Default::default(),
-            relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
             held: Default::default(),

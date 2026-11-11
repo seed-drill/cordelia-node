@@ -500,12 +500,9 @@ pub(crate) fn state_of(machine: Machine) -> crate::state::AppState {
         sync_errors: Default::default(),
         peers_hot: Default::default(),
         peers_warm: Default::default(),
-        push_tx: None,
-        announce_tx: None,
+        networked: false,
         peers: Default::default(),
         relays: Default::default(),
-        outbox_refused: Default::default(),
-        relist: Default::default(),
         sync_control: Default::default(),
         own_channels: Default::default(),
         held: Default::default(),
@@ -637,7 +634,7 @@ impl Node {
     /// channel.
     pub(crate) fn of(machine: Machine) -> Self {
         let mut state = state_of(machine);
-        state.push_tx = Some(tokio::sync::mpsc::unbounded_channel().0);
+        state.networked = true;
         let state = Arc::new(state);
         let relay: AtTheRelay = Default::default();
         let asked: Asked = Default::default();

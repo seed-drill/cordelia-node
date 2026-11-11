@@ -171,6 +171,8 @@ A device checks the same things on what a relay sends it, and further that the a
 
 ### 2.5 A relay's room, when every channel is new
 
+> No node carries the older kind of channel, and a relay's database holds nothing of it once it starts on a version after 0.2.0-alpha.19: [decision 2026-11-10 (older kind)](2026-11-10-removing-the-older-kind.md), rules 1 and 5.
+
 A relay favours the channels it has held longest: where a new channel's first entry would take it past its cap it takes none of it, a write that would take it past its cap is refused and drops nothing, a relay whose cap has come down drops the newest first, and one address may add only so many channels an hour. After a removal, and at the upgrade, every channel of the person's own is new, and the generation in use is always the newest.
 
 - **The removal itself needs no new channel and no new room** (4.6, 7.2): a relay keeps room for a second change made apart from the first, from when it takes the first, where it has the room; it makes none by dropping channels (decision 2026-10-24, rule 15). The change entry replaces the one before it, at the same size, in a channel the relay already holds. `cordelia devices` shows, for each relay, whether it holds the latest.
@@ -687,6 +689,8 @@ A second recovery does not do the second of those by itself, from a list of keys
 **Recovery has a term.** A relay drops a channel that nobody has used for 90 days. So the phrase brings back what the relays hold for 90 days after the last device of the person's was on, and no longer. A relay is a cache, not a backup: recovery is as good as the relays' copies.
 
 ## 10. The upgrade
+
+> The first start of §10.1 is gone, and only alpha.19's database, or a new one, is taken: [decision 2026-11-10 (older kind)](2026-11-10-removing-the-older-kind.md), rules 4 to 6 and 9.
 
 **Nobody is carried over.** Each device starts alone on this version, from its memory folders, and is added again with the two commands.
 

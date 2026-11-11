@@ -553,11 +553,12 @@ alpha pre-releases are published.
 
 The design of a person's devices in this paper (the person secret, the
 recovery phrase, statements, and channels from their secrets) is the one the
-code has. A relay also carries the channels of the design before it, for one
-version more, so that a device that has not been upgraded is not cut off.
-The upgrade is a new start: each device takes the version, the phrase is
-made on one, and each other is added again (decision record of 2026-10-04,
-section 10).
+code has. **There is one kind of channel, the channel from its secret:** no
+node carries the channels of the design before it, and a node answers what
+a node of `v0.2.0-alpha.19` asks of them with nothing. `v0.2.0-alpha.20`
+takes over a device's or a relay's data from `v0.2.0-alpha.19` only; one
+from an earlier release is refused, and nothing of it is changed (decision
+record of 2026-11-10, older kind).
 
 **A removal fails safe** (decision record of 2026-10-24, removal): a
 device that knows of a removal, on any branch, seals nothing that the
@@ -646,7 +647,7 @@ settlement layer is chosen), is in [`docs/vision.md`](docs/vision.md).
 | Keys a device keeps as removed | 2,048 | `MAX_KNOWN_REMOVED` |
 | What a removed device wrote is cut from | the change's time, less 10 minutes | `REMOVAL_TAKEN_MARGIN_SECS` |
 | One channel at a relay | 16 MB | `MAX_ENTRY_CHANNEL_BYTES_AT_RELAY` |
-| A relay in total, for each kind of channel | 1 GiB unless its operator sets it | `max_storage_bytes` |
+| A relay in total | 1 GiB unless its operator sets it | `max_storage_bytes` |
 | New channels from one address | 256 an hour | `NEW_ENTRY_CHANNELS_PER_ADDRESS_PER_HOUR` |
 | A relay keeps a channel that nobody uses | 90 days | `ENTRY_CHANNEL_UNUSED_DAYS` |
 | A relay, and a device, keep a delete | 90 days from when they stored it | `KEYED_TOMBSTONE_RETENTION_DAYS` |

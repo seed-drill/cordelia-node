@@ -120,7 +120,6 @@ pub struct PeerConnection {
 pub struct ConnectContext {
     pub endpoint: Endpoint,
     pub public_key: [u8; 32],
-    pub channel_ids: Vec<String>,
     pub roles: Vec<String>,
     pub p2p_port: u16,
     /// The configs of a connection with a relay listed by key (decision
@@ -155,8 +154,6 @@ pub struct ConnectionManager {
     endpoint: Endpoint,
     /// Active connections by NodeId.
     connections: HashMap<NodeId, PeerConnection>,
-    /// Our subscribed channel IDs (for handshake digest).
-    channel_ids: Vec<String>,
     /// Our advertised roles.
     roles: Vec<String>,
     /// Our P2P listening port (advertised in handshake).
@@ -172,7 +169,6 @@ impl ConnectionManager {
     pub fn new(
         identity: Arc<NodeIdentity>,
         endpoint: Endpoint,
-        channel_ids: Vec<String>,
         roles: Vec<String>,
         p2p_port: u16,
     ) -> Self {
@@ -187,7 +183,6 @@ impl ConnectionManager {
             identity,
             endpoint,
             connections: HashMap::new(),
-            channel_ids,
             roles,
             p2p_port,
             listed,
@@ -224,11 +219,6 @@ impl ConnectionManager {
         self.connections.get(node_id)
     }
 
-    /// Get mutable peer connection metadata.
-    pub fn get_peer_mut(&mut self, node_id: &NodeId) -> Option<&mut PeerConnection> {
-        self.connections.get_mut(node_id)
-    }
-
     /// Get the QUIC connection for a peer.
     pub fn get_connection(&self, node_id: &NodeId) -> Option<&Connection> {
         self.connections.get(node_id).map(|pc| &pc.conn)
@@ -239,17 +229,11 @@ impl ConnectionManager {
         self.connections.keys().cloned().collect()
     }
 
-    /// Update channel subscriptions (recalculates digest for future handshakes).
-    pub fn update_channels(&mut self, channel_ids: Vec<String>) {
-        self.channel_ids = channel_ids;
-    }
-
     /// Clone the context needed for spawned connect/accept tasks.
     pub fn connect_context(&self) -> ConnectContext {
         ConnectContext {
             endpoint: self.endpoint.clone(),
             public_key: self.identity.public_key(),
-            channel_ids: self.channel_ids.clone(),
             roles: self.roles.clone(),
             p2p_port: self.p2p_port,
             listed: self.listed.clone(),
@@ -341,7 +325,6 @@ impl ConnectionManager {
             handshake::initiate_handshake(
                 &mut stream,
                 &self.identity.public_key(),
-                &self.channel_ids,
                 &self.roles,
                 &peer_node_id,
                 self.p2p_port,
@@ -576,7 +559,6 @@ async fn outbound_on(
             handshake::initiate_handshake(
                 &mut stream,
                 &ctx.public_key,
-                &ctx.channel_ids,
                 &ctx.roles,
                 &peer_node_id,
                 ctx.p2p_port,
@@ -691,7 +673,6 @@ async fn inbound_on(
         handshake::accept_handshake(
             &mut stream,
             &ctx.public_key,
-            &ctx.channel_ids,
             &ctx.roles,
             &peer_node_id,
             ctx.p2p_port,
@@ -813,7 +794,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(120)).await;
             drop(conn);
         });
-        let mgr_a = ConnectionManager::new(id_a.clone(), make_endpoint(&id_a), vec![], vec![], 0);
+        let mgr_a = ConnectionManager::new(id_a.clone(), make_endpoint(&id_a), vec![], 0);
         let began = std::time::Instant::now();
         let dialled = tokio::time::timeout(
             Duration::from_secs(HANDSHAKE_TIMEOUT_SECS + 10),
@@ -838,21 +819,9 @@ mod tests {
         let ep_b = make_endpoint(&id_b);
         let b_addr = ep_b.local_addr().unwrap();
 
-        let mut mgr_a = ConnectionManager::new(
-            id_a.clone(),
-            ep_a,
-            vec!["ch1".into()],
-            vec!["personal".into()],
-            9474,
-        );
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
 
-        let mut mgr_b = ConnectionManager::new(
-            id_b.clone(),
-            ep_b,
-            vec!["ch2".into()],
-            vec!["personal".into()],
-            9474,
-        );
+        let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
         let ep_b_clone = mgr_b.endpoint();
         let ctx_b = mgr_b.connect_context();
 
@@ -871,7 +840,7 @@ mod tests {
         // Check handshake result
         let peer = mgr_a.get_peer(&node_b_id).unwrap();
         assert_eq!(peer.handshake.negotiated_version, 1);
-        assert_eq!(peer.handshake.peer_channel_count, 1);
+        assert_eq!(peer.handshake.peer_channel_count, 0);
         assert_eq!(peer.handshake.peer_roles, vec!["personal"]);
 
         let outcome = accept_task.await.unwrap();
@@ -892,8 +861,8 @@ mod tests {
         let ep_b = make_endpoint(&id_b);
         let b_addr = ep_b.local_addr().unwrap();
 
-        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec![], vec![], 9474);
-        let mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec![], vec![], 9474);
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec![], 9474);
+        let mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec![], 9474);
         let ep_b_clone = mgr_b.endpoint();
         let ctx_b = mgr_b.connect_context();
 
@@ -922,8 +891,8 @@ mod tests {
         let ep_b = make_endpoint(&id_b);
         let b_addr = ep_b.local_addr().unwrap();
 
-        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec![], vec![], 9474);
-        let mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec![], vec![], 9474);
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec![], 9474);
+        let mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec![], 9474);
         let ep_b_clone = mgr_b.endpoint();
         let ctx_b = mgr_b.connect_context();
 
@@ -961,22 +930,10 @@ mod tests {
         let ep_b = make_endpoint(&id_b);
         let b_addr = ep_b.local_addr().unwrap();
 
-        let mut mgr_a = ConnectionManager::new(
-            id_a.clone(),
-            ep_a,
-            vec!["ch1".into()],
-            vec!["personal".into()],
-            9474,
-        );
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
         let ctx_a = mgr_a.connect_context();
 
-        let mgr_b = ConnectionManager::new(
-            id_b.clone(),
-            ep_b,
-            vec!["ch2".into()],
-            vec!["personal".into()],
-            9474,
-        );
+        let mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
         let ep_b_clone = mgr_b.endpoint();
         let ctx_b = mgr_b.connect_context();
 
@@ -1008,21 +965,9 @@ mod tests {
         let b_addr = ep_b.local_addr().unwrap();
         let ep_b_accept = ep_b.clone();
 
-        let mut mgr_a = ConnectionManager::new(
-            id_a.clone(),
-            ep_a,
-            vec!["ch1".into()],
-            vec!["personal".into()],
-            9474,
-        );
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
 
-        let mut mgr_b = ConnectionManager::new(
-            id_b.clone(),
-            ep_b,
-            vec!["ch2".into()],
-            vec!["personal".into()],
-            9474,
-        );
+        let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
         let ctx_b = mgr_b.connect_context();
 
         let accept_task = tokio::spawn(async move {
@@ -1059,10 +1004,8 @@ mod tests {
         let ep_b_accept = ep_b.clone();
         let ep_a = make_endpoint(&id_a);
         let ep_a_moves = ep_a.clone();
-        let mut mgr_a =
-            ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-        let mut mgr_b =
-            ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["relay".into()], 9474);
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+        let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["relay".into()], 9474);
         let ctx_b = mgr_b.connect_context();
         let accept_task = tokio::spawn(async move {
             let incoming = ep_b_accept.accept().await.unwrap();
@@ -1127,15 +1070,14 @@ mod tests {
     #[tokio::test]
     async fn the_connections_open_and_gone_are_counted_as_each_is_made_and_goes() {
         let id_a = make_test_identity();
-        let mut mgr_a =
-            ConnectionManager::new(id_a.clone(), make_endpoint(&id_a), vec![], vec![], 9474);
+        let mut mgr_a = ConnectionManager::new(id_a.clone(), make_endpoint(&id_a), vec![], 9474);
         let counts = Arc::new(ConnectionCounts::default());
         mgr_a.count_into(counts.clone());
         let mut peers = Vec::new();
         let mut accepting = Vec::new();
         for _ in 0..2 {
             let id = make_test_identity();
-            let mgr = ConnectionManager::new(id.clone(), make_endpoint(&id), vec![], vec![], 9474);
+            let mgr = ConnectionManager::new(id.clone(), make_endpoint(&id), vec![], 9474);
             let (endpoint, ctx, addr) = (
                 mgr.endpoint(),
                 mgr.connect_context(),

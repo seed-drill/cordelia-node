@@ -794,17 +794,117 @@ pub fn relay_run_by(bin: PathBuf) -> Node {
     relay
 }
 
-/// The variable that names the binary of the release before messages
-/// between a person's agents (alpha.10): what the messages upgrade test
-/// runs (`.github/workflows/ci.yml`, `VERSION_BEFORE`; TESTING.md).
-pub const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
+/// A relay made, and not started, by the binary at `bin`: a version
+/// before this one ([`node_run_by`]). A test gives it the relays it lists
+/// before it starts it.
+pub fn relay_made_by(bin: PathBuf) -> Node {
+    node_made("relay-before", "relay", &[], Some(bin))
+}
 
-/// The variable that names the binary of the release before shared
-/// channels (alpha.17, at step 20, with messages): the version before of
-/// the shared channel's record, which the relays and devices run now, and
-/// which `shared_e2e.rs` runs as the relay and as a device (`ci.yml`,
-/// `VERSION_BEFORE_SHARED`; decision 2026-10-10 §14).
-pub const BINARY_BEFORE_SHARED: &str = "CORDELIA_TEST_BINARY_BEFORE_SHARED";
+// ── The older kind of channel (decision 2026-11-10 (older kind), rule 7) ──
+
+/// A channel of the older kind: a group, as a relay of alpha.19 holds one.
+pub const OLDER_GROUP: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
+
+/// How many items of the older kind the database of `n` holds, read
+/// while the node runs: none where it has no such table, as a database of
+/// this version has none (decision 2026-11-10 (older kind), rule 5).
+pub fn older_items_held(n: &Node) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(
+        n.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let has_items: bool = db
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'items')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    match has_items {
+        true => db
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap(),
+        false => 0,
+    }
+}
+
+/// Half a stream timeout: what "at once" is to a test that waits on a
+/// node's answer or refusal.
+pub fn at_once() -> Duration {
+    Duration::from_secs(cordelia_core::protocol::STREAM_TIMEOUT_SECS / 2)
+}
+
+/// Ask the node at the other end of `conn` what a node of alpha.19 that
+/// carries the older kind asks, on one stream of a sync (0x05): which
+/// channels it holds, and then a page of `channel` from its start. What it
+/// answered to each, or `None` where it refused, or did not answer
+/// [`at_once`].
+pub async fn asks_a_sync_of_the_older_kind(
+    conn: &quinn::Connection,
+    channel: &str,
+) -> Option<(Vec<String>, cordelia_network::messages::SyncResponse)> {
+    use cordelia_network::codec;
+    use cordelia_network::messages::{SyncChannelListRequest, SyncRequest};
+    let asked = async {
+        let (mut send, mut recv) = conn.open_bi().await.ok()?;
+        codec::write_protocol_byte(&mut send, Protocol::ItemSync)
+            .await
+            .ok()?;
+        let list = WireMessage::SyncChannelListRequest(SyncChannelListRequest {});
+        codec::write_frame(&mut send, &list).await.ok()?;
+        let WireMessage::SyncChannelListResponse(listed) =
+            codec::read_frame(&mut recv, Protocol::ItemSync)
+                .await
+                .ok()?
+        else {
+            return None;
+        };
+        let page = WireMessage::SyncRequest(SyncRequest {
+            channel_id: channel.to_string(),
+            since: None,
+            limit: 100,
+            after_seq: Some(0),
+        });
+        codec::write_frame(&mut send, &page).await.ok()?;
+        let WireMessage::SyncResponse(page) = codec::read_frame(&mut recv, Protocol::ItemSync)
+            .await
+            .ok()?
+        else {
+            return None;
+        };
+        let _ = send.finish();
+        Some((listed.channel_ids, page))
+    };
+    tokio::time::timeout(at_once(), asked).await.ok().flatten()
+}
+
+/// Open a stream of `protocol` on `conn`, and send after the protocol byte
+/// a frame of bytes that is no message: whether the node at the other end
+/// stopped the stream [`at_once`]. A node that carries no channel of the
+/// older kind refuses a push (0x06) or an announcement (0x04) before it
+/// reads what follows the byte.
+pub async fn refuses_at_once(conn: &quinn::Connection, protocol: Protocol) -> bool {
+    use cordelia_network::codec;
+    let (mut send, _recv) = conn.open_bi().await.unwrap();
+    codec::write_protocol_byte(&mut send, protocol)
+        .await
+        .unwrap();
+    let _ = codec::write_raw_frame(&mut send, &[0x5a; 64]).await;
+    matches!(
+        tokio::time::timeout(at_once(), send.stopped()).await,
+        Ok(Ok(Some(_)))
+    )
+}
+
+/// The variable that names the binary of the version before: alpha.19,
+/// the one release this version works beside and takes over from
+/// (decision 2026-11-10 (older kind), rules 4 and 10). The tests that run
+/// it as a relay or a device read it (`.github/workflows/ci.yml`,
+/// `VERSION_BEFORE`; TESTING.md).
+pub const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
 
 /// Whether the tests run in CI, as GitHub says it: `CI` is `true`. A `CI`
 /// set to anything else (`false`, `0`, empty) is not CI.
@@ -829,15 +929,9 @@ pub fn binary_given(var: &str) -> Option<PathBuf> {
     Some(before)
 }
 
-/// The binary of the release before messages ([`BINARY_BEFORE`]).
+/// The binary of the version before ([`BINARY_BEFORE`]).
 pub fn binary_before() -> Option<PathBuf> {
     binary_given(BINARY_BEFORE)
-}
-
-/// The binary of the release before shared channels
-/// ([`BINARY_BEFORE_SHARED`]).
-pub fn binary_before_shared() -> Option<PathBuf> {
-    binary_given(BINARY_BEFORE_SHARED)
 }
 
 fn node_made(
@@ -2121,13 +2215,8 @@ pub fn stand_in_relay() -> StandIn {
     let key = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
-    let manager = connection::ConnectionManager::new(
-        identity,
-        endpoint.clone(),
-        vec![],
-        vec!["relay".into()],
-        port,
-    );
+    let manager =
+        connection::ConnectionManager::new(identity, endpoint.clone(), vec!["relay".into()], port);
     let ctx = manager.connect_context();
     let relay = StandIn {
         port,

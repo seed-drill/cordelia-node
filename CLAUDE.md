@@ -10,16 +10,18 @@ key per device, AES-256-GCM per channel. A person's devices share one secret,
 from which each channel of their own is derived; a recovery phrase of twelve
 words removes a device and recovers. Overview: `WHITEPAPER.md` (v3).
 
-There are two kinds of channel in the code: a channel from its secret
-(decision 2026-10-04), which every device uses, and "the older kind" (a
-random ID, a ring of keys, a list of members), which only a relay still
-carries.
+There is one kind of channel: a channel from its secret (decision
+2026-10-04). "The older kind" (a random ID, a ring of keys, a list of
+members) is gone, with its tables and the first start: a node answers what
+an alpha.19 node asks of it with nothing (decision 2026-11-10 (older kind),
+rule 7). This version takes over only alpha.19's database, or makes a new
+one (rules 4 to 6).
 
 ## Where things are
 
 - `crates/cordelia-core`: shared types, config, errors; `protocol.rs` holds every protocol constant.
 - `crates/cordelia-crypto`: keys and what derives from a secret, the phrase, statements, entries sealed and on the wire, shared channels' cards and shares.
-- `crates/cordelia-storage`: SQLite; `schema.rs` has the numbered steps of the schema.
+- `crates/cordelia-storage`: SQLite; `schema.rs` has the schema: alpha.19's, as one baseline (`baseline.sql`, never edited), and the numbered steps after it.
 - `crates/cordelia-network`: QUIC transport, the codec (framing), the governor, rate limits, the mini-protocols.
 - `crates/cordelia-api`: the local REST API (actix-web) and the logic behind each device command.
 - `crates/cordelia-sync`: the adapter between Claude Code memory folders and channels.
@@ -35,7 +37,7 @@ Module headers that say `Spec: .../specs/<file>.md` mean `docs/specs/<file>.md` 
 
 ## Decision records
 
-Comments cite a record by its date and section or rule: `decision 2026-10-04 §4.6`, `decision 2026-11-06 (joining), rule 6`. Some add a short name: `(memory)`, `(removal)`, `(joining)`. Where two records share a date and no name is given, the subject says which; a bare `decision 2026-10-24` with a rule above 10 is the removal record, and with a lower rule usually the words of a change. In `docs/decisions/`:
+Comments cite a record by its date and section or rule: `decision 2026-10-04 §4.6`, `decision 2026-11-06 (joining), rule 6`. Some add a short name: `(memory)`, `(removal)`, `(joining)`, `(older kind)`. Where two records share a date and no name is given, the subject says which; a bare `decision 2026-10-24` with a rule above 10 is the removal record, and with a lower rule usually the words of a change. In `docs/decisions/`:
 
 - `2026-09-30-agent-memory-sync.md`: the sync adapter, ties, conflict copies, deletes, the index, local history (§4.5b). Its device and key model is replaced by 2026-10-04.
 - `2026-10-04-a-persons-devices.md`: a person's devices, the phrase, statements, channels from their secrets, a relay's rules, removal, recovery, the upgrade. The most cited.
@@ -52,6 +54,7 @@ Comments cite a record by its date and section or rule: `decision 2026-10-04 §4
 - `2026-10-24-the-words-of-a-change.md`: the words of a change, its waits and its relay lines.
 - `2026-10-25-a-persons-hold-on-messages.md`: a person's hold on messages.
 - `2026-11-06-joining-by-pull-request.md` (joining): `.cordelia/members`, `subscribe` in a clone, the node's read of each list.
+- `2026-11-10-removing-the-older-kind.md` (older kind): no node carries the older kind of channel; one baseline for the schema.
 
 The design today is 2026-10-04 with 2026-09-30, and the later records that add to them. Each record's Status line says what is built and what it amends. `2026-11-05` is accepted but not built.
 
@@ -81,7 +84,7 @@ cargo test -p cordelia-node --test devices_e2e        # one test file
 cargo test -p cordelia-network <name> -- --nocapture  # one test, with output
 ```
 
-The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" job runs them. A few tests need the binary of an earlier release (`CORDELIA_TEST_BINARY_BEFORE`, `CORDELIA_TEST_BINARY_BEFORE_SHARED`); without it they pass without running, except in CI. TESTING.md has the rest.
+The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" job runs them. A few tests need the binary of the version before, alpha.19 (`CORDELIA_TEST_BINARY_BEFORE`); without it they pass without running, except in CI. TESTING.md has the rest.
 
 ## Public text
 

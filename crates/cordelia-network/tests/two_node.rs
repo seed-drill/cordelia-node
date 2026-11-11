@@ -1,21 +1,17 @@
 //! Two-node integration test (P2P-12).
 //!
-//! End-to-end test: two nodes connect via QUIC, perform handshake,
-//! exchange channel announcements, sync items, and verify PSK exchange.
+//! End-to-end test: two nodes connect via QUIC, perform handshake, and
+//! keep the connection alive. The mini-protocols of the older kind of
+//! channel are gone (decision 2026-11-10 (older kind), rule 2).
 //!
 //! Spec: seed-drill/specs/network-protocol.md §2-§4
 
 use cordelia_crypto::identity::NodeIdentity;
-use cordelia_network::channel_announce::{self, ChannelAnnounceState, create_signed_descriptor};
 use cordelia_network::codec::read_frame;
 use cordelia_network::connection::{self, ConnectionManager};
-use cordelia_network::item_sync;
 use cordelia_network::keepalive::{self, KeepAliveState};
 use cordelia_network::messages::*;
-use cordelia_network::psk_exchange;
 use cordelia_network::transport;
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::sync::Arc;
 
 fn make_identity() -> Arc<NodeIdentity> {
@@ -38,12 +34,10 @@ async fn test_two_node_connect_and_handshake() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let channels_a = vec!["ch_shared".into(), "ch_only_a".into()];
-    let channels_b = vec!["ch_shared".into(), "ch_only_b".into()];
     let roles = vec!["personal".into()];
 
-    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, channels_a, roles.clone(), 9474);
-    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, channels_b, roles, 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, roles.clone(), 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, roles, 9474);
 
     // B accepts in background
     let ep_b_accept = mgr_b.endpoint();
@@ -140,251 +134,6 @@ async fn test_two_node_keepalive() {
     server.await.unwrap();
 }
 
-/// Two nodes exchange channel announcements and verify intersection.
-#[tokio::test]
-async fn test_two_node_channel_announce() {
-    let id_a = make_identity();
-    let id_b = make_identity();
-
-    let psk = [0xAA; 32];
-    let psk_hash: [u8; 32] = Sha256::digest(psk).into();
-
-    // Create descriptors
-    let desc_shared = create_signed_descriptor(
-        &id_a,
-        "ch_shared",
-        Some("shared-channel"),
-        "open",
-        "realtime",
-        &psk_hash,
-        1,
-        "2026-03-14T10:00:00Z",
-    );
-    let desc_only_a = create_signed_descriptor(
-        &id_a,
-        "ch_only_a",
-        Some("a-only"),
-        "open",
-        "batch",
-        &psk_hash,
-        1,
-        "2026-03-14T10:00:00Z",
-    );
-
-    let ep_a = make_endpoint(&id_a);
-    let ep_b = make_endpoint(&id_b);
-    let b_addr = ep_b.local_addr().unwrap();
-
-    let channels_b = vec!["ch_shared".to_string(), "ch_only_b".to_string()];
-
-    // Server side: receive channel announcements
-    let server = tokio::spawn({
-        let channels_b = channels_b.clone();
-        async move {
-            let incoming = ep_b.accept().await.unwrap();
-            let conn = incoming.await.unwrap();
-            let (_send, mut recv) = conn.accept_bi().await.unwrap();
-
-            let mut state = ChannelAnnounceState::new(false);
-            let known = HashMap::new();
-
-            // Read two ChannelJoined messages
-            let msg1 = read_frame(&mut recv, Protocol::ChannelAnnounce)
-                .await
-                .unwrap();
-            if let WireMessage::ChannelJoined(cj) = msg1 {
-                channel_announce::handle_channel_joined(&mut state, &cj, &channels_b, &known)
-                    .unwrap();
-            }
-
-            let msg2 = read_frame(&mut recv, Protocol::ChannelAnnounce)
-                .await
-                .unwrap();
-            if let WireMessage::ChannelJoined(cj) = msg2 {
-                channel_announce::handle_channel_joined(&mut state, &cj, &channels_b, &known)
-                    .unwrap();
-            }
-
-            // Verify intersection
-            assert_eq!(state.peer_channels.len(), 2);
-            assert_eq!(state.shared_channels, vec!["ch_shared"]);
-
-            conn.close(0u32.into(), b"done");
-            state
-        }
-    });
-
-    let conn_a = ep_a.connect(b_addr, "cordelia").unwrap().await.unwrap();
-    let (mut send, _recv) = conn_a.open_bi().await.unwrap();
-
-    // Send channel announcements
-    channel_announce::send_channel_joined(&mut send, "ch_shared", &desc_shared)
-        .await
-        .unwrap();
-    channel_announce::send_channel_joined(&mut send, "ch_only_a", &desc_only_a)
-        .await
-        .unwrap();
-
-    let state = server.await.unwrap();
-    assert_eq!(state.shared_channels.len(), 1);
-    assert_eq!(state.shared_channels[0], "ch_shared");
-
-    conn_a.close(0u32.into(), b"done");
-}
-
-/// Two nodes perform item-sync: request headers, fetch missing items.
-#[tokio::test]
-async fn test_two_node_item_sync() {
-    let id_a = make_identity();
-    let id_b = make_identity();
-
-    let ep_a = make_endpoint(&id_a);
-    let ep_b = make_endpoint(&id_b);
-    let b_addr = ep_b.local_addr().unwrap();
-
-    let blob = vec![0xFF; 128];
-    let hash: Vec<u8> = Sha256::digest(&blob).to_vec();
-
-    let test_item = Item {
-        item_id: "ci_test_sync_001".into(),
-        channel_id: "ch_shared".into(),
-        item_type: "message".into(),
-        encrypted_blob: blob.clone(),
-        content_hash: hash.clone(),
-        content_length: 128,
-        author_id: id_a.public_key().to_vec(),
-        signature: vec![0xBB; 64],
-        key_version: 1,
-        published_at: "2026-03-14T10:30:00Z".into(),
-        is_tombstone: false,
-        parent_id: None,
-        slot: None,
-        rev: None,
-    };
-
-    let test_header = ItemHeader {
-        item_id: "ci_test_sync_001".into(),
-        channel_id: "ch_shared".into(),
-        item_type: "message".into(),
-        content_hash: hash.clone(),
-        author_id: id_a.public_key().to_vec(),
-        signature: vec![0xBB; 64],
-        key_version: 1,
-        published_at: "2026-03-14T10:30:00Z".into(),
-        is_tombstone: false,
-        parent_id: None,
-        slot: None,
-        rev: None,
-    };
-
-    // Server: handle sync request + fetch
-    let server = tokio::spawn({
-        let test_header = test_header.clone();
-        let test_item = test_item.clone();
-        async move {
-            let incoming = ep_b.accept().await.unwrap();
-            let conn = incoming.await.unwrap();
-            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-            let mut stream = tokio::io::join(&mut recv, &mut send);
-
-            // Handle sync request
-            item_sync::handle_sync_request(&mut stream, |ch, _since, _limit| {
-                assert_eq!(ch, "ch_shared");
-                (vec![test_header], false)
-            })
-            .await
-            .unwrap();
-
-            // Handle fetch request
-            item_sync::handle_fetch_request(&mut stream, |ids| {
-                assert_eq!(ids, &["ci_test_sync_001"]);
-                vec![test_item]
-            })
-            .await
-            .unwrap();
-
-            let _ = conn.closed().await;
-        }
-    });
-
-    let conn_a = ep_a.connect(b_addr, "cordelia").unwrap().await.unwrap();
-    let (mut send, mut recv) = conn_a.open_bi().await.unwrap();
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-
-    // Sync
-    let sync_resp = item_sync::send_sync_request(&mut stream, "ch_shared", None, 100)
-        .await
-        .unwrap();
-    assert_eq!(sync_resp.items.len(), 1);
-    assert_eq!(sync_resp.items[0].item_id, "ci_test_sync_001");
-
-    // Determine what to fetch
-    let known = HashMap::new();
-    let to_fetch = item_sync::compute_fetch_list(&sync_resp.items, &known);
-    assert_eq!(to_fetch, vec!["ci_test_sync_001"]);
-
-    // Fetch
-    item_sync::send_fetch_request(&mut stream, &to_fetch)
-        .await
-        .unwrap();
-    let items = item_sync::read_fetch_response(&mut stream).await.unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].item_id, "ci_test_sync_001");
-    assert!(item_sync::verify_content_hash(&items[0]));
-
-    conn_a.close(0u32.into(), b"done");
-    server.await.unwrap();
-}
-
-/// Two nodes perform PSK exchange.
-#[tokio::test]
-async fn test_two_node_psk_exchange() {
-    let id_a = make_identity();
-    let id_b = make_identity();
-
-    let ep_a = make_endpoint(&id_a);
-    let ep_b = make_endpoint(&id_b);
-    let b_addr = ep_b.local_addr().unwrap();
-
-    let fake_ecies = vec![0xEE; 92]; // Simulated ECIES envelope
-
-    // Server: handle PSK request
-    let server = tokio::spawn({
-        let fake_ecies = fake_ecies.clone();
-        async move {
-            let incoming = ep_b.accept().await.unwrap();
-            let conn = incoming.await.unwrap();
-            let (mut send, mut recv) = conn.accept_bi().await.unwrap();
-            let mut stream = tokio::io::join(&mut recv, &mut send);
-
-            psk_exchange::handle_psk_request(&mut stream, |ch, xpk| {
-                assert_eq!(ch, "ch_open");
-                assert_eq!(xpk.len(), 32);
-                psk_exchange::psk_ok(fake_ecies, 1)
-            })
-            .await
-            .unwrap();
-
-            let _ = conn.closed().await;
-        }
-    });
-
-    let conn_a = ep_a.connect(b_addr, "cordelia").unwrap().await.unwrap();
-    let (mut send, mut recv) = conn_a.open_bi().await.unwrap();
-    let mut stream = tokio::io::join(&mut recv, &mut send);
-
-    let xpk = id_a.x25519_public_key();
-    let resp = psk_exchange::request_psk(&mut stream, "ch_open", &xpk)
-        .await
-        .unwrap();
-    assert_eq!(resp.status, "ok");
-    assert_eq!(resp.ecies_envelope.unwrap().len(), 92);
-    assert_eq!(resp.key_version.unwrap(), 1);
-
-    conn_a.close(0u32.into(), b"done");
-    server.await.unwrap();
-}
-
 /// T4-01 (HIGH): Reconnect after disconnect.
 #[tokio::test]
 async fn test_two_node_reconnect_after_disconnect() {
@@ -396,10 +145,8 @@ async fn test_two_node_reconnect_after_disconnect() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -438,45 +185,19 @@ async fn test_two_node_reconnect_after_disconnect() {
 }
 
 /// T4-02 (MEDIUM): Multi-protocol lifecycle on one QUIC connection.
-/// Handshake -> channel announce -> keepalive ping, all on separate streams.
+/// Handshake -> keepalive ping, on separate streams.
 #[tokio::test]
 async fn test_two_node_full_lifecycle() {
     let id_a = make_identity();
     let id_b = make_identity();
-
-    let psk = [0xAA; 32];
-    let psk_hash: [u8; 32] = Sha256::digest(psk).into();
-
-    let desc = channel_announce::create_signed_descriptor(
-        &id_a,
-        "ch_shared",
-        Some("shared"),
-        "open",
-        "realtime",
-        &psk_hash,
-        1,
-        "2026-03-14T12:00:00Z",
-    );
 
     let ep_a = make_endpoint(&id_a);
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
     // Connect + handshake via ConnectionManager
-    let mut mgr_a = ConnectionManager::new(
-        id_a.clone(),
-        ep_a,
-        vec!["ch_shared".into()],
-        vec!["personal".into()],
-        9474,
-    );
-    let mut mgr_b = ConnectionManager::new(
-        id_b.clone(),
-        ep_b,
-        vec!["ch_shared".into()],
-        vec!["personal".into()],
-        9474,
-    );
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -492,23 +213,11 @@ async fn test_two_node_full_lifecycle() {
     let outcome = accept_task.await.unwrap();
     mgr_b.register(outcome).unwrap();
 
-    // Step 2: Channel announce on a new QUIC stream
     let conn_a = mgr_a.get_connection(&node_b_id).unwrap().clone();
-    let (mut send_ann, _) = conn_a.open_bi().await.unwrap();
-    channel_announce::send_channel_joined(&mut send_ann, "ch_shared", &desc)
-        .await
-        .unwrap();
-
-    // B reads the announcement
     let node_a_id = cordelia_core::NodeId(id_a.public_key());
     let conn_b = mgr_b.get_connection(&node_a_id).unwrap().clone();
-    let (_, mut recv_ann) = conn_b.accept_bi().await.unwrap();
-    let msg = read_frame(&mut recv_ann, Protocol::ChannelAnnounce)
-        .await
-        .unwrap();
-    assert!(matches!(msg, WireMessage::ChannelJoined(_)));
 
-    // Step 3: Keepalive on another stream (parallel with announce stream)
+    // Step 2: Keepalive on another stream
     let (mut send_ka, mut recv_ka) = conn_a.open_bi().await.unwrap();
     cordelia_network::codec::write_protocol_byte(&mut send_ka, Protocol::KeepAlive)
         .await
@@ -535,7 +244,7 @@ async fn test_two_node_full_lifecycle() {
     let pong_msg = read_frame(&mut recv_ka, Protocol::KeepAlive).await.unwrap();
     assert!(matches!(pong_msg, WireMessage::Pong(_)));
 
-    // All three protocols worked on separate streams of the same QUIC connection
+    // Both protocols worked on separate streams of the same QUIC connection
     mgr_a.shutdown();
 }
 
@@ -556,7 +265,6 @@ async fn test_chaos_disconnect_during_handshake() {
     let ctx_b = connection::ConnectContext {
         endpoint: ep_b.clone(),
         public_key: id_b.public_key(),
-        channel_ids: vec![],
         roles: vec!["personal".into()],
         p2p_port: 9474,
         listed: None,
@@ -598,10 +306,8 @@ async fn test_chaos_disconnect_during_sync() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -673,10 +379,8 @@ async fn test_stress_concurrent_streams() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -760,10 +464,8 @@ async fn test_incoming_handshake_timeout() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();
@@ -861,10 +563,8 @@ async fn test_shutdown_and_wait() {
     let ep_b = make_endpoint(&id_b);
     let b_addr = ep_b.local_addr().unwrap();
 
-    let mut mgr_a =
-        ConnectionManager::new(id_a.clone(), ep_a, vec![], vec!["personal".into()], 9474);
-    let mut mgr_b =
-        ConnectionManager::new(id_b.clone(), ep_b, vec![], vec!["personal".into()], 9474);
+    let mut mgr_a = ConnectionManager::new(id_a.clone(), ep_a, vec!["personal".into()], 9474);
+    let mut mgr_b = ConnectionManager::new(id_b.clone(), ep_b, vec!["personal".into()], 9474);
 
     let ep_b_accept = mgr_b.endpoint();
     let ctx_b = mgr_b.connect_context();

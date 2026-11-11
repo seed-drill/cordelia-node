@@ -16,8 +16,8 @@
 > restarts the node (`CORDELIA_NO_RESTART=1` leaves the node as it is). Relays
 > are run from [`deploy/relay/`](../../deploy/relay/)
 > ([decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md) §4.6).
-> The upgrade to this version, the copy that a device makes at its first
-> start on it, and how to go back, are in §10.
+> The upgrade to this version, which takes over only a data directory that
+> 0.2.0-alpha.19 left, is in §10.5.
 
 ---
 
@@ -187,19 +187,20 @@ Node is running. Install SDK: npm install @seeddrill/cordelia
 > **v1 status.** In this version the data directory of a personal node
 > holds `config.toml`, `identity.key`, `node-token`, `cordelia.db`,
 > `history/` (local history, mode 0700), and `node.lock` (mode 0600, empty:
-> the file that a running node holds its lock on, §10.5). It holds no `channel-keys/` file
-> once the first start on this version is done: the keys of a device's
-> channels are derived from the person secret, which is in the database.
-> After an upgrade it also holds `before-<version>/` (mode 0700), the copy of
-> §10.5. A relay keeps `channel-keys/` for the older kind.
+> the file that a running node holds its lock on, §10.5). No channel has a
+> key file: the keys of a device's channels are derived from the person
+> secret, which is in the database. A folder `channel-keys/`, empty or with
+> the key files of an earlier version, and folders `before-<version>` that
+> an earlier version's first start made, are read by nothing, and a person
+> may remove them (decision 2026-11-10 (older kind), rule 9; §10.5).
 >
 > **The data directory itself is mode 0700, and `config.toml` in it 0600.**
-> `cordelia init`, `cordelia swarm-init` and the install script make them
-> so. One that is there already is set to 0700, with the configuration file
-> in it to 0600, only where others than its owner and its group can read,
-> write or enter it: by `init`, the install script and a node that starts,
-> and each says so, the node once in its log. A directory shared with its
-> group on purpose is left as it is (configuration.md §5.4).
+> `cordelia init` and the install script make them so. One that is there
+> already is set to 0700, with the configuration file in it to 0600, only
+> where others than its owner and its group can read, write or enter it:
+> by `init`, the install script and a node that starts, and each says so,
+> the node once in its log. A directory shared with its group on purpose
+> is left as it is (configuration.md §5.4).
 
 ### 2.4 Idempotency
 
@@ -359,12 +360,12 @@ Phase 4: device management UI, selective revocation via key rotation.
 > | `cordelia sync map <folder> [name] [--home]`, `cordelia sync unmap <folder or name>` | Sync Claude's memory for a folder under a name, and stop. `--home` maps the home directory itself | |
 > | `cordelia sync home on\|off` | Map the home directory, or unmap it | |
 > | `cordelia sync off` | Stop syncing | |
-> | `cordelia sync status [--seen]` | Show what syncs, what was found and what your other devices sync. `--seen` shows the notice of the folders that stopped syncing once more, and puts it away | |
+> | `cordelia sync status` | Show what syncs, what was found and what your other devices sync | |
 > | `cordelia sync carry [name]` | Bring into the channels of the last change what your devices that count had sent to the relays before it, in each generation that this device left in the last 90 days; with no name, for every name this device holds | |
 > | `cordelia sync carry <name> --from [<label or six words>]` | Take what a removed device signed there, in the generations that this device left. `--from` is given once for each device, which it names by its label or by the first six words of its key's fingerprint, in quotes. With no device after it, it lists the removed keys that signed there, takes nothing and asks nothing: a key whose versions the new channel holds already, all of them, is marked "already brought back". Before its second yes it says that the text which a version replaces is kept beside the file as a conflict copy, and that the status shows a conflict until that copy is deleted | With a device named: twice a yes at most, and then the phrase |
 > | `cordelia sync carry <name> --phrase` | Read the generations whose secret this device never held, and take what your devices that count signed there. `--from` and `--phrase` together are refused | Yes, and the phrase |
 > | `cordelia history [<name or folder>] [--removed] [--since <time>]`, `cordelia history show <id>`, `cordelia history drop`, `cordelia restore <id>...` | Local history: the versions that sync replaced or removed here, printing one, removing kept versions, and putting versions back | |
-> | `cordelia peers`, `cordelia channels`, `cordelia stats` | Connected peers; the names this device holds (on a node of another role, the channels of the older kind in which its own key is a member); what the node stores, as counts | |
+> | `cordelia peers`, `cordelia channels`, `cordelia stats` | Connected peers; the names this device holds (on a relay, how many channels it holds); what the node stores, as counts | |
 >
 > - **A command that asks at a terminal refuses when its input is not one,**
 >   before it asks or does anything. A yes is the word `yes`.
@@ -390,9 +391,9 @@ Phase 4: device management UI, selective revocation via key rotation.
 > - **A command that opens the database itself asks the data directory's
 >   lock first,** the one a node holds for as long as it runs (§10.5), and
 >   asks the port only where the lock tells nothing (below): opening runs
->   the schema's steps, and would step the database under the node. Where a node holds the lock, `cordelia
->   swarm-init`, and `cordelia init` where it makes the database or is given
->   `--force`, open nothing and name the command that stops the node;
+>   the schema's steps, and would step the database under the node. Where a
+>   node holds the lock, `cordelia init`, where it makes the database or is
+>   given `--force`, opens nothing and names the command that stops the node;
 >   `cordelia stats`, `cordelia channels` and what `cordelia status` says of
 >   what is stored read the database for reading only, with no step run,
 >   and only where it is at their own schema version: at another the node
@@ -487,17 +488,14 @@ JSON output (`--json`):
 >   follows has a secret that a removed device holds, decision 2026-10-24
 >   (removal), rule 10; or was answered with a change that it could not
 >   open or apply); the node
->   is held up (its first start on this version has not succeeded, or its
->   database is from a later version: §10.5). With sync on: it follows no
->   phrase, where something is mapped ("not added yet" after the upgrade,
->   "no recovery phrase yet" on a new install); sync errors; a cycle that
->   has stalled; conflict files; files too large; and folders that stopped
->   syncing (the notice of the first start, while it names a folder that no
->   mapping syncs, and until `cordelia sync status --seen`). No phrase is red on every device after this upgrade that has
->   sync on and a folder mapped, and on every new install with a folder
->   mapped, until a person acts: nothing it holds syncs until then. A device
->   that is not to be added turns sync off. With nothing mapped, the notice,
->   errors and a stalled cycle are red all the same.
+>   is held up (its database is from a later version, or from before
+>   0.2.0-alpha.19: §10.5). With sync on: it follows no phrase, where
+>   something is mapped ("no recovery phrase yet"); sync errors; a cycle
+>   that has stalled; conflict files; and files too large. No phrase is red
+>   on every device that has sync on and a folder mapped, until a person
+>   acts: nothing it holds syncs until then. A device that is not to be
+>   added turns sync off. With nothing mapped, errors and a stalled cycle
+>   are red all the same.
 > - **Amber, of a person's devices,** wherever this device follows a phrase,
 >   with sync on or off and with or without a folder mapped: a removal that
 >   some device has not applied, for seven days from when this device
@@ -510,8 +508,8 @@ JSON output (`--json`):
 >   (`cordelia devices --clear`) or a statement lists it, as a renewal does
 >   (`cordelia renew`); a device that has said it left.
 > - **Amber, of folders,** with sync on, something mapped and a report of a
->   cycle: no relay connected for more than five minutes; entries that relays
->   keep refusing; a running node that is not the version the command is; a
+>   cycle: no relay connected for more than five minutes; a running node
+>   that is not the version the command is; a
 >   relay that has been connected for more than five minutes and does not
 >   hold the latest change; a relay that has refused something for room, or
 >   for the address's allowance, in the last twenty minutes; names that a
@@ -521,8 +519,8 @@ JSON output (`--json`):
 >   names not yet sent, for more than five minutes.
 > - **The state is as it was, whatever the level,** for a panel that draws
 >   from it alone. With sync on, something mapped and no phrase it is
->   `attention`, and so it is on a device that has stopped, on a node that
->   is held up, and with the notice. The line and the level never disagree:
+>   `attention`, and so it is on a device that has stopped, and on a node
+>   that is held up. The line and the level never disagree:
 >   where a state is `attention` and there is no level, the line and the bar
 >   draw as the state alone has them.
 > - `--waybar` gives an icon, a tooltip and a class: the state, then the
@@ -578,30 +576,31 @@ System channels (prefixed `__`) are hidden by default. Use `--all` to include th
 > **v1 status.** On a personal node `cordelia channels` lists the names that
 > the device holds, each with how many entries it stores of the name's
 > channel and when it stored the last. A device holds a name once it follows
-> a recovery phrase and a folder is mapped to it.
+> a recovery phrase and a folder is mapped to it. On a relay it says how
+> many channels the relay holds (decision 2026-11-10 (older kind), rule 3).
 
 ### 4.6 `cordelia stats`
 
 > **v1 status.** `cordelia stats` prints counts only: the database's size;
-> what is stored and its encrypted size (entries of its own channels on a
-> personal node, items of the older kind on a relay); the names held, or the
-> channels subscribed; the distinct peers seen in the last day and week; and
-> the channels active in the last day and week. **On a relay it also prints
-> the room of each kind of channel, each against its cap,** which is
-> `max_storage_bytes` for both (decision 2026-10-04 §2.5):
+> the entries stored and their encrypted size, counted on a relay as a
+> device counts them (decision 2026-11-10 (older kind), rule 3); the names
+> held, or the channels a relay holds; the distinct peers seen in the last
+> day and week; and the channels active in the last day and week. **On a
+> relay it also prints its room against its cap,** `max_storage_bytes`
+> (decision 2026-10-04 §2.5):
 >
 > ```
-> Storage:          <in use> in use of <allowed> allowed, by channels of the older kind
->                   <in use> in use of <allowed> allowed, by channels from their secrets (<n> held, <m> entries)
+> Storage:          <in use> in use of <allowed> allowed, by channels from their secrets (<n> held, <m> entries)
 > ```
 >
-> The first line is what the items of the older kind are counted at (each
-> its content and 1 KB); the second is what the entries of the channels from
-> their secrets are counted at, with how many such channels the relay holds
-> and how many entries. Neither kind is counted against the other's cap.
-> `--json` gives the same for tools: `storage_used_bytes` and
-> `storage_max_bytes` for the older kind, and under `entries` the same two
-> with `channels_held`, `entries_stored` and `content_bytes_stored`.
+> That is what the entries of the channels from their secrets are counted
+> at, with how many such channels the relay holds and how many entries.
+> `--json` gives the same for tools: `storage_max_bytes`, and under
+> `entries` `storage_used_bytes` and `storage_max_bytes` with
+> `channels_held`, `entries_stored` and `content_bytes_stored`. The room of
+> the older kind is gone with it, and so is the `storage_used_bytes` at the
+> top of `--json`, which counted that room (decision 2026-11-10 (older
+> kind), rule 3).
 
 ```
 $ cordelia stats
@@ -655,7 +654,6 @@ max_storage_bytes = 1073741824         # 1 GB default local storage limit
 [network]
 listen_addr = "0.0.0.0:9474"          # P2P listen address (UDP, QUIC)
 role = "personal"                      # "personal" | "bootnode" | "relay" | "keeper"
-push_policy = "subscribers_only"       # "subscribers_only" | "pull_only" (personal nodes only)
 bootnodes = [
     "boot1.cordelia.seeddrill.ai:9474",
     "boot2.cordelia.seeddrill.ai:9474",
@@ -706,7 +704,7 @@ CLI flags  >  Environment variables  >  config.toml  >  Compiled defaults
 ### 5.4 Security Constraints
 
 - `api.bind_address` MUST be `127.0.0.1` or `::1` (configuration.md SS2.9). With any other value the node refuses to start, and says why. This is a hard security boundary (network-protocol.md §12.2).
-- Key files (`~/.cordelia/identity.key`, `~/.cordelia/node-token`, `~/.cordelia/channel-keys/*.key`) MUST have mode 0600. The node MUST warn on startup if permissions are too open and SHOULD refuse to start if key files are world-readable (mode & 0044 != 0).
+- Key files (`~/.cordelia/identity.key`, `~/.cordelia/node-token`) MUST have mode 0600. The node MUST warn on startup if permissions are too open and SHOULD refuse to start if key files are world-readable (mode & 0044 != 0).
 
 ---
 
@@ -931,8 +929,8 @@ SPOs running Cardano nodes already have Prometheus + Grafana. The Cordelia dashb
 > **v1 status.** What a person keeps is the **recovery phrase**: twelve
 > words, written down when `cordelia phrase` shows them. A device's key file
 > is that device's alone and is not copied to another: a machine that is
-> lost is replaced, and its key removed. The files under `channel-keys/` are
-> of the older kind, and a personal node has none. §9.2 to §9.4 below are of
+> lost is replaced, and its key removed. No node reads a file under
+> `channel-keys/`: they were of the older kind. §9.1 to §9.4 below are of
 > the design before; what stands in their place:
 >
 > - **A device is lost, and another remains:** `cordelia remove-device
@@ -1080,14 +1078,17 @@ restarted) name the same commands.
 > restarts a node that is running as the service it set up, and waits until
 > the node says that it is the new version. A node and a command that find
 > the database at a later schema version than their own name both versions
-> and change nothing. §10.5 is the upgrade to this version, which is a new
-> start, and how to go back from it.
+> and change nothing; one from before 0.2.0-alpha.19 they refuse likewise.
+> §10.5 is the upgrade to this version, from alpha.19 only, and how to go
+> back from it.
 
 ### 10.4 Rollback
 
-> **v1 status.** After an upgrade to this version, go back by §10.5: it puts
-> the database back as well, and has each step. The short way below is for
-> an upgrade that stepped no database.
+> **v1 status.** The upgrade to this version runs step 34 on the database,
+> and alpha.19 then refuses it as one from a later version, changing
+> nothing: going back needs a copy of the data directory made before the
+> upgrade (§10.5). The short way below is for an upgrade that stepped no
+> database.
 
 If an upgrade causes issues:
 
@@ -1104,236 +1105,76 @@ launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # macOS
 
 **Database rollback caveat:** If the new version applied a schema migration, rolling back the binary may fail if the old version doesn't understand the new schema. Schema migrations are designed to be forward-compatible where possible (additive columns, not destructive). If a migration is not forward-compatible, the release notes will state this explicitly.
 
-### 10.5 The Upgrade to This Version, the Copy, and Going Back
+### 10.5 The Upgrade to This Version
 
-> **v1 status.** Decision 2026-10-04 §10 and §10.1.
+> **v1 status.** Decision 2026-11-10 (older kind), rules 4 to 6 and 9. The
+> upgrade of decision 2026-10-04 §10 (nobody carried over, and the first
+> start on that version, with its copy into `before-<version>` and the way
+> back by that copy) was an earlier version's, and is gone from this one.
+> What this section said of it is at
+> [c3cc5756](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/operations.md).
 
-**Nobody is carried over.** Each device takes this version, starts alone
-from its memory folders, and is added again with the two commands. No
-device is handed a secret on the strength of what it held before, and there
-is one phrase, made once.
+**From 0.2.0-alpha.19 only.** This version takes over a data directory that
+0.2.0-alpha.19 left (schema step 33), or makes a new one. A device or a
+relay on alpha.19 takes it as it takes any release (§10.2). It keeps its
+key, its phrase, its settings, its mappings, what each folder had agreed,
+and local history. A device of this version works beside an alpha.19 relay,
+and an alpha.19 device beside a relay of this version (rule 4). Upgrade a
+relay first, then the devices. Relays that list each other take this
+version together: an alpha.19 relay that lists one of this version is
+answered with nothing when it asks for the older kind of channel (rule 8).
 
-**The order:**
+**When it starts on alpha.19's database,** it runs one step of the schema,
+step 34 (data-formats.md §5.2). The step drops the tables of the older kind
+of channel, which no node carries, and what an earlier version's first
+start kept. On a relay that held many items of the older kind it may take
+seconds; the log says how long (`applied schema step 34`, in ms). The file
+keeps its size.
 
-1. **Bring every device into step first, on the version it has.** Each is
-   on, and has synced, so that every memory folder holds what the others
-   hold. This is the one thing the person has to see to: a file that was
-   deleted on one device and is still on another comes back, and a device
-   that was behind brings its old files as its own.
-2. **The relays take this version.** A relay carries the new channels and,
-   for one version, the older ones as they are, each kind within a cap of
-   its own (`deploy/relay/README.md`).
-3. **Each device takes this version.** It keeps its key, its memory folders
-   and its mappings. Its folders forget what they had agreed. It follows no
-   phrase and publishes nothing, and its status says "not added yet".
-4. **On one device, at a terminal, run `cordelia phrase`:** the device whose
-   memory is the most up to date, since what it holds is then the channels'
-   earliest version of each file.
-5. **Add each other device:** `cordelia add-device` on the first, `cordelia
-   accept` on the other. Its folders meet the channels as on any first sync:
-   a file with the same text on both is agreed; where a file differs, this
-   device's text is kept beside the file as a copy and the file takes the
-   channel's; a file only here is published; `MEMORY.md` is merged.
+**A data directory is one node's.** A node takes a lock on the directory (a
+file in it, `node.lock`) before it opens the database. A second node that
+is started on the same directory, whatever ports it was given, says that
+another is running there, changes nothing, and stops, once it has found the
+lock held for half a second (`NODE_LOCK_WAIT_MS`): a command that asks the
+lock holds it for a moment only.
 
-Between taking this version and being added, a device can be joined to any
-set of devices by `accept` and one yes: add the devices soon after they are
-upgraded. `cordelia renew`, run once they are added, puts them in a list that
-the person has looked at; without it, the first removal asks about every
-device but the first.
+**A database from before 0.2.0-alpha.19 is refused** (rule 6): one at
+schema steps 1 to 32. It is read before any pragma, and nothing in it is
+changed. A personal node stays up, held up (`held.by` `earlier_database`),
+over a database of its own in memory, and answers `GET` requests only; its
+status line says "memory not syncing: the database is from before
+0.2.0-alpha.19". A relay or a bootnode does not start. A command that
+opens the database says the same. The log names the step ("the database is
+at schema step N"). The words, with the data directory in place of
+`<data directory>`:
 
-**What the upgrade does not carry:** what is in the older channels and in no
-folder (the last writes of a device that is gone, and what had been handed
-through the local API and not yet sent); removals made before the upgrade,
-which are forgotten (the first change removes nobody: a device that was
-removed before the upgrade is no device after it, since nothing lists it,
-and its key is not refused either, so it is not to be added again: to have
-the key refused, remove it once by key after the upgrade, with `cordelia
-remove-device <key>`, which asks a typed `refuse` for a key that the device
-knows nothing of); a file
-of more than 60 KB, where the limit was 64 KB; and the named and direct
-channels that the local API of the version before could make. A device left on the
-version before goes on in the older channels alone, for as long as the
-relays carry them, which is one version.
+```text
+This database is from a Cordelia before 0.2.0-alpha.19. This version cannot open it, and changed nothing.
+To keep it: install 0.2.0-alpha.19 (`CORDELIA_VERSION=v0.2.0-alpha.19`, for the install command or a relay's image), start it once, then install this version again.
+Or start afresh: move <data directory> aside and run `cordelia init`. Then run `cordelia phrase` on your first device, add this one from another of yours, or run `cordelia recover`.
+```
 
-**The first start.** A personal node that holds anything of the version
-before makes a copy and then one step, when it starts (data-formats.md §12):
+**A database from a later version is refused.** A personal node stays up,
+held up, and its status names both versions: it answers every `GET`, its
+status among them, and no other request, and changes nothing. A relay or a
+bootnode says the same, and stops. A command that opens the database itself
+is refused likewise.
 
-- **A data directory is one node's.** A node takes a lock on the directory
-  (a file in it, `node.lock`) before it opens the database. A second node
-  that is started on the same directory, whatever ports it was given, says
-  that another is running there, changes nothing, and stops, once it has
-  found the lock held for half a second (`NODE_LOCK_WAIT_MS`): a command
-  that asks the lock holds it for a moment only.
-- **The copy** is a folder beside the database, `before-<version>`: the
-  database as its opening left it (the schema's steps have added tables, and
-  have changed no row that was there), and the key files of the older
-  channels. It is made and checked before anything is emptied. The node
-  answers while it is made: its status says that a copy is being made.
-- **Where the copy cannot be made** (no room, no leave to write), the step
-  is not taken. The room on the volume is compared with what the copy needs
-  before anything is written, and what was written of a copy that failed is
-  removed at once. The node stays up, runs no cycle and no pass, refuses
-  every request that changes anything but one that turns sync off, and its
-  status says why, with the room that is needed and the room there is. It
-  tries again by itself and needs no restart: five seconds after the first
-  try that failed, and twice as long after each further one, up to ten
-  minutes. A copy that was made is used again where only the step failed.
-- **The step** empties what the device held of the older kind, and every
-  folder forgets what it had agreed. The device's key, its settings, its
-  mappings and local history stay.
-- **The key files of the older channels are removed after the step.** At a
-  later start one is removed only where a `before-` folder holds a file of
-  that name with the same bytes: any other is left where it is, and
-  `cordelia status` says how many (`Key files:`).
-- **A device whose scope was "everything found" is told what stopped:** the
-  folders that synced without a mapping sync no longer, and `cordelia sync
-  status` names them, each with the command that maps it. Only what is
-  mapped syncs: `cordelia sync map` each folder that is to go on, and
-  `cordelia sync status --seen` puts the notice away.
-- **The copy holds what the device held:** sealed entries, the keys of
-  channels that relays keep for up to 90 days more, and also text in the
-  clear (removed lines of the index, the names and paths of memory files).
-  It is beside memory folders that hold the same memory in the clear. It can
-  be deleted once you are content.
-- **A database from a later version is refused.** A personal node stays up,
-  held up, and its status names both versions: it answers every `GET`, its
-  status among them, and no other request, and changes nothing. A relay or a bootnode says
-  the same, and stops. A command that opens the database itself is refused
-  likewise.
+**Folders that an earlier version left.** A folder `channel-keys/`, and
+folders `before-<version>` (some named with `.partial` or `.earlier` at the
+end), that an earlier version's first start made, are read by nothing
+(rule 9). You may remove them once you are content. A `before-` folder is a
+copy of what the device held before that version: keys of the older
+channels, and text in the clear (removed lines of the index, the names and
+paths of memory files).
 
-**Going back.** Nine steps, in this order. Each gives the command for Linux
-(systemd) and for macOS (launchd), and says why. The paths are those of a
-node that the install script set up: its data directory is `~/.cordelia`.
-
-The steps name two versions:
-
-- `<version>` is the version that made the copy. `ls ~/.cordelia` shows the
-  copy's folder, `before-<version>`.
-- `<the version before>` is the version you go back to: the one this
-  machine ran before it took `<version>`. `~/.cordelia/bin/cordelia.prev
-  --version` prints it, unless the install script has run again since with
-  another version.
-
-1. **Check that the copy is there.** Do this before you stop or change
-   anything.
-
-   ```bash
-   ls ~/.cordelia/before-<version>/cordelia.db
-   ```
-
-   If the file is not there, stop. There is nothing to go back by, and you
-   have changed nothing. A machine has no copy if its first install was this
-   version, if you deleted the copy, or if the copy could not be made.
-
-   If `ls ~/.cordelia` shows more than one `before-` folder, use the one
-   named exactly `before-<version>`. Do not use one whose name ends in
-   `.partial` or `.earlier`. A `.partial` folder is a copy that was not
-   finished. An `.earlier` folder is an older copy, which a later start kept
-   when it made a new one.
-
-2. **Stop the service.** The next steps replace the database, and a node
-   that runs would write to it meanwhile.
-
-   ```bash
-   systemctl --user stop cordelia                                        # Linux
-   launchctl unload ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist   # macOS
-   ```
-
-3. **Put the older binary back.** The install script kept it beside the new
-   one, as `cordelia.prev`, when it installed this version. Check its
-   version first.
-
-   ```bash
-   ~/.cordelia/bin/cordelia.prev --version      # the version before?
-   cp ~/.cordelia/bin/cordelia.prev ~/.cordelia/bin/cordelia.new
-   mv -f ~/.cordelia/bin/cordelia.new ~/.cordelia/bin/cordelia
-   ```
-
-   Copy it beside the binary and then move it into place, as the install
-   script does. A plain copy over `cordelia` fails while a `cordelia`
-   process runs from that file.
-
-   If `cordelia.prev` is not the version before, install the version before
-   by its number instead:
-
-   ```bash
-   curl -fsSL https://seeddrill.ai/install.sh | CORDELIA_VERSION=v<the version before> sh
-   ```
-
-   **Do not run the "Next steps" that it prints.** They would start the older
-   version on the database that this version stepped, and it would stop with
-   an error. Go on with step 4.
-
-4. **Move the database and its two side files aside.** Do not delete them:
-   if the copy in step 5 fails, you have lost nothing.
-
-   ```bash
-   mkdir -p ~/cordelia-stepped-<version>
-   mv ~/.cordelia/cordelia.db* ~/cordelia-stepped-<version>/
-   ```
-
-   The pattern matches the database and whichever of its side files are
-   there (`cordelia.db-wal` and `cordelia.db-shm`). A node that stopped
-   cleanly leaves neither. They must not stay: the node would replay them
-   over the database that you put back. You can delete
-   `~/cordelia-stepped-<version>` once the older version runs (step 9).
-
-5. **Copy the database and the older channels' key files back from the
-   copy.** Put each where the node keeps it: the database at
-   `~/.cordelia/cordelia.db`, and the key files in
-   `~/.cordelia/channel-keys/`. The older version reads both.
-
-   ```bash
-   cp -p ~/.cordelia/before-<version>/cordelia.db ~/.cordelia/cordelia.db
-   cp -p ~/.cordelia/before-<version>/channel-keys/* ~/.cordelia/channel-keys/
-   ```
-
-   Run the second command only if the copy has a `channel-keys` folder. It
-   has one only where the device had key files.
-
-6. **Move the copy out of the data directory,** to your home directory, say.
-   It is what you went back by. A later upgrade then makes a fresh copy, and
-   does not rename this one or put another in its place.
-
-   ```bash
-   mv ~/.cordelia/before-<version> ~/cordelia-before-<version>
-   ```
-
-7. **On Linux, have the service manager read the service's file again.** The
-   install script writes that file anew each time it runs. (launchd reads it
-   at the next step.)
-
-   ```bash
-   systemctl --user daemon-reload                                        # Linux
-   ```
-
-8. **Start the service.** It runs the older binary, on the database that
-   you put back.
-
-   ```bash
-   systemctl --user start cordelia                                       # Linux
-   launchctl load ~/Library/LaunchAgents/ai.seeddrill.cordelia.plist     # macOS
-   ```
-
-9. **Check.** The status names the version, and says whether the node runs.
-
-   ```bash
-   cordelia status
-   ```
-
-   Once it runs the older version, you can delete
-   `~/cordelia-stepped-<version>`.
-
-What that does not give back: the device's key and its configuration file
-were never in the copy, so a device that was given a new key since cannot go
-back. The mappings and the sync settings are rows of the database, so they
-are as the copy has them, and those made since are in the database that was
-moved aside. And the memory folders are as they are now, so what changed in
-them since is published into the older channels as edits.
-
-A version from before this one that is started by mistake on a database
-which this version stepped stops with words that say the database was moved
-on and where the copy is.
+**Going back.** This version makes no copy. Once it has run step 34,
+alpha.19 refuses the database as one from a later version, and changes
+nothing. To be able to go back, copy the data directory, with the node
+stopped, before you install this version. Going back is then the older
+binary (§10.4) and that copy put back in place of the data directory, with
+the node stopped. A release before 0.2.0-alpha.9 that is started on the
+database by mistake stops at its first write, with SQLite's words.
 
 ---
 
@@ -1349,14 +1190,15 @@ on and where the copy is.
 | `Error: database locked` | Stale lock from crashed process | Remove `~/.cordelia/cordelia.db-wal` and `cordelia.db-shm`, restart |
 | `Error: config parse error` | Invalid TOML | Check `config.toml` syntax. Run `cordelia init` to regenerate |
 
-> **v1 status.** Four more, of this version:
+> **v1 status.** Five more, of this version:
 >
 > | What is said | Why | What to do |
 > |--------------|-----|------------|
 > | `the node's API cannot listen at ...: Address already in use` | The port is taken: a node is probably running already, as the service. The message says so, and names the command that restarts the service on this system | `cordelia status` says whether one runs. Restart the service; do not start a second node |
 > | `another node is running on the data directory ...` | A data directory is one node's: the node that runs holds the lock on it | Stop that node first, or give this one a directory of its own. Nothing was changed |
-> | `the database at ... is from a later version of Cordelia than this one` | The database was stepped by a later version | Install the later version again; or put back the copy that it made, as §10.5 says |
-> | `cordelia status` says `Held up:` | The first start on this version is not done (the copy could not be made), or the database is from a later version | For the first: make the room that the status names. The node tries again by itself |
+> | `the database at ... is from a later version of Cordelia than this one` | The database was stepped by a later version | Install the later version again; or put back a copy of the data directory made before that upgrade |
+> | `This database is from a Cordelia before 0.2.0-alpha.19` | This version takes over only alpha.19's database (§10.5) | Install 0.2.0-alpha.19, start it once, then this version again; or start afresh, as the message says |
+> | `cordelia status` says `Held up:` | The database is from a later version, or from before 0.2.0-alpha.19 | As the two rows above |
 
 ### 11.2 No Peers Connecting
 
@@ -1416,7 +1258,6 @@ Pre-deployment verification:
 | Key file permissions | `ls -la ~/.cordelia/identity.key` | `-rw-------` |
 | Token file permissions | `ls -la ~/.cordelia/node-token` | `-rw-------` |
 | API bind address | `grep bind_address ~/.cordelia/config.toml` | `127.0.0.1` |
-| Channel key permissions | `ls -la ~/.cordelia/channel-keys/` | `-rw-------` per file |
 | Data directory permissions | `ls -ld ~/.cordelia` | `drwx------` |
 | No secrets in logs | `grep -rE "cordelia_sk\|[0-9a-f]{64}" ~/.cordelia/logs/` | No matches (catches Bech32 private keys and hex-encoded 64-char strings such as tokens/PSKs; manual review recommended for base64-encoded secrets) |
 | Binary checksum | `sha256sum ~/.cordelia/bin/cordelia` | Matches release checksum |

@@ -1820,9 +1820,8 @@ impl DeviceEntries {
     /// dropped, and the write-ahead log is truncated, whatever the
     /// device's state: applied or not, with sync on or off.
     ///
-    /// A node that is held up does nothing: before its first start on
-    /// this version is done its store holds no message, and over a
-    /// database from a later version it writes nothing.
+    /// A node that is held up does nothing: over a database from a later
+    /// version, or from before alpha.19, it writes nothing.
     pub fn messages_hourly(&self) {
         // Its takes of the lock end with the checkpoint, and are of its
         // kind (decision 2026-10-22 §1.2).
@@ -4958,12 +4957,9 @@ mod tests {
             sync_errors: Default::default(),
             peers_hot: Default::default(),
             peers_warm: Default::default(),
-            push_tx: None,
-            announce_tx: None,
+            networked: false,
             peers: Default::default(),
             relays: Default::default(),
-            outbox_refused: Default::default(),
-            relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
             held: Default::default(),
@@ -5165,7 +5161,7 @@ mod tests {
         let device = DeviceEntries::new(state.clone(), Clock::system());
         state
             .held
-            .hold(cordelia_api::state::Held::FirstStart("a test".into()));
+            .hold(cordelia_api::state::Held::LaterDatabase("a test".into()));
         device.messages_hourly();
         assert_eq!(held(), 1);
         state.held.release();

@@ -75,12 +75,9 @@ impl Device {
             sync_errors: AtomicU64::new(0),
             peers_hot: AtomicU64::new(0),
             peers_warm: AtomicU64::new(0),
-            push_tx: None,
-            announce_tx: None,
+            networked: false,
             peers: Default::default(),
             relays: Default::default(),
-            outbox_refused: Default::default(),
-            relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
             held: Default::default(),
@@ -1116,21 +1113,14 @@ fn nothing_syncs_until_a_folder_is_mapped() {
 
 /// Only what is mapped syncs (decision 2026-10-04 §10.1). A folder that
 /// is found and not mapped is never a target of a cycle, whatever is
-/// stored of a scope, of exclusions and of a switch for home memory: the
-/// adapter reads none of them. The device holds no name for it, says of
-/// it to no other device that it syncs it, and publishes nothing of it.
+/// stored of exclusions and of a switch for home memory: the adapter
+/// reads neither. The device holds no name for it, says of it to no
+/// other device that it syncs it, and publishes nothing of it.
 #[test]
 fn what_is_found_is_never_synced_whatever_is_stored_of_a_scope() {
-    for scope in [Some("on"), Some("off"), None] {
+    for scope in [Some("on"), None] {
         let mut a = Device::new().with_phrase().sync_on();
-        match scope {
-            Some(scope) => set_meta(&a, meta::SYNC_CLAUDE_ALL, scope),
-            None => {
-                let db = a.state.db.lock().unwrap();
-                meta::remove(&db, meta::SYNC_CLAUDE_ALL).unwrap();
-            }
-        }
-        // What an earlier version stored, each way round: read by nothing.
+        // What an earlier version stored, or nothing: read by nothing.
         if scope == Some("on") {
             set_meta(&a, meta::SYNC_CLAUDE_HOME, "off");
             set_meta(&a, meta::SYNC_CLAUDE_EXCLUDE, r#"["lab-notes"]"#);

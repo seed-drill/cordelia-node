@@ -116,7 +116,6 @@ impl Device {
         let manager = connection::ConnectionManager::new(
             for_transport,
             endpoint,
-            vec![],
             vec!["personal".into()],
             port,
         );
@@ -132,12 +131,9 @@ impl Device {
             sync_errors: AtomicU64::new(0),
             peers_hot: AtomicU64::new(0),
             peers_warm: AtomicU64::new(0),
-            push_tx: network.then(|| tokio::sync::mpsc::unbounded_channel().0),
-            announce_tx: None,
+            networked: network,
             peers: Default::default(),
             relays: Default::default(),
-            outbox_refused: Default::default(),
-            relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
             held: Default::default(),
@@ -775,7 +771,6 @@ impl StandIn {
         let manager = connection::ConnectionManager::new(
             identity,
             endpoint.clone(),
-            vec![],
             roles.iter().map(|role| role.to_string()).collect(),
             port,
         );
@@ -5880,7 +5875,7 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
     // A node that is held up reads nothing.
     a.state
         .held
-        .hold(cordelia_api::state::Held::FirstStart("not done".into()));
+        .hold(cordelia_api::state::Held::LaterDatabase("later".into()));
     let read = reads_left(&a, old, by_secret()).await;
     assert!(matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("held up")));
     a.state.held.release();
@@ -7025,7 +7020,7 @@ async fn a_read_with_places_of_its_own_reads_on_under_its_id_from_the_place_it_r
 
     // A node that is held up reads nothing (decision 2026-10-04 §10.1):
     // no read begins, and a round asks no relay.
-    let held = cordelia_api::state::Held::FirstStart("the copy failed".into());
+    let held = cordelia_api::state::Held::EarlierDatabase("from before".into());
     device.state.held.hold(held);
     assert_eq!(begins_a_read(&device, notes, lasts).await, None);
     assert!(reads_on(&device, &read, lasts).await);
@@ -8726,7 +8721,7 @@ async fn a_device_sweeps_the_deletes_it_has_held_for_90_days() {
     assert_eq!(device.holds_of(&channel).len(), 2, "swept twice in a day");
     // A day after it last swept.
     device.clock.run_ahead(hour);
-    let held = Held::FirstStart("the first start on this version is not done".into());
+    let held = Held::EarlierDatabase("the database is from before 0.2.0-alpha.19".into());
     device.state.held.hold(held);
     device.engine.sweep_deletes();
     assert_eq!(device.holds_of(&channel).len(), 2, "swept while held up");
@@ -9051,7 +9046,7 @@ async fn a_device_that_is_held_up_makes_no_pass() {
     device.writes("notes", "a.md", "a text");
     device.connects_to("relay", relay.port, relay.key).await;
 
-    let held = Held::FirstStart("the first start on this version is not done".into());
+    let held = Held::EarlierDatabase("the database is from before 0.2.0-alpha.19".into());
     device.state.held.hold(held);
     device.passes().await;
     device.sends().await;

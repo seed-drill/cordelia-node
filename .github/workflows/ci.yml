@@ -8,22 +8,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # The newest release before messages between a person's own agents: the
-  # upgrade test runs its node beside this build's (decision 2026-10-09
-  # §9.2). The SHA-256 of that release's cordelia-linux-amd64, as this
-  # repository names it: the download is checked against it, and not
-  # against a checksum taken from the same release. The two change
-  # together, at a release, and only so.
-  VERSION_BEFORE: v0.2.0-alpha.10
-  VERSION_BEFORE_SHA256: cf53f451bf939bb218f3ee10cf9ac25c27e71536fa56d44a6d1feaf2d88ee5a8
-  # The release before shared channels, at step 20 of the schema, with
-  # messages: the version before of the shared channel's record (decision
-  # 2026-10-10 §14), which the relays and devices run now. The tests of
-  # that record run it as a relay and as a device (shared_e2e.rs). Its
-  # SHA-256 is pinned here as above, taken from the release's own
-  # cordelia-linux-amd64.sha256 and checked against a download.
-  VERSION_BEFORE_SHARED: v0.2.0-alpha.17
-  VERSION_BEFORE_SHARED_SHA256: 58fe2242347ecff805ca4528cb8aee65c4af93b1cace3a3c06978cd247d1f611
+  # The version before: alpha.19, the one release that this version works
+  # beside and takes over from (decision 2026-11-10 (older kind), rules 4
+  # and 10). The tests that run it as a relay or a device beside this
+  # build read it. The SHA-256 of that release's cordelia-linux-amd64, as
+  # this repository names it, worked out from the binary and checked
+  # against the release's own .sha256: the download is checked against it,
+  # and not against a checksum taken from the same release. The two change
+  # together, and only so.
+  VERSION_BEFORE: v0.2.0-alpha.19
+  VERSION_BEFORE_SHA256: e7f15e59c089a3d839ad77e25b21abd174cf99c1896c21f474822d765ede4bd6
 
 jobs:
   test:
@@ -57,8 +51,8 @@ jobs:
 
       - name: Download the version before
         # The Linux binary of that release, checked against the hash that
-        # this file names; the upgrade test reads where it is from
-        # CORDELIA_TEST_BINARY_BEFORE, and fails in CI without it.
+        # this file names; the tests that run it read where it is from
+        # CORDELIA_TEST_BINARY_BEFORE, and fail in CI without it.
         run: |
           dir="$RUNNER_TEMP/before"
           mkdir -p "$dir"
@@ -67,18 +61,6 @@ jobs:
           echo "$VERSION_BEFORE_SHA256  $dir/cordelia-linux-amd64" | sha256sum -c -
           chmod +x "$dir/cordelia-linux-amd64"
           echo "CORDELIA_TEST_BINARY_BEFORE=$dir/cordelia-linux-amd64" >> "$GITHUB_ENV"
-
-      - name: Download the version before shared channels
-        # As above, for the tests of shared channels, which read it from
-        # CORDELIA_TEST_BINARY_BEFORE_SHARED and fail in CI without it.
-        run: |
-          dir="$RUNNER_TEMP/before-shared"
-          mkdir -p "$dir"
-          base="https://github.com/${{ github.repository }}/releases/download/$VERSION_BEFORE_SHARED"
-          curl -fsSL -o "$dir/cordelia-linux-amd64" "$base/cordelia-linux-amd64"
-          echo "$VERSION_BEFORE_SHARED_SHA256  $dir/cordelia-linux-amd64" | sha256sum -c -
-          chmod +x "$dir/cordelia-linux-amd64"
-          echo "CORDELIA_TEST_BINARY_BEFORE_SHARED=$dir/cordelia-linux-amd64" >> "$GITHUB_ENV"
 
       - name: Test
         run: cargo test --all

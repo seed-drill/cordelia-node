@@ -77,28 +77,6 @@ pub fn prune_sightings(conn: &Connection, before: i64) -> Result<usize, Cordelia
     .map_err(storage)
 }
 
-/// Channels that received an item in the last `days` days.
-pub fn channels_active(conn: &Connection, days: u32) -> Result<u64, CordeliaError> {
-    conn.query_row(
-        "SELECT COUNT(DISTINCT channel_id) FROM items
-         WHERE received_at >= datetime('now', ?1)",
-        params![format!("-{days} days")],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|n| n as u64)
-    .map_err(storage)
-}
-
-/// What this node stores: `(items, bytes of encrypted content)`.
-pub fn stored(conn: &Connection) -> Result<(u64, u64), CordeliaError> {
-    conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(content_length), 0) FROM items",
-        [],
-        |row| Ok((row.get::<_, i64>(0)? as u64, row.get::<_, i64>(1)? as u64)),
-    )
-    .map_err(storage)
-}
-
 /// The usage counts at `now` (unix seconds). Peers exclude relays.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
@@ -149,10 +127,10 @@ pub fn stored_of_channel(
     .map_err(storage)
 }
 
-/// The usage counts of a device at `now` (unix seconds): the peers it
-/// has seen, and what it stores of the channels of its own. Nothing of
-/// the older kind of channel is counted: a personal node carries none
-/// (decision 2026-10-04 §10), whatever its database once held.
+/// The usage counts of a node at `now` (unix seconds): the peers it has
+/// seen, and what it stores of channels from their secrets, as a device
+/// counts it. A relay counts so too (decision 2026-11-10 (older kind),
+/// rule 3).
 pub fn snapshot_of_a_device(conn: &Connection, now: i64) -> Result<Usage, CordeliaError> {
     let (relays_1d, peers_1d) = peers_seen(conn, now - 86_400)?;
     let (relays_7d, peers_7d) = peers_seen(conn, now - 7 * 86_400)?;
@@ -164,22 +142,6 @@ pub fn snapshot_of_a_device(conn: &Connection, now: i64) -> Result<Usage, Cordel
         relays_7d,
         channels_active_1d: own_channels_active(conn, now - 86_400)?,
         channels_active_7d: own_channels_active(conn, now - 7 * 86_400)?,
-        items_stored,
-        bytes_stored,
-    })
-}
-
-pub fn snapshot(conn: &Connection, now: i64) -> Result<Usage, CordeliaError> {
-    let (relays_1d, peers_1d) = peers_seen(conn, now - 86_400)?;
-    let (relays_7d, peers_7d) = peers_seen(conn, now - 7 * 86_400)?;
-    let (items_stored, bytes_stored) = stored(conn)?;
-    Ok(Usage {
-        peers_1d,
-        relays_1d,
-        peers_7d,
-        relays_7d,
-        channels_active_1d: channels_active(conn, 1)?,
-        channels_active_7d: channels_active(conn, 7)?,
         items_stored,
         bytes_stored,
     })
@@ -206,7 +168,7 @@ mod tests {
 
         assert_eq!(peers_seen(&conn, now - DAY).unwrap(), (1, 1));
         assert_eq!(peers_seen(&conn, now - 7 * DAY).unwrap(), (1, 2));
-        let usage = snapshot(&conn, now).unwrap();
+        let usage = snapshot_of_a_device(&conn, now).unwrap();
         assert_eq!((usage.peers_1d, usage.peers_7d), (1, 2));
         assert_eq!((usage.relays_1d, usage.relays_7d), (1, 1));
 
@@ -217,25 +179,11 @@ mod tests {
 
     /// A device's usage counts are of the channels of its own: the
     /// entries it stores and the bytes of their content, and the channels
-    /// in which it stored one lately. Nothing that the table of the
-    /// older kind holds is counted (decision 2026-10-04 §10).
+    /// in which it stored one lately.
     #[test]
-    fn test_a_device_counts_the_entries_of_its_own_channels_and_nothing_older() {
+    fn test_a_device_counts_the_entries_of_its_own_channels() {
         let conn = db::open_in_memory().unwrap();
         let now = 1_800_000_000;
-        // Of the older kind: a channel with an item, which is not a
-        // device's to count.
-        conn.execute_batch(
-            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                                   created_at, updated_at)
-             VALUES ('grp_a', 'group', 'realtime', 'invite_only', X'AA', '2026-01-01',
-                     '2026-01-01');
-             INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
-                                content_hash, signature, encrypted_blob, content_length)
-             VALUES ('ci_1', 'grp_a', X'AA', 'memory', '2026-01-01', X'01', X'02', X'0303', 2);",
-        )
-        .unwrap();
-        assert_eq!(stored(&conn).unwrap(), (1, 2));
         assert_eq!(stored_of_own(&conn).unwrap(), (0, 0));
         let none = snapshot_of_a_device(&conn, now).unwrap();
         assert_eq!((none.items_stored, none.bytes_stored), (0, 0));
@@ -272,10 +220,7 @@ mod tests {
         let own = snapshot_of_a_device(&conn, now).unwrap();
         assert_eq!((own.items_stored, own.bytes_stored), (3, 9));
         assert_eq!((own.channels_active_1d, own.channels_active_7d), (1, 2));
-        // A node that carries the older kind counts that kind, as it did.
-        let older = snapshot(&conn, now).unwrap();
-        assert_eq!((older.items_stored, older.bytes_stored), (1, 2));
-        // Both count the peers that were seen.
+        // It counts the peers that were seen.
         record_sighting(&conn, &[4; 32], true, now - 50).unwrap();
         assert_eq!(snapshot_of_a_device(&conn, now).unwrap().relays_1d, 1);
     }
@@ -284,8 +229,8 @@ mod tests {
     fn test_empty_node_counts_nothing() {
         let conn = db::open_in_memory().unwrap();
         assert_eq!(peers_seen(&conn, 0).unwrap(), (0, 0));
-        assert_eq!(channels_active(&conn, 7).unwrap(), 0);
-        assert_eq!(stored(&conn).unwrap(), (0, 0));
+        assert_eq!(own_channels_active(&conn, 0).unwrap(), 0);
+        assert_eq!(stored_of_own(&conn).unwrap(), (0, 0));
     }
 
     /// The peers due at one note are written in one transaction, with the

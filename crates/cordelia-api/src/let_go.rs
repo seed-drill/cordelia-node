@@ -227,7 +227,7 @@ pub async fn round(state: &AppState, name: &str, read: Option<ReadId>) -> Result
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::BadRequest(format!("{name} is not mapped on this device")))?;
     // A node with no network reads no relay.
-    if state.push_tx.is_none() {
+    if !state.networked {
         return Err(ApiError::Conflict(not_read_says(name)));
     }
     let reads = state.own_channels.reads();

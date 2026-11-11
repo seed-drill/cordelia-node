@@ -85,7 +85,7 @@ Self-declared metadata published to the entity's keepers. No proof. Like a bio b
 
 Display names are not globally unique -- they are labels, not identifiers. Entity type is metadata, not protocol logic. Entity types: `human`, `agent`, `keeper`, `service`, `org` (identity ADR SS3).
 
-Profile metadata is stored in the entity's personal channel (`__personal`, channel-naming.md SS2.1).
+Profile metadata is stored in the entity's personal channel (`__personal`, [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) SS2.1).
 
 ### 2.3 Layer 2: Verification (Phase 3)
 
@@ -149,12 +149,11 @@ The X25519 key is derived on demand and never persisted separately (ecies-envelo
 > | What it follows: the phrase's public key, the statement key, the ID of the phrase's channel; the statement applied; the change entry of the change it follows, and of each head it sets aside (decision 2026-10-24 (removal), rule 1); the keys it knows to be removed | The database (`person`, `person_change_entries`) | The statement key lets its holder read every later statement: who the person's devices are, by key and label |
 > | The recovery phrase | Nowhere on any device. Written down by the person | CRITICAL: a copy reads everything, through every removal, with no sign; without it no device can be removed and nothing recovered |
 >
-> A personal node has no file under `channel-keys/` from its first start on
-> this version: no channel of its own has a key file. (A key file of an older
-> channel that no copy beside the database holds is left where it is, and
-> `cordelia status` says how many: operations.md §10.5.) The move of the
-> device's key and the person secret to the operating system's keystore is
-> not in this version.
+> No channel has a key file: no node reads a file under `channel-keys/`. A
+> folder `channel-keys/` or `before-<version>` that an earlier version left
+> is read by nothing, and a person may remove it (decision 2026-11-10 (older
+> kind), rule 9; operations.md §10.5). The move of the device's key and the
+> person secret to the operating system's keystore is not in this version.
 
 The data directory `~/.cordelia/` has mode 0700. The node MUST warn on startup if key file permissions are too open and SHOULD refuse to start if key files are world-readable (mode & 0044 != 0) (operations.md SS5.4).
 
@@ -356,7 +355,7 @@ Each published item carries an `author_id` (Ed25519 public key, raw 32 bytes) in
 
 ### 7.3 DM Channel Derivation
 
-Bilateral DM channels are derived deterministically from a sorted pair of Ed25519 public keys (channel-naming.md SS4.2, identity ADR SS7):
+Bilateral DM channels are derived deterministically from a sorted pair of Ed25519 public keys ([channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) SS4.2, identity ADR SS7):
 
 ```
 sorted_keys = sort([pk_a, pk_b])                          -- lexicographic sort of raw 32-byte keys
@@ -373,9 +372,9 @@ Both parties compute the same channel ID regardless of who initiates. The `dm_` 
 - Private: only the two parties know the DM exists (not registered, not listed)
 - Immutable membership: exactly 2 keys, cannot add or remove members
 
-**Note:** The identity ADR (decisions/2026-03-10-identity-privacy-model.md SS7) uses a simplified formula without domain separation: `SHA-256(sort([key_a, key_b]))`. This spec and channel-naming.md supersede the ADR with the domain-separated form (`cordelia:dm:` prefix), which prevents cross-protocol hash collisions. The authoritative formula is the one shown above.
+**Note:** The identity ADR (decisions/2026-03-10-identity-privacy-model.md SS7) uses a simplified formula without domain separation: `SHA-256(sort([key_a, key_b]))`. This spec and [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) supersede the ADR with the domain-separated form (`cordelia:dm:` prefix), which prevents cross-protocol hash collisions. The authoritative formula is the one shown above.
 
-Test vector in channel-naming.md SS7.2 (vector 5).
+Test vector in [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) SS7.2 (vector 5).
 
 ### 7.4 Personal Channel
 
@@ -385,7 +384,7 @@ The system channel `__personal` is created per entity at `cordelia init` (ecies-
 channel_id = hex(SHA-256("cordelia:channel:__personal:" + hex(ed25519_pubkey)))
 ```
 
-Domain-separated, entity-specific: each entity's personal channel has a unique ID (channel-naming.md SS2.1). The personal channel stores:
+Domain-separated, entity-specific: each entity's personal channel has a unique ID ([channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) SS2.1). The personal channel stores:
 - L1-equivalent personal memory (`item_type = "kv"` for key-value pairs, `memory:*` prefix for typed memory items per [memory-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/memory-model.md) SS10)
 - PSK envelope distribution (`item_type = "psk_envelope"`)
 - Agent attestation storage (`item_type = "attestation"`)
@@ -621,7 +620,7 @@ Test vectors in ecies-envelope-encryption.md SS3.6, SS8.5.
 |-------|---------------|-------------|
 | **Phase 1** | Layer 0 (Cryptographic Identity) | Keypair generation, `cordelia init`, device pairing, bearer token auth, entity ID derivation, Bech32 encoding, operator attestation data structure, `cordelia provision --agent` |
 | **Phase 2** | Layer 1 (Profile) | Self-declared profile metadata (name, type, about) in personal channel. Domain and GitHub verification proofs. Verification display in CLI. |
-| **Phase 3** | Layer 2 (Verification) | W3C VC alignment, ADA Handle verification, Calidus SPO identity, credential-based channel access policy enforcement, context-required disclosure. On-chain entity registration (shared namespace with channels, channel-naming.md SS8). |
+| **Phase 3** | Layer 2 (Verification) | W3C VC alignment, ADA Handle verification, Calidus SPO identity, credential-based channel access policy enforcement, context-required disclosure. On-chain entity registration (shared namespace with channels, [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) SS8). |
 | **Phase 4** | Layer 3 (Reputation) | Trust scoring, peer attestations, oracle-published metrics, Shamir key recovery, per-device derived keys, selective device revocation. Formal "Proof of Agency" specification (potential CIP/RFC). |
 
 ---
@@ -633,7 +632,7 @@ Test vectors in ecies-envelope-encryption.md SS3.6, SS8.5.
 | specs/ecies-envelope-encryption.md | SS2 (key types), SS3 (Bech32), SS2.5 (bearer token), SS11 (item signatures), SS14 (init flow) |
 | specs/network-protocol.md | SS2.2 (TLS identity binding), SS4.1 (handshake identity), SS4.4.6 (channel descriptor creator_id), SS4.8 (pairing protocol) |
 | specs/operations.md | SS2 (cordelia init), SS3 (device pairing), SS5.4 (security constraints), SS9 (backup and recovery) |
-| specs/channel-naming.md | SS2.1 (personal channel), SS4.2 (DM derivation) |
+| [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) | SS2.1 (personal channel), SS4.2 (DM derivation) |
 | specs/channels-api.md | SS1.3 (authentication), SS3.4 (author field) |
 | [decisions/2026-03-10-identity-privacy-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-10-identity-privacy-model.md) | SS2 (4-layer model), SS3 (entity types), SS4 (operator-agent chain), SS5 (Proof of Agency), SS7 (DMs), SS8 (namespace), SS9 (privacy principles) |
 | specs/glossary.md | Entity, Node, Peer, Creator, Author, Agent definitions |

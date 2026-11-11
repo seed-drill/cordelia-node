@@ -6,10 +6,13 @@
 
 > **v1 status.** The terms added by v1 are in the last two sections. The
 > personal channel, relay eviction and the economics terms below describe the
-> pre-v1 design. The section "v1 terms (2026-09-30)" is of the
+> pre-v1 design. The sections from "Channels" to "Replication" are of the
+> older kind of channel, which is gone with its routes and its
+> mini-protocols ([decision record of 2026-11-10 (older kind)](../decisions/2026-11-10-removing-the-older-kind.md),
+> rules 1, 2 and 7). The section "v1 terms (2026-09-30)" is of the
 > [decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md):
 > where it speaks of devices, membership and keys it describes the older
-> kind of channel, which a relay carries for one version more. The section
+> kind of channel too. The section
 > "A person's devices" is of the
 > [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md),
 > which replaces that model.
@@ -60,11 +63,11 @@
 
 - **Item**: A published unit of content, encrypted with channel PSK, including metadata, signature, and ciphertext blob.
 - **Publish**: Write an item to a channel via the API. Developer-facing term; internal protocol uses "write".
-- **Listen**: Retrieve items from a channel via cursor-based polling (REST Phase 1, SSE Phase 2).
-- **Item-Push**: Unsolicited sender-initiated item delivery for realtime channels via QUIC.
-- **Item-Sync**: Periodic pull-based synchronisation via hash reconciliation (anti-entropy).
-- **Channel-Announce**: P2P mini-protocol for broadcasting channel descriptor changes.
-- **PSK-Exchange**: P2P request-response mini-protocol for distributing PSKs via ECIES envelope.
+- **Listen**: Retrieve items from a channel via cursor-based polling (REST Phase 1, SSE Phase 2). Gone (decision 2026-11-10 (older kind), rule 2).
+- **Item-Push**: Unsolicited sender-initiated item delivery for realtime channels via QUIC. Gone: every node refuses its stream (decision 2026-11-10 (older kind), rule 7).
+- **Item-Sync**: Periodic pull-based synchronisation via hash reconciliation (anti-entropy). Every node answers it with nothing (decision 2026-11-10 (older kind), rule 7).
+- **Channel-Announce**: P2P mini-protocol for broadcasting channel descriptor changes. Gone: every node refuses its stream (decision 2026-11-10 (older kind), rule 7).
+- **PSK-Exchange**: P2P request-response mini-protocol for distributing PSKs via ECIES envelope. Gone (decision 2026-11-10 (older kind), rule 2).
 - **Tombstone**: Soft-delete marker (`is_tombstone=true`), propagated via replication.
 - **Store-and-forward**: Relay behaviour: receive items, store in LRU cache, re-push to peers.
 - **LRU eviction**: Least-Recently-Used cache policy on relays, triggered at 10GB storage cap.
@@ -101,7 +104,7 @@ The section of the record is given with each. Where a term here has the name
 of one above (personal channel, relay, conflict, slot key), this is what it
 means from this version on.
 
-- **The older kind (of channel)**: The kind the record of 2026-09-30 describes: a random ID, a ring of keys, and a list of members. A relay carries it for one version more; a personal node carries none of it (§10).
+- **The older kind (of channel)**: The kind the record of 2026-09-30 describes: a random ID, a ring of keys, and a list of members. No node carries it: a node answers what an alpha.19 node asks of it with nothing (decision 2026-11-10 (older kind), rules 1 and 7).
 - **Channel from its secret**: A channel is a secret of 32 bytes. Its entry key, its slot key and its signing key are derived from the secret, and its ID is the public half of the signing key, written `cordelia_ch1...` (§2.1).
 - **Person secret**: 32 random bytes, with a number. Every channel of a person's own is derived from it and the channel's name. A device is one of the person's because it holds it. It is never derived from the phrase, and changes only by a statement (§3).
 - **Generation**: The channels derived from one person secret. Person secret number n gives generation n. A device's store holds one generation: the one it has applied (§3, §16).
@@ -145,11 +148,11 @@ means from this version on.
 - **Relays that work together**: Relays that their operator lists together, by key. They pass entries between them without the proof (§2.4).
 - **Relay**: Stores an entry only if both of its signatures hold, with no key, no list of members and no state of the channel. It hands a channel only to a connection that proved the channel's key, and tells nobody which channels it holds. It favours the channels it has held longest, drops what nobody has used for 90 days, and sweeps a slot in which every entry is a delete that it has held for 90 days (§2.3, §2.4, §2.5).
 - **Conflict (copy beside a file)**: Where a device takes a version that is not known to follow its own text, it keeps its text beside the file as `<file>.conflict-<tag>.md`. A tie at one revision goes to the higher hash of the text, and a text beats a delete (§2.3, §7.3).
-- **The level**: What a status carries beside its state, for a personal node that runs: red, amber or none. Red is what a person should act on now: this device has stopped, or the node is held up, whatever sync is set to; and with sync on, no phrase where something is mapped, a sync error, a stalled cycle, conflict files, files too large, and folders that stopped syncing. Amber is what a person should know of: of a person's devices, wherever the device follows a phrase (a removal that some device has not applied, a head set aside, a device added and not cleared, a device that has left, a relay not known to hold the latest change for seven days); and of folders, with sync on and something mapped (no relay for more than five minutes, names not yet sent, and last a relay out of reach while another is reached). The command works it out, and the line shows the first thing of the gravest level (§8, §10.1).
-- **Notice**: Something a device shows until a person clears it there, at a terminal (`cordelia devices --clear`): a device added since the last change (also until a statement lists it), a device that has left, a key that is not in the last change. The folders that stopped syncing at the first start are a notice of their own, which `cordelia sync status --seen` puts away (§10.1).
-- **First start (on this version)**: What a personal node does once to a database of the version before: a copy into `before-<version>`, and then one step that empties what it held of the older kind (§10.1).
-- **Held up**: A node whose first start on this version has not succeeded, or whose database is from a later version. It runs no cycle and no pass, refuses every request that changes anything (the first but one that turns sync off), and its status says why (§10.1).
-- **Not added yet**: What a device says of itself after the upgrade until a person makes the phrase on it or adds it from a device that has one (§10).
+- **The level**: What a status carries beside its state, for a personal node that runs: red, amber or none. Red is what a person should act on now: this device has stopped, or the node is held up, whatever sync is set to; and with sync on, no phrase where something is mapped, a sync error, a stalled cycle, conflict files, and files too large. Amber is what a person should know of: of a person's devices, wherever the device follows a phrase (a removal that some device has not applied, a head set aside, a device added and not cleared, a device that has left, a relay not known to hold the latest change for seven days); and of folders, with sync on and something mapped (no relay for more than five minutes, names not yet sent, and last a relay out of reach while another is reached). The command works it out, and the line shows the first thing of the gravest level (§8, §10.1).
+- **Notice**: Something a device shows until a person clears it there, at a terminal (`cordelia devices --clear`): a device added since the last change (also until a statement lists it), a device that has left, a key that is not in the last change.
+- **First start (on this version)**: Gone (decision 2026-11-10 (older kind), rule 9). It was what a personal node of an earlier version did once to a database of the version before: a copy into `before-<version>`, and a step that emptied what it held of the older kind. Nothing reads a folder that it left, and a person may remove it.
+- **Held up**: A node whose database is from a later version, or from before 0.2.0-alpha.19 (decision 2026-11-10 (older kind), rule 6). It changes nothing in that database, runs no cycle and no pass, answers `GET` requests alone, and its status says why (§10.1). A relay or a bootnode is not held up: it does not start.
+- **Not added yet**: Gone with the first start (decision 2026-11-10 (older kind), rule 9). A device that follows no phrase says "no recovery phrase yet".
 
 ---
 

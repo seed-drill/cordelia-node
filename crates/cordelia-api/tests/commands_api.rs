@@ -30,7 +30,6 @@ const WORDS: &str = "legal winner thank year wave sausage worth useful legal win
 /// nothing waits for one.
 fn state_of(network: bool) -> (web::Data<AppState>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let push_tx = network.then(|| tokio::sync::mpsc::unbounded_channel().0);
     let state = web::Data::new(AppState {
         load: Default::default(),
         db: cordelia_core::lock::TimedLock::new(cordelia_storage::db::open_in_memory().unwrap()),
@@ -41,12 +40,9 @@ fn state_of(network: bool) -> (web::Data<AppState>, tempfile::TempDir) {
         sync_errors: AtomicU64::new(0),
         peers_hot: AtomicU64::new(0),
         peers_warm: AtomicU64::new(0),
-        push_tx,
-        announce_tx: None,
+        networked: network,
         peers: Default::default(),
         relays: Default::default(),
-        outbox_refused: Default::default(),
-        relist: Default::default(),
         sync_control: Default::default(),
         own_channels: Default::default(),
         held: Default::default(),
@@ -1066,7 +1062,6 @@ fn requests_of_a_device() -> Vec<(&'static str, Value)> {
         ),
         ("/api/v1/sync/unmap", json!({ "folder": "/home/sam/notes" })),
         ("/api/v1/sync/status", json!({})),
-        ("/api/v1/sync/seen", json!({})),
         ("/api/v1/history/list", json!({})),
         ("/api/v1/history/show", json!({ "id": "00000000000abc" })),
         (
@@ -1078,226 +1073,68 @@ fn requests_of_a_device() -> Vec<(&'static str, Value)> {
     all
 }
 
-/// Until its first start on this version has succeeded, a node refuses
-/// every request that changes anything, with why it is held up, except
-/// one that turns sync off; it answers what only reads, and its status
-/// says why (decision 2026-10-04 §10.1). Held up no longer, it takes
-/// them again.
-#[actix_web::test]
-async fn test_a_node_that_is_held_up_refuses_what_changes_anything_but_turning_sync_off() {
-    use cordelia_api::first_start::{ANSWERED_WHILE_HELD, SYNC_SETTING};
-    use cordelia_api::state::Held;
-    use cordelia_storage::meta;
-    let (state, _dir) = state_of(false);
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .configure(cordelia_api::configure_device_routes),
-    )
-    .await;
-    let get = |path: &'static str| {
-        test::TestRequest::get()
-            .uri(path)
-            .insert_header(("Authorization", format!("Bearer {TOKEN}")))
-            .to_request()
-    };
-    // Sync is on, with a stored report and a scope that is on by being
-    // absent, as an install from before mappings has it.
-    let stored = |key: &str| meta::get(&state.db.lock().unwrap(), key).unwrap();
-    {
-        let db = state.db.lock().unwrap();
-        meta::set(&db, meta::SYNC_CLAUDE_DIR, "/home/sam/.claude").unwrap();
-        meta::set(&db, meta::SYNC_CLAUDE_REPORT, "{\"folders\":[]}").unwrap();
-    }
-    let everything = |state: &AppState| -> Vec<String> {
-        let db = state.db.lock().unwrap();
-        let mut held: Vec<String> = db
-            .prepare("SELECT key || '=' || value FROM node_meta ORDER BY key")
-            .unwrap()
-            .query_map([], |row| row.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap();
-        for table in ["person", "person_typed_keys", "entries", "sync_files"] {
-            let rows: i64 = db
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            held.push(format!("{table}: {rows}"));
-        }
-        held
-    };
-
-    // What only reads is answered, each by its name: the requests of
-    // `cordelia sync status`, `cordelia devices` and `cordelia history`,
-    // and the local API's two that read.
-    assert_eq!(
-        ANSWERED_WHILE_HELD,
-        [
-            "/api/v1/sync/status",
-            "/api/v1/devices/list",
-            "/api/v1/history/list",
-            "/api/v1/history/show",
-            "/api/v1/channels/entries",
-            "/api/v1/channels/identity",
-        ]
-    );
-
-    let why = "the first start on this version is not done: no room for the copy";
-    state.held.hold(Held::FirstStart(why.into()));
-    let before = everything(&state);
-    let generation = state.sync_control.generation();
-    let mut refused = Vec::new();
-    for (path, body) in requests_of_a_device() {
-        let (status, said) = asks!(app, path, body);
-        if ANSWERED_WHILE_HELD.contains(&path) {
-            assert_ne!(status, 503, "{path}: {said}");
-            continue;
-        }
-        assert_eq!(status, 503, "{path}: {said}");
-        assert_eq!(said["error"]["code"], "held_up", "{path}: {said}");
-        assert_eq!(said["error"]["message"], why, "{path}: {said}");
-        refused.push(path);
-    }
-    // Each request that changes anything is one of those refused: sync
-    // turned on among them, and nothing was written or woken by any.
-    assert_eq!(
-        refused.len(),
-        requests_of_a_device().len() - ANSWERED_WHILE_HELD.len()
-    );
-    assert!(refused.contains(&SYNC_SETTING));
-    assert_eq!(everything(&state), before);
-    assert_eq!(state.sync_control.generation(), generation);
-    assert_eq!(woken(&state).await, (false, false));
-
-    // What reads is answered, and the status says why.
-    for path in ["/api/v1/health", "/api/v1/peers", "/api/v1/metrics"] {
-        let answer = test::call_service(&app, get(path)).await;
-        assert_eq!(answer.status().as_u16(), 200, "{path}");
-    }
-    let answer = test::call_service(&app, get("/api/v1/status")).await;
-    assert_eq!(answer.status().as_u16(), 200);
-    let status: Value = test::read_body_json(answer).await;
-    assert_eq!(
-        status["held"],
-        json!({ "by": "first_start", "why": why }),
-        "{status}"
-    );
-    let (code, sync) = asks!(app, "/api/v1/sync/status", json!({}));
-    assert_eq!(
-        (code, &sync["held"], &sync["enabled"]),
-        (200, &json!(why), &json!(true))
-    );
-    let (code, seen) = asks!(app, "/api/v1/devices/list", json!({}));
-    assert_eq!((code, &seen["state"]), (200, &json!("no_phrase")), "{seen}");
-
-    // Turning sync off is taken: the directory goes, and is kept as the
-    // last one. The stored report stays, for the step to read, and the
-    // scope that was on by being absent is written down as on.
-    let (code, sync) = asks!(app, SYNC_SETTING, json!({ "enabled": false }));
-    assert_eq!((code, &sync["enabled"]), (200, &json!(false)), "{sync}");
-    assert_eq!(stored(meta::SYNC_CLAUDE_DIR), None);
-    assert_eq!(
-        stored(meta::SYNC_CLAUDE_LAST_DIR).as_deref(),
-        Some("/home/sam/.claude")
-    );
-    assert_eq!(stored(meta::SYNC_CLAUDE_ALL).as_deref(), Some("on"));
-    assert_eq!(
-        stored(meta::SYNC_CLAUDE_REPORT).as_deref(),
-        Some("{\"folders\":[]}")
-    );
-    assert!(state.sync_control.generation() > generation);
-    // Again, with sync off already: taken, and nothing more is written.
-    let off = everything(&state);
-    let (code, _) = asks!(app, SYNC_SETTING, json!({ "enabled": false }));
-    assert_eq!(code, 200);
-    assert_eq!(everything(&state), off);
-
-    // Held up no longer: a request that changes something is taken.
-    state.held.release();
-    let (code, sync) = asks!(
-        app,
-        SYNC_SETTING,
-        json!({ "enabled": true, "dir": "/home/sam/.claude" })
-    );
-    assert_eq!((code, &sync["enabled"]), (200, &json!(true)), "{sync}");
-    assert_eq!(sync["held"], Value::Null);
-    let answer = test::call_service(&app, get("/api/v1/status")).await;
-    let status: Value = test::read_body_json(answer).await;
-    assert_eq!(status["held"], Value::Null);
-}
-
-/// A node whose database is from a later version than its own changes
-/// nothing (decision 2026-10-04 §10.1): it refuses every request but
-/// those of its status, turning sync off among them, since the setting
-/// is in that database; and its status says so.
+/// A node whose database is from a later version than its own, or from
+/// a Cordelia before alpha.19, changes nothing (decision 2026-10-04
+/// §10.1; decision 2026-11-10 (older kind), rule 6): it refuses every
+/// request but those of its status, turning sync off among them, since
+/// the setting is in that database; and its status says why.
 #[actix_web::test]
 async fn test_a_node_with_a_database_from_a_later_version_takes_no_request_but_its_status() {
     use cordelia_api::state::Held;
-    let (state, _dir) = state_of(false);
-    let app = test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .configure(cordelia_api::configure_device_routes),
-    )
-    .await;
-    let why = "the database is from a later version of Cordelia than this one";
-    state.held.hold(Held::LaterDatabase(why.into()));
-    let generation = state.sync_control.generation();
-    let mut asked = requests_of_a_device();
-    asked.push(("/api/v1/sync/claude", json!({ "enabled": false })));
-    for (path, body) in asked {
-        let (status, said) = asks!(app, path, body);
-        assert_eq!(status, 503, "{path}: {said}");
-        assert_eq!(said["error"]["message"], why, "{path}: {said}");
-    }
-    assert_eq!(state.sync_control.generation(), generation);
-    assert_eq!(woken(&state).await, (false, false));
-    // The first start is not tried on it.
-    assert!(!cordelia_api::first_start::take(
-        &state,
-        "0.2.0-test",
-        &cordelia_storage::first_start::room_not_known
-    ));
-    assert_eq!(state.held.why(), Some(Held::LaterDatabase(why.into())));
+    let why = "the database is from another version of Cordelia than this one";
+    for (held, by) in [
+        (Held::LaterDatabase(why.into()), "later_database"),
+        (Held::EarlierDatabase(why.into()), "earlier_database"),
+    ] {
+        let (state, _dir) = state_of(false);
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(cordelia_api::configure_device_routes),
+        )
+        .await;
+        state.held.hold(held);
+        let generation = state.sync_control.generation();
+        let mut asked = requests_of_a_device();
+        asked.push(("/api/v1/sync/claude", json!({ "enabled": false })));
+        for (path, body) in asked {
+            let (status, said) = asks!(app, path, body);
+            assert_eq!(status, 503, "{by} {path}: {said}");
+            assert_eq!(said["error"]["code"], "held_up", "{by} {path}: {said}");
+            assert_eq!(said["error"]["message"], why, "{by} {path}: {said}");
+        }
+        assert_eq!(state.sync_control.generation(), generation);
+        assert_eq!(woken(&state).await, (false, false));
 
-    let get = test::TestRequest::get()
-        .uri("/api/v1/status")
-        .insert_header(("Authorization", format!("Bearer {TOKEN}")))
-        .to_request();
-    let answer = test::call_service(&app, get).await;
-    assert_eq!(answer.status().as_u16(), 200);
-    let status: Value = test::read_body_json(answer).await;
-    assert_eq!(
-        status["held"],
-        json!({ "by": "later_database", "why": why }),
-        "{status}"
-    );
+        for path in ["/api/v1/status", "/api/v1/health", "/api/v1/peers"] {
+            let get = test::TestRequest::get()
+                .uri(path)
+                .insert_header(("Authorization", format!("Bearer {TOKEN}")))
+                .to_request();
+            let answer = test::call_service(&app, get).await;
+            assert_eq!(answer.status().as_u16(), 200, "{by} {path}");
+            if path == "/api/v1/status" {
+                let status: Value = test::read_body_json(answer).await;
+                assert_eq!(status["held"], json!({ "by": by, "why": why }), "{status}");
+            }
+        }
+    }
 }
 
-/// The routes of a personal node say what a device has now, and nothing
-/// of the older kind of channel (decision 2026-10-04 §10): its status,
-/// its identity and its metrics count the names it holds, though its
-/// database holds a channel of the older kind that it is a member of.
-/// The routes of a node that carries that kind count it, as they did.
+/// The routes of a personal node say what a device has now: its status,
+/// its identity and its metrics count the names it holds. The routes of
+/// a relay count the channels it holds (decision 2026-11-10 (older
+/// kind), rule 3). Neither counts items.
 #[actix_web::test]
 async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
     let (state, _dir) = state_of(false);
-    {
-        let db = state.db.lock().unwrap();
-        let own = state.identity.public_key();
-        let group = "grp_550e8400-e29b-41d4-a716-446655440000";
-        cordelia_storage::channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
-        cordelia_storage::channels::add_member(&db, group, &own, "owner").unwrap();
-    }
     let get = |path: &'static str| {
         test::TestRequest::get()
             .uri(path)
             .insert_header(("Authorization", format!("Bearer {TOKEN}")))
             .to_request()
     };
-    for (device, counted) in [(true, 0), (false, 1)] {
+    for (device, counted) in [(true, 0), (false, 0)] {
         let routes = match device {
             true => cordelia_api::configure_device_routes,
             false => cordelia_api::configure_routes,
@@ -1320,9 +1157,8 @@ async fn test_a_devices_routes_count_nothing_of_the_older_kind() {
             metrics.contains(&format!("cordelia_channels_subscribed {counted}\n")),
             "{device}: {metrics}"
         );
-        assert_eq!(
-            metrics.contains("cordelia_items_total{channel=\"550e8400\"}"),
-            !device,
+        assert!(
+            !metrics.contains("cordelia_items_total"),
             "{device}: {metrics}"
         );
     }

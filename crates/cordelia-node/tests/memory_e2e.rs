@@ -153,7 +153,6 @@ fn a_phrase_is_made_its_folders_are_published_and_a_second_devices_folders_meet_
         s["summary"], "memory stays here: no recovery phrase yet",
         "{s}"
     );
-    assert_eq!(s["sync"]["moved_on"], false, "{s}");
     // It holds no name, and its local API publishes nothing either.
     assert!(
         person_of(&a)["names"]["sent"]

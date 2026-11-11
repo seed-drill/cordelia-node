@@ -12,27 +12,6 @@ use rusqlite::Connection;
 
 use crate::publish::PlannedAgainst;
 
-/// An item to be pushed to hot peers via P2P.
-#[derive(Debug, Clone)]
-pub struct PushItem {
-    pub channel_id: String,
-    pub item_id: String,
-    pub encrypted_blob: Vec<u8>,
-    pub content_hash: Vec<u8>,
-    pub author_id: Vec<u8>,
-    pub signature: Vec<u8>,
-    pub key_version: u32,
-    pub published_at: String,
-    pub item_type: String,
-    pub is_tombstone: bool,
-    pub parent_id: Option<String>,
-    /// Replaceable-item slot and revision (decision 2026-09-30 §4.3).
-    pub slot: Option<Vec<u8>>,
-    pub rev: Option<u64>,
-    /// If set, don't push back to this peer (relay re-push loop prevention).
-    pub exclude_peer: Option<cordelia_core::NodeId>,
-}
-
 /// Shared state accessible from all request handlers.
 pub struct AppState {
     /// The node's one lock on its database: every take is timed, by the
@@ -53,26 +32,16 @@ pub struct AppState {
     pub peers_hot: AtomicU64,
     /// Number of peers in Warm state (updated by governor tick).
     pub peers_warm: AtomicU64,
-    /// Channel for sending items to the P2P layer for push delivery.
-    /// None if P2P is not running (e.g., in tests).
-    pub push_tx: Option<tokio::sync::mpsc::UnboundedSender<PushItem>>,
-    /// Channel for notifying P2P layer of local channel subscriptions.
-    /// Triggers channel-announce (0x04) to hot peers.
-    /// None if P2P is not running (e.g., in tests).
-    pub announce_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Whether P2P runs beside this state: set where the node starts its
+    /// P2P loop, and not in a test that runs none. A node with no network
+    /// reads no relay, and waits for no pass or cycle of its own (decision
+    /// 2026-11-10 (older kind), rule 3).
+    pub networked: bool,
     /// The peers this node is connected to, refreshed on each governor tick.
     pub peers: std::sync::RwLock<Vec<PeerSnapshot>>,
     /// The relays this node was configured with and whether each is
     /// connected, refreshed by the P2P loop.
     pub relays: std::sync::RwLock<Vec<RelaySnapshot>>,
-    /// Items written here that a relay refused to store, refreshed by the
-    /// P2P loop. They stay in the outbox and are offered again.
-    pub outbox_refused: std::sync::RwLock<Vec<RefusedSnapshot>>,
-    /// Channels whose members have changed since the P2P loop last looked.
-    /// A device stores only what a channel's members wrote, so entries by
-    /// a member it had not heard of yet were refused; the loop lists these
-    /// channels again from the start, and fetches what it lacks.
-    pub relist: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Tells the sync adapter when its settings change.
     pub sync_control: SyncControl,
     /// Local history, and the turn its users take.
@@ -85,33 +54,38 @@ pub struct AppState {
     pub held: HeldUp,
 }
 
-/// Why a node is held up (decision 2026-10-04 §10.1).
+/// Why a node is held up (decision 2026-10-04 §10.1; decision 2026-11-10
+/// (older kind), rules 6 and 9). Either way the node runs over a database of its
+/// own in memory, and nothing of the one on disk is read or changed, for
+/// as long as it runs. It says why, in words for a person.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Held {
-    /// Its first start on this version has not succeeded: the copy could
-    /// not be made, or the step failed. It is tried again each time a
-    /// cycle would have run. It says why, in words for a person.
-    FirstStart(String),
-    /// Its database is from a later version than its own: the node runs
-    /// over a database of its own in memory, and nothing of the one on
-    /// disk is read or changed, for as long as the node runs. It says
-    /// so, with both versions.
+    /// Its database is from a later version than its own: it says so,
+    /// with both versions.
     LaterDatabase(String),
+    /// Its database is from a Cordelia before alpha.19, which this version
+    /// does not take over: it says so, with the ways on.
+    EarlierDatabase(String),
+    /// A step of its database's schema did not finish, the commonest for
+    /// want of room on the disk (decision 2026-11-10 (older kind), rule 9):
+    /// nothing was changed, and it tries again when it next starts.
+    StepFailed(String),
 }
 
 impl Held {
     /// Why the node is held up, in words for a person.
     pub fn says(&self) -> &str {
         match self {
-            Held::FirstStart(why) | Held::LaterDatabase(why) => why,
+            Held::LaterDatabase(why) | Held::EarlierDatabase(why) | Held::StepFailed(why) => why,
         }
     }
 
     /// What it is held up by, as a status names it.
     pub fn kind(&self) -> &'static str {
         match self {
-            Held::FirstStart(_) => "first_start",
             Held::LaterDatabase(_) => "later_database",
+            Held::EarlierDatabase(_) => "earlier_database",
+            Held::StepFailed(_) => "step_failed",
         }
     }
 }
@@ -121,38 +95,12 @@ impl Held {
 /// A node that is held up does not stop: under a service that restarts
 /// what stops, stopping would be a loop, and a stopped node can say
 /// nothing. It stays up, and says why.
-///
-/// It is kept in memory: a step that fails because the database cannot
-/// be written has nowhere else to put it.
-///
-/// With it is what one start of the node keeps of its first start on this
-/// version: what its tries keep between them, and how many key files of
-/// an older version were left in place.
 #[derive(Default)]
 pub struct HeldUp {
     why: Mutex<Option<Held>>,
-    tries: Mutex<crate::first_start::Tries>,
-    key_files_in_place: std::sync::atomic::AtomicUsize,
 }
 
 impl HeldUp {
-    /// What the tries at the first start keep between them. One try is
-    /// made at a time: the next waits here for it.
-    pub fn tries(&self) -> std::sync::MutexGuard<'_, crate::first_start::Tries> {
-        self.tries.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// How many key files of an older version were left in place at this
-    /// start, since no copy holds them (decision 2026-10-04 §10.1).
-    pub fn key_files_in_place(&self) -> usize {
-        self.key_files_in_place.load(Ordering::Relaxed)
-    }
-
-    /// Note how many key files of an older version were left in place.
-    pub fn set_key_files_in_place(&self, files: usize) {
-        self.key_files_in_place.store(files, Ordering::Relaxed);
-    }
-
     /// Why the node is held up, where it is.
     pub fn why(&self) -> Option<Held> {
         self.why.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -169,7 +117,8 @@ impl HeldUp {
         *self.why.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
     }
 
-    /// The node is held up no longer.
+    /// The node is held up no longer: for a test that holds a node and
+    /// lets it go. A node that runs is held for as long as it runs.
     pub fn release(&self) {
         *self.why.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
@@ -1291,16 +1240,6 @@ pub enum CannotGoOn {
     NotApplied { relay: String, why: String },
 }
 
-/// An item of this node's that a relay refused, for status.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RefusedSnapshot {
-    pub item_id: String,
-    /// The relay's reason, as a short code ("invalid", "storage").
-    pub why: String,
-    /// How many times in a row it has been refused.
-    pub refusals: u32,
-}
-
 /// What the sync adapter wrote down when it kept a text in a conflict
 /// file, beside a file. The copy is relied on only while the file has
 /// still to take the version the text was kept against, and what was
@@ -1967,12 +1906,9 @@ mod tests {
             sync_errors: Default::default(),
             peers_hot: Default::default(),
             peers_warm: Default::default(),
-            push_tx: None,
-            announce_tx: None,
+            networked: false,
             peers: Default::default(),
             relays: Default::default(),
-            outbox_refused: Default::default(),
-            relist: Default::default(),
             sync_control: Default::default(),
             own_channels: Default::default(),
             held: Default::default(),

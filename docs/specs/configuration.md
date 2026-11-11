@@ -26,18 +26,23 @@
 >   never stored anywhere. What a device follows, the person secret and the
 >   statement it has applied are in the node's database (data-formats.md
 >   §10.3), and the device's own key is in `identity.key`.
-> - **A personal node carries no channel of the older kind.** `push_policy`
->   (§2.3) and `[replication]` (§2.5) are settings of that kind, and change
->   nothing that a personal node does with its own channels. Those are
->   fetched every 10 seconds and sent every 2, which are constants of
->   `protocol.rs` and not settings.
-> - **A relay's `max_storage_bytes` bounds each kind of channel apart**
->   (§2.2), and **a relay that lists another by `key` works together with
->   it** (§2.3).
-> - **The data directory of a personal node** also holds, after its first
->   start on this version, a folder `before-<version>`: a copy of the
->   database and of the key files of the older channels, as they were
->   (operations.md §10.5).
+> - **Keys that nothing reads are gone:** `network.push_policy`,
+>   `governor.ema_alpha`, `governor.dial_policy`, and every key of
+>   `[replication]` but `relay_ask_again_secs` (decision 2026-11-10 (older
+>   kind), rule 2). A configuration that still sets them loads, and they
+>   change nothing; a configuration saved again leaves them out. A device
+>   fetches its channels every 10 seconds and sends every 2, which are
+>   constants of `protocol.rs` and not settings. A personal node dials
+>   relays only, and every other role any peer: the role sets it.
+> - **`[swarm]` and `network.trusted_peers` are no longer read** (rule 2):
+>   a configuration that still sets them loads, and they change nothing.
+> - **A relay's `max_storage_bytes` bounds what it holds of the channels
+>   from their secrets** (§2.2), and **a relay that lists another by `key`
+>   works together with it** (§2.3).
+> - **A data directory that an earlier version used** may hold a folder
+>   `channel-keys/` and folders `before-<version>`, which an earlier
+>   version's first start made. Nothing reads them, and a person may remove them (decision
+>   2026-11-10 (older kind), rule 9).
 >
 > Per the [decision record of 2026-11-06 (joining)](../decisions/2026-11-06-joining-by-pull-request.md):
 >
@@ -93,18 +98,17 @@ Core node settings: ports, storage location, storage quota.
 | `http_port` | integer | `9473` | 1-65535 | REST API port (TCP, localhost only). | operations.md SS5.1 |
 | `p2p_port` | integer | `9474` | 1-65535 | P2P transport port (UDP, QUIC). | operations.md SS5.1 |
 | `data_dir` | string | `"~/.cordelia"` | Valid directory path | Base data directory. Tilde expanded at startup. Created automatically if it does not exist (with mode 0700); one that is there is set to 0700 only where others than its owner and its group can read, write or enter it (§5.4). | operations.md SS5.1 |
-| `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | The most a relay may hold of each kind of channel. The older kind and the channels from their secrets are each counted against a cap of this size, so for the one version that carries both a relay can hold twice this. Each is counted by what its entries are counted at (an entry's content and 1 KB), and not by the database's pages. At a cap a relay takes no channel of that kind which it does not already hold; over it, it drops the channels of that kind that it has held for the shortest time (decision 2026-09-30 §4.6; decision 2026-10-04 §2.5). It is read when the node starts. Not applied on a personal node. | operations.md SS5.1 |
+| `max_storage_bytes` | integer | `1073741824` (1 GB) | > 0 | The most a relay may hold of the channels from their secrets. It is counted by what their entries are counted at (an entry's content and 1 KB), and not by the database's pages. At its cap a relay takes no channel which it does not already hold; over it, it drops the channels that it has held for the shortest time (decision 2026-09-30 §4.6; decision 2026-10-04 §2.5). It is read when the node starts. Not applied on a personal node. | operations.md SS5.1 |
 
 ### 2.3 `[network]`
 
-P2P networking: listen address, node role, push policy, bootnode addresses, DNS discovery.
+P2P networking: listen address, node role, bootnode addresses, DNS discovery.
 
 | Parameter | Type | Default | Valid Values | Description | Source |
 |-----------|------|---------|--------------|-------------|--------|
 | `listen_addr` | string | `"0.0.0.0:9474"` | `<ip>:<port>` | P2P listen address (UDP, QUIC). | operations.md SS5.1, network-protocol.md SS12.2 |
-| `listen` | boolean | unset | `true`, `false` | Whether to accept inbound connections. Unset: every role listens except `personal`, which only dials out and opens no listening socket (it still listens if it has `trusted_peers`). Set `true` on a personal node that others dial directly, such as a swarm lead. | decision 2026-09-30 §4.6 |
+| `listen` | boolean | unset | `true`, `false` | Whether to accept inbound connections. Unset: every role listens except `personal`, which only dials out and opens no listening socket. A personal node told to listen still turns away every inbound connection: the trusted peers and swarm that it listened for are gone (decision 2026-11-10 (older kind), rule 2). | decision 2026-09-30 §4.6 |
 | `role` | string | `"personal"` | `"personal"`, `"bootnode"`, `"relay"` | Node role. Affects governor targets, push behaviour, and relay/bootstrap duties. A personal node never becomes a relay by default -- operators must set this explicitly. **Any other value is refused when the configuration is loaded**, with a line that names the roles this version takes. | network-protocol.md SS8, SS12.2; decision 2026-10-17 §5 |
-| `push_policy` | string | `"subscribers_only"` | `"subscribers_only"`, `"pull_only"` | Push behaviour for personal nodes. `subscribers_only`: push items to hot peers subscribed to the channel. `pull_only`: never push; peers must pull via Item-Sync. Trade-off: `pull_only` increases latency (bounded by `replication.sync_interval_realtime_secs`). | network-protocol.md SS8.1.1, SS12.2 |
 | `dns_discovery` | string | `""` | any | **No longer used (2026-10-02).** A node learns of no relay from DNS: its relays are the ones it is configured with. The setting is still read, so that older configurations load. | decision 2026-09-30 §4.6 |
 
 **Port precedence:** If both `node.p2p_port` and `network.listen_addr` are set, the port in `listen_addr` MUST match `p2p_port`. If they disagree, the node logs an error and refuses to start. If only `node.p2p_port` is set, `listen_addr` defaults to `0.0.0.0:<p2p_port>`. If only `listen_addr` is set, `p2p_port` is derived from it. This ensures a single source of truth for the P2P port.
@@ -140,10 +144,9 @@ Defaults match the Personal Node profile (network-protocol.md SS8.6). Override f
 | `hot_min` | integer | `2` | >= 1 | Minimum hot peers. Below this, promote aggressively (bypass tenure guard). | SS5.3, SS5.4, SS8.6 |
 | `hot_max` | integer | `2` | >= `hot_min` | Maximum hot peers. Above this, demote worst-scoring. | SS5.3, SS8.6 |
 | `hot_min_relays` | integer | `1` | <= `hot_max` | Minimum relay peers in hot set. Ensures relay backbone connectivity. Independent target from `hot_min`. | SS5.3, SS5.4 step 4a, SS8.6 |
-| `warm_min` | integer | `3` | >= `hot_min` (exempt for `trusted_only`) | Minimum warm peers. Below this, connect cold peers. | SS5.3, SS8.6 |
+| `warm_min` | integer | `3` | >= `hot_min` | Minimum warm peers. Below this, connect cold peers. | SS5.3, SS8.6 |
 | `warm_max` | integer | `10` | >= `warm_min` | Maximum warm+hot peers. | SS5.3, SS8.6 |
-| `cold_max` | integer | `50` | >= `warm_max` (exempt for `trusted_only`) | Maximum cold (known, not connected) peers. | SS5.3, SS8.6 |
-| `dial_policy` | string | `"all"` | `"all"`, `"relays_only"`, `"trusted_only"` | Controls which peers the governor connects to. `trusted_only` for secret keepers. | SS5.3, SS8.5, SS8.6 |
+| `cold_max` | integer | `50` | >= `warm_max` | Maximum cold (known, not connected) peers. | SS5.3, SS8.6 |
 | `tick_interval_secs` | integer | `10` | >= 1 | Governor tick interval. Each tick evaluates promotions, demotions, and churn. | SS5.4, SS12.2 |
 | `churn_interval_secs` | integer | `3600` | > 0 | Base churn interval. Warm peers swapped with cold to prevent topology ossification. A personal node never closes, by churn, its connection to a relay it is set up with. | SS5.4, SS12.2; decision 2026-10-17 §2 |
 | `churn_jitter_secs` | integer | `300` | >= 0 | Random jitter added to churn interval (0 to this value). Prevents correlated churn across nodes. | SS5.4, SS12.2 |
@@ -152,7 +155,6 @@ Defaults match the Personal Node profile (network-protocol.md SS8.6). Override f
 | `hysteresis_secs` | integer | `90` | >= `tick_interval_secs` | Cooldown after demotion before re-promotion. | SS5.4, SS12.2 |
 | `keepalive_timeout_secs` | integer | `90` | >= 60 | Dead detection threshold. No keepalive for this duration triggers demotion. | SS5.4, SS12.2 |
 | `stale_threshold_secs` | integer | `1800` | > 0 | No items for this duration = priority demotion during Hot overflow. | SS5.4, SS12.2 |
-| `ema_alpha` | float | `0.1` | (0.0, 1.0] | EMA decay for peer scoring. Lower = smoother, slower adaptation. | SS5.5, SS12.2 |
 | `max_connection_retries` | integer | `5` | >= 1 | Stop connecting after this many consecutive failures. | SS5.4, SS12.2 |
 | `clear_failure_delay_secs` | integer | `120` | > 0 | Clear failure count after being Hot for this long. | SS5.4, SS12.2 |
 
@@ -160,22 +162,15 @@ Defaults match the Personal Node profile (network-protocol.md SS8.6). Override f
 
 ### 2.5 `[replication]`
 
-Anti-entropy sync intervals, tombstone retention, and batch sizing for the Item-Sync protocol.
+A relay's wait before it asks a device again. The keys that set the Item-Sync protocol, which no node runs, are gone (decision 2026-11-10 (older kind), rule 2): a configuration that still sets them loads.
 
 | Parameter | Type | Default | Valid Range | Description | Source |
 |-----------|------|---------|-------------|-------------|--------|
-| `sync_interval_realtime_secs` | integer | `10` | > 0 | Anti-entropy pull interval for realtime channels (seconds): `REALTIME_SYNC_INTERVAL_SECS` in `protocol.rs`, twice the interval at which a relay passes on what it took. Items also arrive via push, so this is a consistency backstop. | network-protocol.md SS12.3 |
-| `sync_interval_batch_secs` | integer | `900` | > 0 | Anti-entropy pull interval for batch channels (seconds). 15 minutes default. | network-protocol.md SS12.3 |
-| `tombstone_retention_days` | integer | `7` | > 0 | Days to retain tombstoned items before physical deletion. Must be long enough for all peers to observe the tombstone. | network-protocol.md SS12.3 |
-| `max_batch_size` | integer | `100` | 1-10000 | Maximum items per FetchRequest/PushPayload message. | network-protocol.md SS9.2, SS12.3 |
 | `relay_ask_again_secs` | integer | `600` | 1-86400 (a value outside is taken as the nearest) | Relays only. How long a relay waits before it asks a device again which channels it holds, and before it takes again a channel it dropped to make room. | parameter-rationale.md SS4 |
 
 > **v1 status.** The defaults are those of `ReplicationConfig` in
-> `crates/cordelia-core/src/config.rs`, each a constant of `protocol.rs`. Of
-> this section a node acts on `relay_ask_again_secs` alone. Its pull runs
-> every `REALTIME_SYNC_INTERVAL_SECS` (10 seconds) whatever
-> `sync_interval_realtime_secs` is set to, and the other three keys are read
-> from the file and used by nothing.
+> `crates/cordelia-core/src/config.rs`. A device's pull runs every
+> `REALTIME_SYNC_INTERVAL_SECS` (10 seconds), a constant of `protocol.rs`.
 
 ### 2.6 `[limits]`
 
@@ -307,7 +302,6 @@ max_storage_bytes = 1073741824             # 1 GB local storage limit
 [network]
 listen_addr = "0.0.0.0:9474"              # P2P listen address (UDP, QUIC)
 role = "personal"                          # "personal" | "bootnode" | "relay"
-push_policy = "subscribers_only"           # "subscribers_only" | "pull_only"
 
 # Relays: where to dial, and the key that must answer there. The default
 # relays' keys are compiled in.
@@ -328,7 +322,6 @@ hot_min_relays = 1                         # Minimum relay peers in hot set
 warm_min = 3                               # Below this, connect cold peers
 warm_max = 10                              # Maximum warm+hot peers
 cold_max = 50                              # Maximum known peer addresses
-dial_policy = "all"                        # "all" | "relays_only" | "trusted_only"
 tick_interval_secs = 10                    # Governor tick interval
 churn_interval_secs = 3600                 # Base churn interval (1 hour)
 churn_jitter_secs = 300                    # Random jitter on churn interval
@@ -337,16 +330,11 @@ min_warm_tenure_secs = 300                 # Minimum warm time before Hot promot
 hysteresis_secs = 90                       # Cooldown after demotion
 keepalive_timeout_secs = 90                # Dead detection threshold
 stale_threshold_secs = 1800                # No items for 30 min = priority demotion
-ema_alpha = 0.1                            # Peer scoring EMA decay
 max_connection_retries = 5                 # Stop connecting after this many failures
 clear_failure_delay_secs = 120             # Clear failure count after being Hot for this long
 
 # --- Replication ---
 [replication]
-sync_interval_realtime_secs = 10           # Anti-entropy interval for realtime channels
-sync_interval_batch_secs = 900             # Anti-entropy interval for batch channels (15 min)
-tombstone_retention_days = 7               # Days to keep tombstones
-max_batch_size = 100                       # Items per FetchRequest/PushPayload
 relay_ask_again_secs = 600                 # A relay asks its devices what they hold this often
 
 # --- Rate Limits ---
@@ -423,7 +411,7 @@ Environment variables override `config.toml` values. All use the `CORDELIA_` pre
 | `CORDELIA_LISTEN_ADDR` | `network.listen_addr` | `0.0.0.0:9474` | operations.md SS5.2 |
 | `CORDELIA_BIND_ADDRESS` | `api.bind_address` | `127.0.0.1` | operations.md SS5.2 |
 
-No variable sets the relays (`network.bootnodes`) or the role: those are read from the file alone. Which file that is can be set: the binary takes `CORDELIA_CONFIG` for the path of the configuration, where `--config` is not given. The node also reads `CORDELIA_SWARM_INDEX`, `CORDELIA_LEAD_IDENTITY_PATH` and `CORDELIA_LEAD_ENTITY_ID`, for the swarm settings from before v1.
+No variable sets the relays (`network.bootnodes`) or the role: those are read from the file alone. Which file that is can be set: the binary takes `CORDELIA_CONFIG` for the path of the configuration, where `--config` is not given. `CORDELIA_SWARM_INDEX`, `CORDELIA_LEAD_IDENTITY_PATH` and `CORDELIA_LEAD_ENTITY_ID`, for the swarm settings from before v1, are no longer read (decision 2026-11-10 (older kind), rule 2).
 
 See SS4.2 for SDK-specific variables (`CORDELIA_TOKEN`).
 
@@ -461,7 +449,7 @@ The node validates configuration at startup. Invalid configuration prevents the 
 |-----------|-------|
 | `api.bind_address` is neither `127.0.0.1` nor `::1` (SS2.9) | `the node's API address is set to '...'`, with the two it may be and where it is set |
 | `config.toml` contains invalid TOML syntax | `config parse error` |
-| Key files (`identity.key`, `node-token`, `channel-keys/*.key`) are world-readable (mode & 0044 != 0) | `permission denied on key file` |
+| Key files (`identity.key`, `node-token`) are world-readable (mode & 0044 != 0) | `permission denied on key file` |
 | `node.http_port` or `node.p2p_port` already in use | `address already in use` |
 | `node.http_port` == `node.p2p_port` | `port conflict: HTTP and P2P ports must differ` |
 | `messages.per_folder_per_hour` is over 20 (SS2.12) | `[messages] per_folder_per_hour is ...: it may be from 0 to 20` |
@@ -497,21 +485,20 @@ These are hard invariants enforced at startup (operations.md SS5.4, network-prot
 
 1. **API loopback binding**: `api.bind_address` MUST be `127.0.0.1` or `::1` (SS2.9). With any other value the node refuses to start, and says why. Phase 2 adds TLS and permits non-loopback binding.
 
-2. **Key file permissions**: Files at `~/.cordelia/identity.key`, `~/.cordelia/node-token`, and `~/.cordelia/channel-keys/*.key` MUST have mode 0600. The node warns on startup if permissions are too open and MUST refuse to start if key files are world-readable.
+2. **Key file permissions**: Files at `~/.cordelia/identity.key` and `~/.cordelia/node-token` MUST have mode 0600. The node warns on startup if permissions are too open and MUST refuse to start if key files are world-readable.
 
 3. **Data directory permissions**: `~/.cordelia` SHOULD have mode 0700.
 
-> **v1 status.** A personal node has no key file for each channel from its
-> first start on this version: the files under `channel-keys/` are of the
-> older kind, and are removed then, after a copy. What a device's channels
-> are derived from, the person secret, is in the database (`cordelia.db`,
-> mode 0600), so that it changes in one transaction with a statement
-> (decision 2026-10-04 §3). Whoever can read that file can read every name
-> of the person's. The copy folder `before-<version>` is mode 0700, and each
-> file in it 0600.
+> **v1 status.** A node has no key file for each channel. What a device's
+> channels are derived from, the person secret, is in the database
+> (`cordelia.db`, mode 0600), so that it changes in one transaction with a
+> statement (decision 2026-10-04 §3). Whoever can read that file can read
+> every name of the person's. A folder `channel-keys/` or `before-<version>`
+> that an earlier version left is read by nothing, and a person may remove
+> it (decision 2026-11-10 (older kind), rule 9).
 >
-> **The data directory is its owner's alone.** `cordelia init`, `cordelia
-> swarm-init` and the install script make it with mode 0700, and the
+> **The data directory is its owner's alone.** `cordelia init` and the
+> install script make it with mode 0700, and the
 > configuration file that `init` writes is 0600; the install script sets the
 > one in a directory that it makes 0600 as well. **A directory that is there
 > already is set to 0700 only where others than its owner and its group can

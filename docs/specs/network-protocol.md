@@ -5,10 +5,10 @@
 **Date**: 2026-03-10
 **Scope**: Phase 1 (Encrypted Pub/Sub MVP)
 **Implements**: WP3 (Pub/Sub API network layer), WP12 (Bootnode DNS)
-**Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, specs/channel-naming.md
+**Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md)
 
-> **v1 status.** Transport, framing, handshake, keep-alive, peer-sharing, the
-> governor and relay forwarding stand. Two kinds of channel travel:
+> **v1 status.** Transport, framing, handshake, keep-alive, peer-sharing and
+> the governor stand. One kind of channel travels:
 >
 > - **A channel from its secret,** on five streams of its own, `0x10` to
 >   `0x14` (§4.9), per the
@@ -21,38 +21,21 @@
 >   channel, hands each before it says it holds the entry shown, passes each
 >   on until it is taken, and names the role `heads` in its handshake; and a
 >   device shows each head it keeps (§4.1, §4.9.2, §4.9.4 to §4.9.6).
-> - **The older kind,** on Channel-Announce, Item-Sync and Item-Push (§4.4 to
->   §4.6, §6, §7), per the
->   [decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md)
->   §4.3 and §4.4a. **Relays carry it, for one version more. A personal node
->   carries none of it** (decision 2026-10-04 §10): it pushes no item of that
->   kind, fetches and announces no channel of it, answers an Item-Sync with
->   nothing, and refuses an Item-Push and a Channel-Announce. A device that is
->   still on the version before goes on in the older channels through the
->   relays.
->
-> For the older kind, as a relay carries it:
->
-> - **Swarm (§8.2.2) is not part of v1.** A node makes no swarm channel, removes
->   one that an earlier version made when it starts, tells no peer a channel ID
->   of that kind, and as a relay stores no item of one.
-> - **Items** (`Item`, `ItemHeader`) gain optional `slot` (32 bytes) and `rev`
->   (u64), both present or both absent and omitted when absent, so ordinary
->   items encode as before.
-> - **Every node verifies an item's signature before storing it,** and keeps
->   the newest `rev` per `(channel, slot, author)`.
-> - **Item-Sync (0x05)** serves every item, including internal items and
->   tombstones. `SyncRequest` gains optional `after_seq` and `SyncResponse`
->   optional `last_seq`, for paging in arrival order; peers that omit them get
->   the `since` behaviour.
-> - **Item-Push (0x06).** A node that writes items of this kind pushes its own
->   new ones to one relay from an outbox, at most every 2 s, and marks them
->   relayed when the relay acknowledges them.
-> - **PSK-Exchange (0x07)** is deferred and **Pairing (§4.8)** is dropped. Keys
->   of the older kind travel as sealed channel states in inbox channels
->   (decision 2026-09-30 §4.1). A channel from its secret has no key to hand
->   over for each channel: a device is added by a hand-over in a pair channel
->   (decision 2026-10-04 §6), which is an entry like any other (§4.9).
+> - **The older kind is gone** (the
+>   [decision record of 2026-11-10 (older kind)](../decisions/2026-11-10-removing-the-older-kind.md),
+>   rules 1, 2 and 7). No node of any role stores, sends, fetches or serves
+>   it. Every node answers an Item-Sync (`0x05`) as an alpha.19 device does,
+>   with no channels and no items, and refuses a Channel-Announce (`0x04`) and
+>   an Item-Push (`0x06`) at the byte; a refusal resets that one stream, and
+>   the connection goes on. Only the two sync requests and their answers, with
+>   `ItemHeader`, stay on the wire, since alpha.19 decodes them (§4.5).
+>   PSK-Exchange (`0x07`) and Pairing (`0x08`) have no messages. The bytes
+>   `0x04` to `0x08` are never used again. The handshake keeps
+>   `channel_digest` and `channel_count`, which every node sends for no
+>   channels (§4.1). §4.4 to §4.8, §6 and §7 say only that they are gone.
+> - **Swarm (§8.2.2) is gone:** no `swarm-init`, no trusted peers, no swarm
+>   children. A configuration that still sets `[swarm]` or
+>   `network.trusted_peers` loads; the keys are not read.
 > - **Secret keepers (§8.5)** are deferred. The bootnodes (§8.3, §10) are the
 >   two relays, `relay1` and `relay2.cordelia.seeddrill.ai:9474`
 >   (`FALLBACK_PEERS`).
@@ -60,7 +43,8 @@
 >   identity ADR) are in [`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md).
 >
 > The TLA+ model (`network-protocol.tla`) is of the governor and of the
-> replication of items (§4.4 to §4.6). It has no model of §4.9.
+> replication of items of the older kind (§4.4 to §4.6), which is gone. It
+> has no model of §4.9.
 
 ---
 
@@ -164,8 +148,7 @@ so the end that asks for a page bounds it:
 
 - **A relay serves every relay listed by key the full page it asks for**
   (up to `ENTRY_PAGE_MAX_BYTES`, 896 KiB). It does so by the key in the
-  peer's certificate, whatever the settings of the connection. The same
-  holds for the older kind's full fetch answers.
+  peer's certificate, whatever the settings of the connection.
 - **A relay asks a listed relay for `SMALL_WINDOWS_PULL_ENTRIES` (1)
   entry a page** where its own end of their connection does not carry the
   listed settings (`carries_listed_settings`). That happens when the
@@ -179,9 +162,6 @@ so the end that asks for a page bounds it:
 - **Entries passed on to a listed relay go a small page to a message**
   (`to_pass_on`, at most `SMALL_PAGE_BYTES` of entries), since the pusher
   cannot see the other end's windows.
-- **The older kind's fetch between relays** asks for fewer items after an
-  answer it could not read (`SYNC_PAGE_STEPS`). An item's header carries
-  no size, so a request cannot be fitted to the windows beforehand.
 
 Where a relay's NAT keeps the port (a static or one-to-one NAT), its
 operator should configure it at the relays it works with at the public
@@ -202,15 +182,13 @@ round trip at which one of its pages does:
 | A device's pass of 10 pages of 128 KiB, dialling its relay by key | 3.64 s | 5.37 s | 7.20 s | about 5.5 s |
 | The same pass, to a relay configured by address alone | 11.2 s | 16.7 s | 22.2 s | about 1.8 s |
 | A device of the version before pushes 896 KiB | 6.03 s | 8.99 s | 12.0 s | about 0.33 s |
-| An older kind's fetch answer of 1 MiB, between relays not listed by key | 6.85 s | 10.2 s | 13.6 s | about 0.29 s |
 | A full page of 896 KiB between relays listed by key | 0.41 s | 0.61 s | 0.80 s | about 4.9 s |
 
 A message larger than a stream's window takes about one round trip for
 each 31.5 KiB. A device of this version sends nothing larger than a
 small message, so its exchanges work at round trips up to more than a
-second. Only a node of the version before, and the older kind between
-relays not listed by key, send messages large enough to fail the stream
-timeout above about 0.3 s (§9.5).
+second. Only a node of the version before sends messages large enough to
+fail the stream timeout above about 0.3 s (§9.5).
 
 **The kernel's receive batching of UDP (`UDP_GRO`) is off** on every
 node's endpoint socket. It is turned off after quinn wraps the socket,
@@ -258,10 +236,9 @@ Initiator                                    Responder
     |--- First bidi stream: Handshake Propose -->|
     |<-- First bidi stream: Handshake Accept ---|
     |                                            |
-    |  [Channel intersection computed]           |
     |  [Peer added to governor peer table]       |
     |                                            |
-    |--- Stream N: Keep-Alive, Sync, Push ------>|
+    |--- Stream N: Keep-Alive, entries --------->|
 ```
 
 **Stream ownership:** The initiator opens the first bidirectional stream (`open_bi()`), writes the protocol byte and `HandshakePropose`. The responder accepts the stream (`accept_bi()`), reads the protocol byte, and dispatches. For quinn, `open_bi()` returns split `(SendStream, RecvStream)`; use `tokio::io::join(&mut recv, &mut send)` to combine into a single bidirectional `AsyncRead + AsyncWrite` stream for the handshake functions. The responder's `accept_bi()` MUST run concurrently with the initiator's `open_bi().await` (e.g., via `tokio::spawn`), otherwise mutual TLS with client certs will deadlock.
@@ -362,12 +339,12 @@ The first byte of each new QUIC stream identifies the mini-protocol:
 | `0x01` | Handshake | Bidirectional (one round-trip) | §4.1 |
 | `0x02` | Keep-Alive | Bidirectional (ongoing) | §4.2 |
 | `0x03` | Peer-Sharing | Request-Response | §4.3 |
-| `0x04` | Channel-Announce | Push with reconciliation | §4.4 |
-| `0x05` | Item-Sync | Request-Response (pull) | §4.5 |
-| `0x06` | Item-Push | Sender-initiated (push) | §4.6 |
-| `0x07` | PSK-Exchange | Request-Response | §4.7 |
-| `0x08` | Pairing | Request-Response | §4.8 |
-| `0x09` | RouteACK | Sender-initiated (push) | §7.4 |
+| `0x04` | Channel-Announce | Gone: refused at the byte | §4.4 |
+| `0x05` | Item-Sync | Gone: answered with nothing | §4.5 |
+| `0x06` | Item-Push | Gone: refused at the byte | §4.6 |
+| `0x07` | PSK-Exchange | Gone: no messages | §4.7 |
+| `0x08` | Pairing | Gone: no messages | §4.8 |
+| `0x09` | RouteACK | Gone, never built | §7.4 |
 | `0x10` | Entry-Show | Request-Response | §4.9.2 |
 | `0x11` | Channel-Prove | Request-Response | §4.9.1 |
 | `0x12` | Entry-Pull | Request-Response (pull) | §4.9.3 |
@@ -377,8 +354,10 @@ The first byte of each new QUIC stream identifies the mini-protocol:
 Stream lifecycle: the initiator opens a bidirectional QUIC stream, writes the protocol byte, then the first message. The responder reads the protocol byte to determine the handler. Unknown protocol bytes (0x0A+) cause the stream to be reset with application error code `0x02` (unknown protocol).
 
 > **v1 status.** `0x10` to `0x14` are the streams of a channel from its secret
-> (§4.9). They begin at `0x10`, apart from the streams of the older kind, so
-> that neither is read as the other. Only a relay serves them.
+> (§4.9). They begin at `0x10`, apart from the bytes of the older kind, so
+> that neither is read as the other. Only a relay serves them. The bytes
+> `0x04` to `0x08` are never used again (decision 2026-11-10 (older kind),
+> rule 7).
 
 ---
 
@@ -413,6 +392,10 @@ HandshakeAccept {
 }
 ```
 
+**Every node sends `channel_digest` and `channel_count` for no channels**
+(decision 2026-11-10 (older kind), rule 7): an alpha.19 node reads them,
+and no node carries a channel they could count.
+
 **A relay of this version also names the role `heads`** (`RELAY_ROLE_HEADS`)
 among its roles, in both messages: it keeps every head of a change entry,
 and hands each (§4.9.2; decision 2026-10-24 (removal), rule 18). A node of
@@ -424,8 +407,6 @@ own.
 #### 4.1.2 Handshake Design: Privacy-First
 
 **Key change from pre-pivot:** The handshake no longer includes the full channel list. Instead, it sends a `channel_digest` (SHA-256 of the sorted list of channel IDs). This reveals channel count but not channel identities.
-
-Channel intersection is computed lazily via the Channel-Announce protocol (§4.4) after the handshake completes. This prevents a connecting peer from learning the full channel membership in a single message.
 
 **Rationale:** In the pre-pivot design, `HandshakePropose` included `groups: Vec<GroupId>`. A Sybil attacker connecting to multiple nodes could build a complete membership graph of the network. With `channel_digest`, the attacker learns only that a change occurred (different digest), not what channels exist.
 
@@ -490,7 +471,7 @@ PeerAddress {
 
 **Key change from pre-pivot:** `PeerAddress` no longer includes `groups: Vec<GroupId>`. Channel membership is private information, not gossiped. Peer-sharing provides connectivity (addresses), not membership intelligence.
 
-**Rationale:** In the pre-pivot design, gossiping group lists let any node map the full network's channel membership. Removing channel lists from peer-sharing closes this metadata leak. Peers discover shared channels via Channel-Announce (§4.4), which is point-to-point, not broadcast.
+**Rationale:** In the pre-pivot design, gossiping group lists let any node map the full network's channel membership. Removing channel lists from peer-sharing closes this metadata leak.
 
 **Peer selection for sharing:** The responder MUST shuffle the peer list before returning it. Each requester receives a random subset in a random order. This prevents all bootstrapping nodes from connecting to the same relays, distributing load across the relay mesh.
 
@@ -514,497 +495,74 @@ Outbound connections to peer-shared addresses SHOULD be rate-limited to 1/second
 
 ### 4.4 Channel-Announce (0x04)
 
-Event-driven announcements with periodic reconciliation. This replaces the pre-pivot GroupExchange protocol.
-
-**Purpose:** Channel-Announce serves channel membership discovery between peers and governor scoring (§5.5). When a relay receives ChannelJoined/ChannelLeft from a hot peer, it tracks channel interest for metrics, relay affinity scoring, and future optimisation. Channel-Announce is **informational** -- it is NOT used for push routing decisions. Relay re-push targets all hot relay peers (broadcast, §7.2); personal nodes and keepers receive items via pull-sync (§4.5).
-
-**Relay participation:** Relays are **receive-only** for Channel-Announce. They listen to peers' announcements but do NOT send `ChannelJoined` for channels they carry. This prevents metadata amplification across the relay mesh.
-
-**Stream direction:** QUIC connections support bidirectional stream creation. Either side (initiator or responder) can open new streams at any time. This is critical for secret keeper connectivity (§8.5): the keeper initiates the connection to its relay, but the relay opens streams to push items back to the keeper.
-
-#### 4.4.1 Design: Push IDs, Pull Delta
-
-Inspired by Cardano's tx-submission mini-protocol: the sender pushes lightweight identifiers, the receiver decides what to fetch. The receiver controls bandwidth.
-
-Five message types on a long-lived bidirectional stream:
-
-```
-// Sender pushes when joining a new channel (includes full descriptor)
-ChannelJoined {
-    channel_id:   string            // Channel ID (hex SHA-256, dm_..., or grp_...)
-    descriptor:   ChannelDescriptor // Full signed descriptor (§4.4.6)
-}
-
-// Sender pushes when leaving a channel (§4.4.4)
-ChannelLeft {
-    channel_id: string      // Channel ID being left
-}
-
-// Periodic reconciliation (every 5 minutes)
-ChannelStateHash {
-    digest: bytes(32)       // SHA-256 of sorted channel ID list (see below)
-    count:  u16             // Number of channels
-}
-
-// Digest computation (deterministic, same as handshake channel_digest):
-//   1. Collect all subscribed channel IDs as UTF-8 strings
-//   2. Sort lexicographically (byte-order, ASCII/UTF-8 safe)
-//   3. Join with newline (\n) separator
-//   4. SHA-256 the resulting byte string
-
-// Receiver requests full list on digest mismatch
-ChannelListRequest {}
-
-// Response includes full descriptors (not just IDs)
-ChannelListResponse {
-    channels: [ChannelDescriptor]   // Full signed descriptors for all shared channels
-}
-```
-
-#### 4.4.2 Protocol Flow
-
-**Event-driven (immediate):**
-```
-Node A joins channel "research" (channel_id = SHA-256("cordelia:channel:research"))
-
-A -> B: ChannelJoined { channel_id: "a1b2c3..." }
-B updates intersection(A) locally. No response needed.
-```
-
-**Periodic reconciliation (every 5 minutes, initiated by both sides independently, staggered):**
-
-Each side of a Channel-Announce stream sends `ChannelStateHash` on its own 5-minute timer. Timers are offset by the peer's role in the connection: the connection initiator sends at 0:00, 5:00, 10:00...; the responder sends at 2:30, 7:30, 12:30... (150-second offset). This avoids simultaneous full-list exchanges.
-```
-A -> B: ChannelStateHash { digest: 0xabc..., count: 7 }
-B computes: does digest match what B expects for A?
-
-If match:  no action (common case)
-If mismatch:
-    B -> A: ChannelListRequest {}
-    A -> B: ChannelListResponse { channels: [ChannelDescriptor, ...] }
-    B recomputes intersection(A)
-```
-
-**Digest computation** (same algorithm as handshake `channel_digest`):
-
-The digest is computed identically to §4.4.1: collect all subscribed channel IDs as UTF-8 strings, sort lexicographically, join with newline (`\n`) separator, SHA-256 the resulting byte string. One canonical algorithm, used in both the handshake and reconciliation.
-
-The `count` field is the number of channels in the set (allows quick mismatch detection before comparing the 32-byte digest).
-
-**Reconciliation is immediate on first mismatch.** There is no retry or backoff -- a single digest mismatch triggers a full list exchange. This is acceptable because:
-1. Mismatches are rare (only on actual channel changes between reconciliation intervals)
-2. The full list is bounded by subscribed channels (~100 descriptors, ~10-20 KB)
-3. The tenure guard (§4.4.5) prevents abuse by newly-connected peers
-
-#### 4.4.3 Bandwidth Analysis
-
-**Pre-pivot (GroupExchange every 60s):**
-- 5 hot peers × 10 channels × 64 bytes/ID × every 60s = 53 bytes/s per node
-- Plus: full channel list exposed to all peers every minute
-
-**Phase 1 (Channel-Announce):**
-- Steady state: 5 hot peers × 32-byte digest × every 300s = 0.5 bytes/s per node (106x reduction)
-- Join event: 1 message × 64 bytes × 5 peers = 320 bytes total (one-time)
-- Mismatch recovery: rare, only on actual channel changes
-
-#### 4.4.4 ChannelLeft Semantics
-
-Nodes MUST send `ChannelLeft` when unsubscribing. This allows immediate intersection update. Without it, peers continue pushing items to the unsubscribed node until the next reconciliation (up to 5 minutes), wasting bandwidth.
-
-On node restart, all locally subscribed channels MUST be re-announced via `ChannelJoined` within 30 seconds. Items received for channels not in `node_subscribed_channels` are silently dropped at Gate 3 (§7.1).
-
-#### 4.4.5 Privacy Properties
-
-- `ChannelStateHash` reveals channel count and whether the set changed, but not which channels
-- `ChannelJoined` / `ChannelLeft` reveal a single channel ID, only to existing hot peers (already trusted for replication)
-- `ChannelListResponse` reveals the full list, but only when (a) digests mismatch AND (b) the requesting peer has been in Hot or Warm state for at least `min_warm_tenure` (300s, §5.4). Peers below this tenure receive an empty response. This prevents a newly-connected Sybil attacker from sending a spoofed digest to extract the full channel list.
-- Channel lists are never gossiped to third parties (unlike pre-pivot PeerShareResponse)
-
-**Accepted limitation:** A peer that maintains Hot status for 5+ minutes (by behaving well) can eventually learn the full channel list via digest manipulation. This is accepted because: (a) the peer is already trusted enough for item replication at that point, (b) it could learn channel membership by observing pushed items over time anyway, and (c) the min tenure makes mass reconnaissance via Sybil impractical (each identity requires 5+ minutes of good behaviour).
-
-**Free-rider risk:** A non-relay peer can send `ChannelJoined` for channels it doesn't actually subscribe to (the descriptor is signed by the creator, not the sender). This causes the receiver to push items to the free-rider, who collects metadata (author_id, timestamps, blob sizes) without contributing. In Phase 1 this is accepted -- the governor's scoring mechanism (§5.5) detects free-riders (low `items_delivered` → demotion → eventual eviction). Phase 2 should add proof-of-membership for non-relay peers: `HMAC-SHA256(psk, "membership:" || node_id || channel_id)` included in `ChannelJoined`, verifiable by any PSK holder.
-
-#### 4.4.6 Channel Descriptor
-
-A channel descriptor is the metadata record for a channel. It is created by the channel creator, signed, and replicated via Channel-Announce messages.
-
-```
-ChannelDescriptor {
-    channel_id:     string        // Channel ID (hex SHA-256, dm_..., or grp_...)
-    channel_name:   ?string       // Human-readable name (null for DMs and groups)
-    access:         string        // "open" | "invite_only"
-    mode:           string        // "realtime" | "batch"
-    key_version:    u32           // Current PSK version (incremented on rotation)
-    psk_hash:       bytes(32)     // SHA-256(current PSK) -- allows subscribers to verify PSK authenticity
-    creator_id:     bytes(32)     // Creator's Ed25519 public key
-    created_at:     string        // ISO 8601 timestamp
-    signature:      bytes(64)     // Ed25519 signature over CBOR-encoded descriptor (all fields except signature)
-}
-```
-
-**Signed payload** (CBOR deterministic encoding, per ECIES spec §11.4):
-
-The signature covers all fields except `signature` itself. CBOR map keys are sorted by **encoded byte length first, then lexicographic** per RFC 8949 §4.2.1 (not simple alphabetical). The canonical key order for Phase 1 fields is: `mode`, `access`, `psk_hash`, `channel_id`, `created_at`, `creator_id`, `key_version`, `channel_name`. See TV-C2 in ECIES spec §8.6 for the verified CBOR encoding.
-
-**Implementation note:** For Phase 1 fields, alphabetical sorting (e.g., Rust `BTreeMap`) and RFC 8949 encoded-byte-length sorting produce identical results. This is coincidental -- all Phase 1 field names are ASCII with no shared length prefixes. If new descriptor fields are added in future phases, use explicit key ordering rather than BTreeMap to avoid subtle signing mismatches between implementations.
-
-**PSK authenticity:** The `psk_hash` field binds the PSK to the signed descriptor. After receiving a PSK via PSK-Exchange (§4.7), the subscriber MUST verify `SHA-256(received_psk) == descriptor.psk_hash`. On mismatch: discard the PSK, ban the responding peer (identity mismatch severity, §5.6), and retry with a different peer. This prevents a malicious subscriber from distributing a fake PSK for an open channel.
-
-**Security property:** The `psk_hash` is a one-way hash, safe to include in the plaintext descriptor. Relays see the hash but cannot reverse it to obtain the PSK (SHA-256 preimage resistance, 256-bit security). The hash does allow offline verification of whether a candidate PSK matches a channel, but the PSK is 32 bytes of CSPRNG output -- brute force is infeasible.
-
-**Descriptor distribution:**
-
-Descriptors piggyback on Channel-Announce messages (§4.4.1). `ChannelJoined` carries the full descriptor; `ChannelListResponse` carries an array of descriptors. Message definitions are in §4.4.1.
-
-When a node receives a descriptor, it:
-1. Verifies the `signature` against `creator_id` and the CBOR-encoded fields
-2. Stores the descriptor locally (keyed by `channel_id`)
-3. If `key_version` is higher than the stored version, updates the stored descriptor
-
-**Descriptor updates:** When a channel's PSK is rotated (member removal, ECIES spec §6.4), the owner increments `key_version`, updates `psk_hash` to `SHA-256(new_psk)`, re-signs the descriptor, and sends a new `ChannelJoined` to all hot peers. Receivers update their stored descriptor if the new `key_version` is strictly higher and the `creator_id` matches.
-
-**Conflict resolution:** Once a node stores a descriptor for a channel_id, it rejects descriptors from a different `creator_id` (first-seen creator wins). All received descriptors MUST have their signature verified before any storage decision. Invalid signatures are rejected and the sending peer's ban severity is escalated. For the same `channel_id`, if a descriptor arrives from a different `creator_id`, it is silently dropped and a WARNING is logged with both `creator_id` values. The sending peer is NOT banned (legitimate network partition scenario). Phase 3 on-chain registration resolves creator disputes.
-
-**PSK discovery:** When a subscriber needs a PSK for an open channel, they identify PSK holders from their Channel-Announce data (peers that share the channel). Any existing subscriber can respond to PSKRequest (§4.7) for open channels. In Phase 2+, the descriptor gains an `anchor_keeper` field (Ed25519 key of the designated keeper node).
-
-**Field size limits:**
-- `channel_name`: max 63 characters (aligned with RFC 1035 label limit for named channels, same limit for group labels)
-- `access`: enum, max 11 characters
-- `mode`: enum, max 8 characters
-- Total serialized descriptor: max 512 bytes (CBOR-encoded, before signature). Reject oversized descriptors on receive.
-
-**Phase 1 simplification:** No `anchor_keeper` field. PSK distribution is peer-to-peer -- any subscriber holding the PSK can distribute it to new subscribers of open channels. The creator's node is the initial PSK holder; as more nodes subscribe, PSK availability increases organically.
+Gone (decision 2026-11-10 (older kind), rules 2 and 7): no node sends or
+hears an announcement. Every node refuses a stream of `0x04` at the byte,
+which resets that stream alone. Its messages, and §4.4.1 to §4.4.6 with
+them, went.
 
 ### 4.5 Item-Sync (0x05)
 
-Pull-based anti-entropy. Each node periodically syncs with a random hot peer per channel. The receiver controls what it fetches.
+Gone as a sync (decision 2026-11-10 (older kind), rule 7): no node fetches
+or serves the older kind. Every node answers as an alpha.19 device does: a
+`SyncChannelListRequest` with no channels, and each `SyncRequest` with no
+items and `has_more: false`, up to 64 answers a stream; anything else ends
+the stream. These two requests and their answers stay on the wire, with
+`ItemHeader`, since alpha.19 decodes them. `SyncRequest` also has an
+optional `after_seq`, `SyncResponse` an optional `last_seq`, and
+`ItemHeader` an optional `slot` and `rev`, each left out where absent.
 
 ```
+SyncChannelListRequest {}
+
+SyncChannelListResponse {
+    channel_ids: [string]
+}
+
 SyncRequest {
-    channel_id: string          // Channel to sync
-    since:      ?string         // ISO 8601 cursor (items newer than this)
-    limit:      u32             // Max headers to return (default: 100)
+    channel_id: string
+    since:      ?string
+    limit:      u32
 }
 
 SyncResponse {
-    items:    [ItemHeader]      // Headers of items the responder has
-    has_more: bool              // More items available beyond limit
+    items:    [ItemHeader]
+    has_more: bool
 }
 
 ItemHeader {
-    item_id:      string        // Unique item identifier
-    channel_id:   string        // Channel this item belongs to
-    item_type:    string        // Content type (e.g., "message", "event", "state")
-    content_hash: bytes(32)     // SHA-256 of encrypted payload
-    author_id:    bytes(32)     // Author's Ed25519 public key (raw, not Bech32)
-    signature:    bytes(64)     // Ed25519 signature over metadata envelope (ECIES spec §11)
-    key_version:  u32           // PSK version used for encryption
-    published_at: string        // ISO 8601 timestamp
-    is_tombstone: bool          // True if this is a deletion marker
-    parent_id:    ?string       // Parent item ID (threading, replies)
-}
-
-Note: `author_id` is raw bytes(32) on the wire for compactness. The signed metadata envelope (ECIES spec §11.7) uses the same raw bytes in CBOR encoding. Bech32 encoding (`cordelia_pk1...`) is used only in the REST API and SDK (human-readable contexts). The signed metadata envelope covers: `author_id`, `channel_id`, `content_hash`, `is_tombstone`, `item_id`, `key_version`, `published_at`. Both `is_tombstone` and `key_version` MUST be signed -- without them, a malicious relay could forge deletions or cause targeted decryption failures by manipulating the PSK version.
-```
-
-**Sync flow:**
-
-Phase 0 (relay channel discovery): Before per-channel sync, relay nodes send a `SyncChannelListRequest` to learn which channels the peer has items for. The responder returns `SyncChannelListResponse` with its stored channel IDs. The initiator merges these into its `relay_learned_channels` set for this and future sync cycles. This solves the bootstrap problem: a relay with 0 items can discover channels from its peers, then sync items for those channels.
-
-```
-SyncChannelListRequest {}           // "What channels do you have?"
-
-SyncChannelListResponse {
-    channel_ids: [string]           // Channels the responder has stored items for
+    item_id:      string
+    channel_id:   string
+    item_type:    string
+    content_hash: bytes(32)
+    author_id:    bytes(32)
+    signature:    bytes(64)
+    key_version:  u32
+    published_at: string
+    is_tombstone: bool
+    parent_id:    ?string
 }
 ```
-
-A relay asks its hot peers on every sync cycle. It asks every other peer connected to it when that peer connects and every `relay_ask_again_secs` after, and asks a peer that is not a relay it lists only for the channels the peer listed: at most 1,024 of them, each an ID that could be a channel's (decision record §4.6). Phase 0 runs on the same stream before per-channel SyncRequests. Personal nodes skip Phase 0 (they know their subscribed channels). The overhead is one extra round-trip per peer per cycle -- acceptable given it also serves as a liveness signal.
-
-Phase 1-4 (per-channel sync):
-1. Initiator sends `SyncRequest` for a channel, with cursor from last successful sync
-2. Responder returns `SyncResponse` with item headers since the cursor
-3. Initiator compares headers to local storage:
-   - Unknown item_id → queue for fetch
-   - Known item_id, different content_hash → compare `published_at`, keep latest (LWW)
-   - Known item_id, same content_hash → skip (already have it)
-   - is_tombstone → mark local item as deleted
-4. Initiator fetches missing items via Item-Fetch (piggybacked on sync stream)
-5. Repeat steps 1-4 for each remaining channel on the same stream
-6. Initiator sends FIN (closes write half) to signal end of batch
-
-**Batched sync:** All channels are synced on a single QUIC stream per peer. The initiator writes the protocol byte once, optionally performs Phase 0, then loops SyncRequest/FetchRequest pairs for each channel. The responder loops correspondingly: after serving a SyncResponse + optional FetchResponse, it reads the next frame. A SyncRequest means another channel follows; EOF (FIN) means the batch is complete. This is backward-compatible: old clients that close after one channel cause the responder to read EOF and exit the loop naturally. Scope-rejected channels receive an empty SyncResponse and do not abort the stream.
-
-**Item-Fetch (on same stream, after SyncResponse):**
-
-```
-FetchRequest {
-    item_ids: [string]          // Items to fetch (max 100)
-}
-
-FetchResponse {
-    items: [Item]
-}
-
-Item {
-    item_id:        string
-    channel_id:     string
-    item_type:      string      // Content type
-    encrypted_blob: bytes       // Opaque ciphertext (AES-256-GCM, ECIES spec §5)
-    content_hash:   bytes(32)   // SHA-256 of encrypted_blob
-    content_length: u32         // Length of encrypted_blob in bytes
-    author_id:      bytes(32)   // Ed25519 public key (raw)
-    signature:      bytes(64)   // Ed25519 signature (ECIES spec §11)
-    key_version:    u32         // PSK version
-    published_at:   string      // ISO 8601
-    is_tombstone:   bool
-    parent_id:      ?string     // Parent item ID (threading)
-}
-```
-
-**Sync intervals by channel delivery mode:**
-
-| Mode | SDK name | Sync interval | Push on write? |
-|------|----------|---------------|----------------|
-| Realtime | `realtime` | 10s (primary delivery for personal/keeper) | Yes (to hot relays only) |
-| Batch | `batch` | 900s (15 min) | No |
-
-**Pull-sync is the primary delivery mechanism for personal nodes and secret keepers.** Relays push items to other relays (single-hop, §7.2), but personal nodes and keepers receive items exclusively via pull-sync. This makes personal nodes responsible for fetching what they need, eliminates relay-side routing state, and bounds relay complexity to store-and-forward.
-
-**Sync targets: Hot peers only (§5.1, §5.4.2).** Item-Sync runs exclusively on Hot peers. Warm peers maintain connections for keepalive and peer-sharing but do NOT participate in data exchange. Bootnode peers (§8.2) are never sync targets -- they do not store or replicate items.
-
-**Peer selection for pull-sync:** The node MUST sync from all **hot** peers each cycle (governor state = Hot, §5). Each peer sync is independent and MAY run concurrently (separate tasks). This ensures O(hot_max) sync cost per cycle, bounded by the governor's hot peer set regardless of total network size.
-
-**Channel source for pull-sync:** Personal nodes sync their subscribed channels (`list_for_entity`). Relay nodes sync `relay_learned_channels`: the union of channels they have stored items for (`SELECT DISTINCT channel_id FROM items`) and channels discovered from peers via Phase 0 channel discovery (`SyncChannelListResponse`). This breaks the bootstrap dependency: a relay with 0 items discovers channels from peers, then syncs items for those channels. The `relay_learned_channels` set is maintained in memory and rebuilt each sync cycle from stored items + peer responses.
-
-The governor (§5) manages which peers are hot:
-- Peers that deliver items the node didn't have are scored higher (§5.5)
-- High-scoring peers are promoted to Hot (§5.4 step 4)
-- Stale peers (no new items for 30 min) are demoted Hot→Warm (§5.4 step 5)
-- Bootnode peers (§8.2) are never sync targets
-
-**Convergence time bound:** After a network partition heals, convergence requires:
-
-**Bootstrap (hot_count < hot_min):**
-```
-T_bootstrap = T_idle_timeout + T_tick + T_sync_interval + T_margin
-            = 60s + 10s + 10s + ~5s ≈ 85s
-```
-
-Reconnecting peers are promoted to Hot immediately (§5.4.1 bypass).
-
-**Steady state (hot_count >= hot_min):**
-```
-T_steady = T_idle_timeout + T_tick + T_warm_tenure + T_sync_interval + T_margin
-         = 60s + 10s + 300s + 10s + ~10s ≈ 390s
-```
-
-Reconnecting peers must survive `min_warm_tenure_secs` (300s) before Hot promotion. This is the anti-eclipse cost: slower convergence in exchange for Sybil resistance.
-
-Where:
-- `max_idle_timeout` (60s): zombie QUIC connections must expire before reconnection
-- `T_tick` (10s): governor tick discovers new peers via peer-sharing
-- `min_warm_tenure` (300s): anti-eclipse tenure guard (steady state only)
-- `sync_interval` (10s): one full pull-sync cycle covering all hot peers
-- `margin`: network/scheduling jitter
-
-Both bounds are **independent of network size N**. For relay chains of depth D, each hop adds at most `sync_interval` to convergence. This is O(D), not O(N).
-
-**Phase 1 networks (<20 peers):** Personal nodes keep at most 2 hot peers (`hot_max=2`); relays keep up to 50. The relay backbone handles fan-out. `min_warm_tenure` only matters after churn or partition heal when a reconnecting peer must re-earn Hot status.
-
-**Phase 2+ optimisation:** For large networks (100+ peers), sync-from-all becomes expensive. Consider prioritised sync (prefer peers with highest clock skew) or bloom filter-based set reconciliation to reduce per-cycle cost while maintaining O(1) convergence.
 
 ### 4.6 Item-Push (0x06)
 
-Unsolicited item delivery for realtime channels. Sender opens a new stream, writes items, receiver acknowledges.
-
-```
-// Sender writes:
-PushPayload {
-    items: [Item]               // Same Item type as FetchResponse
-}
-
-// Receiver replies:
-PushAck {
-    stored:              u32    // Items successfully stored
-    dedup_dropped:       u32    // Items dropped as duplicates (same item_id + content_hash)
-    policy_rejected:     u32    // Items rejected by access policy or rate limit
-    verification_failed: u32    // Items the receiver did not store: invalid, or it could not store them
-    refused:             [{ item_id: tstr, why: tstr }]
-                                // Optional (0.2.0-alpha.4): which items were not stored, and why
-                                // ("invalid", "storage"). Omitted when empty. The sender keeps
-                                // these in its outbox and offers them again. A receiver without
-                                // this field only counts them, and the sender then takes nothing
-                                // in the push as delivered.
-}
-```
-
-**Item wire format extensions:**
-
-Items carried in PushPayload gain the following optional fields:
-
-```
-Item {
-    // ... existing fields (item_id, channel_id, content_hash, encrypted_blob, etc.) ...
-    routing_mode:  u8           // 0 = epidemic (default), 1 = routed
-    ttl:           u8           // Default 255 (epidemic), starts at 2 (routed expanding ring)
-    route_tokens:  [bytes]      // Optional, empty for epidemic. Each token ~48 bytes.
-}
-```
-
-- `routing_mode`: Set by the publisher. Group channels use `epidemic` (0); personal channels use `routed` (1). Relays forward both modes identically via the seen table (§7.2) -- the distinction affects only ACK behaviour (§7.4) and rate limiting (§9.2).
-- `ttl`: Decremented by relays before forwarding. Items with TTL=0 are stored but not forwarded (§7.5).
-- `route_tokens`: Accumulated encrypted routing tokens for path privacy (§7.4). Empty for epidemic items.
-
-**RouteACK (0x09):**
-
-```
-RouteACK {
-    item_id:  string            // Item being acknowledged
-    tokens:   [bytes]           // Reversed token chain from receiver to publisher
-}
-```
-
-Sent by the receiver of a `routed` item back through the relay chain. Each relay peels one token to discover the next hop (§7.4).
-
-**When Item-Push fires:**
-- On local write to a realtime channel: push to hot relay peers only. The originator (personal node or keeper) pushes to its hot relays; relays handle distribution. Non-relay peers receive items via Item-Sync pull (§4.5). Respects `push_policy` (§8.1.1).
-- Relay forwarding (§7.2): if a relay stores an item (`stored > 0`), it forwards to all hot peers not in the seen table for this item's `content_hash`. Items received from other relays ARE forwarded (with duplicate suppression). Bootnodes (§8.2) do NOT forward -- they are discovery-only.
-- Bootnode nodes never initiate or relay Item-Push. They participate only in Handshake, Peer-Sharing, and Keep-Alive.
-- Personal nodes and secret keepers receive items exclusively via Item-Sync pull (§4.5), not via relay push. This eliminates relay-side routing state and Channel-Announce dependency for push routing.
-
-**Epidemic relay forwarding:** Relays forward newly stored items to all hot relay peers that have not seen this item (checked via seen table, §7.2). This replaces the single-hop model and ensures items propagate across the full relay mesh in O(log N) hops. Pull-sync (§4.5) remains the safety net for any items missed during forwarding.
-
-**Loop prevention:** The seen table (§7.2) tracks which peers have received each item. Combined with dedup (step 3 in §6.2), each item is forwarded at most once per peer. No cascading loops are possible.
-
-**Forward item filtering:** The relay MUST only queue items that were **newly stored** (`store_item` returned true) for forwarding. Items that were deduplicated or already present MUST NOT be queued, even if other items in the same batch were new.
-
-**Signature verification:** Before storing a pushed item, the receiver MUST verify the `signature` against the `author_id` and metadata envelope (ECIES spec §11.7). Reject items with invalid signatures.
+Gone (decision 2026-11-10 (older kind), rules 2 and 7): no node pushes or
+takes an item of the older kind. Every node refuses a stream of `0x06` at
+the byte, which resets that stream alone; an alpha.19 relay drops its older
+pushes after three tries (rule 8). Its messages, the item's routing fields
+and RouteACK (`0x09`) went.
 
 ### 4.7 PSK-Exchange (0x07)
 
-Request-response for channel PSK distribution. Used when a subscriber needs the PSK for an open or gated channel from another node that holds it.
-
-```
-PSKRequest {
-    channel_id:      string        // Channel to subscribe to
-    subscriber_xpk:  bytes(32)     // Subscriber's X25519 public key (for ECIES envelope)
-}
-
-PSKResponse {
-    status:          string        // "ok" | "denied"
-    reason:          ?string       // Present only if status == "denied": "not_found" | "not_authorized" | "not_available"
-    ecies_envelope:  ?bytes(92)    // ECIES-encrypted PSK (ECIES spec §4), present only if status == "ok"
-    key_version:     ?u32          // Current PSK version
-}
-
-// Rejection reason codes:
-//   "not_found"      - channel unknown to this node
-//   "not_authorized" - access policy denied (invite-only, gated condition failed)
-//   "not_available"  - PSK not held locally (relay nodes, nodes that haven't received PSK yet)
-
-```
-
-**Protocol flow:**
-
-1. Subscriber sends `PSKRequest` with their X25519 public key
-2. Holder evaluates access policy:
-   - Open channel: approve automatically
-   - Gated channel: evaluate condition (Phase 2+)
-   - Invite-only channel: deny (PSK distributed via direct invitation, not request)
-3. Holder verifies `subscriber_xpk == ed25519_to_x25519(peer.node_id)` (TLS-authenticated identity). The `subscriber_xpk` field contains the raw 32-byte X25519 public key (CBOR major type 2, binary). The holder MUST compute `ed25519_to_x25519(peer.node_id)` using the algorithm in ecies-envelope-encryption.md §2.2 and verify equality with the received `subscriber_xpk`. Mismatch indicates a key confusion attack or low-order point attack; the holder rejects with status `denied`, reason `not_authorized`, and bans the peer for `identity_mismatch` (Moderate tier, §5.6).
-4. If approved: ECIES-encrypt the channel PSK to the subscriber's X25519 key (92-byte envelope, ECIES spec §4)
-5. Return `PSKResponse` with the encrypted envelope
-6. Subscriber decrypts envelope, verifies `SHA-256(decrypted_psk) == descriptor.psk_hash` (§4.4.6). On mismatch: discard PSK, ban peer, retry with a different peer.
-
-**Security:**
-- The PSK is encrypted to the subscriber's specific key. Eavesdroppers on the QUIC stream see only ciphertext.
-- Only nodes that hold the PSK can respond. Relays (which never hold PSKs) return `unknown_channel`.
-- Rate limited: max 1 PSK request per channel per peer per minute (§9.2).
-- Invalid or excessive requests result in ban escalation (§5.6).
-
-**Phase 1 scope:** In Phase 1, open channels are the primary use case. The channel creator's node holds the PSK and responds to requests from any authenticated peer. Gated channels and keeper-based PSK distribution are Phase 2+.
+Gone (decision 2026-11-10 (older kind), rule 2): no node asks for or hands a
+channel's key. The byte `0x07` has no messages.
 
 ---
 
 ### 4.8 Pairing (Device Enrollment)
 
-Protocol byte `0x08`. Enables second-device enrollment via one-time pairing codes. Used between two personal nodes and between personal nodes and bootnodes.
-
-**Bootnode messages (registration and lookup):**
-
-```
-PairRegister {
-    code:        string       // Raw pairing code (transport-encrypted by TLS 1.3)
-    address:     string       // Initiator's reachable address (ip:port)
-    ttl_seconds: u32          // Expiry (default 300, max 600)
-}
-
-PairRegisterAck {
-    accepted:    bool
-    reason:      ?string      // "rate_limited" | "capacity" | "session_in_use" if rejected
-}
-
-PairLookup {
-    code:        string       // Raw pairing code (transport-encrypted by TLS 1.3)
-}
-
-PairLookupResponse {
-    found:       bool
-    address:     ?string      // Initiator address if found
-}
-```
-
-**HMAC storage:** The bootnode computes `HMAC-SHA256(bootnode_secret, code)` on receipt and stores only the HMAC-to-address mapping. The raw pairing code is held in memory only during HMAC computation, then discarded. The HMAC key is per-bootnode (CSPRNG, 32 bytes), never shared between bootnodes. This prevents offline brute-force even with bootnode database access. Transport encryption (TLS 1.3 via QUIC) protects the raw code in transit.
-
-Bootnodes MUST rate-limit PairLookup: max 10 requests per source IP per minute. Exceeding returns `PairLookupResponse { found: false }`.
-
-**Device-to-device messages (after lookup resolves address):**
-
-```
-PairOffer {
-    initiator_pk:  bytes(32)  // Initiator's Ed25519 public key
-    fingerprint:   string     // SHA-256(initiator_pk)[0..8] hex, for visual verification
-}
-
-PairAccept {
-    joiner_pk:     bytes(32)  // Joiner's Ed25519 public key (from `cordelia init`, NOT ephemeral)
-    fingerprint:   string     // SHA-256(joiner_pk)[0..8] hex
-}
-
-PairBundle {
-    identity_key:  bytes(92)  // ECIES envelope: Ed25519 seed encrypted for joiner's X25519 (derived from joiner_pk per ECIES spec §2)
-    channel_psks:  [bytes(92)]  // ECIES envelopes: one per channel PSK
-    channel_ids:   [string]   // Corresponding channel IDs (same order as channel_psks, plaintext -- transport-encrypted only)
-}
-
-PairComplete {
-    ok:            bool
-    channels_received: u32    // Number of channels synced
-}
-```
-
-**Flow:**
-1. Initiator sends PairRegister (raw code over TLS) to configured bootnodes (`network.bootnodes`), NOT all hot peers
-2. Joiner sends PairLookup (raw code over TLS) to bootnodes; bootnode HMACs and looks up
-3. Joiner connects directly to initiator address via QUIC
-4. Initiator sends PairOffer, joiner sends PairAccept
-5. Both devices display fingerprints for visual verification (out-of-band). Initiator MUST NOT proceed to step 6 until user confirms fingerprint match. In `--non-interactive` mode, fingerprint verification is skipped (acceptable for automated provisioning in trusted networks; the threat model assumes physical proximity or secure channel for pairing code exchange).
-6. Initiator sends PairBundle (ECIES-encrypted identity + all channel PSKs)
-7. Joiner sends PairComplete, replaces init-generated identity with received Ed25519 seed, re-derives all keys, begins replication
-8. Initiator sends PairRegister with `ttl_seconds: 0` to bootnodes (cleanup)
-
-Initiator accepts only ONE pairing connection per session. Subsequent connections receive `PairRegisterAck { accepted: false, reason: "session_in_use" }`. The initiator MUST verify that the connecting peer's Ed25519 public key is NOT already known (not an existing peer) -- pairing is only for new devices.
-
-Pairing codes are single-use. Bootnodes delete the registration after one successful lookup or on TTL expiry.
-
-**Security properties:**
-- Pairing code sent over TLS, never stored on bootnode (only HMAC)
-- Identity key encrypted in transit (ECIES envelope for joiner's X25519)
-- Visual fingerprint verification (mandatory in interactive mode) defeats active MITM
-- Single-use code prevents replay
-- Single-connection guard prevents malicious bootnode racing
-- PairBundle reveals initiator's full channel list to joiner (intentional -- same identity). Channel IDs are transport-encrypted (TLS 1.3) but not content-encrypted within the bundle. A compromised TLS session would expose channel membership but not PSKs (which are ECIES-encrypted).
+Gone (decision 2026-11-10 (older kind), rule 2): the byte `0x08` has no
+messages. A device is added by a hand-over in a pair channel (decision
+2026-10-04 §6), which is an entry like any other (§4.9).
 
 ---
 
@@ -1024,7 +582,7 @@ relay needs no list of members and no state of a channel to serve them.
 | `0x13` | Entry-Push | A device, to a relay | Entries to be stored |
 | `0x14` | Relay-Entries | A relay, to a relay its operator lists | Which channels it holds, a page of one without the proof, and entries passed on |
 
-They begin at `0x10`, apart from the streams of the older kind. A peer that
+They begin at `0x10`, apart from the bytes of the older kind. A peer that
 does not know them refuses the stream, and reads none of them as one of its
 own. Nothing of §4.1 to §4.8 is changed by them.
 
@@ -1492,12 +1050,12 @@ are not held back by this, and are few.
 
 #### 4.9.7 The Limits on These Streams
 
-The limits on bytes are the ones the older kind of channel has, with the
-same numbers, and the two kinds are counted together against them. Bytes and
+The limits on bytes are the ones the older kind of channel had, with the
+same numbers. Bytes and
 requests are each counted for the connection and for its address: all the
 connections from one address share 5 times a connection's allowance
 (`MAX_CONNECTIONS_PER_IP`). Requests on these streams have a count of their
-own. New channels are counted by address alone, each kind apart.
+own. New channels are counted by address alone.
 
 | What | Limit | Counted as | Over it |
 |------|-------|-----------|---------|
@@ -1513,8 +1071,7 @@ own. New channels are counted by address alone, each kind apart.
   proofs in one burst, as many as a relay remembers for a connection
   (1,024); a show for each pass and each time it sends; and what it pushes.
 - **Three breaches in ten minutes cut a peer off,** and its address is
-  refused for fifteen minutes (`BAN_TRANSIENT_SECS`, §5.6), as for the older
-  kind.
+  refused for fifteen minutes (`BAN_TRANSIENT_SECS`, §5.6).
 - **A pull that is refused for the asker's bytes is no breach:** the relay
   sized the page, and the asker cannot know its room. The stream is reset
   with the rate limit's code (`0x03`), and nothing is counted. Where the
@@ -1525,9 +1082,7 @@ own. New channels are counted by address alone, each kind apart.
   (`SHOW_ANSWER_ROOM_BYTES`: one entry of the largest size, as it is
   counted), and of the requests on these streams only the entry that answers
   a show uses that room. So a device that pulls at its full rate, or shares
-  its address with one that does, is still told of a removal. (What a relay
-  fetches of the older kind from a node at that address is counted against
-  the same allowance, with no room kept.)
+  its address with one that does, is still told of a removal.
 - **The answer to a show is handed while the asker is not yet over its
   bytes,** so it can take the asker over by one entry and no more. After
   that a show that would be answered with an entry is refused as "not now",
@@ -1566,7 +1121,7 @@ Background tokio task, ticks every 10 seconds.
 |-------|-----------|-----------|---------|
 | **Cold** | None | None | Address book entry. No resource cost. |
 | **Warm** | **Open**, keepalive active | Keep-Alive (ss4.2), Peer-Sharing (ss4.3) | Ready reserve. Fast failover (~0 promote cost). Discovery aid. |
-| **Hot** | Open, keepalive + data | All above + Push (ss4.6), Sync (ss4.5), Channel-Announce (ss4.4) | Active data peer. Items flow here. |
+| **Hot** | Open, keepalive + data | All above + the streams of entries (ss4.9), at a relay | Active data peer. |
 | **Banned** | Closed | None | Violation cooldown. Duration depends on tier (ss5.6). |
 
 **Critical property:** When a peer is demoted Hot->Warm, the QUIC connection stays open. Only data protocols stop. This makes Warm->Hot promotion near-instant (start streams on existing connection) vs Cold->Warm (full QUIC handshake). The Warm set is a pre-connected ready reserve that provides fast failover and enables network-size-independent convergence.
@@ -1592,17 +1147,12 @@ PeerInfo {
     node_id:         bytes(32)      // Ed25519 public key (verified by TLS)
     addrs:           [SocketAddr]   // Known addresses
     state:           PeerState      // Cold | Warm | Hot | Banned { until, reason }
-    channels:        [string]       // Channel IDs shared with this peer
     rtt_ms:          ?f64           // Latest RTT measurement
     last_activity:   Instant        // Last keepalive or item received
-    items_delivered:  u64           // Cumulative items received from this peer
-    items_relayed:   u64            // Items this peer has forwarded to us (§16.1.1)
-    items_requested: u64            // Items we have requested from this peer
     bytes_in:        u64            // Total bytes received
     bytes_out:       u64            // Total bytes sent
     probes_sent:     u32            // Probe items expected from this peer (§16.1.2)
     probes_received: u32            // Probe items actually received
-    score_ema:       f64            // Exponential moving average score
     state_changed_at: Instant       // When peer entered current state (for tenure checks)
     demoted_at:      ?Instant       // When last demoted (hysteresis)
     connection:      ?Connection    // Live QUIC connection handle (present for Warm + Hot)
@@ -1621,45 +1171,33 @@ GovernorTargets {
     warm_min:       usize     // Default: 3.  Below this, connect cold peers
     warm_max:       usize     // Default: 10. Maximum warm+hot peers
     cold_max:       usize     // Default: 50. Maximum known peer addresses
-    dial_policy:    DialPolicy // Default: "all". "all" | "relays_only" | "trusted_only"
+    dial_policy:    DialPolicy // "all" | "relays_only": by the role (below)
 }
 ```
 
 **`hot_min_relays`:** Independent target from `hot_min`. Ensures relay backbone connectivity. On each governor tick, if fewer than `hot_min_relays` relays are in the hot set, promote a random warm relay to Hot (bypassing the regular random selection for non-relay peers). This guarantees items reach the relay backbone for fan-out.
 
-**`dial_policy`:** Controls which peers the governor will connect to. `all` = any discovered peer. `relays_only` = only peers that identified as relay during handshake. `trusted_only` = only peers in `[[network.trusted_peers]]` config (secret keeper mode).
+**`dial_policy`:** Controls which peers the governor will connect to. `all` = any discovered peer. `relays_only` = only peers that identified as relay during handshake. A personal node dials relays only, and every other role any peer: the role sets it, and no key of the configuration does. `trusted_only` is gone with the trusted peers (decision 2026-11-10 (older kind), rule 2).
 
 **Configuration validation (enforced on startup, node MUST refuse to start if violated):**
 ```
 hot_min >= 1
 hot_min <= hot_max
 hot_min_relays <= hot_max
-hot_max <= warm_max              (except: dial_policy = "trusted_only" exempts this)
-warm_min >= hot_min              (except: dial_policy = "trusted_only" allows warm_min = 0)
-cold_max >= warm_max             (except: dial_policy = "trusted_only" allows cold_max = 0)
+hot_max <= warm_max
+warm_min >= hot_min
+cold_max >= warm_max
 tick_interval_secs >= 1
 keepalive_timeout_secs >= 60     (>= 2x keep-alive interval of 30s)
 min_warm_tenure_secs >= 60
 hysteresis_secs >= tick_interval_secs
 churn_fraction in (0.0, 1.0]
-dial_policy in ("all", "relays_only", "trusted_only")
 ```
-
-**`trusted_only` exemption:** Secret keepers (§8.5) use `dial_policy = "trusted_only"` with no gossip discovery. They connect only to configured relays, so `warm_min=0` and `cold_max=0` are valid -- there are no peers to discover.
 
 ### 5.3.1 Trusted Peers
 
-Operators MAY configure trusted peers that the governor MUST always maintain as Warm or Hot:
-
-```toml
-[[network.trusted_peers]]
-addr = "relay1.example.com:9474"
-
-[[network.trusted_peers]]
-addr = "relay2.example.com:9474"
-```
-
-Trusted peers are never demoted below Warm, never evicted by churn, and are always eligible for promotion regardless of scoring. They provide the primary defense against eclipse attacks (cf. Cardano's "local root peers"). Bootnodes are NOT automatically trusted -- they are transient discovery aids.
+Gone (decision 2026-11-10 (older kind), rule 2): `network.trusted_peers` is
+not read. A configuration that still sets it loads.
 
 ### 5.4 Tick Logic (every `tick_interval_secs`, default: 10s)
 
@@ -1670,8 +1208,8 @@ Executed in order:
 3. **Promote Cold→Warm**: If `warm_count < warm_min`, connect to cold peers. Prefer peers with channel overlap. **Failure tracking:** After `max_connection_retries` (default: 5) consecutive failures, stop trying until the peer's backoff expires (exponential, base 30s, cap 900s). Clear failure count after `clear_failure_delay` (default: 120s) of being Hot.
 4. **Promote Warm→Hot**: If `hot_count < hot_min`, promote from eligible warm peers. Guard: `min_warm_tenure_secs` (default: 300s) -- peer must be warm for 5 min, UNLESS `hot_count < hot_min` (bootstrap bypass). Guard: `hysteresis_secs` (default: 90s) -- recently demoted peers ineligible. **Anti-eclipse: promotion is RANDOM among eligible warm peers, not best-scoring.** This prevents an attacker from gaming their score to get promoted faster than honest peers (cf. Cardano's `simplePromotionPolicy`).
 4a. **Ensure relay connectivity**: If fewer than `hot_min_relays` relay peers are Hot, promote a random warm relay to Hot. This bypasses the regular random selection and the tenure guard (same urgency as `hot < hot_min`). Evaluated after step 4, independent of `hot_count`.
-5. **Demote Hot→Warm**: If `hot_count > hot_max`, demote worst-scoring hot peer. Stale peers (no items for `stale_threshold_secs`, default: 1800s) demoted first. Trusted peers are never demoted.
-6. **Churn (hot)**: Every `churn_interval_secs` (default: 3600s) plus a jitter drawn at random, uniform from 0 to `churn_jitter_secs` (default: 300s), once for each churn when the one before it runs, demote 1 random hot peer to Warm and promote 1 random warm peer to Hot in its place, so the hot count does not change. The peer demoted is chosen among hot peers that are not trusted: a trusted peer and a swarm member are never demoted by churn, and nor is a relay while no more than `hot_min_relays` relays are hot, so churn never leaves fewer hot relays than step 4a keeps. The peer promoted is chosen at random (as in step 4, anti-eclipse) among the warm peers that pass step 4's guards with none bypassed: `min_warm_tenure_secs` and `hysteresis_secs`, and no bootnode or swarm member. It is chosen before the demotion, so the peer just demoted is never the one promoted. A trusted warm peer may be promoted. If no hot peer may be demoted, or no warm peer passes, nothing moves: a demotion with no peer to take its place explores nothing and only shrinks the hot set, which step 4 refills only below `hot_min`. Churn runs only while `hot_count > hot_min`. Moving a peer between Hot and Warm opens and closes no connection, so a personal node keeps the relays it is set up with (decision 2026-10-17 §2). This forces hot-tier exploration and prevents topology ossification.
+5. **Demote Hot→Warm**: If `hot_count > hot_max`, demote hot peers until it is not. Stale peers (no keep-alive answer for `stale_threshold_secs`, default: 1800s) are demoted first; there is no score after that (§5.5).
+6. **Churn (hot)**: Every `churn_interval_secs` (default: 3600s) plus a jitter drawn at random, uniform from 0 to `churn_jitter_secs` (default: 300s), once for each churn when the one before it runs, demote 1 random hot peer to Warm and promote 1 random warm peer to Hot in its place, so the hot count does not change. The peer demoted is chosen among hot peers at random, but a relay is never demoted by churn while no more than `hot_min_relays` relays are hot, so churn never leaves fewer hot relays than step 4a keeps. The peer promoted is chosen at random (as in step 4, anti-eclipse) among the warm peers that pass step 4's guards with none bypassed: `min_warm_tenure_secs` and `hysteresis_secs`, and no bootnode. It is chosen before the demotion, so the peer just demoted is never the one promoted. If no hot peer may be demoted, or no warm peer passes, nothing moves: a demotion with no peer to take its place explores nothing and only shrinks the hot set, which step 4 refills only below `hot_min`. Churn runs only while `hot_count > hot_min`. Moving a peer between Hot and Warm opens and closes no connection, so a personal node keeps the relays it is set up with (decision 2026-10-17 §2). This forces hot-tier exploration and prevents topology ossification.
 7. **Churn (warm)**: Same interval, swap `churn_fraction` (default: 0.2) of warm peers with random cold peers. A personal node never closes, by churn, its connection to a relay it is set up with: each is one the person chose (decision 2026-10-17 §2).
 8. **Evict excess cold**: If `cold_count > cold_max`, remove peers with most connection failures first, then oldest-seen.
 
@@ -1690,26 +1228,27 @@ This prevents Sybil attacks: an attacker connecting many identities can only get
 | Handshake (0x01) | On promotion Cold→Warm | -- | -- | -- |
 | Keep-Alive (0x02) | -- | YES | YES | YES |
 | Peer-Sharing (0x03) | -- | YES (after `min_warm_tenure`) | YES | YES |
-| Channel-Announce (0x04) | -- | -- | YES | YES |
-| Item-Sync (0x05) | -- | -- | YES | YES |
-| Item-Push (0x06) | -- | -- | YES | YES |
-| PSK-Exchange (0x07) | -- | -- | -- | YES |
-| Pairing (0x08) | Bootnode only | -- | -- | -- |
+| Channel-Announce (0x04), Item-Push (0x06) | -- | Refused (§4.4, §4.6) | Refused | Refused |
+| Item-Sync (0x05) | -- | Answered with nothing (§4.5) | Answered with nothing | Answered with nothing |
+| PSK-Exchange (0x07), Pairing (0x08) | -- | Gone (§4.7, §4.8) | Gone | Gone |
 | Entries (0x10 to 0x14, §4.9) | -- | Not served | YES | Relay: YES. Personal: not served |
 
-**Relay inbound gating (§7.2):** Relays are public infrastructure and MUST accept data protocols (Item-Push, Item-Sync, Channel-Announce) from Warm peers. Hot sets are asymmetric in sparse meshes (`hot_max < R`): peer A may have B as Hot while B has A as Warm. Without Warm acceptance, B rejects A's forwarded items and sync requests, partitioning the network. Personal nodes retain Hot-only gating for data protocols (they are private and serve only their chosen hot peers). PSK-Exchange remains Hot-only for all roles (security boundary).
-
-> **v1 status.** For the older kind, a personal node of this version serves
-> none of the data protocols, whatever a peer's state: it answers an Item-Sync
-> with nothing, as a device that holds no such channel would, so that a relay
-> which asks its devices what they hold asks again at its usual pace; and it
-> refuses an Item-Push and a Channel-Announce at once. The streams of §4.9 are
-> served by a relay alone, to peers that are Warm or Hot, and
-> `0x14` only to a relay that its operator lists by key.
-
-**Outbound vs inbound:** The Hot-only rule applies to *outbound* decisions -- nodes only push/sync to peers they have promoted to Hot. The gating table above governs *inbound* acceptance. This distinction matters because governor promotion is local: two nodes may disagree on each other's state.
+> **v1 status.** No node serves the data protocols of the older kind,
+> whatever a peer's state (decision 2026-11-10 (older kind), rule 7): it
+> answers an Item-Sync with nothing, as a device that holds no such channel
+> would, so that an alpha.19 relay which asks its devices, and the relays it
+> lists, what they hold asks again at its usual pace; and it refuses an
+> Item-Push and a Channel-Announce at once. The streams of §4.9 are served by
+> a relay alone, to peers that are Warm or Hot, and `0x14` only to a relay
+> that its operator lists by key.
 
 ### 5.5 Peer Scoring
+
+> **v1 status.** The governor scores no peer: excess demotion orders by
+> staleness alone (§5.4 step 5). The score below was items delivered, which
+> was always 0 once no node carried the older kind, and it is gone, with
+> its key `ema_alpha` (decision 2026-11-10 (older kind), rule 2).
+> What follows is the design before.
 
 ```
 contribution_ratio = items_relayed / max(items_requested, 1)
@@ -1736,9 +1275,7 @@ The governor MUST receive these events from the P2P loop to function correctly:
 | Peer connected (inbound or outbound) | After handshake completes | `add_peer()` + `mark_connected()` |
 | Peer disconnected | QUIC connection closed | `mark_disconnected()` |
 | Keep-Alive response received | Each pong | `record_activity(node_id, rtt_ms)` |
-| Items received from peer | After storing pushed/synced items | `record_items_delivered(node_id, count)` |
 | Protocol violation detected | On invalid message/signature | `ban_peer(node_id, reason, tier)` |
-| Channel subscription changed | After subscribe/unsubscribe API | `set_groups(channel_ids)` |
 | Connection attempt failed | On connect_to error | `mark_dial_failed(node_id)` |
 | Trust decay event | On rate breach, protocol violation, escalation skip | `decay_trust(node_id, reason, amount)` |
 | Trust recovery event | On item delivery, sync completion | `recover_trust(node_id, amount)` |
@@ -1828,44 +1365,23 @@ Protocol violations are classified into severity tiers:
 
 ### 6.1 Culture Dispatch
 
-When an item is written locally, the replication engine consults the channel's delivery mode:
-
-| Mode | Action | SDK term |
-|------|--------|----------|
-| Realtime | Item-Push (0x06) to all hot peers sharing the channel + all hot relay peers | `realtime` |
-| Batch | No push. Peers discover via Item-Sync (0x05) at the batch sync interval. | `batch` |
-
-**Moderate culture is removed.** Two modes only. Any legacy `moderate` configuration maps to `realtime`.
+Gone (decision 2026-11-10 (older kind), rule 2): no node writes, pushes or
+syncs an item of the older kind. A channel from its secret is sent by a
+device's passes (§4.9.6).
 
 ### 6.2 On Remote Receive
 
-When a node receives a pushed or synced item:
-
-1. **Verify signature**: Check Ed25519 signature on metadata envelope (ECIES spec §11.7). Reject invalid.
-2. **Check channel membership**: Item's `channel_id` must be in the node's subscribed channels (or, for relay nodes, in accepted channels). Reject otherwise.
-3. **Dedup**: Same `item_id` + same `content_hash` → skip (idempotent).
-4. **Conflict resolution**: Same `item_id`, different `content_hash` → last-writer-wins by `published_at`. Deterministic tiebreak compares the hex-encoded `content_hash` strings lexicographically (character-by-character, using ASCII ordering: 0-9, a-f). The item with the lexicographically smaller `content_hash` wins. This ensures all replicas converge to the same item regardless of receive order.
-5. **Store**: Write encrypted blob to SQLite. Never decrypt at the P2P layer.
-6. **Relay forwarding (§7.2)**: If this node is a relay AND `stored > 0`, forward newly stored items to all hot peers not in the seen table for this item's `content_hash`. Items received from other relays ARE forwarded (with duplicate suppression via seen table).
-7. **Log**: Record in access log (author_id, channel_id, item_id, action, timestamp).
+Gone (decision 2026-11-10 (older kind), rule 2). What a relay and a device
+do with an entry they receive is in §4.9.
 
 ### 6.3 Tombstones
 
-Deletions are soft-delete tombstones (`is_tombstone: true`). Tombstones propagate via the same culture-governed replication as regular items. Tombstones are retained for 7 days, then garbage-collected.
+Gone (decision 2026-11-10 (older kind), rule 2). A delete of a channel from
+its secret is an entry (§4.9.4).
 
 ### 6.4 Anti-Entropy as Safety Net
 
-Anti-entropy sync runs periodically regardless of push success. For realtime channels, it catches items missed during push (network partition, peer churn, race conditions). For batch channels, it is the primary delivery mechanism.
-
-**Per-channel sync state:**
-```
-ChannelSyncState {
-    channel_id:     string
-    last_synced_at: Instant     // When we last synced this channel
-    cursor:         string      // ISO 8601 cursor for incremental sync
-    sync_interval:  Duration    // 10s default (realtime), 900s (batch). Production: 60s realtime.
-}
-```
+Gone (decision 2026-11-10 (older kind), rule 2).
 
 ---
 
@@ -1873,207 +1389,33 @@ ChannelSyncState {
 
 ### 7.1 Three Gates
 
-An item must pass all three gates to reach its destination:
-
-**Gate 1: Push Target Selection (Writer Side)**
-
-When a node writes an item, the replication engine selects peers:
-
-```
-IF push_policy == "pull_only":
-    return []   // No push targets. Rely on peers pulling via Item-Sync.
-
-target IF:
-    peer.state.is_active()
-    AND NOT peer.is_bootnode
-    AND (peer.is_relay OR peer.channels.contains(channel_id))
-```
-
-Relay peers are always push targets (they store-and-forward). Non-relay peers are targets only if they share the channel. Bootnode peers are never push targets (discovery-only, §8.2). Nodes with `push_policy: pull_only` (§8.1.1) return no targets -- they consume via Item-Sync only.
-
-Gate 1 applies only for realtime channels. Batch channels return no push targets.
-
-**Gate 2: Relay Acceptance (Intermediate Node)**
-
-When a relay receives a pushed item:
-
-```
-accept IF channel_id IN relay_subscribed_channels
-         OR channel_id IN relay_learned_channels
-```
-
-Phase 1 relays are transparent: they accept all channels. The `relay_learned_channels` set grows from two sources: (a) channels observed in stored items (`SELECT DISTINCT channel_id FROM items`) and (b) channels discovered from peers via sync Phase 0 (`SyncChannelListResponse`, §4.5). Future phases add explicit allowlists.
-
-Bootnodes (§8.2) never reach Gate 2 -- they do not participate in item replication.
-
-**Gate 3: Destination Acceptance (Final Recipient)**
-
-When a non-relay node receives an item:
-
-```
-accept IF channel_id IN node_subscribed_channels
-```
-
-Strict membership check. The channel must be explicitly subscribed on the destination node.
+Gone (decision 2026-11-10 (older kind), rule 2): no node routes or forwards
+an item of the older kind.
 
 ### 7.2 Relay Forwarding
 
-When a relay stores an item and `stored > 0`, it forwards to all hot peers that have NOT seen this item, checked via the seen table. Items received from other relays ARE forwarded (with duplicate suppression). This replaces the previous single-hop model and fixes sparse mesh partitioning (cordelia-node#9).
-
-**Epidemic forwarding with seen table:**
-
-```
-seen_table: HashMap<[u8; 32], SeenEntry>
-
-SeenEntry {
-    peers: HashSet<NodeId>,     // peers we've forwarded to or received from
-    first_seen: Instant,        // for TTL eviction
-}
-```
-
-On receiving an item (push or sync), the relay:
-1. Adds the sender to `seen_table[content_hash].peers`
-2. Computes `forward_targets = hot_relay_peers - seen_table[content_hash].peers`
-3. Forwards to each target, adding them to the seen set
-
-**Seen table bounds:**
-- `SEEN_TABLE_MAX = 10,000` (configurable) -- max entries
-- `SEEN_TABLE_TTL = 600s` (10 minutes) -- covers 2x the slowest convergence path
-- Eviction: LRU by `first_seen` when at capacity
-- Memory: ~10K entries * (32 hash + ~60 peers * 32 bytes + 8 timestamp) = ~19 MB worst case
-- Typical: much smaller (most items seen by <10 peers before TTL expiry)
-
-**Push targets: relay peers only.** Personal nodes and secret keepers receive items exclusively via Item-Sync pull (§4.5). The relay does not maintain per-channel routing tables for push delivery. This eliminates Channel-Announce as a routing dependency and makes relays stateless store-and-forward nodes.
-
-**Channel-Announce role (informational):** Channel-Announce (§4.4) remains implemented for governor scoring and relay affinity (§5.5). Relays receive announcements from peers and track channel interest for metrics and future optimisation, but do NOT use Channel-Announce data for push routing decisions.
-
-**Anti-censorship principle:** Relays MUST be agnostic to content. They store and forward ciphertext without knowing what's inside. Channel-aware routing is an efficiency optimisation (don't send data to peers that didn't ask for it), not a censorship mechanism. Content sovereignty resides at the edge: personal nodes and secret keepers choose what channels to subscribe to. Relays MUST NOT refuse to forward based on channel_id, content patterns, or originator identity.
-
-**Lazy storage (future):** The relay SHOULD only store items for channels that at least one of its hot peers has announced interest in. Items for channels with no local interest are forwarded to other relays but not persisted. This reduces relay storage from O(all_channels) to O(locally_interesting_channels). Phase 1: relays store everything (transparent).
-
-**Relay affinity:** The governor (§5.4) SHOULD prefer promoting relays that carry the node's subscribed channels. When a personal node's governor evaluates warm relay peers for promotion to Hot, it SHOULD prefer relays that have announced interest in the personal node's channels. This naturally clusters related nodes on the same relays without explicit sharding, providing self-organising channel locality.
-
-**Loop prevention:** The seen table tracks which peers have received each item. Combined with dedup (`stored: 0` for known items, §6.2 step 3), each item is forwarded at most once per peer. No cascading loops are possible regardless of network topology.
-
-**Amplification bound:** With the seen table, each relay forwards to at most `hot_max` unseen peers per item. The seen set grows per hop, limiting total network-wide push messages to O(N * log(N)) where N is the number of relays:
-
-| Scale | Total Relays | hot_max | Hops to converge | Cost/item (epidemic) |
-|-------|-------------|---------|-------------------|---------------------|
-| Small (<1K nodes) | 7 | 6 | 2 | ~12 pushes |
-| Medium (<100K nodes) | 100 | 20 | 3-4 | ~200 pushes |
-| Large (>100K nodes) | 1,000 | 50 | 4-5 | ~3,000 pushes |
-
-Pull-sync (§4.5) remains the safety net for any items missed during forwarding.
-
-**Asymmetric hot sets:** In sparse meshes (`hot_max < R`), hot sets are asymmetric: relay A may have B in its hot set while B has A in its warm set. Relays MUST accept all data protocols (Item-Push, Item-Sync, Channel-Announce) from Warm peers (§5.4.2). Without this, B rejects A's forwarded items, personal nodes cannot sync from relays that have them as Warm, and channel announcements are lost. Personal nodes retain Hot-only inbound gating -- they serve only their chosen hot peers.
-
-**Concurrency:** The relay MUST forward to all hot relay peers present at the time the forwarding handler executes. If a peer is being accepted concurrently, it is acceptable to miss that peer on this cycle; the peer will receive the item via the next Item-Sync pull (§4.5).
-
-**Backward compatibility:** Old relays running the single-hop model will still function correctly -- they store items and serve them via pull-sync. They will not forward items from other relays, so they act as dead-ends in the epidemic propagation. The network converges slower with mixed versions but remains correct.
+Gone (decision 2026-11-10 (older kind), rule 2): no node routes or forwards
+an item of the older kind.
 
 ### 7.3 Channel Intersection
 
-`channel_intersection(peer)` determines which channels a peer and this node have in common. Computed from Channel-Announce data (§4.4) and sync Phase 0 discovery (§4.5).
-
-```
-local_channels = subscribed_channels
-    UNION relay_learned_channels (if this node is a relay)
-    // relay_learned_channels = stored items channels + sync Phase 0 discovered channels
-
-channel_intersection(peer) = peer.channels INTERSECT local_channels
-    (bootnode peers excluded -- they have no channel state)
-```
-
-Updated when:
-- Channel-Announce receives a `ChannelJoined` from the peer
-- Channel-Announce reconciliation reveals a change
-- Local node subscribes to a new channel
+Gone (decision 2026-11-10 (older kind), rule 2): no node routes or forwards
+an item of the older kind.
 
 ### 7.4 Route Discovery
 
-Personal memories (routed items) target a specific secret keeper whose network location is unknown at publish time. Route discovery uses broadcast-discover-cache routing with encrypted routing tokens for path privacy.
-
-**Two routing modes:**
-
-| Mode | Behaviour | Envelope | ACK | Cache |
-|------|-----------|----------|-----|-------|
-| `epidemic` (0) | Forward to all unseen peers | Optional (privacy tokens) | None | No |
-| `routed` (1) | Broadcast-discover-cache | Required (tokens) | Required (RouteACK 0x09) | Yes |
-
-The `routing_mode` field on the item (§4.6) determines the mode. Group channels use `epidemic`; personal channels use `routed`. Relays forward both modes identically via the seen table (§7.2) -- the distinction affects only ACK behaviour and rate limiting.
-
-**Forward path (discovery broadcast):**
-
-1. Publisher P sends item with empty `route_tokens`
-2. Relay R_1 receives, generates session key `k_1`, stores `nonce_1 -> k_1` in LRU cache
-3. R_1 appends: `Token_1 = AES-256-GCM(k_1, {prev_hop_addr, nonce_1})` (~48 bytes)
-4. R_2 receives, appends Token_2 (same process)
-5. Envelope grows: `[Token_1, Token_2, ..., Token_n]`
-
-**Return path (ACK):**
-
-1. Receiver reverses token list: `[Token_n, ..., Token_1]`
-2. Sends RouteACK (0x09) to the peer it received the item from
-3. R_n decrypts Token_n, finds `prev_hop_addr`, forwards RouteACK to R_{n-1}
-4. Cascade continues until publisher receives the ACK
-
-**Cached routing (subsequent messages):**
-
-1. Publisher stores `[Token_1, ..., Token_n]` from successful ACK
-2. Subsequent items include the cached tokens in `route_tokens`
-3. Each relay peels one token, finds `next_hop_addr`, forwards remainder
-4. If any token fails decryption (key expired, relay gone), message falls back to epidemic broadcast
-
-**Path staleness:** Session keys in relay LRU caches have TTL aligned with warm tenure (300s). Expired keys cause decryption failure, triggering automatic re-broadcast. This is self-healing -- no explicit path invalidation needed.
-
-**Multi-path:** The receiver may receive the same item via multiple paths. It keeps the top 2-3 shortest paths (fewest tokens) for failover. If the primary path fails (no ACK on return), the publisher re-broadcasts to discover a new path.
-
-**Privacy properties:**
-
-| Observer | Knows | Does not know |
-|----------|-------|---------------|
-| Publisher | Path works, hop count (see §7.6) | Relay identities |
-| Receiver | Hop count (token count) | Relay identities, addresses |
-| Relay R_i | Predecessor + successor addresses | Full path, other relay identities |
-| Network observer | Adjacent message flow | End-to-end correspondence |
-
-**Token format:** `AES-256-GCM(session_key, {prev_hop_addr, nonce})` -- 16 bytes addr + 12 bytes nonce + 16 bytes auth tag + 4 bytes length = ~48 bytes per token. Symmetric crypto only (AES-256-GCM already in our stack). No asymmetric crypto per hop.
-
-**Session key storage:** Bounded LRU per relay, ~64 bytes per active path. TTL aligned with warm tenure (300s).
+Gone (decision 2026-11-10 (older kind), rule 2): no node routes or forwards
+an item of the older kind.
 
 ### 7.5 Expanding Ring Search
 
-Route discovery (§7.4) uses expanding ring search to bound broadcast scope for routed items.
-
-**Mechanism:**
-
-1. Publisher sends with `ttl=2` (2-hop neighbourhood)
-2. If no ACK within `2 * estimated_round_trip` (default 30s), retry with `ttl=4`
-3. If still no ACK, full broadcast (`ttl=255`)
-4. Each relay decrements TTL before forwarding; TTL=0 items are stored but NOT forwarded
-
-**TTL semantics:**
-- Epidemic items: TTL defaults to 255 (full mesh propagation)
-- Routed items: TTL starts at 2, escalates on timeout
-- Relays decrement TTL before forwarding regardless of routing mode
-- TTL=0 items are stored locally but not forwarded to any peer
-
-**Escalation timeout:** `2 * estimated_round_trip` between each escalation step. The round trip estimate is derived from Keep-Alive RTT measurements (§4.2) across hot peers.
-
-**Rationale:** Most secret keepers will be 2-3 hops away in a well-connected mesh. Full broadcast is expensive at scale (1000+ relays) and only needed for edge cases (target behind a partition, just joined). Expanding ring is a standard optimisation from AODV/DSR literature.
+Gone (decision 2026-11-10 (older kind), rule 2): no node routes or forwards
+an item of the older kind.
 
 ### 7.6 Envelope Padding (Paranoia Mode)
 
-Optional padding to fixed envelope size prevents hop count leakage from `route_tokens` length.
-
-**Mechanism:**
-- Publisher pads `route_tokens` to a fixed number of tokens (default 20) with random bytes
-- Dummy tokens are indistinguishable from real tokens (same size, random content)
-- Receiver counts all tokens but cannot determine actual hop count (decryption of dummy tokens fails silently)
-
-**Cost:** 20 tokens * 48 bytes = ~960 bytes per message. Negligible compared to typical item payload.
-
-**Configuration:** Per-channel or per-publisher option. Default off. Secret keepers already require a degree of trust (they hold PSKs), so hop count leakage is acceptable in default mode. Enable for high-sensitivity personal channels.
+Gone (decision 2026-11-10 (older kind), rule 2): no node routes or forwards
+an item of the older kind.
 
 ---
 
@@ -2089,27 +1431,20 @@ Phase 1 defines four node roles. Each role determines which mini-protocols the n
 | Handshake (0x01) | Yes | Yes | Yes | Yes |
 | Keep-Alive (0x02) | Yes | Yes | Yes | Yes |
 | Peer-Sharing (0x03) | Yes | Yes (primary function) | Yes | Yes |
-| Channel-Announce (0x04) | Yes (send) | No | Yes (receive-only) | Yes (send) |
-| Item-Sync (0x05) | Yes (pull, primary delivery) | No | Yes (serve + pull) | Yes (pull, primary delivery) |
-| Item-Push (0x06) | Originator push to relays only | No | Single-hop re-push to relays | Originator push to relays only |
-| PSK-Exchange (0x07) | Yes (if holds PSK) | No | No | Yes |
+| Channel-Announce, Item-Sync, Item-Push, PSK-Exchange (0x04 to 0x07) | No: answers 0x05 with nothing, refuses 0x04 and 0x06 (§4.4 to §4.7) | The same | The same | -- |
 | Entry-Show, Channel-Prove, Entry-Pull, Entry-Push (0x10 to 0x13) | Yes (opens them, to a relay) | No | Yes (serves them) | -- |
 | Relay-Entries (0x14) | No | No | Yes (with relays its operator lists by key) | -- |
-| Stores items | Own channels only | No | Ciphertext (store-and-forward) | Yes (can decrypt anchored) |
-| Holds PSKs | Own channels | Never | Never | Anchored channels |
-| Receives items via | Pull-sync (§4.5) | Never | Push + pull-sync | Pull-sync (§4.5) |
 | Phase | 1 | 1 | 1 | 2+ |
 
-> **v1 status.** In this version a personal node's rows for Channel-Announce,
-> Item-Sync, Item-Push and PSK-Exchange read "No": it carries no channel of
-> the older kind (decision 2026-10-04 §10). What it stores is the entries of
-> its own channels: the personal channel, one for each name it holds, and in
-> a pair channel the hand-over that it wrote itself. It receives the first
-> two by Entry-Pull from a relay, and the change entry, which it keeps, in
-> the answer to an Entry-Show. It holds one secret for the person, from
-> which every channel of its own is derived, and no key for each channel. A
-> relay stores both kinds, each within a cap of its own, and holds no key of
-> either.
+> **v1 status.** No node of any role carries a channel of the older kind
+> (decision 2026-11-10 (older kind), rule 1). What a personal node stores is
+> the entries of its own channels: the personal channel, one for each name
+> it holds, and in a pair channel the hand-over that it wrote itself. It
+> receives the first two by Entry-Pull from a relay, and the change entry,
+> which it keeps, in the answer to an Entry-Show. It holds one secret for
+> the person, from which every channel of its own is derived, and no key for
+> each channel. A relay stores the entries of channels from their secrets
+> within its cap, and holds no key.
 
 ### 8.1 Network Topology
 
@@ -2128,14 +1463,10 @@ Each role has a fundamentally different relationship with the network. Personal 
 
 The user's local node. Runs as a daemon on the user's machine. Its job is reliable network access and occasional publishing of memories. Minimal resource footprint.
 
-- Subscribes to channels via the local API (channels-api.md)
 - Stores encrypted items in local SQLite
 - Connects to bootnodes for initial discovery, then relays via gossip
 - Small hot set: 1-2 relays + a few personal peers. Selection prefers lowest RTT (indicator of network colocation/quality)
 - Never accepts inbound connections from the public internet (unless explicitly configured)
-- MAY specify preferred peers (e.g., within the same org) via `[[network.trusted_peers]]`
-- Pushes items to hot relay peers only on local write (originator push). Never pushes to other personal nodes.
-- Receives items from peers exclusively via Item-Sync pull (§4.5), every 10s for realtime channels.
 - Makes outbound connections only (§2.1). Rejects all inbound QUIC connections.
 - `dial_policy = "relays_only"`
 
@@ -2152,71 +1483,15 @@ The user's local node. Runs as a daemon on the user's machine. Its job is reliab
 
 #### 8.2.1 Push Policy
 
-Personal nodes support a configurable `push_policy` that controls outbound item traffic:
-
-| Policy | Behaviour | Use case |
-|--------|-----------|----------|
-| `relay_only` (default) | Push to hot relay peers on local write. Receive via pull-sync. | Normal operation. Minimal outbound traffic. |
-| `pull_only` | Never initiate Item-Push. Only serve items via Item-Sync when requested. | Enterprise-constrained networks, bandwidth-sensitive environments. |
-
-**Design rationale:** Personal nodes push only to their hot relays (1-2 peers). The relay mesh handles distribution to other relays (single-hop re-push, §7.2). Other personal nodes and keepers receive items by pulling from their own hot relays. This makes personal nodes lightweight: they push O(1) streams on write and pull O(hot_max) streams per sync cycle. No routing tables, no Channel-Announce dependency for push routing.
-
-**Trade-off:** Personal nodes receive items via pull-sync with latency bounded by `sync_interval` (10s for realtime, 900s for batch). This is acceptable for AI agent memory workloads where sub-second latency is not required.
+Gone (decision 2026-11-10 (older kind), rule 2): no node pushes an item of
+the older kind. The key `push_policy` is gone; a configuration that sets it loads.
 
 #### 8.2.2 Personal Area Network (Agent Swarm)
 
-An agent orchestrator (e.g. Claude Code spawning sub-agents) can run a "lead" personal node that connects to the relay mesh, with swarm member nodes connecting only to the lead. The lead acts as a local gateway for the swarm: stores items, serves pull-sync, and handles relay connectivity. Swarm nodes never touch the public network.
-
-**Topology:** `swarm_node -> lead_node -> relay -> relay_mesh`
-
-**Identity model -- HD derivation:** Swarm node identities are derived from the lead's seed using HKDF-SHA256:
-
-```
-child_seed = HKDF-SHA256(lead_seed, salt="", info="cordelia-swarm-v1/{index}")
-child_keypair = Ed25519::from_seed(child_seed)
-```
-
-Each swarm node has its own Ed25519 keypair, cryptographically traceable to the lead. The index is a u32, allowing on-demand derivation with no artificial cap.
-
-**Lead role:** The lead runs `role = personal` with swarm relay capability. It does NOT participate in the relay mesh as a relay node. Instead, it:
-- Accepts inbound ONLY from verified child keys (derived from its own seed)
-- Pushes items from swarm nodes to the relay mesh via its upstream relay connection
-- Serves Item-Sync pull requests to swarm nodes
-- Forwards network-scoped items between the relay mesh and the swarm
-
-**Trust model -- on-demand verification:** When a peer connects inbound, the lead verifies membership by computing `derive_child_public_key(i)` for i=0..255 and checking against the connecting peer's NodeId. Verified peers are added to a `swarm_members` set. No pre-computed limit, no config-based allowlist -- the lead's own seed is the trust anchor.
-
-**PSK distribution:** Swarm nodes receive PSKs via the PSK-Exchange protocol (0x07). This works for both same-machine and distributed swarms. Filesystem mount is an optional optimisation that pre-populates the key file, but PSK-Exchange is the canonical mechanism.
-
-**Channels:**
-
-| Type | Channel ID | Scope | Forwarded to relay mesh? |
-|------|-----------|-------|--------------------------|
-| Persistent swarm | `cordelia:swarm:<lead_entity_id>` | `network` | Yes -- durable shared memory |
-| Ephemeral local | Created per session | `local` | No -- scratchpad, never leaves PAN |
-
-- **Persistent:** `cordelia:swarm:<lead_entity_id>` -- created once, replicated to relay mesh. Durable shared memory for the swarm.
-- **Ephemeral local:** Channels with `scope = "local"` are created per session, NEVER forwarded to the relay mesh. One default ephemeral channel on init, swarm nodes can create more. Since local channels never leave the PAN, they impose no load on the relay mesh.
-
-**Scope-aware push filtering:** The push path and relay re-push MUST skip items for local-scope channels. The lead MUST NOT serve local-scope items to non-swarm peers via Item-Sync.
-
-**Configuration:**
-
-| Node | role | hot_max | bootnodes | Notes |
-|------|------|---------|-----------|-------|
-| Lead | personal | 2 (default) | Zone relay + bootnode | Upstream relay + swarm children accepted inbound |
-| Swarm | personal | 1 | Lead address only | Single connection to lead, derived identity |
-
-**Swarm init:** `cordelia swarm-init --index N --lead-identity PATH --lead-entity-id ID`:
-1. Reads lead seed, derives child identity via HKDF at the given index
-2. Writes child `identity.key`
-3. Creates persistent swarm channel + default ephemeral local channel
-4. Sets swarm config fields (`swarm_index`, `lead_identity_path`, `lead_entity_id`)
-
-**Use cases:**
-- AI agent orchestration: one daemon per machine, sub-agents share memory via the lead
-- Team environments: shared office node acts as local relay for team members' agents
-- Development: test swarms without deploying relay infrastructure
+Gone (decision 2026-11-10 (older kind), rule 2): its channels were of the
+older kind. No `swarm-init`, no swarm children, no trusted peers; a personal
+node accepts no inbound connection. A configuration that still sets
+`[swarm]` or `network.trusted_peers` loads, and the keys are not read.
 
 ### 8.3 Bootnode
 
@@ -2234,7 +1509,6 @@ Lightweight discovery node. Its sole function is peer introduction -- Handshake 
 
 - Publicly addressable (static IP or DNS)
 - Accepts inbound QUIC connections
-- Does NOT participate in Channel-Announce, Item-Sync, Item-Push, or PSK-Exchange
 - Does NOT store items (no SQLite, no ciphertext, no PSKs)
 - Does NOT relay traffic
 - Maintains a large peer table for Peer-Sharing responses (passive discovery -- learns about the network via inbound connections, does not actively crawl)
@@ -2253,10 +1527,7 @@ Infrastructure node forming the network backbone. Relays store-and-forward encry
 
 - Publicly addressable (static IP or DNS)
 - Accepts inbound QUIC connections from personal nodes, other relays, bootnodes, and secret keepers
-- Participates in all mini-protocols except PSK-Exchange (never holds PSKs)
-- Stores encrypted items as ciphertext only (see data-formats.md §3.1, Relay auto-creation)
-- Re-pushes items to hot **relay** peers only, single-hop from originator (§7.2)
-- Serves items to personal nodes and keepers via Item-Sync pull requests
+- Stores entries as ciphertext only, and holds no key
 - **Highly connected to other relays** -- the relay mesh is the network backbone
 - Expected to be permanently available with demanding resource requirements
 - Never reveals secret keeper addresses in Peer-Sharing responses
@@ -2268,14 +1539,15 @@ The `hot_min_relays=5` ensures each relay maintains connections to at least 5 ot
 
 **Phase 1 relay posture:** Transparent. Accept all channels. No access control on which channels to relay.
 
-> **v1 status.** A relay carries both kinds of channel for one version. It
-> stores an entry of a channel from its secret only if both of its signatures
-> hold, hands a channel only to a connection that proved the channel's key,
-> and tells nobody which channels it holds, the relays its operator lists by
-> key aside (§4.9). Each kind is counted against a cap of its own
-> (`max_storage_bytes` each), so for that one version a relay can hold twice
-> its cap. Its room, and what is not defended, are in the decision record of
-> 2026-10-04, §2.5, and in `deploy/relay/README.md`.
+> **v1 status.** A relay carries channels from their secrets alone (decision
+> 2026-11-10 (older kind), rule 1). It stores an entry only if both of its
+> signatures hold, hands a channel only to a connection that proved the
+> channel's key, and tells nobody which channels it holds, the relays its
+> operator lists by key aside (§4.9). What it holds is counted against its
+> cap (`max_storage_bytes`). Its database holds nothing of the older kind:
+> step 34 of the schema drops it (rule 5). Its room, and what is not
+> defended, are in the decision record of 2026-10-04, §2.5, and in
+> `deploy/relay/README.md`.
 
 **Phase 2+:** Dynamic and explicit relay postures (accept only learned or explicitly configured channels).
 
@@ -2350,28 +1622,15 @@ Beyond limits: new connections receive QUIC `CONNECTION_CLOSE` with application 
 
 | Limit | Default | Action on exceed |
 |-------|---------|-----------------|
-| Writes per peer per minute | 36 | Reject with `PushAck.policy_rejected++` |
+| Writes per peer per minute | 36 | Stream reset; a breach. Counted on streams of Item-Push (0x06), each refused anyway (§4.6) |
 | Writes per channel per minute | 100 | Drop, log warning |
-| Sync streams per peer per minute | 18 | Ignore excess, log |
+| Sync streams per peer per minute | 18 | Stream reset; a breach. Counted on streams of Item-Sync (0x05), each answered with nothing (§4.5) |
 | Peer-share requests per peer per minute | 6 | Ignore excess |
 | Requests on the streams of entries (§4.9) per peer per minute, all five together | 3,000 | Stream reset; a breach (§4.9.7) |
 
 Exceeding rate limits 3 times in 10 minutes → ban (§5.6).
 
-**Sync streams vs sync requests:** Rate limiting counts sync *streams* (one QUIC stream per peer per cycle), not individual channel SyncRequests within a batched stream. A node with N subscribed channels opens one stream and sends N SyncRequests on it -- this counts as one sync stream for rate limiting purposes. All limits follow the 3x headroom principle: `limit = 3 * expected_legitimate_rate` (see `protocol.rs` derivations).
-
-**Discovery rate limits (routed items only):**
-
-| Limit | Default | Action on exceed |
-|-------|---------|-----------------|
-| Discovery broadcasts (TTL 1-4) per peer per minute | 10 | Drop, log, trust decay (§5.5.2) |
-| Discovery broadcasts (TTL 5-16) per peer per minute | 3 | Drop, log, trust decay |
-| Discovery broadcasts (TTL 17+) per peer per minute | 1 | Drop, log, trust decay |
-| Max discoveries per peer per hour | 20 | Drop all discoveries until window resets |
-
-Only `routing_mode=routed` messages consume discovery budget. Epidemic items (group memories, TTL=255) use the existing write rate limits above.
-
-TTL-proportional rate limiting makes expanding ring search (§7.5) the economically rational strategy. A legitimate publisher doing expanding ring uses ~1 low-TTL attempt (succeeds 90%+ of the time), occasionally 1 mid-TTL, and rarely 1 global. High-TTL broadcasts consume expensive budget for no additional benefit in the common case. Skipping to TTL=255 is strictly worse for a legitimate user (wastes global budget) and time-limited for an attacker (budget exhaustion + trust decay + ban).
+All limits follow the 3x headroom principle: `limit = 3 * expected_legitimate_rate` (see `protocol.rs` derivations).
 
 ### 9.3 Size Limits
 
@@ -2380,17 +1639,14 @@ TTL-proportional rate limiting makes expanding ring search (§7.5) the economica
 | `max_item_bytes` | 64 KB (65,536) | The device that writes the item, each relay, the device that receives it |
 | an item's other fields | ID and parent 64 bytes, channel 96, type 32, time 40 | The same; so an item as it travels is at most its ciphertext and 1 KB (`ENTRY_OVERHEAD_BYTES`) |
 | `max_message_bytes` | 1 MB (1,048,576) | Wire codec (length prefix check) |
-| `max_batch_size` | 100 | Items per FetchRequest/PushPayload |
 | an entry of a channel from its secret | A content that is a power of two from 256 bytes to 64 KB, and 237 bytes beside it | Whoever writes it, each relay, the device that receives it (§4.9, data-formats.md §9.2) |
 | a text and its name in such an entry | 60 KB together (`MAX_ENTRY_NAME_AND_VALUE_BYTES`) | The device that writes it; one that is over is no version to a device that reads it |
 | a page, and a push, of such entries | 100 entries; 128 KiB of entries (`SMALL_PAGE_BYTES`) in a page for a peer that is not a relay listed by key and in a device's push, and at least one entry; 896 KB (`ENTRY_PAGE_MAX_BYTES`) to a relay listed by key, served by its key; a listed relay asks for 1 entry a page (`SMALL_WINDOWS_PULL_ENTRIES`) where its own end of the connection lacks the listed settings (§2.1); entries passed on to a listed relay go `SMALL_PAGE_BYTES` to a message | 100: sender and receiver (a message that holds more is not read). The bytes: whoever builds the page or the push; the entries a page holds, the asker. A page that stops at its bytes says there is more, and its reader reads on |
 | a small message (`SMALL_MESSAGE_BYTES`) | 144 KiB (147,456): a small page and 16 KiB | Every message a device of alpha.16 sends or is sent fits one. A node reads a longer frame from a peer that is not a relay listed by key only under a large permit (below) |
 
-Items exceeding `max_item_bytes` are rejected at all boundaries: the size is that of the item as it travels, ciphertext included, and a node that refuses one tells the sender which and why (§4.6). The limit is the one the REST API applies (channels-api.md §3.2). It was 256 KB, checked only by the sender, until 0.2.0-alpha.3; parameter-rationale.md §4 gives the reasons for 64 KB.
+The wire codec rejects messages exceeding `max_message_bytes` before any parsing occurs.
 
-The `max_message_bytes` of 1 MB accommodates 14 max-size items with their headers, or ~100 typical items (~10 KB each). A sender keeps a push to what three entries of the largest size cost, 195 KB (`OUTBOX_BATCH_MAX_BYTES`), and a node that fetches asks for fewer items when a page's would not fit (`SYNC_PAGE_STEPS`). The wire codec rejects messages exceeding this before any parsing occurs.
-
-**Large messages, under a permit** (decision 2026-10-22, memory across connections, rules 2, 6 and 7; parameter-rationale.md §13). A node reads a frame's protocol byte and length first. A frame from a peer that is not a relay listed by key whose length is over `SMALL_MESSAGE_BYTES` is read only under a large permit, which the node takes before it allocates the payload. The same holds for a stream's requests, for the older kind's fetch answers over `SMALL_PAGE_BYTES`, and for the answers to a relay's own fetch from such a peer.
+**Large messages, under a permit** (decision 2026-10-22, memory across connections, rules 2, 6 and 7; parameter-rationale.md §13). A node reads a frame's protocol byte and length first. A frame from a peer that is not a relay listed by key whose length is over `SMALL_MESSAGE_BYTES` is read only under a large permit, which the node takes before it allocates the payload. The same holds for a stream's requests.
 
 - A node holds at most `LARGE_MESSAGES_AT_ONCE` (4) permits across all its connections.
 - It holds at most one for each /24 (IPv4) or /48 (IPv6) of the peers' addresses.
@@ -2409,9 +1665,6 @@ Bounded inbound queue per protocol type:
 | Handshake (0x01) | 16 | FIFO, one worker |
 | Keep-Alive (0x02) | 256 | FIFO, inline |
 | Peer-Sharing (0x03) | 32 | FIFO, one worker |
-| Channel-Announce (0x04) | 64 | FIFO, one worker |
-| Item-Sync (0x05) | 64 | FIFO, worker pool |
-| Item-Push (0x06) | 128 | FIFO, worker pool |
 
 When a queue is full, the node does not accept new streams for that protocol type. QUIC flow control handles the rest -- the sender's `open_bi()` blocks until the receiver is ready.
 
@@ -2433,14 +1686,12 @@ The QUIC application error codes a node closes a connection or resets a stream w
 
 **What a node of alpha.15 or alpha.14 meets from one of alpha.16.** Nothing changes on the wire for a message that fits a small message.
 
-- **A stop with `0x05`.** It comes on a push of over 144 KiB (a device of those versions pushes up to 896 KiB) while every permit it could take is held. A relay of those versions can also meet it on an older kind's fetch answer or channel list over that size, sent to a relay of alpha.16 that does not list it by key. A sender blocked in its write of the payload sees the stop (`WriteError::Stopped(0x05)`), not the reset. Those versions match only `ERR_RATE_LIMIT` (`refused_for_now`), so they take `0x05` as a request not answered and send the same batch again at their next send. Nothing else in their handling changes.
+- **A stop with `0x05`.** It comes on a push of over 144 KiB (a device of those versions pushes up to 896 KiB) while every permit it could take is held. A sender blocked in its write of the payload sees the stop (`WriteError::Stopped(0x05)`), not the reset. Those versions match only `ERR_RATE_LIMIT` (`refused_for_now`), so they take `0x05` as a request not answered and send the same batch again at their next send. Nothing else in their handling changes.
 - **Smaller windows and 8 streams,** announced by QUIC itself. A large message arrives a window at a time, about one round trip for each 31.5 KiB.
 - **At round trips above about 0.3 s, its large messages fail the stream timeout** (§2.1's table).
   - Its pushes of up to 896 KiB to a relay of alpha.16 take about 6.0 s at 200 ms, 9.0 s at 300 ms and 12.0 s at 400 ms. They fail on every try past about 0.33 s, so its outbox does not drain at that relay over such a link.
-  - An older kind's fetch answer of 1 MiB between relays not listed by key takes 6.85 s at 200 ms, 10.2 s at 300 ms and 13.6 s at 400 ms. It fails past about 0.29 s, and the fetcher then asks for fewer items (`SYNC_PAGE_STEPS`).
   - A node of alpha.16 does not meet this. Its pushes and pages are small messages: a push of 128 KiB fails only past about 1.7 s. Between relays listed by key, which keep the windows from before, a full page fails only past about 4.9 s.
-  - **What to do.** A person whose device runs alpha.15 or alpha.14 over a link of more than about 0.33 s should upgrade the device. An operator whose relays carry the older kind between them without listing each other by key should list them by key (each relay's key in the other's configuration), so that they keep the windows from before (§2.1).
-- **8 streams, against a relay of alpha.16 that does not list it by key.** A relay of those versions retries the older kind's pushes one stream for each item, and most of those retries wait for a stream and time out. The older kind's fetch brings what they lose later. Relays configured by key with each other keep 64 streams (§2.1), so listing them by key removes this as well.
+  - **What to do.** A person whose device runs alpha.15 or alpha.14 over a link of more than about 0.33 s should upgrade the device.
 - **Small pages.** A page from a relay of alpha.16 holds at most 128 KiB of entries and says there is more. Those versions read on from such a page as from any other, except `cordelia accept`, which reads one page of the pair channel. Where an entry of the largest size comes before the typed key's hand-over, an older device does not find the hand-over. The device being added runs alpha.16, and it reads on.
 
 ---
@@ -2483,8 +1734,7 @@ Phase A: Discovery (bootnode interaction)
 5. After handshake: initiate Peer-Sharing with bootnodes
 6. Receive relay and peer addresses → add to Cold
 7. Bootnode interaction complete. Bootnodes may be demoted/disconnected as
-   real peers fill Hot/Warm slots. Bootnodes do not participate in
-   Channel-Announce or Item-Sync.
+   real peers fill Hot/Warm slots.
 ```
 
 **Bootstrap timeout:** Each bootnode connection attempt MUST use a 10-second timeout. On timeout, the node logs a warning and continues to the next bootnode. Bootstrap is best-effort: the node proceeds to Phase B after attempting all bootnodes, even if some failed.
@@ -2493,9 +1743,7 @@ Phase A: Discovery (bootnode interaction)
 Phase B: Replication (relay and peer interaction)
 8. Governor tick: promote best Cold → Warm, best Warm → Hot
    (prefer relays and channel-matching peers over bootnodes)
-9. Initiate Channel-Announce with hot peers (relays + personal nodes)
-10. Begin Item-Sync for subscribed channels
-11. Steady state: governor manages peer lifecycle autonomously
+9. Steady state: governor manages peer lifecycle autonomously
 ```
 
 **Time to first sync:** ~20-30s (1-3 governor ticks to discover peers via bootnode, promote relay/peer to Hot, then immediate sync). The bootnode is a brief stepping-stone, not a long-lived connection.
@@ -2508,8 +1756,9 @@ In addition to bootnodes, the binary includes 3-5 hardcoded fallback peer addres
 
 ## 11. Security Model
 
-> **v1 status.** §11.1 to §11.5 are written of the older kind of channel. For
-> a channel from its secret: a relay holds no key, checks two signatures on
+> **v1 status.** §11.1, §11.4 and §11.5 are written of the older kind of
+> channel, which no node carries (decision 2026-11-10 (older kind), rule 1).
+> For a channel from its secret: a relay holds no key, checks two signatures on
 > every entry, and hands a channel only to a connection that proved the
 > channel's key (§4.9.1). What a relay still learns is listed in the decision
 > record of 2026-10-04, §2.4: channel IDs (all of a person's change at once
@@ -2545,11 +1794,8 @@ In addition to bootnodes, the binary includes 3-5 hardcoded fallback peer addres
 
 ### 11.2 Invariants
 
-1. **PSKs never leave the subscriber node.** The P2P layer moves opaque ciphertext. Relays never hold PSKs.
-2. **Items are signed.** Ed25519 signature on metadata envelope (ECIES spec §11). Verified before storage. Relays verify authorship without holding PSKs.
-3. **Channel membership is private.** Not gossiped in peer-sharing. Exchanged point-to-point via Channel-Announce only with direct peers.
-4. **All replication is encrypted.** QUIC provides transport encryption. Channel PSKs provide content encryption. Two independent layers.
-5. **Idempotent writes.** Duplicate items (same item_id + content_hash) are no-ops. No state confusion from replays.
+Gone (decision 2026-11-10 (older kind), rule 2): they were of the older
+kind's keys, items and announcements.
 
 ### 11.3 Threat Mitigations
 
@@ -2557,31 +1803,14 @@ In addition to bootnodes, the binary includes 3-5 hardcoded fallback peer addres
 |--------|-----------|-------|
 | **Sybil** (flood with fake peers) | Connection limits per IP/subnet (§9.1). Min warm tenure before promotion (§5.4). | 1 |
 | **Eclipse** (surround target with attacker peers) | 20%/hr churn (§5.4). Bootnode diversity. 25+ active peers needed at >75% network control. | 1 |
-| **Amplification** (one write → many messages) | Seen table dedup bounds epidemic forwarding to O(N * log N) (§7.2). Rate limits (§9.2). Trust scoring (§5.5.2). | 1 |
 | **Replay** | TLS 1.3 (transport). Idempotent writes (application). Timestamp validation in handshake. | 1 |
 | **Identity spoofing** | TLS certificate binds to Ed25519 key (§2.2). Application-layer verification (§4.1.6). | 1 |
 | **Metadata leakage** | Channel lists removed from peer-sharing (§4.3). Channel digest in handshake, not full list (§4.1.2). | 1 |
 | **DDoS** | Connection limits, bounded queues, per-peer fairness (§9). QUIC flow control. | 1 |
-| **Governor manipulation** | EMA scoring (§5.5). Min warm tenure. Hysteresis. Escalating bans. | 1 |
-| **Item forgery** | Ed25519 signature verification on all received items (§6.2). | 1 |
+| **Governor manipulation** | Random promotion (§5.4 step 4). Min warm tenure. Hysteresis. Escalating bans. | 1 |
 | **Relay compromise** | Relays see only ciphertext. No PSKs, no plaintext, no keys. Expendable by design. | 1 |
-| **PSK key substitution** | `psk_hash` in signed channel descriptor (§4.4.6). Subscriber verifies after PSK-Exchange. | 1 |
-| **Metadata field tampering** | `key_version` and `is_tombstone` both included in signed metadata envelope (ECIES spec §11.7). | 1 |
 | **Peer-sharing poisoning** | Address validation: reject private IPs, loopback, link-local, own address (§4.3). | 1 |
-| **FTS5 query DoS** | Query sanitization: max length, max terms, prefix minimum, timeout (channels-api.md §3.13). | 1 |
-| **Channel name squatting** | First-seen `creator_id` wins for channel descriptors (§4.4.6). On-chain registration Phase 3. | 1 |
-| **Free-rider metadata observation** | Governor scoring detects low-contribution peers (§5.5). Proof-of-membership Phase 2 (§4.4.5). | 1 |
-| **Relay defection (silent drop)** | Contribution tracking + probe items + escalating bans + ban propagation (§16.1.2). | 1 |
-| **Relay bandwidth free-riding** | Contribution-weighted scoring (§16.1.2). Relay credit ledger Phase 3 (§16.1.3). | 1 |
 | **Bootnode exhaustion** | Bootstrap rate limits per IP/subnet (§16.2.1). Bootnodes discovery-only (§8.2). | 1 |
-| **Storage quota evasion** | Quota check on API write (channels-api.md §9.3). Relay LRU eviction (§16.3). | 1 |
-| **Bandwidth amplification** | Per-peer/channel/relay fanout rate limits (§16.4). pull_only mode (§8.1.1). | 1 |
-| **DM spam** | DM creation rate limit 5/min (channels-api.md §9.1). | 1 |
-| **Ephemeral channel griefing** | Channel creation rate limit 1/sec, cap 50/entity (channels-api.md §9.1). | 1 |
-| **Broadcast flood** (route discovery spam) | TTL-proportional rate limits (§9.2): 10/3/1 per minute for low/mid/high TTL. Max 20 discoveries per peer per hour. Trust decay on abuse (§5.5.2). | 1 |
-| **TTL skip** (bypass expanding ring) | Statistical escalation detection: peers consistently using high TTL without prior low-TTL attempts incur trust penalty (§5.5.2). Expanding ring is the economically rational strategy. | 1 |
-| **Seen table exhaustion** (flood unique fake IDs) | Content hash verification before seen table insertion. `SEEN_TABLE_MAX=10,000` with LRU eviction (§7.2). Attacker must create valid items (expensive) to occupy slots. | 1 |
-| **Token cache exhaustion** (flood discovery messages) | Relay session key LRU caches bounded. Discovery rate limits (§9.2) cap inbound discoveries. Trust decay on repeated invalid tokens (§5.5.2). | 1 |
 
 ### 11.4 Accepted Risks (Phase 1)
 
@@ -2625,7 +1854,6 @@ public_key = "cordelia_pk1..."             # Ed25519 public key (Bech32, read-on
 listen_addr = "0.0.0.0:9474"              # P2P listen address
 api_addr = "127.0.0.1:9473"               # REST API listen address (127.0.0.1 or ::1 only, see below)
 role = "personal"                           # "personal" | "bootnode" | "relay" | "keeper"
-push_policy = "subscribers_only"           # "subscribers_only" | "pull_only" (personal nodes only, §8.1.1)
 bootstrap_timeout_secs = 10              # Per-bootnode connection timeout during bootstrap
 # All stream I/O uses STREAM_TIMEOUT (10s) at the codec layer.
 # One timeout, one layer. See parameter-rationale.md §6 and protocol.rs.
@@ -2635,10 +1863,6 @@ addr = "boot1.cordelia.seeddrill.ai:9474"
 
 [[network.bootnodes]]
 addr = "boot2.cordelia.seeddrill.ai:9474"
-
-# Trusted peers: always maintained as Warm/Hot, never demoted or evicted (§5.3.1)
-# [[network.trusted_peers]]
-# addr = "relay1.example.com:9474"
 ```
 
 **API loopback binding (Phase 1):** Phase 1 nodes MUST bind the channels API (`api_addr`) to `127.0.0.1` or `::1` only (configuration.md SS2.9). With any other address configured, the node refuses to start, and says why. Phase 2 adds TLS and allows non-loopback binding.
@@ -2654,7 +1878,6 @@ hot_min_relays = 1                     # Minimum relay peers in hot set (§5.3)
 warm_min = 3                           # Below this, connect cold peers
 warm_max = 10                          # Maximum warm+hot peers
 cold_max = 50                          # Maximum known peer addresses (discovery breadth)
-dial_policy = "all"                    # "all" | "relays_only" | "trusted_only"
 tick_interval_secs = 10                # Governor tick frequency
 churn_interval_secs = 3600             # Base churn interval (1 hour)
 churn_jitter_secs = 300                # Random jitter added to churn interval (0-300s)
@@ -2663,7 +1886,6 @@ min_warm_tenure_secs = 300             # Minimum time as Warm before Hot promoti
 hysteresis_secs = 90                   # Cooldown after demotion before re-promotion
 keepalive_timeout_secs = 90            # Dead detection threshold
 stale_threshold_secs = 1800            # 30 min no items → priority demotion
-ema_alpha = 0.1                        # Scoring EMA decay (§5.5)
 max_connection_retries = 5             # Stop connecting to a peer after this many consecutive failures
 clear_failure_delay_secs = 120         # Clear failure count after being Hot for this long
 ```
@@ -2674,10 +1896,7 @@ See §8.6 for role-specific profiles (Bootnode, Relay, Secret Keeper).
 
 ```toml
 [replication]
-sync_interval_realtime_secs = 10           # Phase 1 default (fast convergence). Production: 60s.
-sync_interval_batch_secs = 900
-tombstone_retention_days = 7
-max_batch_size = 100
+relay_ask_again_secs = 600                 # Relays only
 ```
 
 ### 12.4 Rate Limiting Section
@@ -2784,7 +2003,7 @@ CBOR's extensibility (unknown fields preserved) means message types can gain new
 - **CIP-19**: Cardano addresses (Bech32 convention alignment)
 - **specs/ecies-envelope-encryption.md**: Cryptographic primitives, ECIES construction, item signatures
 - **specs/channels-api.md**: REST API endpoints (local node API, not P2P)
-- **specs/channel-naming.md**: Channel ID derivation, naming rules
+- **[channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md)**: Channel ID derivation, naming rules (the older kind's; gone)
 - **decisions/2026-10-04-a-persons-devices.md**: A channel from its secret, what a relay does and its room (§2.4, §2.5), how a statement reaches a device (§4.6)
 - **specs/data-formats.md §9**: An entry on the wire and inside its ciphertext, the statement, the change entry, the hand-over
 - **RFC 5705**: Keying Material Exporters for TLS (the value a proof is made over, §4.9.1)
@@ -2816,62 +2035,13 @@ Relays bear bandwidth and storage costs for channels they cannot read. Without i
 
 #### 16.1.1 Relay Contribution Tracking
 
-Each node tracks per-peer contribution metrics:
-
-```
-PeerContribution {
-    items_relayed:     u64    // Items this peer has forwarded to us
-    items_requested:   u64    // Items we have requested from this peer
-    bytes_received:    u64    // Total bytes received from this peer
-    bytes_sent:        u64    // Total bytes sent to this peer
-    contribution_ratio: f64   // items_relayed / max(items_requested, 1)
-}
-```
-
-Updated on every Item-Push (PushAck) and Item-Sync (FetchResponse). The `contribution_ratio` measures how much a peer gives vs how much it takes.
+Gone (decision 2026-11-10 (older kind), rule 2): it counted the older kind's
+pushes and fetches.
 
 #### 16.1.2 Relay Reputation and Peer Eviction
 
-The peer scoring formula (§5.5) is extended with contribution weight:
-
-```
-score = (items_delivered / connected_duration_s)
-      * (1 / (1 + rtt_ms / 100))
-      * contribution_factor
-
-contribution_factor =
-    IF peer.is_relay THEN
-        clamp(peer.contribution_ratio, 0.1, 2.0)
-    ELSE
-        1.0   // Personal nodes are not penalised for low contribution
-```
-
-**Effect:** Relays that silently drop items develop a low `contribution_ratio`. The governor's scoring (§5.4, §5.5) naturally demotes low-scoring relays from Hot to Warm to Cold. Relays that consistently drop items are evicted from the peer table entirely.
-
-**Detection mechanism for relay defection (E6):**
-
-1. **Cross-peer verification.** When a node receives an item from peer A, it records `(item_id, channel_id, received_from)`. If the same item later arrives from peer B, the node knows both A and B are honest for that item. If items routinely arrive from B but never from relay R (which claims to serve the channel), R's contribution_ratio drops.
-
-2. **Probe items.** Every `probe_interval` (default: 300s), a node publishes a zero-length probe item to a random subscribed channel with `item_type = "probe"`. Probe items are regular items -- signed, encrypted, replicated. The node tracks which relays deliver the probe within `probe_timeout` (default: 60s). Relays that fail to deliver >50% of probes within timeout are flagged as defecting.
-
-3. **Escalating consequence:**
-
-| Defection signal | Action | Recovery |
-|-----------------|--------|----------|
-| contribution_ratio < 0.3 for 10+ min | Demote Hot → Warm | Ratio recovers above 0.5 |
-| Failed >50% probes in 1 hour | Demote to Cold, notify peers via Peer-Sharing `exclude` flag | 24 hours, then re-evaluate |
-| Failed >80% probes in 1 hour | Ban 24 hours | Escalating (§5.6) |
-| Repeated ban (3x in 7 days) | Permanent ban, propagate ban to peers | Manual unban only |
-
-4. **Ban propagation.** When a node permanently bans a relay for defection, it includes the relay's `node_id` in Peer-Sharing responses with an `exclude: true` flag. Receiving nodes add the relay to a watchlist (not auto-ban -- that would enable censorship attacks). If 3+ independent peers report the same relay as defecting, the receiving node auto-bans.
-
-```
-PeerShareEntry {
-    addr:       SocketAddr
-    node_id:    bytes(32)
-    exclude:    bool        // true = reporting node has banned this peer
-}
-```
+Gone (decision 2026-11-10 (older kind), rule 2): its contribution weight and
+probe items were of the older kind's items.
 
 #### 16.1.3 Relay Incentives (Phase 3)
 
@@ -2908,47 +2078,23 @@ This makes it feasible to run 5-10 bootnodes at negligible cost. Phase 3 SPOs ca
 
 ### 16.3 Storage Quota Enforcement (E5)
 
-The channels-api.md §3.2 (publish) is extended with quota enforcement. See channels-api.md §9.1 for specification.
-
-**Protocol-level enforcement (this spec):**
-
-When a relay receives an item via Item-Push and the relay's local storage exceeds `max_relay_storage_bytes` (default: 10 GB, configurable):
-
-1. Stop storing new items for the least-recently-active channel (LRU eviction)
-2. Continue forwarding items (relay without storing)
-3. Log warning: `relay_storage_full`
-4. Metric: `cordelia_relay_storage_bytes` gauge
-
-Relays degrade gracefully: they stop caching but continue forwarding. This prevents storage exhaustion from shutting down relay service entirely.
+Gone (decision 2026-11-10 (older kind), rule 2). A relay's room for channels
+from their secrets is in decision 2026-10-04 §2.5.
 
 ### 16.4 Bandwidth Amplification Limits (E11)
 
-P2P bandwidth rate limits (complement to §9.2 message rate limits):
-
-| Limit | Default | Scope |
-|-------|---------|-------|
-| `max_bytes_per_peer_per_second` | 10 MB/s | Per-peer inbound bytes (all protocols) |
-| `max_push_items_per_channel_per_minute` | 1000 | Per-channel Item-Push rate on receiver side |
-| `max_relay_fanout_per_second` | 100 items | Relay re-push rate cap |
-
-Exceeding `max_bytes_per_peer_per_second` triggers QUIC flow control (receiver stops reading). Exceeding per-channel push rate triggers `PushAck.policy_rejected++` and eventual ban (§9.2).
-
-The relay fanout cap prevents a single relay from saturating its outbound bandwidth on behalf of one channel. Relay processes re-push queue with token-bucket rate limiter (100 tokens/s, burst 200).
+Gone (decision 2026-11-10 (older kind), rule 2): its limits were on the
+older kind's pushes and re-pushes. The limits on the streams of entries are
+in §4.9.7.
 
 ### 16.5 DM and Channel Creation Rate Limits (E9, E12, E13)
 
-API-level enforcement in channels-api.md. Protocol-level complementary limits:
-
-| Limit | Default | Scope |
-|-------|---------|-------|
-| Channel-Announce new channel IDs per peer per minute | 10 | Prevents rapid channel creation flooding announce |
-| PSK-Exchange requests per peer per minute | 1 per channel | Already specified (§9.2) |
-
-Exceeding channel announce rate: the receiving node drops excess ChannelJoined messages and logs a warning. No ban (may be legitimate during initial sync), but the peer's contribution score is not credited for dropped announcements.
+Gone (decision 2026-11-10 (older kind), rule 2): its limits were on
+announcements and key requests of the older kind.
 
 ### 16.6 Channel Name Registration Economics (E4, Phase 3)
 
-Phase 3 on-chain channel registration model (extends channel-naming.md §8):
+Phase 3 on-chain channel registration model (extends [channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md) §8):
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|

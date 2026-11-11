@@ -274,8 +274,8 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 /// Read a frame on a stream whose honest messages are all within a small
 /// message, refusing a longer one at its length before the payload is
 /// read or allocated (decision 2026-10-22 (memory), rule 2). On these
-/// streams (peer-sharing, channel-announce, and the older kind's sync as
-/// a node that carries none answers it) no honest message of any version
+/// streams (peer-sharing, and the older kind's sync as every node answers
+/// it) no honest message of any version
 /// is over `SMALL_MESSAGE_BYTES`, so there is no permit to wait for: a
 /// longer frame is a `MessageTooLarge`, which the caller ends the stream
 /// on.
@@ -392,84 +392,6 @@ mod tests {
     }
 
     #[test]
-    fn test_channel_descriptor_encode_decode() {
-        let desc = ChannelDescriptor {
-            channel_id: "abc123".into(),
-            channel_name: Some("research".into()),
-            access: "open".into(),
-            mode: "realtime".into(),
-            key_version: 1,
-            psk_hash: vec![0x11; 32],
-            creator_id: vec![0x22; 32],
-            created_at: "2026-03-10T14:30:00Z".into(),
-            signature: vec![0x33; 64],
-        };
-        let msg = WireMessage::ChannelJoined(ChannelJoined {
-            channel_id: "abc123".into(),
-            descriptor: desc,
-        });
-        let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
-        match decoded {
-            WireMessage::ChannelJoined(cj) => {
-                assert_eq!(cj.channel_id, "abc123");
-                assert_eq!(cj.descriptor.channel_name, Some("research".into()));
-                assert_eq!(cj.descriptor.psk_hash.len(), 32);
-                assert_eq!(cj.descriptor.signature.len(), 64);
-            }
-            other => panic!("expected ChannelJoined, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_item_encode_decode() {
-        let item = Item {
-            item_id: "ci_test123".into(),
-            channel_id: "abc123".into(),
-            item_type: "message".into(),
-            encrypted_blob: vec![0xFF; 256],
-            content_hash: vec![0xAA; 32],
-            content_length: 256,
-            author_id: vec![0xBB; 32],
-            signature: vec![0xCC; 64],
-            key_version: 1,
-            published_at: "2026-03-10T14:30:00Z".into(),
-            is_tombstone: false,
-            parent_id: None,
-            slot: None,
-            rev: None,
-        };
-        let msg = WireMessage::PushPayload(PushPayload { items: vec![item] });
-        let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
-        match decoded {
-            WireMessage::PushPayload(pp) => {
-                assert_eq!(pp.items.len(), 1);
-                assert_eq!(pp.items[0].item_id, "ci_test123");
-                assert_eq!(pp.items[0].encrypted_blob.len(), 256);
-            }
-            other => panic!("expected PushPayload, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_psk_exchange_encode_decode() {
-        let msg = WireMessage::PskRequest(PskRequest {
-            channel_id: "abc123".into(),
-            subscriber_xpk: vec![0xDD; 32],
-        });
-        let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
-        match decoded {
-            WireMessage::PskRequest(r) => {
-                assert_eq!(r.channel_id, "abc123");
-                assert_eq!(r.subscriber_xpk.len(), 32);
-            }
-            other => panic!("expected PskRequest, got {:?}", other),
-        }
-    }
-
-    #[test]
     fn test_all_message_types_encode() {
         let messages: Vec<WireMessage> = vec![
             WireMessage::HandshakePropose(HandshakePropose {
@@ -504,29 +426,6 @@ mod tests {
             }),
             WireMessage::PeerShareRequest(PeerShareRequest { max_peers: 20 }),
             WireMessage::PeerShareResponse(PeerShareResponse { peers: vec![] }),
-            WireMessage::ChannelJoined(ChannelJoined {
-                channel_id: "test".into(),
-                descriptor: ChannelDescriptor {
-                    channel_id: "test".into(),
-                    channel_name: None,
-                    access: "open".into(),
-                    mode: "batch".into(),
-                    key_version: 0,
-                    psk_hash: vec![0; 32],
-                    creator_id: vec![0; 32],
-                    created_at: "2026-01-01T00:00:00Z".into(),
-                    signature: vec![0; 64],
-                },
-            }),
-            WireMessage::ChannelLeft(ChannelLeft {
-                channel_id: "test".into(),
-            }),
-            WireMessage::ChannelStateHash(ChannelStateHash {
-                digest: vec![0; 32],
-                count: 0,
-            }),
-            WireMessage::ChannelListRequest(ChannelListRequest {}),
-            WireMessage::ChannelListResponse(ChannelListResponse { channels: vec![] }),
             WireMessage::SyncRequest(SyncRequest {
                 channel_id: "test".into(),
                 since: None,
@@ -537,36 +436,6 @@ mod tests {
                 items: vec![],
                 has_more: false,
                 last_seq: None,
-            }),
-            WireMessage::FetchRequest(FetchRequest { item_ids: vec![] }),
-            WireMessage::FetchResponse(FetchResponse { items: vec![] }),
-            WireMessage::PushPayload(PushPayload { items: vec![] }),
-            WireMessage::PushAck(PushAck::default()),
-            WireMessage::PushAck(PushAck {
-                verification_failed: 1,
-                refused: vec![Refusal {
-                    item_id: "ci_x".into(),
-                    why: REFUSED_INVALID.into(),
-                }],
-                ..Default::default()
-            }),
-            WireMessage::PskRequest(PskRequest {
-                channel_id: "test".into(),
-                subscriber_xpk: vec![0; 32],
-            }),
-            WireMessage::PskResponse(PskResponse {
-                status: "ok".into(),
-                reason: None,
-                ecies_envelope: None,
-                key_version: None,
-            }),
-            WireMessage::PairingRequest(PairingRequest {
-                node_id: vec![0; 32],
-                pairing_code: "123456".into(),
-            }),
-            WireMessage::PairingResponse(PairingResponse {
-                status: "ok".into(),
-                reason: None,
             }),
         ];
 
@@ -955,25 +824,6 @@ mod tests {
             assert!(h.node_id.is_empty());
             assert!(h.roles.is_empty());
             assert_eq!(h.p2p_port, 0);
-        } else {
-            panic!("wrong message type");
-        }
-    }
-
-    #[test]
-    fn test_cbor_psk_denied_response_roundtrip() {
-        let msg = WireMessage::PskResponse(PskResponse {
-            status: "denied".into(),
-            reason: Some("not authorized".into()),
-            ecies_envelope: None,
-            key_version: None,
-        });
-        let encoded = encode_message(&msg).unwrap();
-        let decoded = decode_message(stream_of(&msg), &encoded).unwrap();
-        if let WireMessage::PskResponse(r) = decoded {
-            assert_eq!(r.status, "denied");
-            assert!(r.ecies_envelope.is_none());
-            assert!(r.key_version.is_none());
         } else {
             panic!("wrong message type");
         }

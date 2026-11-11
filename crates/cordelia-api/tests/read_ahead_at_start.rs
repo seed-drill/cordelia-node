@@ -43,12 +43,9 @@ fn test_after_start_a_read_under_the_lock_checks_nothing_again() {
         sync_errors: AtomicU64::new(0),
         peers_hot: AtomicU64::new(0),
         peers_warm: AtomicU64::new(0),
-        push_tx: None,
-        announce_tx: None,
+        networked: false,
         peers: Default::default(),
         relays: Default::default(),
-        outbox_refused: Default::default(),
-        relist: Default::default(),
         sync_control: Default::default(),
         own_channels: Default::default(),
         held: Default::default(),
@@ -57,7 +54,7 @@ fn test_after_start_a_read_under_the_lock_checks_nothing_again() {
     // Neither a node of another role nor one that is held up reads
     // ahead.
     assert!(read_ahead_at_start(state.clone(), false).is_none());
-    state.held.hold(Held::FirstStart("a test".into()));
+    state.held.hold(Held::LaterDatabase("a test".into()));
     assert!(read_ahead_at_start(state.clone(), true).is_none());
     assert_eq!(not_read_ahead(&state.db.lock().unwrap()).unwrap(), stored);
     state.held.release();
