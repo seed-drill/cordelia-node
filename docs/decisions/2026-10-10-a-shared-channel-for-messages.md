@@ -542,20 +542,17 @@ The line on answering, where the message asks: `It asks for an answer. To answer
 
 ### 5.4 What a command that writes says of who wrote there (S10)
 
-`share`, `accept --channel`, `shared anew`, `shared move` and `msg send --channel` print, where they write in a channel, which keys have written there, as a change, on standard output after their own line. **They never say who reads it:** a member can hand the seed to anyone, and nothing shows a key that only reads.
+`share`, `accept --channel`, `shared anew`, `shared move` and `msg send --channel` print, where they write in a channel, which keys came to be shown there since this folder (for `send`) or this device last wrote there, on standard output after their own line. **Where none came, they print nothing of it.** A folder's last write there is its agent's newest message in the channel, sent on any device of the person's, known by its sent mark (6.1) and dated by when this device first held it; where this device knows of none, it is when this device first held the channel (section 19, item 62). **They never say who reads it:** a member can hand the seed to anyone, and nothing shows a key that only reads; the yes of `subscribe` says so (5.2). Where a key came, a first line, and a line for each change:
 
 ```
-Keys that wrote here, in "<name>": unchanged since <date>: <n keys>, <m> of them labelled by you. Anyone a member handed the channel to reads it too, unseen.
-```
-
-where no key came to be shown in the channel since this folder (for `send`) or this device last wrote there. A folder's last write there is its agent's newest message in the channel, sent on any device of the person's, known by its sent mark (6.1) and dated by when this device first held it; where this device knows of none, it is when this device first held the channel (section 19, item 62); otherwise the same first line ending `New since <date>:`, and a line for each change:
-
-```
+New in "<name>" since <date>:
   new: <sender form>, first held on this device on <date>
   refused for room: <sender form>, first refused on this device on <date>, key <the whole key>
 ```
 
 and, where the channel was made anew and the person has not moved: `This channel was made anew by <sender form> on <date>, without <k keys>. You have not moved: what you write here is read by those keys too. Move with: cordelia shared move <name>`; and, in a channel moved to, `not moved yet: <sender form>` for each key that the offer sealed to and that has not written there, where the offer counts (§7: made by this device, or by a maker who has written in the new channel and is not a key the person removed). `<date>` is by this device's clock, as `YYYY-MM-DD`.
+
+**Made terser on 11 November 2026, on the person's ruling (issue #338).** These lines were printed after every write: with nothing new, `Keys that wrote here, in "<name>": unchanged since <date>:`, the count of keys and of those labelled, and that anyone a member handed the channel to reads it too, unseen. A command now says only what came: nothing, where nothing did. `shared list` gives the counts, and the yes of `subscribe` says who else reads.
 
 **This narrows S10.** S10 asks for who brought a new key in, and when, as far as this device knows. A device knows that only from the word of the keys involved, which any member can make up. It says what it saw itself: when it first held an entry of that key in the channel.
 

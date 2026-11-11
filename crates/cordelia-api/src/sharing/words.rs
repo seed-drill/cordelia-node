@@ -155,15 +155,8 @@ fn the_shared_commands_say_what_this_record_says() {
             &[&own, "<a name of their choosing>", &relay_words, &words]
         )
     );
-    // §5.4, the lines after it: nobody else wrote there yet.
-    assert_eq!(
-        lines[4],
-        says(
-            "Keys that wrote here, in \"<name>\": unchanged since <date>: <n keys>, <m> of them \
-             labelled by you. Anyone a member handed the channel to reads it too, unseen.",
-            &["design-review", &date_of(now), "0 keys", "0"]
-        )
-    );
+    // §5.4: nobody else wrote there yet, so nothing more is said.
+    assert_eq!(lines.len(), 4, "{lines:?}");
 
     // `accept <key> --channel review-with-alice`, before its yes.
     let plan = accept_plan(
@@ -593,6 +586,46 @@ fn the_shared_commands_say_what_this_record_says() {
              wrote there since. Share the new channel with them again.",
             &["review-with-alice"]
         )
+    );
+    // §5.4, once a key came to write there: Carol, in
+    // "review-with-alice", since this device last wrote there.
+    let filing = filed(conn)
+        .unwrap()
+        .into_iter()
+        .find(|filing| filing.name == "review-with-alice")
+        .unwrap();
+    let review = crate::shared::tests::Shared {
+        secret: filing.card.secret().unwrap(),
+        id: filing.channel,
+    };
+    crate::shared::tests::stores(
+        &s,
+        0,
+        &crate::shared::tests::anew(&carol, &review, 1),
+        now + 1,
+    );
+    let held = crate::person::held(conn).unwrap().unwrap();
+    let carol_form = format!("({}) no label of yours", six_words(&carol.public_key()));
+    assert_eq!(
+        who_wrote(
+            conn,
+            &held,
+            &s.key(0),
+            &review.id,
+            "review-with-alice",
+            None
+        )
+        .unwrap(),
+        [
+            says(
+                "New in \"<name>\" since <date>:",
+                &["review-with-alice", &date_of(now)]
+            ),
+            says(
+                "  new: <sender form>, first held on this device on <date>",
+                &[&carol_form, &date_of(now + 1)]
+            ),
+        ]
     );
     // A count and its noun (§5).
     assert_eq!(

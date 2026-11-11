@@ -191,10 +191,8 @@ fn a_share_and_an_accept_in_either_order() {
             )),
             "{said}"
         );
-        assert!(
-            said.contains("Keys that wrote here, in \"review-with-alice\""),
-            "{said}"
-        );
+        // Only a key that came since is said (§5.4): nothing, or a key new.
+        assert!(!said.contains("unchanged since"), "{said}");
     }
     let taken = holds_in_the_end(&all, &bob, "review-with-alice");
     assert_eq!(taken["words"], words.as_str());
@@ -796,6 +794,18 @@ fn sends_into(
     extra: &[&str],
     body: &str,
 ) -> String {
+    sent_into(all, n, dir, name, extra, body).0
+}
+
+/// [`sends_into`], with all that the send printed.
+fn sent_into(
+    all: &[&Node],
+    n: &Node,
+    dir: &Path,
+    name: &str,
+    extra: &[&str],
+    body: &str,
+) -> (String, String) {
     let said = wait_for("the shared message is sent", all, 180, || {
         let said = msg_in(
             n,
@@ -818,8 +828,7 @@ fn sends_into(
         line.starts_with(&format!("Sent {id} to the shared channel \"{name}\".\n")),
         "{line}"
     );
-    assert!(line.contains("Keys that wrote here, in"), "{line}");
-    id.to_string()
+    (id.to_string(), line)
 }
 
 /// Two people's devices that share a channel, each mapping a folder to
@@ -913,13 +922,19 @@ fn the_summary_prints_a_count_and_no_text_of_a_shared_channel() {
         &["--re", "owner/quokka#77"],
         "zebra-subject-1\nzebra-body-1",
     );
-    let second = sends_into(
+    let (second, said) = sent_into(
         &all,
         &two.bob,
         &two.bob_dir,
         "review-with-alice",
         &[],
         "zebra-subject-2",
+    );
+    // No key came since this folder last wrote there: the send says its
+    // own line alone (decision 2026-10-10 §5.4).
+    assert_eq!(
+        said,
+        format!("Sent {second} to the shared channel \"review-with-alice\".\n")
     );
     let said = wait_for("the summary counts both", &all, 180, || {
         let said = summary_in(&two.alice, &two.alice_dir);
