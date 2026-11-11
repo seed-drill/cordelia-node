@@ -1160,9 +1160,10 @@ fn a_body_is_read_inside_a_frame_that_it_cannot_close() {
 }
 
 /// The label and the fingerprint's words printed of a message are those
-/// of the device that signed it, the label first: in `read`'s header the
-/// label, and the words too with `-v`; in `log`'s line of the message both
-/// (decision 2026-10-09 §3, §4.1, property 2).
+/// of the device that signed it, the label first: in `read`'s header and
+/// `log`'s line of the message the label, and the words too with `-v`
+/// (decision 2026-10-09 §3, §4.1, property 2; `log`'s words behind `-v`
+/// since 11 November 2026, issue #338).
 #[test]
 fn a_message_is_shown_from_the_device_that_signed_it() {
     let two = Two::new();
@@ -1207,8 +1208,23 @@ fn a_message_is_shown_from_the_device_that_signed_it() {
     );
     let printed = logged(&two.desktop, "work");
     assert!(
-        block_of(&printed, &id).contains(&format!(" from notes on \"laptop\" ({words}) to work, ")),
+        block_of(&printed, &id).contains(" from notes on \"laptop\" to work, "),
         "{printed}"
+    );
+    assert!(!printed.contains(words), "{printed}");
+    let said = msg_in(
+        &two.desktop,
+        &folder(&two.desktop, "work"),
+        &[],
+        &["log", "-v"],
+        b"",
+    );
+    assert!(said.status.success(), "{}", err(&said));
+    assert!(
+        block_of(&out(&said), &id)
+            .contains(&format!(" from notes on \"laptop\" ({words}) to work, ")),
+        "{}",
+        out(&said)
     );
     // Its own reads it as from this device.
     let own = out(&read(&two.laptop, "notes", &id));
@@ -1784,8 +1800,8 @@ fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log(
     );
     assert_eq!(summary(&two.desktop, "work"), "");
     // `log` at a terminal shows it, as from a device that is no longer
-    // one of yours, by its label and its four words, between the bare
-    // fence; nothing calls that device the person's.
+    // one of yours, by its label, between the bare fence; nothing calls
+    // that device the person's.
     let mut at = two.desktop.at_terminal(&["msg", "log"]);
     at.says("Type yes to mark it: ");
     at.types("no");
@@ -1796,7 +1812,7 @@ fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log(
         "{shown}"
     );
     assert!(
-        block.contains(" from notes on \"tablet\" (") && block.contains(") to work, "),
+        block.contains(" from notes on \"tablet\" to work, "),
         "{shown}"
     );
     let m = marker_of(&shown);
@@ -1805,12 +1821,17 @@ fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log(
         "{shown}"
     );
     assert!(!shown.contains("your user's"), "{shown}");
-    // With `-v`, in `read`'s frame, which does not call its agent the
-    // user's.
+    // With `-v`, with the device's four words, in `read`'s frame, which
+    // does not call its agent the user's.
     let mut at = two.desktop.at_terminal(&["msg", "log", "-v"]);
     at.says("Type yes to mark it: ");
     at.types("no");
     let shown = at.done();
+    let block = block_of(&shown, &id);
+    assert!(
+        block.contains(" from notes on \"tablet\" (") && block.contains(") to work, "),
+        "{shown}"
+    );
     let m = marker_of(&shown);
     assert!(
         shown.contains(&format!(
@@ -2800,7 +2821,7 @@ fn log_outside_a_terminal_shows_only_the_folders_agent() {
     assert!(!printed.contains("to plans") && !printed.contains("from work on laptop"));
     let block = block_of(&printed, &to_work);
     assert!(
-        block.contains(" from notes on \"laptop\" (") && block.contains(") to work, "),
+        block.contains(" from notes on \"laptop\" to work, "),
         "{block}"
     );
     assert!(
@@ -3154,8 +3175,7 @@ fn a_misled_agent_on_one_device_holds_two_other_names_on_another() {
     // The person sees which device they came from.
     let shown = log_at_a_terminal(desktop, 10, "yes");
     assert!(
-        block_of(&shown, &ids[0]).contains(" from y on \"laptop\" (")
-            && block_of(&shown, &ids[0]).contains(") to z, "),
+        block_of(&shown, &ids[0]).contains(" from y on \"laptop\" to z, "),
         "{shown}"
     );
     let freed = send(desktop, "z", &["--to", "y"], "freed\n");

@@ -127,19 +127,22 @@ fn the_shared_commands_say_what_this_record_says() {
     assert_eq!(
         plan.asks,
         says(
-            "This hands the shared channel \"design-review\" (channel <four words>) to the \
-             device (<six words>) <\"label\", or no label of yours>.\n\
-             Before you go on, have the person whose device it is read you the six words that \
-             cordelia id --words prints there, by another way than the one the key came by: a \
-             call, or in person. They must be these: <six words>. If they are not, someone has \
-             put their own key in its place: stop here.\n\
-             Whoever holds that device reads every message written there from now on, and can \
-             write there and hand it on, until the channel is made anew without them.\n\
-             Nothing of your own goes with it: no memory, no name of yours, and no other \
-             channel.",
+            "This hands \"design-review\" (channel <four words>, a name that proves nothing) to \
+             the device (<six words>) <\"label\", or no label of yours>: whoever holds it reads \
+             and writes there from now on, and can hand it on, until the channel is made anew \
+             without it.\n\
+             Check first: have its person read you the six words that cordelia id --words prints \
+             there, by another way than the one the key came by, such as a call or in person. \
+             They must be: <six words>. If not, someone put their own key in its place: stop \
+             here.",
             &[&words, &alice_six, "no label of yours", &alice_six]
         )
     );
+    // The person's choices of 11 November 2026 (issue #338): nothing is
+    // said of what does not go with it, and the channel's words are said
+    // to prove nothing here, once.
+    assert!(!plan.asks.contains("Nothing of your own"), "{}", plan.asks);
+    assert_eq!(plan.asks.matches("proves nothing").count(), 1);
     let lines = make_share(conn, identity, &relays(), &plan.what, false, now).unwrap();
     assert_eq!(
         lines[..4].join("\n"),
@@ -148,11 +151,12 @@ fn the_shared_commands_say_what_this_record_says() {
              device's key> --channel <a name of their choosing>\n\
              It lives at relay.example.org:9474 (<four words>). The other device takes it only \
              where that relay, by its key, is one of its own.\n\
-             It prints these words for the channel once it has taken it: <four words>. They are \
-             its name, and prove nothing.",
+             It prints these words for the channel once it has taken it: <four words>.",
             &[&own, "<a name of their choosing>", &relay_words, &words]
         )
     );
+    // Said at the yes, and not after it (issue #338).
+    assert!(!lines.join("\n").contains("prove"), "{lines:?}");
     // §5.4: nobody else wrote there yet, so nothing more is said.
     assert_eq!(lines.len(), 4, "{lines:?}");
 
@@ -169,19 +173,16 @@ fn the_shared_commands_say_what_this_record_says() {
     assert_eq!(
         plan.asks,
         says(
-            "This device will take, within the hour, one shared channel that the device (<six \
-             words>) <\"label\", or no label of yours> hands it, and file it as \
-             \"review-with-alice\" on every device of yours.\n\
-             Before you go on, have the person whose device it is read you the six words that \
-             cordelia id --words prints there, by another way than the one the key came by: a \
-             call, or in person. They must be these: <six words>. If they are not, someone has \
-             put their own key in its place: stop here.\n\
-             It is asked for at your relays that have a key, and taken only where it lives at \
-             them:\n  relay.example.org:9474 (<four words>)\n\
-             It carries messages from other people's agents, and never memory. No agent of yours \
-             is shown anything from it until you subscribe a folder: cordelia subscribe \
-             review-with-alice",
-            &[&alice_six, "no label of yours", &alice_six, &relay_words]
+            "This device takes, within the hour, the shared channel that the device (<six \
+             words>) <\"label\", or no label of yours> hands it, and files it as \
+             \"review-with-alice\" on every device of yours. It is asked for at your relays \
+             that have a key, relay.example.org:9474 (<four words>), and taken only where it \
+             lives at them.\n\
+             Check first: have its person read you the six words that cordelia id --words prints \
+             there, by another way than the one the key came by, such as a call or in person. \
+             They must be: <six words>. If not, someone put their own key in its place: stop \
+             here.",
+            &[&alice_six, "no label of yours", &relay_words, &alice_six]
         )
     );
 

@@ -781,8 +781,8 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
                 println!("This key counts as one of your devices already, by an earlier addition.");
             }
             at.yes(&format!(
-                "This gives {} every name's memory, and the means to read what your devices \
-                 write from now on.{}",
+                "This gives {} every name's memory, {}and the means to read what your devices \
+                 write from now on.",
                 named(label, &device),
                 shared_handed(&would)
             ))?
@@ -796,44 +796,28 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
     body["would"] = yes_is_for.into();
     let added = api_post(config_path, "/api/v1/devices/add", body)?;
     names_this_device(&added, &own)?;
-    let this_device = encode_public_key(&own)?;
-    match added["record"] == true {
-        true => println!(
-            "\nAdded. Every device of yours shows the addition until a person clears it there."
-        ),
-        false => println!("\nThe last change is handed to it again."),
-    }
-    println!("\nOn the other device, within the hour, run:");
-    println!("  cordelia accept {this_device}");
+    // What the person does next, and the words they check there: the yes
+    // said what it does, and every device shows the addition until a
+    // person clears it (made terser on 11 November 2026, issue #338).
+    println!("On the other device, within the hour, run:");
+    println!("  cordelia accept {}", encode_public_key(&own)?);
     println!(
-        "\nIt shows these words for this device's key before it asks its yes: {}",
+        "It shows these words for this device's key before it asks its yes: {}",
         fingerprint::shown(&own)
     );
     Ok(())
 }
 
 /// What `add-device`'s yes adds where the person holds a shared channel
-/// (decision 2026-10-10 §5.2): that the new device holds each, and can read
-/// and write in each, with the keys of each. Nothing where it holds none.
+/// (decision 2026-10-10 §5.2): the shared channels the new device holds,
+/// by their count, in its list of what it gives. Nothing where it holds
+/// none. `shared list` names each, with its keys.
 fn shared_handed(would: &Value) -> String {
-    let held: Vec<&Value> = list(would, "shared").collect();
-    if held.is_empty() {
-        return String::new();
+    match list(would, "shared").count() {
+        0 => String::new(),
+        1 => "the shared channel you are in, ".into(),
+        n => format!("the {n} shared channels you are in, "),
     }
-    let mut says = format!(
-        " It also holds the {} shared channel{} you are in, and can read and write in each:",
-        held.len(),
-        if held.len() == 1 { "" } else { "s" }
-    );
-    for channel in held {
-        let keys = channel["keys"].as_u64().unwrap_or(0);
-        says.push_str(&format!(
-            "\n  {:?}: {keys} key{}",
-            cordelia_api::messages::cleaned(text(channel, "name")),
-            if keys == 1 { "" } else { "s" }
-        ));
-    }
-    says
 }
 
 // ── cordelia accept ─────────────────────────────────────────────────
@@ -3537,21 +3521,37 @@ mod tests {
     const OTHER_PHRASE: &str =
         "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 
-    /// `add-device`'s yes names each shared channel the person holds, with
-    /// the keys that wrote there (decision 2026-10-10 §5.2), and adds
-    /// nothing where the person holds none.
+    /// `add-device`'s yes counts the shared channels the person holds, in
+    /// one line, as the record writes it (decision 2026-10-10 §5.2, made
+    /// terser on 11 November 2026, issue #338), and says nothing of them
+    /// where the person holds none.
     #[test]
-    fn add_device_names_each_shared_channel_with_its_keys() {
-        assert_eq!(shared_handed(&json!({ "shared": [] })), "");
-        assert_eq!(shared_handed(&json!({})), "");
-        let would = json!({ "shared": [
+    fn add_device_counts_the_shared_channels_in_its_one_line() {
+        const RECORD: &str =
+            include_str!("../../../docs/decisions/2026-10-10-a-shared-channel-for-messages.md");
+        let yes = |would: &Value| {
+            format!(
+                "This gives <device> every name's memory, {}and the means to read what your \
+                 devices write from now on.",
+                shared_handed(would)
+            )
+        };
+        let none = yes(&json!({ "shared": [] }));
+        assert_eq!(none, yes(&json!({})));
+        let one = yes(&json!({ "shared": [{ "name": "design", "keys": 1 }] }));
+        let two = yes(&json!({ "shared": [
             { "name": "review-with-alice", "keys": 3 },
             { "name": "design", "keys": 1 },
-        ] });
-        assert_eq!(
-            shared_handed(&would),
-            " It also holds the 2 shared channels you are in, and can read and write in each:\n  \
-             \"review-with-alice\": 3 keys\n  \"design\": 1 key"
+        ] }));
+        for line in [&none, &one, &two.replace("the 2 ", "the <n> ")] {
+            assert!(
+                RECORD.contains(line.as_str()),
+                "the record does not say: {line}"
+            );
+        }
+        assert!(
+            one.contains(", the shared channel you are in, and"),
+            "{one}"
         );
     }
 

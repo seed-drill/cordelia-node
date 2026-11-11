@@ -572,9 +572,9 @@ enum MsgCommand {
         /// give the folder you gave `msg summary --folder`
         #[arg(long, value_name = "DIR")]
         folder: Option<String>,
-        /// For a message from your own agents, also show the four words
-        /// of the device that sent it, its thread, and how many messages
-        /// the two agents have here
+        /// Also show the message's thread and how many messages it has
+        /// here, and for a message from your own agents, the four words
+        /// of the device that sent it
         #[arg(short = 'v', long)]
         verbose: bool,
     },
@@ -631,8 +631,9 @@ enum MsgCommand {
         /// shared channel's are all shown
         #[arg(long)]
         since: Option<String>,
-        /// At a terminal too, show the lines an agent sees around each
-        /// message
+        /// Also show the four words of the device that sent each
+        /// message, and at a terminal too, the lines an agent sees around
+        /// each message
         #[arg(short = 'v', long)]
         verbose: bool,
     },
@@ -1084,9 +1085,10 @@ fn main() -> anyhow::Result<()> {
                 folder,
                 verbose,
             } => match (id, next_shared) {
-                // A shared message's header says its thread and counts,
-                // with `-v` or without it.
-                (_, true) => msg_cmd::read_next_shared(&cli.config, folder.as_deref()),
+                // A shared message's header says its thread and counts
+                // only with `-v`, as one of your own agents' does
+                // (decision 2026-10-10 §5.3).
+                (_, true) => msg_cmd::read_next_shared(&cli.config, folder.as_deref(), verbose),
                 (Some(id), false) => msg_cmd::read(&cli.config, &id, folder.as_deref(), verbose),
                 (None, false) => unreachable!("the parser asks for an id or --next-shared"),
             },

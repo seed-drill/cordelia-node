@@ -193,17 +193,18 @@ fn asking_line(words: &str, until: &str) -> String {
 }
 
 /// What `accept --channel` says of a share it took (§5.2): the name it is
-/// filed under, its words and its relays, where the node lists it.
+/// filed under, its words and its relays, where the node lists it, and the
+/// next act, which its yes no longer says (made terser on 11 November
+/// 2026, issue #338). That the words prove nothing is said once, at the
+/// yes of `share`.
 fn taken_line(name: Option<&str>, words: &str, relays: &[&str]) -> String {
     match name {
         Some(name) => format!(
-            "Taken: \"{name}\" is channel {words}, at {}. The channel's words are its name, and \
-             prove nothing.",
+            "Taken: \"{name}\" is channel {words}, at {}. No folder subscribes to it: in a \
+             folder, run cordelia subscribe {name}",
             relays.join(" and ")
         ),
-        None => {
-            format!("Taken: channel {words}. The channel's words are its name, and prove nothing.")
-        }
+        None => format!("Taken: channel {words}."),
     }
 }
 
@@ -596,9 +597,7 @@ pub fn list_lines(listed: &Value) -> Vec<String> {
     let channels: Vec<&Value> = list(listed, "channels").collect();
     match channels.len() {
         0 => lines.push("No shared channel is held on your devices.".to_string()),
-        n => lines.push(format!(
-            "Shared channels: {n} of 16. Each lives at the relays named, known by their keys."
-        )),
+        n => lines.push(format!("Shared channels: {n} of 16.")),
     }
     for channel in channels {
         let relays: Vec<&str> = list(channel, "relays")
@@ -740,9 +739,16 @@ mod tests {
             taken_line(Some("review-with-alice"), four, &[relay]),
             says(
                 "Taken: \"review-with-alice\" is channel <four words>, at relay.example.org:9474 \
-                 (<four words>). The channel's words are its name, and prove nothing.",
+                 (<four words>). No folder subscribes to it: in a folder, run cordelia subscribe \
+                 review-with-alice",
                 &[four, "kind lamp mint nest"]
             )
+        );
+        // That the words prove nothing is said once, at the yes of `share`
+        // (the person's choice of 11 November 2026, issue #338).
+        assert_eq!(
+            taken_line(None, four, &[]),
+            format!("Taken: channel {four}.")
         );
         assert_eq!(
             nothing_taken_line("14:00"),
@@ -979,10 +985,9 @@ mod tests {
             "past_a_bound": [],
         });
         let lines = list_lines(&listed);
-        assert_eq!(
-            lines[0],
-            "Shared channels: 1 of 16. Each lives at the relays named, known by their keys."
-        );
+        // Its header is the count alone (made terser on 11 November 2026,
+        // issue #338).
+        assert_eq!(lines[0], "Shared channels: 1 of 16.");
         assert_eq!(
             lines[1],
             "  \"review\": channel a b c d, 1 key wrote there, 0 labelled by you; at \
