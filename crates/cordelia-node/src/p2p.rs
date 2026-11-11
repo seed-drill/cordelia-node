@@ -1135,7 +1135,8 @@ pub async fn p2p_loop(
                     // to be by a dial that timed out since the wake
                     // began, and one that came back is asked within the
                     // wake (decision 2026-10-24 (removal), section 8).
-                    if reach.dials_at_wake() {
+                    // It reads the lists it follows at once too.
+                    if woke(reach, &state.own_channels) {
                         wake_dials.woke(&relays, now);
                     }
                 }
@@ -2265,6 +2266,23 @@ fn dial_errored(
             reach,
         );
     }
+}
+
+/// Whether the device woke since the dial loop last asked
+/// ([`Reach::dials_at_wake`](cordelia_node::device_entries::Reach::dials_at_wake)).
+/// Where it did, the lists of the repositories it follows are read at once
+/// (decision 2026-11-06 (joining), rule 3): the timer that reads them
+/// stops while the machine sleeps, and a status would show each list as
+/// long unread until its next read (rule 7, issue #338).
+fn woke(
+    reach: &cordelia_node::device_entries::Reach,
+    own: &cordelia_api::state::OwnChannels,
+) -> bool {
+    let woke = reach.dials_at_wake();
+    if woke {
+        own.ask_members_read();
+    }
+    woke
 }
 
 /// Cut the wait already set to dial each of `came`, the relays that came
@@ -4668,6 +4686,30 @@ mod tests {
         })
         .await;
         wrote.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A device that wakes reads the lists of the repositories it follows
+    /// at once, and asks no read where it did not wake (issue #338).
+    #[tokio::test]
+    async fn a_device_that_wakes_reads_its_lists_at_once() {
+        let reach = cordelia_node::device_entries::Reach::new(
+            cordelia_node::device_entries::Clock::system(),
+        );
+        let own = cordelia_api::state::OwnChannels::default();
+        // Whether a read was asked: one asked is kept for the next wait.
+        async fn asked(own: &cordelia_api::state::OwnChannels) -> bool {
+            let soon = std::time::Duration::from_millis(50);
+            tokio::time::timeout(soon, own.wait_members_read())
+                .await
+                .is_ok()
+        }
+        assert!(!woke(&reach, &own));
+        assert!(!asked(&own).await, "no wake, no read asked");
+        reach.woke();
+        assert!(woke(&reach, &own));
+        assert!(asked(&own).await, "the wake asks a read");
+        assert!(!woke(&reach, &own), "the wake is read once");
+        assert!(!asked(&own).await);
     }
 
     /// The peer-share and older-kind-sync handlers read a frame only
