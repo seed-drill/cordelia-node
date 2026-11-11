@@ -1,7 +1,7 @@
 # Decision: a person's hold on messages
 
 **Date**: 2026-10-25
-**Status**: Built. Revised twice after its reviews (section 8).
+**Status**: Accepted, and built in `v0.2.0-alpha.17`; the pairs held, under the status (rule 4), in `v0.2.0-alpha.18`. It amends the record of 2026-10-09, `channels-api.md` and the threat model's T22 (section 5).
 **Cited as**: "decision 2026-10-25, rule 2", and "rule 3.6" for an item of a rule. The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -377,47 +377,4 @@ Listed here, and changed when this is built.
 
 ## 8. After its review
 
-The first form (commit 2160a7f3, pull request #212) had one independent review: one high, six medium and eleven low findings. The high and every medium were settled; the lows were taken where they were right.
-
-| # | Level | Finding | Settled |
-|---|---|---|---|
-| H1 | high | A 10 could lose to an older bound that it had not heard of; an older bound could come back from a relay that was behind | Settled with M1. `allow` is refused before the first fetch (refusal 5) and with sync off. Every bound a device sets, a 10 among them, is listed for 7 days and 10 minutes after its `set`, or until a later one for its pair is held (rule 3.5, `AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS`). A listed 10 is the usual hold in the look and the status. Room: a list holds as many as fit, and a full one names its pairs (rule 2). Both tests added (rule 3) |
-| M1 | medium | The order was by the clock, so a later act could lose; a bound whose start was ahead was unclear | `set` is the clock, or one second after the latest `set` held for that pair: what was heard of first is ordered first, whatever the clocks say; only two acts that neither had heard of go by the clocks, as said (rule 3.1, 3.2). A bound holds from when it is held, and its end alone uses the first holding (rule 3.3). The review's numbers were weighed and set aside (section 6) |
-| M2 | medium | A restored store's own later list of bounds was not said | It replaces the device's own rows, in the door's write; nothing is set before the first fetch (rule 2). Test added |
-| M3 | medium | A device's list of a person's reads hides messages from `log` on every device; the record of 2026-10-09 and T22 say it cannot | Said in rule 5; `log` names on which device you read what it does not show (`<where>`, rule 1); the sentences of §7.2, §11 and T22 listed (section 5). Test added |
-| M4 | medium | The limit named a pseudo-terminal, not the routes, which need none | Rule 5's sentence names the token and the routes; tests `the_route_sets_a_bound_with_no_terminal` and `the_route_marks_with_no_terminal` |
-| M5 | medium | Lists stored by the version before are never read after the upgrade (`take.rs:226-232`) | Read once at the first start after step 20, before the count is set to 0; the notes say that 0 clears a real count too (rule 1). Test added |
-| M6 | medium | `allow X --all any` says only the hourly limits stop sending, but X's other held pairs still stop `--all`; `allow X Y any` does not free X's `--all` | The first is right: the question for `--all` says so (rule 2). The second is not: the words for X and Y speak of sending between X and Y, which they free, and X's `--all` is the pair of X and every agent |
-| L1 | low | First holding stamped again at each list lets a bound run twice its time | Kept for each bound across later lists (rule 3.3); test extended |
-| L2 | low | Form 4's checks: `a` and `b` order, the kind, a kind 2 with a `b`, a bad newer list | Taken, but `a` equal to `b` is a pair (`pairs_with`, `messages.rs:1061` in storage), so only `a` above `b` is refused; a kind 2 has no `b` field to carry, and bytes past its end fail the checks. A bad newer list drops that key's bounds (rule 2) |
-| L3 | low | The `for` of a 10, and `10 --for`, unstated | A 10 carries 604,800; `--for` with 10 is not used, as rule 2 said (rule 3.3) |
-| L4 | low | "1 messages"; "until your user reads them" untrue where they expire; `allow` in the help | The singular, ", or they expire" (rule 4); `allow`'s help line begins "For a person at a terminal:" (rule 2). A lower bound that ends is your act, and is left unsaid |
-| L5 | low | With sync off, or beside the version before, the words are untrue | `allow` is refused with sync off; `log` says that sync is off (rule 1); the help and the notes say what an older device does not hear |
-| L6 | low | Ended bounds take places unseen; "allow its pair 10" frees nothing | The full list's refusal names each pair and when it leaves, and a pair held can be set again in its place (rule 2, rule 3.6) |
-| L7 | low | 64, and 3,360, were overstated or one-sided; `any` overwrites the ring | The reason for 64 is said rightly; 6,720 for two folders; the ring in three hours (rule 2, section 2, section 4) |
-| L8 | low | A key's rows came back or not by when the hourly task ran | Dropped in the statement's transaction (rule 1, hard cases 3 and 4) |
-| L9 | low | Rule 2's real-process test could not pass as written | The pair's count across both devices; each side sends five, under the folder's rate (rule 2) |
-| L10 | low | §5 missed sentences of the record of 2026-10-09 | Added: three forms, 65 entries, H and the lists, 65 slots twice, §7.2's `log`, §11's holder of the key, the test of 65 slots, §9.2's first-start step, T22 |
-| L11 | low | For the build: `set` named twice; one count of lists sent again; `marks::answered`; `pairs_with` needs the keys; the route's own checks | The route's field is `yes`; each list counts apart and `answered` matches its slot (rule 1); `pairs_with` is passed the keys (rule 1); the route checks again, with its test (rule 2) |
-
-**The check of the revision** (commit 58c57c3d) found every finding above settled, and no new way to end or raise a hold beyond rule 5. It found two medium and five low findings, each an edge, each taken at its least change.
-
-| # | Level | Finding | Settled |
-|---|---|---|---|
-| 1 | medium | A restored store could still bring back an `any` it had ended, where a relay answered another to its list, or lose what you set after the restore, where its later list came late | Its own later list is merged by pair, the later `set` kept, and an own bound the later list lacks is kept only where it was set since this start; at a relay's answer of another, the device first drops its own bounds set before this start (rule 2). Test added |
-| 2 | medium | A clock far ahead made a bound hold longer, and the one second spread it to every later bound of the pair | Each bound carries `at`, its device's clock at the yes, beside `set`: `set` orders, `at` times its end and its listing, by the device's own clock (rule 3.1, 3.3, 3.5); 4 bounds at the longest names still fit (1,706 bytes). What is left is said: a bound whose `at` is more than 7 days ahead can hold, for its `for` at most, on a device that first gets it late from a relay that is behind. Test added. The first case as written does not arise, since the setter counts its 7 days by its own clock; the second, and a device that holds it late, do |
-| 3 | low | `set` signed or unsigned, and its one second at the top | Unsigned; the one second stops at the top, where two tie and 3.2's tie decides, so your 10 beats an `any` there (rule 3.1). Test added. A `set` far ahead is not refused: it orders and times nothing else now, and only a holder of a key writes one at the top |
-| 4 | low | The first-start read could be marked done unread, on a device that does not stand applied | Done where it stands applied, or at its first pass after it does; the read, the 0 and the key of `node_meta` in one transaction, before any route of messages answers (rule 1) |
-| 5 | low | A later version that changed form 4 would have this version drop its 10s | A change takes a new form byte, and a form this version does not know leaves that key's bounds as they were; a form 4 that fails its checks still drops them (rule 2) |
-| 6 | low | How `<where>` joins three or more | This device first, the rest in order of label, joined with ", " and " and " (section 1) |
-| 7 | low | §5 missed §12's figure of a reader's rows | Added, with the figure of section 7 (162,518 for each signer) |
-
-**The review of the build** (pull request #215) found one medium and four low findings (rows 2 to 5 are its lows 1 to 4).
-
-| # | Level | Finding | Settled |
-|---|---|---|---|
-| 1 | medium | A relay that answers another could end a 10: the device dropped every own bound of before its start, whatever revision the answer named, however often, and even where it then wrote nothing; another device's older `any` then held everywhere | It acts only on an answer to the list it holds, within its three, where it may write; and of its own bounds of before the start it drops only those that allow more than the usual hold (rule 2). Test `a_relay_that_answers_another_cannot_end_a_ten` |
-| 2 | low | A bad list of the device's own key left its own bounds, though the record said that key's bounds go | Kept, and said: the device's own bounds are its person's acts (rule 2) |
-| 3 | low | Four rules had no test that caught them undone: a person's read of another device going with its message's row; the device's own key in the answer of another; the tie by key; the list of bounds counting its writes again apart | A test for each |
-| 4 | low | The look for 0 and 1, the question's "1 wait now", and a `--for` given with 10, which the command refused for its time | The words are said in full (rule 2), "1 waits now" in both, and a `--for` given with 10 is not read |
-| 5 | low | The status could count before the lists held from before step 20 were read | Left: the status writes nothing of its own (its test, `test_a_devices_status_identity_and_metrics_count_nothing_of_the_older_kind`), and the node reads the lists at its start, before its server answers, and at each pass, before it writes a list |
+The reviews of this record (pull request #212) and of its build (pull request #215) are in those pull requests; each finding was taken into the rules and sections above.

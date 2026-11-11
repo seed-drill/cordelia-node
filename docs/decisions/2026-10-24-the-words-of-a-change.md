@@ -1,9 +1,9 @@
 # Decision: the words of a change
 
 **Date**: 2026-10-24
-**Status**: Rules 1 to 7 built. Revised once after its review (section 8). **Rules 1 to 7 are built first; rules 8 and 9, and the parts of rule 10 that state them, are held** until the record of a removal that fails safe (`2026-10-24-removal-fails-safe.md`) is settled. The person ruled on 24 October that a removal must fail safe by construction, and that a warning before the phrase is a nicety, not the fix. Under that record a fork can no longer let a removed device back in, so what rule 9 warns of changes; and its narrow check found two high findings in rules 8 and 9 (section 8). They are written again against that record before they are built.
+**Status**: Rules 1 to 7 accepted, and built in `v0.2.0-alpha.17`. Rules 8 and 9, and the parts of rule 10 that state them, are held: the person ruled on 24 October that a removal must fail safe by construction (`2026-10-24-removal-fails-safe.md`), and under that record a fork can no longer let a removed device back in, so what rule 9 warns of changes. They are written again against that record before they are built. It amends the record of 2026-10-04, the record of reach and `channels-api.md` (section 5), and that record amends it (below).
 
-**Under the record of a removal that fails safe, as built** (its section 5, item 35): "in a fork" here is "closed, or keeping a head set aside" (that record's rules 10 and 11). Rule 9's sentence "Until you do, a device that the other change removed may still be listed in this one, and may read what your devices write after it" holds only until each device has read both changes: from then each follows a clear one (its rule 8), and the next change made on a device that has seen both joins them (its rule 21), with no `settle` asked. Rules 8 and 9 are still held, and are written again against that record before they are built.
+**Under the record of a removal that fails safe, as built** (its section 5, item 35): "in a fork" here is "closed, or keeping a head set aside" (that record's rules 10 and 11). Rule 9's sentence "Until you do, a device that the other change removed may still be listed in this one, and may read what your devices write after it" holds only until each device has read both changes: from then each follows a clear one (its rule 8), and the next change made on a device that has seen both joins them (its rule 21), with no `settle` asked.
 **Cited as**: "decision 2026-10-24, rule 3". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -477,34 +477,4 @@ The tests that answer "Type \`stays\` or \`removed\`" (`common/mod.rs:1499-1502`
 
 ## 8. The review, and what became of each finding
 
-The first form (commit bb91d29) had one independent review: one high, five medium and eight low findings. Each was taken at its least change.
-
-| # | Level | Finding | Settled |
-|---|---|---|---|
-| 1 | high | Rules 8 and 9 measured the personal channel, which does not hold the change; a relay that holds the kept entry was warned of as a fork | Two notes by relay, ASKED (an answer that it holds the kept entry) and READ (every own channel read to its end); rule 9 goes by ASKED, rule 8's reading lines by READ; what an unread personal channel puts at risk is said (a device added through that relay); the "Today" text and §5's sentence for 7.1 corrected (rule 8, rule 9, section 5) |
-| 2 | medium | The fork warning overclaimed, and "can read" was untrue of a removed device that applied its removal | The limit is written for any change made apart, an unread relay one cause of three; "may still be listed, and may read"; the warning never says that asking every relay rules a fork out, and today's line after every change stays (rule 9, section 5) |
-| 3 | medium | A settlement said none of rule 8's lines, and lost today's "did not answer" | In a fork each relay not asked which change it holds is named, and rule 9's words are said for a third change; no relay that today's line names goes unnamed (rule 8, in a fork; rule 9) |
-| 4 | medium | Rule 8 dropped today's warning that memory was not fetched | "Read" is every own channel but messages, as `read_all` counts; the reason is given; names not read are said (rule 8) |
-| 5 | medium | The note by pass was not defined well enough | Read by any pass begun after the asking; the reason from the last such pass; the kept entry as when `fetch` returns; "an earlier pass was still reading it" and "not reached in the two minutes" added (rule 8) |
-| 6 | medium | Rule 7 fixed only the lines of a relay that lacks the change | D5, T3, S3, S6 and S8 (holding) say "cannot be reached from here" too; section 2 says where a person learns it before any change (rule 7, section 2) |
-| 7 | low | Rule 9's advice was wrong for some reasons | Advice by reason, in rule 8's lines; rule 9 points to it |
-| 8 | low | Rule 2.1 rested on data the node does not hand, and `cordelia devices` kept one address line | The data is named, its source (the dial loop) and its cost; the line of `cordelia devices` is reworded (rule 2, section 7) |
-| 9 | low | "Still waiting" was ambiguous, could be untrue, and its clock was fixed | "no new line since" the last line that was not a notice; a dropped line is no new line, as today; the clock is given to the wait (rule 3) |
-| 10 | low | The count said "0 of 5", and "still trying" could be untrue | The count starts at minute 1; after five minutes one sentence true in both cases (rule 4) |
-| 11 | low | "since the change at" misled on a device that applied a change made elsewhere | "since this device applied the change at" (rule 6) |
-| 12 | low | The answer word `add` | `list`, with the reason (rule 1) |
-| 13 | low | Rule 8's real-process test would be flaky | It waits until the relay shows as not connected (section 4) |
-| 14 | low | R0 had no sentence on times; a time on S8's first line set it apart | R0 gets the sentence; each end begins with a timed line of its own, and its lines have none (rule 3) |
-
-**The review of what was built** (pull request #211): no high, one medium and seven low findings. Each was taken at its least change; where the record's own words were the fault, they changed with the code.
-
-| # | Level | Finding | Settled |
-|---|---|---|---|
-| 1 | medium | From minute 5 the count said "has not been reached for <m> minutes", counted from the reference: of a relay lost before the change it read as though the relay was reached until the change | "has not been reached in the <m> minutes that this command has waited for it" (rule 4) |
-| 2 | low | A recovery whose first look gives R1 said its lines with a time, though no R0 said that the times are UTC; S1 and R0 said that each line below has its time, though the lines of an end have none; "still waiting" could name R0's moment, which no line shows | Before R0 the lines have no time, as before; "Until the wait ends, each line below starts with the time it was said, in UTC."; the record says what the second `<time>` is where no line has come (rule 3) |
-| 3 | low | "Still waiting" and "The wait has ended." could be said at one look | Not at a look that ends the wait (rule 3) |
-| 4 | low | A row could be shown for up to a tick of the dial loop with no name, its relay not yet said to be its connection's | Where each relay stands is said at a connection and at the governor's tick, before the peers (rule 2, 4) |
-| 5 | low | Two relays given no key at one address share a connection, and its row named only the first | The row names both, and has no `name`, so `cordelia devices` matches it by address as before (rule 2, 5) |
-| 6 | low | "both were signed before it was added" could be untrue of the change made apart | "both were made without it" (rule 1) |
-| 7 | low | Rule 4 was not built in a recovery's wait, which "the wait" includes | Built there, for each relay that lacks the change (rule 4, 5) |
-| 8 | low | Four changes passed every test: init's relay by its address, a settlement's question as a renewal's, "5 of the 5 minutes", and an early line of a relay not known to hold the change | A test for each (section 4); the real-process test of the upgrade checks both forms of the line before five minutes |
+The reviews of this record and of its build (pull request #211) are in their pull requests; each finding was taken into the rules and sections above.

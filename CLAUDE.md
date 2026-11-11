@@ -56,7 +56,7 @@ Comments cite a record by its date and section or rule: `decision 2026-10-04 §4
 - `2026-11-06-joining-by-pull-request.md` (joining): `.cordelia/members`, `subscribe` in a clone, the node's read of each list.
 - `2026-11-10-removing-the-older-kind.md` (older kind): no node carries the older kind of channel; one baseline for the schema.
 
-The design today is 2026-10-04 with 2026-09-30, and the later records that add to them. Each record's Status line says what is built and what it amends. `2026-11-05` is accepted but not built. The March records are older and in part superseded, as each says at its head.
+The design today is 2026-10-04 with 2026-09-30, and the later records that add to them. Each record's Status line says what is built and what it amends. `2026-11-05` is accepted but not built.
 
 ## Engineering rules
 

@@ -949,9 +949,9 @@ Gone (decision 2026-11-10 (older kind), rule 2): this was of the older kind of c
 - **specs/ecies-envelope-encryption.md**: Cryptographic primitives (ECIES, AES-256-GCM, Bech32 encoding, CBOR signing, AAD binding)
 - **cordelia-core/docs/reference/api.md**: Pre-pivot node API (reference only, not carried forward)
 - **[decisions/2026-03-09-mvp-implementation-plan.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-09-mvp-implementation-plan.md)**: WP3 scope and endpoint definitions
-- **decisions/2026-03-09-architecture-simplification.md**: Provider interface, channel encryption model
+- **[decisions/2026-03-09-architecture-simplification.md](https://github.com/seed-drill/cordelia-node/blob/82f370f6/docs/decisions/2026-03-09-architecture-simplification.md)**: Provider interface, channel encryption model
 - **[decisions/2026-03-10-identity-privacy-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-10-identity-privacy-model.md)**: DM derivation, namespace rules, access policies
-- **decisions/2026-03-10-phase1-design-decisions.md**: Node is encryption boundary, greenfield build
+- **[decisions/2026-03-10-phase1-design-decisions.md](https://github.com/seed-drill/cordelia-node/blob/82f370f6/docs/decisions/2026-03-10-phase1-design-decisions.md)**: Node is encryption boundary, greenfield build
 - **RFC 4287**: Atom Syndication Format (cursor-based polling model)
 - **W3C Server-Sent Events**: Push delivery specification (Phase 2)
 
