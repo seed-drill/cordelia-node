@@ -2049,7 +2049,7 @@ impl Drop for Begun<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{channels, db, items};
+    use crate::db;
     use cordelia_core::protocol::{
         LABEL_ENTRY_AUTHOR, LABEL_ENTRY_CHANNEL, MAX_ENTRY_NAME_AND_VALUE_BYTES,
         MAX_ENTRY_WIRE_BYTES, MAX_ITEM_BYTES, SMALL_PAGE_BYTES,
@@ -5882,20 +5882,18 @@ mod tests {
         assert_eq!(counted(&conn), 0);
     }
 
-    // ── The two kinds ────────────────────────────────────────────────
+    // ── What the older kind left ─────────────────────────────────────
 
-    /// The channels of the older kind and those from their secrets are
-    /// counted apart in the store. What this kind counts against its cap,
-    /// and what it drops to make room or as unused, is never of the older
-    /// kind. And what the older kind's functions count, list and drop is
-    /// never of this kind.
+    /// What a relay's database still holds of the older kind, as an
+    /// earlier version left it, is never counted against this kind's cap,
+    /// and never dropped to make room or as unused (decision 2026-11-10
+    /// (older kind), rule 3).
     #[test]
-    fn test_the_older_kinds_room_and_this_kinds_do_not_touch_each_other() {
+    fn test_what_the_older_kind_left_is_no_part_of_this_kinds_room() {
         let (conn, mut room) = relay_of(2 * SMALL);
         // What the relay holds of the older kind: two channels, far more
-        // than this kind's cap.
-        let key = device(1).public_key();
-        let blob = vec![0x5a; 8192];
+        // than this kind's cap, in plain SQL.
+        let blob = vec![0x5au8; 8192];
         for (n, channel_id) in ["old_a", "old_b"].into_iter().enumerate() {
             conn.execute(
                 "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
@@ -5905,39 +5903,33 @@ mod tests {
             )
             .unwrap();
             for i in 0..4u8 {
-                let id = format!("ci_{channel_id}_{i}");
-                let hash = [i + 16 * n as u8; 32];
-                let item = items::NewItem::plain(
-                    &id,
-                    channel_id,
-                    &key,
-                    "memory",
-                    "2026-01-01T00:00:00Z",
-                    1,
-                    &hash,
-                    &[0x02; 64],
-                    &blob,
-                );
-                assert!(items::insert_item(&conn, &item).unwrap());
+                conn.execute(
+                    "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                        content_hash, signature, encrypted_blob, content_length)
+                     VALUES (?1, ?2, ?3, 'memory', '2026-01-01T00:00:00Z', ?4, ?5, ?6, ?7)",
+                    params![
+                        format!("ci_{channel_id}_{i}"),
+                        channel_id,
+                        device(1).public_key().as_slice(),
+                        [i + 16 * n as u8; 32].as_slice(),
+                        [0x02u8; 64].as_slice(),
+                        blob.as_slice(),
+                        blob.len() as i64,
+                    ],
+                )
+                .unwrap();
             }
         }
-        let older = |conn: &Connection| {
-            let rows: i64 = conn
-                .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
-                .unwrap();
-            (
-                rows,
-                items::channel_cost(conn, "old_a").unwrap(),
-                items::channel_cost(conn, "old_b").unwrap(),
-                channels::newest_stored(conn).unwrap(),
-                channels::list_stored_channel_ids(conn).unwrap().len(),
+        let older = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(content_length), 0) FROM items",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
+            .unwrap()
         };
         let before = older(&conn);
-        assert_eq!(before.0, 8);
-        assert_eq!(before.1, 4 * (8192 + 1024));
-        assert_eq!(before.3.as_deref(), Some("old_b"));
-        assert!(before.1 + before.2 > room.max_bytes);
+        assert_eq!(before, (8, 8 * 8192));
 
         // None of it is counted against this kind's cap: the relay takes
         // new channels up to it.
@@ -5969,27 +5961,6 @@ mod tests {
         take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW + 20).unwrap();
         assert_eq!(sweep_unused(&conn, NOW + 365 * DAY).unwrap(), [channel(2)]);
         assert_eq!(older(&conn), before);
-
-        // The other way round: what the older kind counts and drops is
-        // never of this kind.
-        room.max_bytes = u64::MAX;
-        for c in [4, 5] {
-            take(&conn, &mut room, &small(c, 1, 5), &from(1), NOW + 30).unwrap();
-        }
-        // Its newest channel, and the channels it lists, are its own.
-        assert_eq!(older(&conn), before);
-        // It drops its newest, and then its other one: this kind's
-        // channels and entries are as they were.
-        assert_eq!(channels::drop_stored(&conn, "old_b").unwrap(), 4);
-        assert_eq!(
-            channels::newest_stored(&conn).unwrap().as_deref(),
-            Some("old_a")
-        );
-        assert_eq!(channels::drop_stored(&conn, "old_a").unwrap(), 4);
-        assert_eq!(channels::newest_stored(&conn).unwrap(), None);
-        assert_eq!(held(&conn), [4, 5]);
-        assert_eq!(counted(&conn), 2 * SMALL);
-        assert_eq!(ids(&conn, 4).len(), 1);
     }
 
     // ── Every head (decision 2026-10-24 (removal), rules 14 to 16) ───

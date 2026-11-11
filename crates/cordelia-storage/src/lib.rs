@@ -1,4 +1,5 @@
-//! SQLite storage: channels, items, PSK management, search indexes, migrations.
+//! SQLite storage: what a device and a relay hold of channels from their
+//! secrets, and the steps of the schema.
 //!
 //! Spec: seed-drill/specs/data-formats.md, seed-drill/specs/channels-api.md
 
@@ -6,22 +7,17 @@ pub mod acts;
 pub mod arrivals;
 pub mod at_relays;
 pub mod atomic;
-pub mod channels;
 pub mod db;
 pub mod entries;
 pub mod first_start;
 pub mod follows;
 pub mod history;
 pub mod index_lines;
-pub mod items;
 pub mod messages;
 pub mod meta;
-pub mod naming;
 pub mod person;
-pub mod psk;
 pub mod relay;
 pub mod schema;
-pub mod search;
 pub mod shared;
 pub mod shared_anew;
 pub mod shared_lists;

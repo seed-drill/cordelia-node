@@ -23,10 +23,9 @@ use cordelia_core::load::Stream;
 use cordelia_core::protocol::{
     CHANNEL_MARK_BYTES, DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, ENTRY_PAGE_MAX_ENTRIES,
     ITEM_AUTHOR_BYTES, ITEM_HASH_BYTES, ITEM_SIGNATURE_BYTES, ITEM_SLOT_BYTES, MAX_CHANNEL_ID_LEN,
-    MAX_CHANNELS_ASKED_OF_A_PEER, MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_ITEM_ID_LEN,
-    MAX_ITEM_TYPE_LEN, MAX_LISTED_CHANNEL_IDS, MAX_PUSHED_ITEMS, MAX_SHARED_PEER_ADDRS,
-    MAX_TIMESTAMP_LEN, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL, PROTOCOL_ENTRY_PUSH,
-    PROTOCOL_ENTRY_SHOW, PROTOCOL_RELAY_ENTRIES, RELAY_CHANNELS_PAGE_MAX,
+    MAX_HANDSHAKE_ROLES, MAX_ITEM_ID_LEN, MAX_ITEM_TYPE_LEN, MAX_LISTED_CHANNEL_IDS,
+    MAX_SHARED_PEER_ADDRS, MAX_TIMESTAMP_LEN, PROTOCOL_CHANNEL_PROVE, PROTOCOL_ENTRY_PULL,
+    PROTOCOL_ENTRY_PUSH, PROTOCOL_ENTRY_SHOW, PROTOCOL_RELAY_ENTRIES, RELAY_CHANNELS_PAGE_MAX,
 };
 use cordelia_storage::relay;
 use serde::{Deserialize, Serialize};
@@ -195,54 +194,12 @@ pub struct PeerAddress {
     pub exclude: bool,
 }
 
-// ── Channel-Announce (0x04, §4.4) ──────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelJoined {
-    pub channel_id: String,
-    pub descriptor: ChannelDescriptor,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelLeft {
-    pub channel_id: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelStateHash {
-    #[serde(with = "serde_bytes")]
-    pub digest: Vec<u8>, // 32 bytes
-    pub count: u16,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelListRequest {}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelListResponse {
-    /// At most MAX_CHANNELS_ASKED_OF_A_PEER.
-    #[serde(deserialize_with = "at_most_descriptors")]
-    pub channels: Vec<ChannelDescriptor>,
-}
-
-/// Channel descriptor (§4.4.6). Signed by creator.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelDescriptor {
-    pub channel_id: String,
-    pub channel_name: Option<String>,
-    pub access: String,
-    pub mode: String,
-    pub key_version: u32,
-    #[serde(with = "serde_bytes")]
-    pub psk_hash: Vec<u8>, // 32 bytes
-    #[serde(with = "serde_bytes")]
-    pub creator_id: Vec<u8>, // 32 bytes
-    pub created_at: String,
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>, // 64 bytes
-}
-
 // ── Item-Sync (0x05, §4.5) ─────────────────────────────────────────
+//
+// The older kind of channel's: what an alpha.19 node asks, which every
+// node answers with nothing (decision 2026-11-10 (older kind), rule 7).
+// The two requests and answers stay, with the header, as alpha.19 decodes
+// them.
 
 /// Phase 0: relay channel discovery (§4.5). "What channels do you have?"
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,137 +457,6 @@ fn a_slot<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Ve
     }
 
     deserializer.deserialize_option(Slot)
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FetchRequest {
-    /// At most MAX_FETCH_ITEMS.
-    #[serde(deserialize_with = "at_most_fetched_ids")]
-    pub item_ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FetchResponse {
-    /// At most MAX_FETCH_ITEMS: one for each ID asked for.
-    #[serde(deserialize_with = "at_most_fetched_items")]
-    pub items: Vec<Item>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Item {
-    pub item_id: String,
-    pub channel_id: String,
-    pub item_type: String,
-    #[serde(with = "serde_bytes")]
-    pub encrypted_blob: Vec<u8>,
-    #[serde(with = "serde_bytes")]
-    pub content_hash: Vec<u8>, // 32 bytes
-    pub content_length: u32,
-    #[serde(with = "serde_bytes")]
-    pub author_id: Vec<u8>, // 32 bytes
-    #[serde(with = "serde_bytes")]
-    pub signature: Vec<u8>, // 64 bytes
-    pub key_version: u32,
-    pub published_at: String,
-    pub is_tombstone: bool,
-    pub parent_id: Option<String>,
-    /// Replaceable-item slot (32 bytes) and revision (decision 2026-09-30
-    /// §4.3). Both present or both absent; omitted from the encoding when
-    /// absent, so ordinary items encode exactly as before.
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "serde_bytes")]
-    pub slot: Option<Vec<u8>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rev: Option<u64>,
-}
-
-// ── Item-Push (0x06, §4.6) ─────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PushPayload {
-    /// At most MAX_PUSHED_ITEMS.
-    #[serde(deserialize_with = "at_most_pushed_items")]
-    pub items: Vec<Item>,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct PushAck {
-    pub stored: u32,
-    pub dedup_dropped: u32,
-    pub policy_rejected: u32,
-    pub verification_failed: u32,
-    /// The items of this push that the receiver neither stored nor already
-    /// held, and why. A sender keeps those and offers them again; without
-    /// the list it could not tell which they were. Omitted when empty, so
-    /// an answer with nothing refused is unchanged on the wire. A receiver
-    /// older than 0.2.0-alpha.4 never sends it and only counts them.
-    ///
-    /// At most MAX_PUSHED_ITEMS: one for each item a push may hold.
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        deserialize_with = "at_most_refusals"
-    )]
-    pub refused: Vec<Refusal>,
-}
-
-/// One item a receiver refused to store.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Refusal {
-    pub item_id: String,
-    /// A short code for status to show: [`REFUSED_INVALID`],
-    /// [`REFUSED_STORAGE`], [`REFUSED_TOO_LARGE`], [`REFUSED_NOT_MEMBER`] or
-    /// [`REFUSED_FULL`].
-    pub why: String,
-}
-
-/// The item is not valid: its hash, its signature or its shape. Or the
-/// receiver is a relay, and the item's channel is one whose ID may not be
-/// told to a peer: a relay stores nothing of such a channel.
-pub const REFUSED_INVALID: &str = "invalid";
-/// The receiver could not store it (its disk, or its database).
-pub const REFUSED_STORAGE: &str = "storage";
-/// The item is over the size every entry must fit in.
-pub const REFUSED_TOO_LARGE: &str = "too_large";
-/// The receiver is a device, and the item is not one a member of one of
-/// its channels wrote.
-pub const REFUSED_NOT_MEMBER: &str = "not_member";
-/// The receiver is a relay with no room: it is at its storage cap and does
-/// not hold this channel, or the channel has reached what one channel may
-/// hold, or the sender's address has made it hold enough new channels for
-/// now.
-pub const REFUSED_FULL: &str = "full";
-
-// ── PSK-Exchange (0x07, §4.7) ──────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PskRequest {
-    pub channel_id: String,
-    #[serde(with = "serde_bytes")]
-    pub subscriber_xpk: Vec<u8>, // 32 bytes
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PskResponse {
-    pub status: String,
-    pub reason: Option<String>,
-    #[serde(with = "serde_bytes")]
-    pub ecies_envelope: Option<Vec<u8>>, // 92 bytes when present
-    pub key_version: Option<u32>,
-}
-
-// ── Pairing (0x08, §4.8) ──────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairingRequest {
-    #[serde(with = "serde_bytes")]
-    pub node_id: Vec<u8>, // 32 bytes
-    pub pairing_code: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairingResponse {
-    pub status: String,
-    pub reason: Option<String>,
 }
 
 // ── Entries of a channel from its secret (0x10 to 0x13) ─────────────
@@ -1038,18 +864,6 @@ where
     at_most(deserializer, MAX_SHARED_PEER_ADDRS, "addresses")
 }
 
-/// At most MAX_CHANNELS_ASKED_OF_A_PEER channel descriptors.
-fn at_most_descriptors<'de, D>(deserializer: D) -> Result<Vec<ChannelDescriptor>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    at_most(
-        deserializer,
-        MAX_CHANNELS_ASKED_OF_A_PEER as u32,
-        "channels",
-    )
-}
-
 /// The first MAX_LISTED_CHANNEL_IDS channel IDs listed; the rest are
 /// passed over. Whoever asks takes at most MAX_CHANNELS_ASKED_OF_A_PEER
 /// of them from a peer it is held to, in any case.
@@ -1066,38 +880,6 @@ where
     D: serde::Deserializer<'de>,
 {
     at_most(deserializer, DEFAULT_SYNC_LIMIT, "headers")
-}
-
-/// At most MAX_FETCH_ITEMS IDs asked for in one fetch.
-fn at_most_fetched_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    at_most(deserializer, MAX_FETCH_ITEMS as u32, "item IDs")
-}
-
-/// At most MAX_FETCH_ITEMS items handed for one fetch.
-fn at_most_fetched_items<'de, D>(deserializer: D) -> Result<Vec<Item>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    at_most(deserializer, MAX_FETCH_ITEMS as u32, "items")
-}
-
-/// At most MAX_PUSHED_ITEMS items in one push.
-fn at_most_pushed_items<'de, D>(deserializer: D) -> Result<Vec<Item>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    at_most(deserializer, MAX_PUSHED_ITEMS as u32, "items")
-}
-
-/// At most MAX_PUSHED_ITEMS items refused: one for each a push holds.
-fn at_most_refusals<'de, D>(deserializer: D) -> Result<Vec<Refusal>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    at_most(deserializer, MAX_PUSHED_ITEMS as u32, "refusals")
 }
 
 /// Relay-Entries (0x14): a relay asks which channels from their secrets
@@ -1285,32 +1067,12 @@ pub enum WireMessage {
     PeerShareRequest(PeerShareRequest),
     PeerShareResponse(PeerShareResponse),
 
-    // Channel-Announce
-    ChannelJoined(ChannelJoined),
-    ChannelLeft(ChannelLeft),
-    ChannelStateHash(ChannelStateHash),
-    ChannelListRequest(ChannelListRequest),
-    ChannelListResponse(ChannelListResponse),
-
-    // Item-Sync
+    // Item-Sync: what an alpha.19 node asks of the older kind, which every
+    // node answers with nothing (decision 2026-11-10 (older kind), rule 7)
     SyncChannelListRequest(SyncChannelListRequest),
     SyncChannelListResponse(SyncChannelListResponse),
     SyncRequest(SyncRequest),
     SyncResponse(SyncResponse),
-    FetchRequest(FetchRequest),
-    FetchResponse(FetchResponse),
-
-    // Item-Push
-    PushPayload(PushPayload),
-    PushAck(PushAck),
-
-    // PSK-Exchange
-    PskRequest(PskRequest),
-    PskResponse(PskResponse),
-
-    // Pairing
-    PairingRequest(PairingRequest),
-    PairingResponse(PairingResponse),
 
     // Entries of a channel from its secret
     EntryShow(EntryShow),
@@ -1373,23 +1135,10 @@ named![
     Pong,
     PeerShareRequest,
     PeerShareResponse,
-    ChannelJoined,
-    ChannelLeft,
-    ChannelStateHash,
-    ChannelListRequest,
-    ChannelListResponse,
     SyncChannelListRequest,
     SyncChannelListResponse,
     SyncRequest,
     SyncResponse,
-    FetchRequest,
-    FetchResponse,
-    PushPayload,
-    PushAck,
-    PskRequest,
-    PskResponse,
-    PairingRequest,
-    PairingResponse,
     EntryShow,
     EntryShowShort,
     EntryShown,
@@ -1414,26 +1163,17 @@ impl Named {
             Protocol::Handshake => matches!(self, HandshakePropose | HandshakeAccept),
             Protocol::KeepAlive => matches!(self, Ping | Pong),
             Protocol::PeerSharing => matches!(self, PeerShareRequest | PeerShareResponse),
-            Protocol::ChannelAnnounce => matches!(
-                self,
-                ChannelJoined
-                    | ChannelLeft
-                    | ChannelStateHash
-                    | ChannelListRequest
-                    | ChannelListResponse
-            ),
             Protocol::ItemSync => matches!(
                 self,
-                SyncChannelListRequest
-                    | SyncChannelListResponse
-                    | SyncRequest
-                    | SyncResponse
-                    | FetchRequest
-                    | FetchResponse
+                SyncChannelListRequest | SyncChannelListResponse | SyncRequest | SyncResponse
             ),
-            Protocol::ItemPush => matches!(self, PushPayload | PushAck),
-            Protocol::PskExchange => matches!(self, PskRequest | PskResponse),
-            Protocol::Pairing => matches!(self, PairingRequest | PairingResponse),
+            // No message of the older kind is read on these: every node
+            // refuses their streams at the byte (decision 2026-11-10
+            // (older kind), rule 7).
+            Protocol::ChannelAnnounce
+            | Protocol::ItemPush
+            | Protocol::PskExchange
+            | Protocol::Pairing => false,
             Protocol::EntryShow => matches!(self, EntryShow | EntryShowShort | EntryShown),
             Protocol::ChannelProve => matches!(self, ChannelProve | ChannelProved),
             Protocol::EntryPull => matches!(self, EntryPull | EntryPulled),
@@ -1460,20 +1200,10 @@ pub(crate) fn stream_of(message: &WireMessage) -> Protocol {
         HandshakePropose(_) | HandshakeAccept(_) => Protocol::Handshake,
         Ping(_) | Pong(_) => Protocol::KeepAlive,
         PeerShareRequest(_) | PeerShareResponse(_) => Protocol::PeerSharing,
-        ChannelJoined(_)
-        | ChannelLeft(_)
-        | ChannelStateHash(_)
-        | ChannelListRequest(_)
-        | ChannelListResponse(_) => Protocol::ChannelAnnounce,
         SyncChannelListRequest(_)
         | SyncChannelListResponse(_)
         | SyncRequest(_)
-        | SyncResponse(_)
-        | FetchRequest(_)
-        | FetchResponse(_) => Protocol::ItemSync,
-        PushPayload(_) | PushAck(_) => Protocol::ItemPush,
-        PskRequest(_) | PskResponse(_) => Protocol::PskExchange,
-        PairingRequest(_) | PairingResponse(_) => Protocol::Pairing,
+        | SyncResponse(_) => Protocol::ItemSync,
         EntryShow(_) | EntryShowShort(_) | EntryShown(_) => Protocol::EntryShow,
         ChannelProve(_) | ChannelProved(_) => Protocol::ChannelProve,
         EntryPull(_) | EntryPulled(_) => Protocol::EntryPull,
@@ -1606,119 +1336,6 @@ mod tests {
         buf
     }
 
-    /// T3. One size for every entry: with every field at its largest, an
-    /// entry as it travels is at most its ciphertext and what an entry may
-    /// take beyond it. That bound is what every limit on bytes counts.
-    #[test]
-    fn the_largest_entry_as_it_travels_is_its_ciphertext_and_the_overhead() {
-        use cordelia_core::protocol::{
-            ENTRY_OVERHEAD_BYTES, MAX_CHANNEL_ID_LEN, MAX_ITEM_BYTES, MAX_ITEM_ID_LEN,
-            MAX_ITEM_TYPE_LEN, MAX_REV, MAX_TIMESTAMP_LEN, entry_fields_fit,
-        };
-        let long = |len: usize| "x".repeat(len);
-        let largest = Item {
-            item_id: long(MAX_ITEM_ID_LEN),
-            channel_id: long(MAX_CHANNEL_ID_LEN),
-            item_type: long(MAX_ITEM_TYPE_LEN),
-            content_length: u32::MAX,
-            encrypted_blob: vec![0xFF; MAX_ITEM_BYTES],
-            content_hash: vec![0xFF; 32],
-            author_id: vec![0xFF; 32],
-            signature: vec![0xFF; 64],
-            key_version: u32::MAX,
-            published_at: long(MAX_TIMESTAMP_LEN),
-            is_tombstone: true,
-            parent_id: Some(long(MAX_ITEM_ID_LEN)),
-            slot: Some(vec![0xFF; 32]),
-            rev: Some(MAX_REV),
-        };
-        assert!(entry_fields_fit(
-            &largest.item_id,
-            &largest.channel_id,
-            &largest.item_type,
-            &largest.published_at,
-            largest.parent_id.as_deref(),
-        ));
-        let travels = encode(&largest).len();
-        assert!(
-            travels <= MAX_ITEM_BYTES + ENTRY_OVERHEAD_BYTES,
-            "the largest entry is {travels} bytes as it travels"
-        );
-        // And its header is what the overhead is for: well over half of it.
-        assert!(
-            travels - MAX_ITEM_BYTES > ENTRY_OVERHEAD_BYTES / 2,
-            "{travels}"
-        );
-
-        // One byte more in any field, and it does not fit.
-        for (id, channel, kind, time, parent) in [
-            (MAX_ITEM_ID_LEN + 1, 1, 1, 1, None),
-            (1, MAX_CHANNEL_ID_LEN + 1, 1, 1, None),
-            (1, 1, MAX_ITEM_TYPE_LEN + 1, 1, None),
-            (1, 1, 1, MAX_TIMESTAMP_LEN + 1, None),
-            (1, 1, 1, 1, Some(MAX_ITEM_ID_LEN + 1)),
-        ] {
-            assert!(!entry_fields_fit(
-                &long(id),
-                &long(channel),
-                &long(kind),
-                &long(time),
-                parent.map(long).as_deref(),
-            ));
-        }
-    }
-
-    /// The answer to a push as nodes before 0.2.0-alpha.4 know it.
-    #[derive(Debug, PartialEq, Serialize, Deserialize)]
-    struct OlderPushAck {
-        stored: u32,
-        dedup_dropped: u32,
-        policy_rejected: u32,
-        verification_failed: u32,
-    }
-
-    /// The list of refused items is an addition that older nodes never
-    /// notice: an answer with nothing refused is the same bytes as before,
-    /// an older sender reads an answer that carries the list, and a newer
-    /// sender reads an older receiver's answer as carrying none.
-    #[test]
-    fn the_list_of_refused_items_is_compatible_both_ways() {
-        let older = OlderPushAck {
-            stored: 2,
-            dedup_dropped: 1,
-            policy_rejected: 0,
-            verification_failed: 1,
-        };
-        let nothing_refused = PushAck {
-            stored: 2,
-            dedup_dropped: 1,
-            verification_failed: 1,
-            ..Default::default()
-        };
-        assert_eq!(encode(&nothing_refused), encode(&older));
-
-        let with_list = PushAck {
-            refused: vec![Refusal {
-                item_id: "ci_x".into(),
-                why: REFUSED_STORAGE.into(),
-            }],
-            ..nothing_refused.clone()
-        };
-        let read_by_older: OlderPushAck =
-            ciborium::from_reader(encode(&with_list).as_slice()).unwrap();
-        assert_eq!(read_by_older, older);
-        // The same inside the message envelope, as it travels.
-        let framed = encode(&WireMessage::PushAck(with_list.clone()));
-        let WireMessage::PushAck(read) = decode_message(&framed).unwrap() else {
-            panic!("not a push answer");
-        };
-        assert_eq!(read.refused, with_list.refused);
-
-        let read_by_newer: PushAck = ciborium::from_reader(encode(&older).as_slice()).unwrap();
-        assert!(read_by_newer.refused.is_empty());
-        assert_eq!(read_by_newer.verification_failed, 1);
-    }
-
     // ── Entries of a channel from its secret ─────────────────────────
 
     use crate::codec::{encode_message, read_frame, write_frame};
@@ -1834,23 +1451,10 @@ mod tests {
         Pong(Pong),
         PeerShareRequest(PeerShareRequest),
         PeerShareResponse(PeerShareResponse),
-        ChannelJoined(ChannelJoined),
-        ChannelLeft(ChannelLeft),
-        ChannelStateHash(ChannelStateHash),
-        ChannelListRequest(ChannelListRequest),
-        ChannelListResponse(ChannelListResponse),
         SyncChannelListRequest(SyncChannelListRequest),
         SyncChannelListResponse(SyncChannelListResponse),
         SyncRequest(SyncRequest),
         SyncResponse(SyncResponse),
-        FetchRequest(FetchRequest),
-        FetchResponse(FetchResponse),
-        PushPayload(PushPayload),
-        PushAck(PushAck),
-        PskRequest(PskRequest),
-        PskResponse(PskResponse),
-        PairingRequest(PairingRequest),
-        PairingResponse(PairingResponse),
     }
 
     /// One of each message of the four streams, with every answer there
@@ -2326,9 +1930,12 @@ mod tests {
             assert!(read.is_err(), "{message:?}");
         }
         // The control: it reads a message it knows, from this codec.
-        let ack = encode_message(&WireMessage::PushAck(PushAck::default())).unwrap();
-        let read: OlderWireMessage = ciborium::from_reader(ack.as_slice()).unwrap();
-        assert!(matches!(read, OlderWireMessage::PushAck(_)));
+        let asked = encode_message(&WireMessage::SyncChannelListRequest(
+            SyncChannelListRequest {},
+        ))
+        .unwrap();
+        let read: OlderWireMessage = ciborium::from_reader(asked.as_slice()).unwrap();
+        assert!(matches!(read, OlderWireMessage::SyncChannelListRequest(_)));
     }
 
     /// A message of entries as a peer might write it that does not keep
@@ -3155,9 +2762,10 @@ mod tests {
 
     // ── Every message, read by its stream ──────────────────────────────
 
-    /// One of each of the 36 messages, with every field set, and both
-    /// forms of a field that may be left out: the messages of the eight
-    /// older streams, and those of the streams of entries.
+    /// One of each of the 23 messages, with every field set, and both
+    /// forms of a field that may be left out: the messages of the older
+    /// streams that stay (decision 2026-11-10 (older kind), rule 7), and
+    /// those of the streams of entries.
     fn every_message() -> Vec<WireMessage> {
         let header = ItemHeader {
             item_id: "ci_header".into(),
@@ -3172,33 +2780,6 @@ mod tests {
             parent_id: Some("ci_parent".into()),
             slot: Some(vec![0xa4; 32]),
             rev: Some(9),
-        };
-        let item = Item {
-            item_id: "ci_item".into(),
-            channel_id: "grp_00000000-0000-4000-8000-000000000000".into(),
-            item_type: "memory".into(),
-            encrypted_blob: vec![0xb0; 300],
-            content_hash: vec![0xb1; 32],
-            content_length: 300,
-            author_id: vec![0xb2; 32],
-            signature: vec![0xb3; 64],
-            key_version: 1,
-            published_at: "2026-10-22T10:00:01Z".into(),
-            is_tombstone: true,
-            parent_id: None,
-            slot: None,
-            rev: None,
-        };
-        let descriptor = ChannelDescriptor {
-            channel_id: "grp_00000000-0000-4000-8000-000000000000".into(),
-            channel_name: Some("research".into()),
-            access: "open".into(),
-            mode: "realtime".into(),
-            key_version: 2,
-            psk_hash: vec![0xc1; 32],
-            creator_id: vec![0xc2; 32],
-            created_at: "2026-10-22T10:00:02Z".into(),
-            signature: vec![0xc3; 64],
         };
         let mut messages = vec![
             WireMessage::HandshakePropose(HandshakePropose {
@@ -3258,28 +2839,6 @@ mod tests {
                     },
                 ],
             }),
-            WireMessage::ChannelJoined(ChannelJoined {
-                channel_id: descriptor.channel_id.clone(),
-                descriptor: descriptor.clone(),
-            }),
-            WireMessage::ChannelJoined(ChannelJoined {
-                channel_id: "grp_x".into(),
-                descriptor: ChannelDescriptor {
-                    channel_name: None,
-                    ..descriptor.clone()
-                },
-            }),
-            WireMessage::ChannelLeft(ChannelLeft {
-                channel_id: "grp_y".into(),
-            }),
-            WireMessage::ChannelStateHash(ChannelStateHash {
-                digest: vec![0xd1; 32],
-                count: 3,
-            }),
-            WireMessage::ChannelListRequest(ChannelListRequest {}),
-            WireMessage::ChannelListResponse(ChannelListResponse {
-                channels: vec![descriptor.clone(), descriptor],
-            }),
             WireMessage::SyncChannelListRequest(SyncChannelListRequest {}),
             WireMessage::SyncChannelListResponse(SyncChannelListResponse {
                 channel_ids: vec!["grp_a".into(), "grp_b".into()],
@@ -3310,58 +2869,6 @@ mod tests {
                 }],
                 has_more: false,
                 last_seq: None,
-            }),
-            WireMessage::FetchRequest(FetchRequest {
-                item_ids: vec!["ci_item".into(), "ci_header".into()],
-            }),
-            WireMessage::FetchResponse(FetchResponse {
-                items: vec![item.clone()],
-            }),
-            WireMessage::PushPayload(PushPayload {
-                items: vec![
-                    item.clone(),
-                    Item {
-                        slot: Some(vec![0xb4; 32]),
-                        rev: Some(2),
-                        parent_id: Some("ci_parent".into()),
-                        ..item
-                    },
-                ],
-            }),
-            WireMessage::PushAck(PushAck::default()),
-            WireMessage::PushAck(PushAck {
-                stored: 1,
-                dedup_dropped: 2,
-                policy_rejected: 3,
-                verification_failed: 4,
-                refused: vec![Refusal {
-                    item_id: "ci_item".into(),
-                    why: REFUSED_FULL.into(),
-                }],
-            }),
-            WireMessage::PskRequest(PskRequest {
-                channel_id: "grp_a".into(),
-                subscriber_xpk: vec![0xe1; 32],
-            }),
-            WireMessage::PskResponse(PskResponse {
-                status: "ok".into(),
-                reason: None,
-                ecies_envelope: Some(vec![0xe2; 92]),
-                key_version: Some(2),
-            }),
-            WireMessage::PskResponse(PskResponse {
-                status: "denied".into(),
-                reason: Some("not authorized".into()),
-                ecies_envelope: None,
-                key_version: None,
-            }),
-            WireMessage::PairingRequest(PairingRequest {
-                node_id: vec![0xf1; 32],
-                pairing_code: "123456".into(),
-            }),
-            WireMessage::PairingResponse(PairingResponse {
-                status: "ok".into(),
-                reason: Some("paired".into()),
             }),
         ];
         // The messages of the streams of entries, with bytes that are the
@@ -3519,23 +3026,10 @@ mod tests {
         Pong(Pong),
         PeerShareRequest(PeerShareRequest),
         PeerShareResponse(PeerShareResponse),
-        ChannelJoined(ChannelJoined),
-        ChannelLeft(ChannelLeft),
-        ChannelStateHash(ChannelStateHash),
-        ChannelListRequest(ChannelListRequest),
-        ChannelListResponse(ChannelListResponse),
         SyncChannelListRequest(SyncChannelListRequest),
         SyncChannelListResponse(SyncChannelListResponse),
         SyncRequest(SyncRequest),
         SyncResponse(SyncResponse),
-        FetchRequest(FetchRequest),
-        FetchResponse(FetchResponse),
-        PushPayload(PushPayload),
-        PushAck(PushAck),
-        PskRequest(PskRequest),
-        PskResponse(PskResponse),
-        PairingRequest(PairingRequest),
-        PairingResponse(PairingResponse),
         EntryShow(EntryShow),
         EntryShowShort(EntryShowShort),
         EntryShown(EntryShown),
@@ -3552,25 +3046,28 @@ mod tests {
     }
 
     /// The digest of [`every_message`] as 0.2.0-alpha.14 writes it: the
-    /// same test, run on that version's code (main at 5bb3fb6).
+    /// same test, run on that version's code (main at 5bb3fb6), over 54
+    /// messages, gave b9b808a5...; these 38 are those that stay, of types
+    /// that did not change when the others went (decision 2026-11-10
+    /// (older kind), rule 7), so each is written byte for byte as before.
     const EVERY_MESSAGE_AT_ALPHA_14: &str =
-        "b9b808a5181dcd97f4bc06f860916e9aed5625512a8063431c9c684d9234e3d8";
+        "c59eeaf4fd8b0757ecdbd12f6ee18c6e5382d1c7900b0b6c9e549d0c34389974";
 
     /// Nothing on the wire is changed: every message is written as it was,
     /// byte for byte.
     #[test]
     fn every_message_is_written_as_alpha_14_writes_it() {
-        assert_eq!(every_message().len(), 54);
+        assert_eq!(every_message().len(), 38);
         assert_eq!(digest_of_every_message(), EVERY_MESSAGE_AT_ALPHA_14);
     }
 
-    /// Each of the 36 messages goes through the codec on its stream, and
+    /// Each of the 23 messages goes through the codec on its stream, and
     /// is read as it was written; on every other stream it is refused.
     #[test]
     fn every_message_is_read_on_its_stream_and_on_no_other() {
         let messages = every_message();
         let names: std::collections::BTreeSet<String> = messages.iter().map(name_of).collect();
-        assert_eq!(names.len(), 36, "{names:?}");
+        assert_eq!(names.len(), 23, "{names:?}");
         let protocols: Vec<Protocol> = (0..=u8::MAX).filter_map(Protocol::from_byte).collect();
         assert_eq!(protocols.len(), 13);
         for message in &messages {
@@ -3721,15 +3218,14 @@ mod tests {
         assert!(read(&twice).is_err());
     }
 
-    /// Each list of the eight older streams is bounded where it is read:
+    /// Each list of the older streams that stay is bounded where it is read:
     /// a list as long as its bound is read, and one longer is refused. The
     /// one other, the channel IDs a relay lists, keeps its first and passes
     /// over the rest (`decode_cost.rs`).
     #[test]
     fn each_list_of_the_older_streams_is_bounded_where_it_is_read() {
         use cordelia_core::protocol::{
-            DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, MAX_CHANNELS_ASKED_OF_A_PEER,
-            MAX_FETCH_ITEMS, MAX_HANDSHAKE_ROLES, MAX_PUSHED_ITEMS, MAX_SHARED_PEER_ADDRS,
+            DEFAULT_MAX_PEERS_SHARE, DEFAULT_SYNC_LIMIT, MAX_HANDSHAKE_ROLES, MAX_SHARED_PEER_ADDRS,
         };
         let messages = every_message();
         let first = |name: &str| {
@@ -3743,16 +3239,8 @@ mod tests {
             WireMessage::SyncResponse(page) => page.items[0].clone(),
             _ => unreachable!(),
         };
-        let item = match first("FetchResponse") {
-            WireMessage::FetchResponse(fetched) => fetched.items[0].clone(),
-            _ => unreachable!(),
-        };
         let peer = match first("PeerShareResponse") {
             WireMessage::PeerShareResponse(shared) => shared.peers[0].clone(),
-            _ => unreachable!(),
-        };
-        let descriptor = match first("ChannelListResponse") {
-            WireMessage::ChannelListResponse(list) => list.channels[0].clone(),
             _ => unreachable!(),
         };
         // Each list: its name, its bound, and the message that holds `n`.
@@ -3802,17 +3290,6 @@ mod tests {
                     })
                 })
             }),
-            (
-                "ChannelListResponse.channels",
-                MAX_CHANNELS_ASKED_OF_A_PEER,
-                {
-                    Box::new(move |n| {
-                        WireMessage::ChannelListResponse(ChannelListResponse {
-                            channels: vec![descriptor.clone(); n],
-                        })
-                    })
-                },
-            ),
             ("SyncResponse.items", DEFAULT_SYNC_LIMIT as usize, {
                 Box::new(move |n| {
                     WireMessage::SyncResponse(SyncResponse {
@@ -3822,50 +3299,10 @@ mod tests {
                     })
                 })
             }),
-            (
-                "FetchRequest.item_ids",
-                MAX_FETCH_ITEMS,
-                Box::new(|n| {
-                    WireMessage::FetchRequest(FetchRequest {
-                        item_ids: vec![String::new(); n],
-                    })
-                }),
-            ),
-            ("FetchResponse.items", MAX_FETCH_ITEMS, {
-                let item = item.clone();
-                Box::new(move |n| {
-                    WireMessage::FetchResponse(FetchResponse {
-                        items: vec![item.clone(); n],
-                    })
-                })
-            }),
-            ("PushPayload.items", MAX_PUSHED_ITEMS, {
-                Box::new(move |n| {
-                    WireMessage::PushPayload(PushPayload {
-                        items: vec![item.clone(); n],
-                    })
-                })
-            }),
-            (
-                "PushAck.refused",
-                MAX_PUSHED_ITEMS,
-                Box::new(|n| {
-                    WireMessage::PushAck(PushAck {
-                        refused: vec![
-                            Refusal {
-                                item_id: "ci_x".into(),
-                                why: REFUSED_FULL.into(),
-                            };
-                            n
-                        ],
-                        ..Default::default()
-                    })
-                }),
-            ),
         ];
         // The channel IDs a relay lists are kept to their bound, not
         // refused past it: `decode_cost.rs` reads such a list.
-        assert_eq!(lists.len(), 10);
+        assert_eq!(lists.len(), 5);
         for (list, most, of) in &lists {
             for n in [0, 1, *most] {
                 let message = of(n);

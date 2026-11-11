@@ -953,7 +953,7 @@ fn key_bytes_of(n: &Node) -> [u8; 32] {
 /// the relay listens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
-    use cordelia_storage::{channels, first_start, items, meta};
+    use cordelia_storage::{first_start, meta};
     let relay = stand_in_relay();
     let mut a = node("a", "personal", Some(relay.port));
     let own = key_bytes_of(&a);
@@ -971,25 +971,36 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
         // No mark, and no guard, as such a build left the database.
         assert!(first_start::remove_guard(&db).unwrap());
         meta::remove(&db, meta::FIRST_START).unwrap();
-        channels::ensure_group(&db, group, None, "realtime", &own).unwrap();
-        channels::add_member(&db, group, &own, "owner").unwrap();
-        let blob = b"what an earlier version sealed".to_vec();
-        let item = items::NewItem {
-            item_id: "ci_01JARV8XMHW8G9QZP0000000AA",
-            channel_id: group,
-            author_id: &own,
-            item_type: "memory",
-            published_at: "2026-10-01T00:00:00Z",
-            parent_id: None,
-            key_version: 1,
-            content_hash: &cordelia_crypto::sha256(&blob),
-            signature: &[7u8; 64],
-            encrypted_blob: &blob,
-            is_tombstone: false,
-            slot: None,
-            rev: None,
-        };
-        assert!(items::insert_item(&db, &item).unwrap());
+        // The rows, in plain SQL, as such a build wrote them.
+        db.execute(
+            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                                   created_at, updated_at)
+             VALUES (?1, 'group', 'realtime', 'invite_only', ?2, '2026-10-01', '2026-10-01')",
+            rusqlite::params![group, own.as_slice()],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO channel_members (channel_id, entity_key, role, joined_at)
+             VALUES (?1, ?2, 'owner', '2026-10-01')",
+            rusqlite::params![group, own.as_slice()],
+        )
+        .unwrap();
+        let blob = b"what an earlier version sealed";
+        db.execute(
+            "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                content_hash, signature, encrypted_blob, content_length)
+             VALUES ('ci_01JARV8XMHW8G9QZP0000000AA', ?1, ?2, 'memory',
+                     '2026-10-01T00:00:00Z', ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                group,
+                own.as_slice(),
+                cordelia_crypto::sha256(blob).as_slice(),
+                [7u8; 64].as_slice(),
+                blob.as_slice(),
+                blob.len() as i64,
+            ],
+        )
+        .unwrap();
     }
     // What the older outbox, fetch and announcement would each have gone
     // by: it is there while the node runs.
@@ -1000,9 +1011,13 @@ async fn a_device_says_nothing_to_its_relay_of_a_channel_of_the_older_kind() {
         )
         .unwrap();
         db.busy_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let rows = |sql: &str| -> i64 {
+            db.query_row(sql, rusqlite::params![own.as_slice()], |row| row.get(0))
+                .unwrap()
+        };
         (
-            items::outbox_len(&db, &own).unwrap(),
-            channels::list_for_entity(&db, &own).unwrap().len(),
+            rows("SELECT COUNT(*) FROM items WHERE author_id = ?1"),
+            rows("SELECT COUNT(*) FROM channel_members WHERE entity_key = ?1"),
             first_start::mark(&db).unwrap().map(|mark| mark.stepped),
         )
     };

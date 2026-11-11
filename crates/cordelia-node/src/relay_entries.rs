@@ -6792,13 +6792,15 @@ mod tests {
         assert!(places.get(&peer(8), &channel(1)).is_some());
     }
 
-    /// The room for this kind of channel is its own: what the relay holds
-    /// of the older kind is not counted against it, and is never dropped
-    /// to make room in it.
+    /// The room for this kind of channel is its own: what the relay's
+    /// database still holds of the older kind, as an earlier version left
+    /// it, is not counted against it, and is never dropped to make room in
+    /// it (decision 2026-11-10 (older kind), rule 3).
     #[test]
     fn the_room_for_entries_is_its_own_and_takes_none_of_the_older_kinds() {
         let at = relay_of(2 * SMALL, &[]);
-        // The older kind: a channel with far more than this kind's cap.
+        // The older kind: a channel with far more than this kind's cap, in
+        // plain SQL.
         {
             let db = lock(&at.db);
             db.execute(
@@ -6808,22 +6810,31 @@ mod tests {
                 [],
             )
             .unwrap();
-            let blob = vec![0x5a; 60_000];
-            let item = cordelia_storage::items::NewItem::plain(
-                "ci_old",
-                "old_a",
-                &[1; 32],
-                "memory",
-                "2026-01-01T00:00:00Z",
-                1,
-                &[2; 32],
-                &[3; 64],
-                &blob,
-            );
-            assert!(cordelia_storage::items::insert_item(&db, &item).unwrap());
+            let blob = vec![0x5au8; 60_000];
+            db.execute(
+                "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                    content_hash, signature, encrypted_blob, content_length)
+                 VALUES ('ci_old', 'old_a', ?1, 'memory', '2026-01-01T00:00:00Z', ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    [1u8; 32].as_slice(),
+                    [2u8; 32].as_slice(),
+                    [3u8; 64].as_slice(),
+                    blob.as_slice(),
+                    blob.len() as i64,
+                ],
+            )
+            .unwrap();
         }
-        let older = || cordelia_storage::items::stored_cost(&lock(&at.db)).unwrap();
-        assert_eq!(older(), 60_000 + 1024);
+        let older = || -> i64 {
+            lock(&at.db)
+                .query_row(
+                    "SELECT COALESCE(SUM(content_length), 0) FROM items",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(older(), 60_000);
 
         // This kind is taken up to its own cap, and no further.
         assert_eq!(
@@ -6842,15 +6853,13 @@ mod tests {
             ]
         );
         assert_eq!(at.used(), 2 * SMALL);
-        // And what the relay holds of this kind is no part of what the
-        // older kind's cap is set against.
-        assert_eq!(older(), 60_000 + 1024);
+        assert_eq!(older(), 60_000);
         // Making room, and sweeping, take nothing of the older kind.
         lock(&at.entries.room).max_bytes = SMALL;
         at.entries.make_room(&at.db);
         at.entries.sweep_at(&at.db, NOW + 365 * DAY);
         assert_eq!(at.used(), 0);
-        assert_eq!(older(), 60_000 + 1024);
+        assert_eq!(older(), 60_000);
     }
 
     /// What `relay` holds through the write of its answer to `request`,
