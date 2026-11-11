@@ -842,10 +842,10 @@ pub async fn p2p_loop(
 
     // The loop begins after a wait of up to REPUSH_INTERVAL_SECS, set by the
     // node's key, as it did while it re-pushed the older kind (decision
-    // 2026-11-10 (older kind), rule 3). So nodes do not all begin at once,
-    // and a device's whole pass keeps its place apart from its reads of the
-    // lists it follows, whose timer starts with the loop: a read that types
-    // a key again while a pass asks for it leaves it unasked.
+    // 2026-11-10 (older kind), rule 3), so nodes do not all begin at once.
+    // It only shifts the reads of the lists a device follows against its
+    // whole passes; it does not keep them apart. A read that types a key
+    // again while a pass asks for it leaves that key unasked (#336).
     let start_after = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
