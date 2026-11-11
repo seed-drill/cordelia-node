@@ -930,23 +930,7 @@ Each property of section 1 has tests. The threat model's rows T16 (a device that
 
 ## 15. Where to look for faults
 
-For an outside reviewer: where this design is under most strain, and where a fault would cost most.
-
-- Two changes made apart, and removals that must not stop at a relay: decision 2026-10-24, sections 7 and 12.
-
-- **The time before a device hears** (property 2, 4.6). Everything that a removal promises starts when a device applies it. A device that reaches only relays which lack the change takes what the removed device writes, and sends its own edits where the removed device reads, for as long as that lasts. Look for anything a node sends, serves or takes on a connection ahead of the show there, and for any answer that gives leave and should not.
-- **The chain** (7.3). A sequence in which a text is replaced with nothing kept though it was not an ancestor of the version taken, or though a key that does not count signed a version in between; a chain that an entry forges, and what the forger must know to do it; a merge of two chains; the window of 100 links; and the put-back of index lines, which a chain does not show.
-- **The renumbering** (2.3). Two revisions whose order it changes; two devices that give one version two revisions, whatever each holds and however far behind it was; a revision that speaks of another and is not moved with it; a name that stays out of reach after a statement; an entry that a device takes in a band it should not; what a device that still counts can do with it.
-- **A relay's room** (2.5). A relay that is full takes no new channel. A removed device holds every channel of the generation it was in: it can fill them, and go on proving them, so that their room is never given back; at a relay that is over its cap it pushes out the new generation. Every limit is by address, and a removed device at the same address can use each up. Two caps for the one version that carries both kinds, and tenure by the earlier of two times (2.4), are new.
-- **Recovery** (section 9). It cannot know whether the statement it found is the latest. Everything a gone device wrote up to the moment of the look is carried, and a relay keeps nothing older. A gone device can have listed names, and can be shown under a label that is not its own. Look for what a recovery that looks once loses, and for what a device marked as gone can still get in.
-- **The phrase** (section 5). It is one secret, typed at a terminal. A copy of it reads everything, through every removal, with no sign, and cannot be shut out short of starting again. It makes at most 256 statements and removes at most 256 keys, and a device that counts can use both up.
-- **A program that runs as the person** (section 5, T17). Every yes can be given by an agent with a shell. What is left is that every device shows an addition, and that nothing which asks for the phrase can be done without it. Look for any way to have the phrase sign a list that the person was not shown.
-- **Which phrase a device follows** (5.1). Any way that a device which is one of several is moved to another person's devices, and any hand-over taken in a state where the table says it is not.
-- **One secret for every name** (section 12). Every device reads every name, a database that is read gives up the person secret, and a pair channel's secret never changes.
-- **What stays readable** (4.6, section 12). Every device that ever followed the phrase reads every later statement, and a relay hands the change entry to whoever shows it an earlier one.
-- **A folder's first cycle after its first fetch** (section 6): what it holds up, and for how long.
-- **A record with no version under it** (4.2): what dropping it loses.
-- **Section 13:** a promise in this record with no test, or a test that cannot hold as worded.
+The reviews of this record are in the pull requests that built it. Its limits are with each rule, and its costs in section 12.
 
 ## 16. Rules the implementation keeps
 
