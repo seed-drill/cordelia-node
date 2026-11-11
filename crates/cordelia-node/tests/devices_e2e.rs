@@ -120,46 +120,6 @@ fn entries_at(relay: &Node) -> u64 {
     held as u64
 }
 
-/// The ID of the channel that `n` holds the name [`NAME`] with, read from
-/// its database.
-fn channel_of_the_name(n: &Node) -> [u8; 32] {
-    cordelia_storage::person::channel_of_name(&store_of(n), NAME)
-        .unwrap()
-        .expect("the device holds the name")
-}
-
-/// Whether a relay holds the channel whose ID is `channel`, read from its
-/// database.
-fn holds_the_channel(relay: &Node, channel: &[u8; 32]) -> bool {
-    let held: i64 = store_of(relay)
-        .query_row(
-            "SELECT COUNT(*) FROM relay_channels WHERE channel_id = ?1",
-            [channel.as_slice()],
-            |row| row.get(0),
-        )
-        .unwrap();
-    held > 0
-}
-
-/// What a device tells its relay of: `n` makes a recovery phrase, comes to
-/// hold the name [`NAME`] and publishes an entry under it, and this comes
-/// back once `relay` holds the name's channel and the device has nothing
-/// left to send. Returns the channel's ID, which the relay was told.
-fn tells_its_relay_of_its_name(n: &Node, relay: &Node) -> [u8; 32] {
-    let all = [relay, n];
-    makes_a_phrase(n, "desktop");
-    holds_the_name(n);
-    publishes(n, "notes.md", serde_json::json!({ "text": "an entry" }));
-    let channel = channel_of_the_name(n);
-    wait_for("the relay holds the name's channel", &all, 90, || {
-        holds_the_channel(relay, &channel).then_some(())
-    });
-    wait_for("the device has sent what it holds", &all, 90, || {
-        (n.get("/api/v1/status")?["outbox_waiting"] == 0).then_some(())
-    });
-    channel
-}
-
 /// Two of a person's devices and the relay between them, end to end
 /// (decision 2026-10-04 §5.2, §6, §16): what a running node says of its
 /// connections; the relay's counts of who it has seen; the documented
@@ -814,14 +774,14 @@ fn the_bar_counts_every_relay_the_device_is_connected_to() {
 }
 
 /// `cordelia channels` names no command that does not exist: a relay that
-/// holds no channel lists none, and says nothing more.
+/// holds no channel says how many it holds, and nothing more (decision
+/// 2026-11-10 (older kind), rule 3).
 #[test]
 fn channels_names_no_command_that_does_not_exist() {
     let relay = node("relay", "relay", None);
     let said = relay.cli(&["channels"]);
     let lines: Vec<&str> = said.lines().collect();
-    assert_eq!(lines.len(), 1, "{said}");
-    assert!(lines[0].starts_with("CHANNEL "), "{said}");
+    assert_eq!(lines, ["Channels:  0 held"], "{said}");
     assert!(!said.contains("subscribe"), "{said}");
 }
 
@@ -3356,28 +3316,6 @@ fn the_line_of_a_memory_that_comes_back_is_put_back_after_a_restart() {
     a_memory_deleted_with_its_line_comes_back_listed(true);
 }
 
-/// The files under a node's directory that contain `needle`, as raw
-/// bytes: its database and the write-ahead log beside it, where SQLite
-/// keeps text and bytes as they were written, and its log.
-fn files_holding(n: &Node, needle: impl AsRef<[u8]>) -> Vec<PathBuf> {
-    let needle = needle.as_ref();
-    let mut found = Vec::new();
-    let mut dirs = vec![n.dir.path().to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        for entry in std::fs::read_dir(&dir).unwrap().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                dirs.push(path);
-            } else if let Ok(bytes) = std::fs::read(&path)
-                && bytes.windows(needle.len()).any(|w| w == needle)
-            {
-                found.push(path);
-            }
-        }
-    }
-    found
-}
-
 /// A log without the colour codes a terminal would take.
 fn without_colour(log: &str) -> String {
     let mut plain = String::with_capacity(log.len());
@@ -3396,413 +3334,35 @@ fn without_colour(log: &str) -> String {
     plain
 }
 
-/// A node's entity ID, from its configuration.
-fn entity_id(n: &Node) -> String {
-    cordelia_core::config::Config::load(&n.config())
-        .unwrap()
-        .identity
-        .entity_id
-}
-
-/// How many swarm channels a node's database holds: a look at the
-/// database itself. (`cordelia channels` says nothing of them on a
-/// personal node, where it lists the names that the device holds.)
-fn swarm_channels_held(n: &Node) -> i64 {
-    let prefix = cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
-    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
-    db.busy_timeout(Duration::from_secs(10)).unwrap();
-    db.query_row(
-        "SELECT COUNT(*) FROM channels WHERE substr(channel_id, 1, ?1) = ?2",
-        rusqlite::params![prefix.len() as i64, prefix],
-        |row| row.get(0),
-    )
-    .unwrap()
-}
-
-/// The key files a node keeps for swarm channels.
-fn swarm_key_files(n: &Node) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(n.data_dir().join("channel-keys")) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with(cordelia_storage::naming::SWARM_CHANNEL_PREFIX))
-        .collect()
-}
-
-/// Put in a node's database the swarm channel that a personal node made
-/// for itself each time it started, up to 0.2.0-alpha.7, as that version
-/// made it: its row, the node as its owner, and its key file. Its ID
-/// holds the node's entity ID. Returns the ID.
-///
-/// A database of this version refuses a new row of the older kind, from
-/// its first start on (decision 2026-10-04 §10.1). Where the node has
-/// started, the test takes that guard away first: it puts the row where
-/// nothing of this version would.
-fn swarm_channel_as_an_earlier_version_made_it(n: &Node) -> String {
-    let id = cordelia_storage::naming::swarm_channel_id(&entity_id(n));
-    let pk = cordelia_crypto::bech32::decode_public_key(&key_of(n)).unwrap();
-    let psk = cordelia_crypto::generate_psk().unwrap();
-    let now = "2026-10-01T00:00:00+00:00";
-    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
-    db.busy_timeout(Duration::from_secs(10)).unwrap();
-    cordelia_storage::first_start::remove_guard(&db).unwrap();
-    db.execute(
-        "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
-         VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",
-        rusqlite::params![id, pk.as_slice(), cordelia_crypto::sha256(&psk).as_slice(), now, now],
-    )
-    .unwrap();
-    db.execute(
-        "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
-         VALUES (?1, ?2, 'owner', ?3)",
-        rusqlite::params![id, pk.as_slice(), now],
-    )
-    .unwrap();
-    cordelia_storage::psk::write_psk(&n.data_dir(), &id, &psk).unwrap();
-    id
-}
-
-/// Put in a node's database an entry of the channel `channel` of the
-/// older kind, as the node of an earlier version wrote one there: signed
-/// with the node's own key, and sent to no relay yet. Returns its ID.
-fn entry_as_an_earlier_version_wrote_it(n: &Node, channel: &str) -> String {
-    let own =
-        cordelia_crypto::identity::NodeIdentity::from_file(&n.data_dir().join("identity.key"))
-            .unwrap();
-    let entry = entry_in(&own, channel, vec![9; 40]);
-    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
-    db.busy_timeout(Duration::from_secs(10)).unwrap();
-    // The node runs beside this connection and writes now and then.
-    // insert_item reads before it writes, and a transaction that has read
-    // cannot wait for a write: where the node commits between its read and
-    // its write, SQLite refuses it at once with BUSY, whatever the busy
-    // timeout. A transaction that takes the write lock first waits for the
-    // node's write as long as the busy timeout allows.
-    db.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let stored = cordelia_storage::items::insert_item(
-        &db,
-        &cordelia_storage::items::NewItem {
-            item_id: &entry.item_id,
-            channel_id: channel,
-            author_id: &own.public_key(),
-            item_type: &entry.item_type,
-            published_at: &entry.published_at,
-            parent_id: None,
-            key_version: 1,
-            content_hash: &entry.content_hash,
-            signature: &entry.signature,
-            encrypted_blob: &entry.encrypted_blob,
-            is_tombstone: false,
-            slot: None,
-            rev: None,
-        },
-    )
-    .unwrap();
-    db.execute_batch("COMMIT").unwrap();
-    assert!(stored, "the entry was not stored");
-    entry.item_id
-}
-
-/// What a relay must never be told: a swarm channel's ID, which holds an
-/// entity ID, and the entity ID of the node it serves. Nothing the relay
-/// has written to disk holds either: not its log, and not its database,
-/// where it keeps what it is sent. What it was told is there: `told`, the
-/// ID of a channel of the node's own, is.
-fn assert_told_no_id_that_holds_a_name(relay: &Node, of: &Node, told: &[u8; 32]) {
-    assert!(
-        !files_holding(relay, told).is_empty(),
-        "the relay was told of a channel, so its ID should be on its disk"
-    );
-    let entity = entity_id(of);
-    for needle in [cordelia_storage::naming::SWARM_CHANNEL_PREFIX, &entity] {
-        let found = files_holding(relay, needle);
-        assert!(
-            found.is_empty(),
-            "the relay was told {needle:?}: it is in {found:?}"
-        );
-    }
-}
-
-/// A node makes no channel that it does not use. Up to 0.2.0-alpha.7 a
-/// personal node made a swarm channel for itself each time it started,
-/// whose ID holds its entity ID, and told its relay of it. A node that
-/// starts and reaches its relay now holds no such channel and no key for
-/// one. What it tells its relay of is the channels of its own, from a
-/// secret, once it follows a recovery phrase: its relay is told no channel
-/// ID that begins as a swarm channel's does, and none that holds the
-/// node's entity ID.
-#[test]
-fn a_node_makes_no_swarm_channel_and_tells_its_relay_of_none() {
-    use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let mut a = node("unnamed-canary", "personal", Some(relay.p2p));
-    a.start();
-    let all = [&relay, &a];
-    wait_for("node healthy", &all, 30, || healthy(&a));
-    wait_for("connected to the relay", &all, 60, || has_hot_peer(&a));
-
-    let told = tells_its_relay_of_its_name(&a, &relay);
-    assert_told_no_id_that_holds_a_name(&relay, &a, &told);
-
-    // The node holds none, and so had none to remove.
-    assert_eq!(swarm_channels_held(&a), 0);
-    let channels = a.cli(&["channels"]);
-    assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
-    assert_eq!(swarm_key_files(&a), Vec::<String>::new());
-    let log = std::fs::read_to_string(a.log()).unwrap();
-    assert!(!log.contains("removed swarm channels"), "{log}");
-    // Nor had it anything of the older kind to copy and move on at its
-    // first start (decision 2026-10-04 §10.1): it made no copy.
-    assert_eq!(copies_made(&a), Vec::<String>::new());
-    assert!(!log.contains("was copied and moved on"), "{log}");
-}
-
-/// The copies that a node made of its database, beside it, by their
-/// names.
-fn copies_made(n: &Node) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(n.data_dir()) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with("before-"))
-        .collect()
-}
-
-/// A node that ran a version up to 0.2.0-alpha.7 holds the swarm channel
-/// that version made, with its key. When it starts, the channel and the
-/// key go, and the node says once that they did, with how many and not
-/// which. Its relay is told nothing of the channel.
-///
-/// On a personal node they go with everything of the older kind that it
-/// holds, at its first start on this version (decision 2026-10-04 §10.1):
-/// its database is copied and moved on, and the key files of the older
-/// channels are removed. A node of a role that carries the older kind
-/// removes a swarm channel by itself, and keeps the rest: a relay that
-/// holds one shows it.
-#[test]
-fn a_swarm_channel_an_earlier_version_made_is_removed_when_the_node_starts() {
-    use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
-    // A relay that holds one removes it, and says so once, with how many
-    // and not which. It makes no copy.
-    let mut older = node("older-relay", "relay", None);
-    let of_the_relay = swarm_channel_as_an_earlier_version_made_it(&older);
-    older.start();
-    wait_for("relay healthy", &[&older], 30, || healthy(&older));
-    assert_eq!(swarm_key_files(&older), Vec::<String>::new());
-    let log = without_colour(&std::fs::read_to_string(older.log()).unwrap());
-    let said: Vec<&str> = log
-        .lines()
-        .filter(|line| line.contains("removed swarm channels"))
-        .collect();
-    assert_eq!(said.len(), 1, "{log}");
-    for count in ["INFO", "channels=1", "items=0", "key_files=1"] {
-        assert!(said[0].contains(count), "{}", said[0]);
-    }
-    assert!(!log.contains(&of_the_relay), "{log}");
-    assert_eq!(copies_made(&older), Vec::<String>::new());
-    older.stop();
-
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let mut b = node("earlier-canary", "personal", Some(relay.p2p));
-
-    // What the earlier version left: the node lists the channel, and
-    // keeps a key for it.
-    let swarm = swarm_channel_as_an_earlier_version_made_it(&b);
-    assert!(swarm.ends_with(&entity_id(&b)), "{swarm}");
-    assert_eq!(swarm_channels_held(&b), 1);
-    assert_eq!(swarm_key_files(&b), vec![format!("{swarm}.key")]);
-
-    b.start();
-    let all = [&relay, &b];
-    wait_for("node healthy", &all, 30, || healthy(&b));
-    wait_for("connected to the relay", &all, 60, || has_hot_peer(&b));
-    let told = tells_its_relay_of_its_name(&b, &relay);
-    assert_told_no_id_that_holds_a_name(&relay, &b, &told);
-
-    // The channel is gone from the node, and its key with it.
-    assert_eq!(swarm_channels_held(&b), 0);
-    assert_eq!(swarm_key_files(&b), Vec::<String>::new());
-    // The node said so once, and nowhere in its log is the channel's ID:
-    // its database was copied and moved on, and the key file removed.
-    let log = without_colour(&std::fs::read_to_string(b.log()).unwrap());
-    let said = |what: &str| -> Vec<String> {
-        let lines = log.lines().filter(|line| line.contains(what));
-        lines.map(str::to_string).collect()
-    };
-    let moved_on = said("the database was copied and moved on");
-    assert_eq!(moved_on.len(), 1, "{log}");
-    assert!(moved_on[0].contains("INFO"), "{}", moved_on[0]);
-    // It says what the device's status says of it: not added yet, and
-    // the three ways on, in their order. Not the two of before.
-    let says = cordelia_api::first_start::moved_on_says();
-    assert!(moved_on[0].contains(&says), "{}", moved_on[0]);
-    for way in [
-        "(`cordelia phrase`)",
-        "`cordelia accept` here",
-        "(`cordelia recover`)",
-    ] {
-        assert!(moved_on[0].contains(way), "{way}: {}", moved_on[0]);
-    }
-    assert!(
-        !moved_on[0].contains("is added again with"),
-        "{}",
-        moved_on[0]
-    );
-    let removed = said("removed the key files of the older channels");
-    assert_eq!(removed.len(), 1, "{log}");
-    for count in ["INFO", "key_files=1"] {
-        assert!(removed[0].contains(count), "{}", removed[0]);
-    }
-    assert!(said("removed swarm channels").is_empty(), "{log}");
-    assert!(!log.contains(SWARM_CHANNEL_PREFIX), "{log}");
-    // The copy holds what the node held, the key file among it.
-    let copies = copies_made(&b);
-    assert_eq!(copies.len(), 1, "{copies:?}");
-    let copied_key = b
-        .data_dir()
-        .join(&copies[0])
-        .join("channel-keys")
-        .join(format!("{swarm}.key"));
-    assert!(copied_key.exists(), "{}", copied_key.display());
-}
-
-/// A channel ID that holds a name is never told to a peer, though the
-/// node holds the channel. No command puts a swarm channel in a node that
-/// is running, and a node removes one when it starts, so the test puts it
-/// there: in the database of a running node, as an earlier version made
-/// it, with an entry in it that the node wrote and that no relay was
-/// sent. The node goes on writing under a name it holds, and its relay is
-/// sent that: what a device tells a relay of is the channels of its own,
-/// from a secret, and nothing of a channel of the older kind (decision
-/// 2026-10-04 §10). Nothing that the relay has written to disk holds the
-/// swarm channel's ID, the node's entity ID, or the entry.
-#[test]
-fn a_swarm_channel_that_a_running_node_holds_is_told_to_no_relay() {
-    let mut relay = node("relay", "relay", None);
-    relay.start();
-    wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
-    let mut c = node("held-canary", "personal", Some(relay.p2p));
-    c.start();
-    let all = [&relay, &c];
-    wait_for("node healthy", &all, 30, || healthy(&c));
-    wait_for("connected to the relay", &all, 60, || has_hot_peer(&c));
-    let told = tells_its_relay_of_its_name(&c, &relay);
-
-    // Written before the entry under the name, so that it is first among
-    // what the node holds and has not sent.
-    let swarm = swarm_channel_as_an_earlier_version_made_it(&c);
-    let held = entry_as_an_earlier_version_wrote_it(&c, &swarm);
-    let before = entries_at(&relay);
-    publishes(
-        &c,
-        "later.md",
-        serde_json::json!({ "text": "a later entry" }),
-    );
-    wait_for("the relay holds the later entry", &all, 90, || {
-        (entries_at(&relay) > before).then_some(())
-    });
-    // And a pass or two of the node's own go by, in which it sends what
-    // it has to send.
-    std::thread::sleep(Duration::from_secs(
-        2 * cordelia_core::protocol::REALTIME_SYNC_INTERVAL_SECS,
-    ));
-    assert_told_no_id_that_holds_a_name(&relay, &c, &told);
-    assert_eq!(files_holding(&relay, &held), Vec::<PathBuf>::new());
-
-    // The node holds the channel and its entry all the while: the relay
-    // was not told because such an ID is not told, not for want of one.
-    assert_eq!(swarm_channels_held(&c), 1);
-    assert!(!files_holding(&c, &held).is_empty());
-    // And the entry that is not sent is not counted as waiting to be.
-    wait_for("nothing is left waiting to be sent", &all, 60, || {
-        (c.get("/api/v1/status")?["outbox_waiting"] == 0).then_some(())
-    });
-}
-
-/// A key file that cannot be removed does not stop the node. A node that
-/// ran an earlier version holds the swarm channel that version made; where
-/// a slot key of it would be there is a directory, which cannot be removed
-/// as a file is. The node starts, removes the channel and the key it can
-/// remove, and warns once that one could not be removed: how many, and not
-/// which.
-///
-/// So does a personal node, which removes the key files of the older
-/// channels after its first start on this version (decision 2026-10-04
-/// §10.1), and a node of a role that carries the older kind, which
-/// removes those of a swarm channel.
+/// A key file that cannot be removed does not stop the node. A personal
+/// node that ran an earlier version holds a channel of the older kind,
+/// and removes the key files of the older channels after its first start
+/// on this version (decision 2026-10-04 §10.1); where a slot key would be
+/// there is a directory, which cannot be removed as a file is. The node
+/// starts, and warns once that one could not be removed: how many, and
+/// not which.
 #[test]
 fn a_key_file_that_cannot_be_removed_does_not_stop_the_node() {
-    use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
-    for (role, of_which) in [
-        ("personal", "of the older channels"),
-        ("relay", "of a swarm channel"),
-    ] {
-        let mut a = node("stuck-canary", role, None);
-        let swarm = swarm_channel_as_an_earlier_version_made_it(&a);
-        let stuck = cordelia_storage::psk::slot_key_path(&a.data_dir(), &swarm);
-        std::fs::create_dir(&stuck).unwrap();
+    let mut a = node("stuck-canary", "personal", None);
+    holds_an_older_channel(&a, OLDER_GROUP);
+    let stuck = a
+        .data_dir()
+        .join("channel-keys")
+        .join(format!("{OLDER_GROUP}.slot"));
+    std::fs::create_dir_all(&stuck).unwrap();
 
-        a.start();
-        wait_for("node healthy", &[&a], 30, || healthy(&a));
+    a.start();
+    wait_for("node healthy", &[&a], 30, || healthy(&a));
 
-        assert_eq!(swarm_channels_held(&a), 0, "{role}");
-        assert_eq!(swarm_key_files(&a), vec![format!("{swarm}.slot")], "{role}");
-        let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
-        let warned: Vec<&str> = log
-            .lines()
-            .filter(|line| line.contains("could not remove every key file"))
-            .collect();
-        assert_eq!(warned.len(), 1, "{role}: {log}");
-        for said in ["WARN", "key_files=1", of_which] {
-            assert!(warned[0].contains(said), "{role}: {}", warned[0]);
-        }
-        assert!(!log.contains(SWARM_CHANNEL_PREFIX), "{role}: {log}");
-    }
-}
-
-/// An entry of `channel` with this ciphertext, signed by `author`, as it
-/// travels.
-fn entry_in(
-    author: &cordelia_crypto::identity::NodeIdentity,
-    channel: &str,
-    blob: Vec<u8>,
-) -> cordelia_network::messages::Item {
-    let item_id = cordelia_storage::items::generate_item_id();
-    let hash = cordelia_crypto::sha256(&blob);
-    let published_at = "2026-10-02T00:00:00Z";
-    let cbor = cordelia_crypto::signing::build_item_metadata_envelope(
-        &author.public_key(),
-        channel,
-        &hash,
-        false,
-        &item_id,
-        1,
-        published_at,
-    )
-    .unwrap();
-    cordelia_network::messages::Item {
-        item_id,
-        channel_id: channel.into(),
-        item_type: "memory".into(),
-        content_length: blob.len() as u32,
-        encrypted_blob: blob,
-        content_hash: hash.to_vec(),
-        author_id: author.public_key().to_vec(),
-        signature: author.sign(&cbor).to_vec(),
-        key_version: 1,
-        published_at: published_at.into(),
-        is_tombstone: false,
-        parent_id: None,
-        slot: None,
-        rev: None,
+    assert!(stuck.is_dir());
+    let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
+    let warned: Vec<&str> = log
+        .lines()
+        .filter(|line| line.contains("could not remove every key file"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{log}");
+    for said in ["WARN", "key_files=1", "of the older channels"] {
+        assert!(warned[0].contains(said), "{}", warned[0]);
     }
 }
 
@@ -3911,28 +3471,59 @@ async fn asked_of_the_older_kind_answers_nothing(
     });
 }
 
-/// A device answers its relay with nothing of a channel whose ID may not
-/// be told to a peer, though it holds the channel and an entry in it (put
-/// there as in the test of what a running node tells its relay). It
-/// answers its relay with nothing of any channel of the older kind: no
-/// node of this version carries one (decision 2026-11-10 (older kind),
-/// rule 7). The test is the relay: it asks the device which channels it
-/// holds, and for the swarm channel's entries by its ID, as a device that
-/// holds no such channel would be answered (decision 2026-10-04 §10.1);
-/// and it pushes the device a frame, and announces one, of the older kind,
-/// each refused at once. On the same connection the device does answer
-/// its relay on a stream that it serves.
+/// Put in the database of the running device `n` a channel of the older
+/// kind with one item in it, in plain SQL, as an earlier version left one.
+/// A database of this version refuses a new row of that kind, from its
+/// first start on (decision 2026-10-04 §10.1): the test takes that guard
+/// away first, and puts the rows where nothing of this version would.
+fn an_older_channel_in_a_running_device(n: &Node, channel: &str) {
+    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    cordelia_storage::first_start::remove_guard(&db).unwrap();
+    let now = "2026-10-01T00:00:00Z";
+    db.execute(
+        "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                               created_at, updated_at)
+         VALUES (?1, 'group', 'realtime', 'invite_only', ?2, ?3, ?3)",
+        rusqlite::params![channel, [0xAAu8; 32].as_slice(), now],
+    )
+    .unwrap();
+    let blob = b"what an earlier version held of the older kind";
+    db.execute(
+        "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                            content_hash, signature, encrypted_blob, content_length, seq)
+         VALUES ('ci_01JARV8XMHW8G9QZP0000000AB', ?1, ?2, 'memory', ?3, ?4, ?5, ?6, ?7, 1)",
+        rusqlite::params![
+            channel,
+            [0xAAu8; 32].as_slice(),
+            now,
+            cordelia_crypto::sha256(blob).as_slice(),
+            [7u8; 64].as_slice(),
+            blob.as_slice(),
+            blob.len() as i64,
+        ],
+    )
+    .unwrap();
+}
+
+/// A device answers its relay with nothing of a channel of the older
+/// kind, though it holds the channel and an item in it: no node of this
+/// version carries one (decision 2026-11-10 (older kind), rule 7). The
+/// test is the relay: it asks the device which channels it holds, and for
+/// that channel's entries by its ID, as a device that holds no such
+/// channel would be answered (decision 2026-10-04 §10.1); and it pushes
+/// the device a frame, and announces one, of the older kind, each refused
+/// at once. On the same connection the device does answer its relay on a
+/// stream that it serves.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
-    use cordelia_storage::naming::SWARM_CHANNEL_PREFIX;
     let (port, connections) = relay_that_asks();
     let mut a = node("asked-canary", "personal", Some(port));
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
 
-    let swarm = swarm_channel_as_an_earlier_version_made_it(&a);
-    let held = entry_as_an_earlier_version_wrote_it(&a, &swarm);
+    an_older_channel_in_a_running_device(&a, OLDER_GROUP);
 
     // The control: the device answers its relay on a stream that it does
     // serve.
@@ -3947,16 +3538,15 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
         answers_a_request_for_peers(&conn)
     });
 
-    asked_of_the_older_kind_answers_nothing(&a, &conn, &swarm).await;
+    asked_of_the_older_kind_answers_nothing(&a, &conn, OLDER_GROUP).await;
     assert!(answers_a_request_for_peers(&conn).is_some());
 
-    // The device's database holds the channel and its own entry all the
-    // while. (`cordelia channels` says nothing of them: on a personal node
-    // it lists the names that the device holds.)
-    assert_eq!(swarm_channels_held(&a), 1);
+    // The device's database holds the channel and its item all the while.
+    // (`cordelia channels` says nothing of them: on a personal node it
+    // lists the names that the device holds.)
+    assert_eq!(older_items_held(&a), 1);
     let channels = a.cli(&["channels"]);
-    assert!(!channels.contains(SWARM_CHANNEL_PREFIX), "{channels}");
-    assert!(!files_holding(&a, &held).is_empty());
+    assert!(!channels.contains(OLDER_GROUP), "{channels}");
 }
 
 /// A relay answers what is asked of the older kind with nothing, as a

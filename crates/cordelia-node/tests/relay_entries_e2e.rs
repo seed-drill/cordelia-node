@@ -984,10 +984,17 @@ async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
         }),
         "{stats}"
     );
+    // And it counts its entries as a device does, and its channels as
+    // those it holds (decision 2026-11-10 (older kind), rule 3).
+    assert_eq!(
+        (&stats["channels_subscribed"], &stats["items_stored"]),
+        (&serde_json::json!(3), &serde_json::json!(3)),
+        "{stats}"
+    );
     let plain = relay.cli(&["stats"]);
     assert!(
         plain.contains(
-            "                  3.8 KB in use of 3.8 KB allowed, by channels from their secrets \
+            "Storage:          3.8 KB in use of 3.8 KB allowed, by channels from their secrets \
              (3 held, 3 entries)"
         ),
         "{plain}"

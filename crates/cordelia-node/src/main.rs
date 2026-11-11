@@ -526,20 +526,6 @@ enum Commands {
         #[command(subcommand)]
         what: MsgCommand,
     },
-    /// Initialise a swarm child node (derive identity from lead, create channels)
-    SwarmInit {
-        /// HKDF derivation index for this child's identity
-        #[arg(long)]
-        index: u32,
-
-        /// Path to the lead node's identity.key
-        #[arg(long)]
-        lead_identity: String,
-
-        /// Entity ID of the lead node (for swarm channel naming)
-        #[arg(long)]
-        lead_entity_id: String,
-    },
 }
 
 #[derive(clap::Subcommand)]
@@ -1145,11 +1131,6 @@ fn main() -> anyhow::Result<()> {
                 },
             ),
         },
-        Some(Commands::SwarmInit {
-            index,
-            lead_identity,
-            lead_entity_id,
-        }) => cmd_swarm_init(&cli.config, index, &lead_identity, &lead_entity_id),
         None => {
             println!("Cordelia v{}", env!("CARGO_PKG_VERSION"));
             println!("{ABOUT}");
@@ -1692,12 +1673,6 @@ fn cmd_status(
             if status.facts.outbox_waiting > 0 {
                 details.push(format!("Waiting to send: {}", status.facts.outbox_waiting));
             }
-            if status.facts.outbox_refused > 0 {
-                details.push(format!(
-                    "Not taken by a relay: {}",
-                    status.facts.outbox_refused
-                ));
-            }
         }
         if let Some(sync) = &status.sync {
             let folders = folders_that_sync(&sync["report"]).count();
@@ -1797,7 +1772,6 @@ fn cmd_status(
                 "warm": live["peers_warm"],
             });
             out["outbox_waiting"] = live["outbox_waiting"].clone();
-            out["outbox_refused"] = live["outbox_refused"].clone();
             // What the node says of messages between its person's agents,
             // as it gave it, where it gives it (decision 2026-10-09 §8):
             // here alone, and in nothing the level is worked out from.
@@ -1944,14 +1918,14 @@ fn cmd_status(
         println!();
         println!("Storage:");
         // A personal node holds names, each with its channel from the
-        // person's secret. A node of another role holds channels of the
-        // older kind.
+        // person's secret. A relay holds channels (decision 2026-11-10
+        // (older kind), rule 3).
         if config.network.role == "personal" {
             let names = cordelia_storage::person::names(&conn)?;
             println!("  Names:     {}", names.len());
         } else {
-            let channels = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
-            println!("  Channels:  {}", channels.len());
+            let channels = cordelia_storage::relay::count_held(&conn)?;
+            println!("  Channels:  {channels}");
         }
         println!("  DB size:   {} KB", db_size / 1024);
     }
@@ -2631,49 +2605,22 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         "node starting"
     );
 
-    // A personal node writes nothing of the older kind of channel: what
-    // it holds of that kind goes at its first start on this version,
-    // below. A node of any other role goes on carrying that kind.
+    // No node writes anything of the older kind of channel (decision
+    // 2026-11-10 (older kind), rule 1): what a personal node holds of
+    // that kind goes at its first start on this version, below.
     let personal = config.network.role == "personal";
     if !personal {
-        // A node makes no channel that it does not use. Up to
-        // 0.2.0-alpha.7 a node made a swarm channel for itself each time
-        // it started, and v1 uses none. Any that this node holds is
-        // removed, with its key and whatever it holds. Its ID holds a
-        // name, so the log says how many went and does not say which.
-        let removed = cordelia_storage::channels::remove_swarm_channels(&conn, &data_dir)?;
-        if removed.any() {
-            tracing::info!(
-                channels = removed.channels,
-                items = removed.items,
-                key_files = removed.key_files,
-                "removed swarm channels, which this version does not use"
-            );
-        }
-        // A key file that could not be removed is no reason not to start.
-        // The node says how many, and tries again the next time it starts.
-        if removed.key_files_left > 0 {
-            tracing::warn!(
-                key_files = removed.key_files_left,
-                "could not remove every key file of a swarm channel; they are left, and the node starts"
-            );
-        }
         // The guard against a new channel of the older kind is a
         // device's. A node of this role that is started on a database
         // which a personal node moved on removes it (decision 2026-10-04
         // §10.1).
         if cordelia_storage::first_start::remove_guard(&conn)? {
-            tracing::info!(
-                "removed the guard that a personal node set on this database: a node of this \
-                 role takes channels of the older kind"
-            );
+            tracing::info!("removed the guard that a personal node set on this database");
         }
     }
 
     // Build app state
     let identity_arc = std::sync::Arc::new(identity);
-    let (push_tx, push_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (announce_tx, announce_rx) = tokio::sync::mpsc::unbounded_channel();
 
     let state = web::Data::new(cordelia_api::state::AppState {
         load: Default::default(),
@@ -2685,10 +2632,10 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         sync_errors: std::sync::atomic::AtomicU64::new(0),
         peers_hot: std::sync::atomic::AtomicU64::new(0),
         peers_warm: std::sync::atomic::AtomicU64::new(0),
-        push_tx: Some(push_tx),
+        push_tx: None,
         // The P2P loop is started below, with this state.
         networked: true,
-        announce_tx: Some(announce_tx),
+        announce_tx: None,
         peers: Default::default(),
         relays: Default::default(),
         outbox_refused: Default::default(),
@@ -2779,7 +2726,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let conn_mgr = cordelia_network::connection::ConnectionManager::new(
             identity_arc.clone(),
             endpoint,
-            vec![], // channel IDs loaded later from DB
+            vec![], // no channel: the handshake says none (decision 2026-11-10 (older kind), rule 7)
             roles,
             advertised_port,
         );
@@ -2796,9 +2743,8 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
             .iter()
             .map(|b| (b.addr.clone(), b.key.clone()))
             .collect();
-        let relays =
-            cordelia_network::bootstrap::relays_dialled(&config.network.role, &configured)
-                .map_err(|e| anyhow::anyhow!("network.bootnodes: {e}"))?;
+        let relays = cordelia_network::bootstrap::relays_dialled(&config.network.role, &configured)
+            .map_err(|e| anyhow::anyhow!("network.bootnodes: {e}"))?;
         for relay in &relays {
             if relay.key.is_none() {
                 tracing::warn!(
@@ -2816,18 +2762,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let p2p_shutdown = tokio::sync::watch::channel(false);
         let mut p2p_shutdown_rx = p2p_shutdown.1.clone();
         let role_for_p2p = config.network.role.clone();
-        // Parse trusted peers for PAN (§8.2.2)
-        let trusted_peer_ids: Vec<cordelia_core::NodeId> = config.network.trusted_peers.iter()
-            .filter_map(|tp| {
-                cordelia_crypto::bech32::decode_public_key(&tp.public_key)
-                    .map(cordelia_core::NodeId)
-                    .map_err(|e| tracing::warn!(key = %tp.public_key, error = %e, "invalid trusted_peer key"))
-                    .ok()
-            })
-            .collect();
-        if !trusted_peer_ids.is_empty() {
-            tracing::info!(count = trusted_peer_ids.len(), "trusted peers configured (PAN §8.2.2)");
-        }
 
         // ── Sync adapter (decision 2026-09-30 §4.5) ─────────────────
         // Runs while a Claude Code directory is configured. A change of
@@ -2855,19 +2789,45 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // Whether each relay can be reached, on a device (decision
         // 2026-10-19 §1): shared by its passes, its dials and the
         // lookups of its relays' names.
-        let reach = (config.network.role == "personal")
-            .then(|| cordelia_node::device_entries::Reach::new(cordelia_node::device_entries::Clock::system()));
+        let reach =
+            (config.network.role == "personal").then(|| {
+                cordelia_node::device_entries::Reach::new(
+                    cordelia_node::device_entries::Clock::system(),
+                )
+            });
         if !relays.is_empty() {
-            tokio::spawn(p2p::keep_relays_resolved(relays, relay_addrs.clone(), reach.clone()));
+            tokio::spawn(p2p::keep_relays_resolved(
+                relays,
+                relay_addrs.clone(),
+                reach.clone(),
+            ));
         }
 
         let p2p_handle = tokio::spawn(async move {
-            p2p::p2p_loop(conn_mgr, p2p_state, push_rx, announce_rx, &mut p2p_shutdown_rx, allow_private, role_for_p2p, config.governor.clone(), relays_set_up, relay_addrs, trusted_peer_ids, config.node.max_storage_bytes, std::time::Duration::from_secs(config.replication.relay_ask_again_secs.clamp(1, 86_400)), config.limits.most_proved_on_a_connection(), reach, config.members.read_interval()).await;
+            p2p::p2p_loop(
+                conn_mgr,
+                p2p_state,
+                &mut p2p_shutdown_rx,
+                allow_private,
+                role_for_p2p,
+                config.governor.clone(),
+                relays_set_up,
+                relay_addrs,
+                config.node.max_storage_bytes,
+                std::time::Duration::from_secs(
+                    config.replication.relay_ask_again_secs.clamp(1, 86_400),
+                ),
+                config.limits.most_proved_on_a_connection(),
+                reach,
+                config.members.read_interval(),
+            )
+            .await;
         });
 
         // ── HTTP API ───────────────────────────────────────────────
-        // A personal node serves the local API of a device, and no
-        // Channels API of the older kind (decision 2026-10-04 §10).
+        // A personal node serves the local API of a device, and no node
+        // the Channels API of the older kind (decision 2026-11-10 (older
+        // kind), rule 2).
         let serves_a_device = config.network.role == "personal";
         let server = HttpServer::new(move || {
             App::new()
@@ -3478,42 +3438,22 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
         anyhow::bail!("Node not initialised. Run `cordelia init` first.");
     }
 
-    let identity = NodeIdentity::from_file(&identity_path)?;
-    let pk = identity.public_key();
     let conn = open_to_read(&config)?;
 
-    // A personal node carries no channel of the older kind (decision
-    // 2026-10-04 §10): what it has is the names that it holds, each with
-    // its channel from the person's secret. Nothing of the older kind is
-    // read.
+    // No node carries a channel of the older kind (decision 2026-11-10
+    // (older kind), rule 1): what a device has is the names that it
+    // holds, each with its channel from the person's secret, and a relay
+    // the channels it holds.
     if config.network.role == "personal" {
         for line in names_held(&conn)? {
             println!("{line}");
         }
         return Ok(());
     }
-
-    let all = cordelia_storage::channels::list_for_entity(&conn, &pk)?;
-
     println!(
-        "{:<24} {:<10} {:>6}   {:<20} TYPE",
-        "CHANNEL", "MODE", "ITEMS", "LAST ACTIVITY"
+        "Channels:  {} held",
+        cordelia_storage::relay::count_held(&conn)?
     );
-    for ch in &all {
-        let name = ch
-            .channel_name
-            .as_deref()
-            .unwrap_or(&ch.channel_id[..ch.channel_id.len().min(16)]);
-        let count = cordelia_storage::items::count_for_channel(&conn, &ch.channel_id)?;
-        let activity = cordelia_storage::items::last_activity(&conn, &ch.channel_id)?
-            .unwrap_or_else(|| "-".into());
-
-        println!(
-            "{:<24} {:<10} {:>6}   {:<20} {}",
-            name, ch.mode, count, activity, ch.channel_type
-        );
-    }
-
     Ok(())
 }
 
@@ -3554,37 +3494,25 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
         anyhow::bail!("Node not initialised. Run `cordelia init` first.");
     }
 
-    let identity = NodeIdentity::from_file(&identity_path)?;
-    let pk = identity.public_key();
     let db_path = data_dir.join("cordelia.db");
     let conn = open_to_read(&config)?;
 
     let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
-    // A personal node carries no channel of the older kind (decision
-    // 2026-10-04 §10): its channels are the names it holds, and what it
-    // stores is the entries of its own channels. Nothing of the older
-    // kind is read.
+    // No node carries a channel of the older kind (decision 2026-11-10
+    // (older kind), rule 3): what a node stores is the entries of channels
+    // from their secrets, counted as a device counts them. A device's
+    // channels are the names it holds, and a relay's the channels it
+    // holds.
     let personal = config.network.role == "personal";
     let now = chrono::Utc::now().timestamp();
-    let (channels, usage) = match personal {
-        true => (
-            cordelia_storage::person::names(&conn)?.len(),
-            cordelia_storage::usage::snapshot_of_a_device(&conn, now)?,
-        ),
-        false => (
-            cordelia_storage::channels::list_for_entity(&conn, &pk)?.len(),
-            cordelia_storage::usage::snapshot(&conn, now)?,
-        ),
+    let channels = match personal {
+        true => cordelia_storage::person::names(&conn)?.len() as u64,
+        false => cordelia_storage::relay::count_held(&conn)?,
     };
-    // What a relay's storage cap counts, and the cap: what its items are
-    // counted at, each its content and what an entry takes beyond it. It
-    // falls when a channel is dropped (the file does not shrink).
-    let used = cordelia_storage::items::stored_cost(&conn)?;
+    let usage = cordelia_storage::usage::snapshot_of_a_device(&conn, now)?;
     let cap = config.node.max_storage_bytes;
-    // What a node that carries both kinds holds of the channels from
-    // their secrets: they are counted apart, by what their entries are
-    // counted at, against a cap of their own of the same size (decision
-    // 2026-10-04 §2.5). An operator sees the room of each kind.
+    // What a relay holds, by what its entries are counted at, against its
+    // cap (decision 2026-10-04 §2.5): an operator sees its room.
     let of_entries = match personal {
         true => None,
         false => {
@@ -3601,7 +3529,6 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     if json {
         let mut out = serde_json::json!({
             "database_bytes": db_size,
-            "storage_used_bytes": used,
             "storage_max_bytes": cap,
             "channels_subscribed": channels,
             "items_stored": usage.items_stored,
@@ -3629,20 +3556,19 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     }
 
     println!("Database:         {}", format_bytes(db_size));
-    if config.network.role == "relay" {
-        for line in storage_lines(used, cap, of_entries.as_ref()) {
-            println!("{line}");
-        }
+    if config.network.role == "relay"
+        && let Some(held) = &of_entries
+    {
+        println!("{}", storage_line(cap, held));
     }
     println!(
-        "Stored:           {} {}, {} of encrypted content",
+        "Stored:           {} entries, {} of encrypted content",
         usage.items_stored,
-        if personal { "entries" } else { "items" },
         format_bytes(usage.bytes_stored)
     );
     match personal {
         true => println!("Names:            {channels} held"),
-        false => println!("Channels:         {channels} subscribed"),
+        false => println!("Channels:         {channels} held"),
     }
     println!(
         "Peers seen:       {} in the last day, {} in the last week (plus {} and {} relays)",
@@ -3656,8 +3582,8 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// What a node that carries both kinds of channel holds of the channels
-/// from their secrets (decision 2026-10-04 §2.5).
+/// What a relay holds of the channels from their secrets (decision
+/// 2026-10-04 §2.5).
 struct EntriesHeld {
     /// What its entries are counted at: what this kind's cap is set
     /// against.
@@ -3669,31 +3595,22 @@ struct EntriesHeld {
     content_bytes: u64,
 }
 
-/// What `cordelia stats` says of a relay's room: each kind of channel
-/// against its cap, which is of one size for both (decision 2026-10-04
-/// §2.5). `used` is what the older kind holds.
-fn storage_lines(used: u64, cap: u64, of_entries: Option<&EntriesHeld>) -> Vec<String> {
-    let mut lines = vec![format!(
-        "Storage:          {} in use of {} allowed, by channels of the older kind",
-        format_bytes(used),
-        format_bytes(cap)
-    )];
-    if let Some(held) = of_entries {
-        lines.push(format!(
-            "                  {} in use of {} allowed, by channels from their secrets ({} held, \
-             {} {})",
-            format_bytes(held.used),
-            format_bytes(cap),
-            held.channels,
-            held.entries,
-            if held.entries == 1 {
-                "entry"
-            } else {
-                "entries"
-            },
-        ));
-    }
-    lines
+/// What `cordelia stats` says of a relay's room: what it holds against
+/// its cap (decision 2026-10-04 §2.5).
+fn storage_line(cap: u64, held: &EntriesHeld) -> String {
+    format!(
+        "Storage:          {} in use of {} allowed, by channels from their secrets ({} held, {} \
+         {})",
+        format_bytes(held.used),
+        format_bytes(cap),
+        held.channels,
+        held.entries,
+        if held.entries == 1 {
+            "entry"
+        } else {
+            "entries"
+        },
+    )
 }
 
 /// `1.5 MB`, `12.0 KB`.
@@ -3703,137 +3620,6 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} KB", bytes as f64 / 1024.0)
     }
-}
-
-// ── cordelia swarm-init ────────────────────────────────────────────
-
-/// What `cordelia swarm-init` says where the node's role is `personal`.
-const NO_SWARM_ON_A_PERSONAL_NODE: &str = "a personal node carries no swarm channel in this \
-    version, and nothing was set up. A device's channels come from its recovery phrase: \
-    `cordelia phrase` on the first device, and `cordelia add-device` and `cordelia accept` \
-    for each one after.";
-
-fn cmd_swarm_init(
-    config_path: &str,
-    index: u32,
-    lead_identity_path: &str,
-    lead_entity_id: &str,
-) -> anyhow::Result<()> {
-    let config_file = config::expand_tilde(config_path);
-    let mut config = Config::load(&config_file)?;
-    config.apply_env_overrides();
-    let data_dir = config.data_dir();
-
-    // A personal node carries no channel of the older kind (decision
-    // 2026-10-04 §10), and a swarm channel is one: this command would
-    // write rows and key files that such a node never reads, and that
-    // its first start on this version copies and removes. It is refused
-    // there, before anything is written.
-    if config.network.role == "personal" {
-        anyhow::bail!(NO_SWARM_ON_A_PERSONAL_NODE);
-    }
-
-    // Load lead identity and derive child
-    let lead_path = config::expand_tilde(lead_identity_path);
-    let lead = NodeIdentity::from_file(&lead_path)?;
-    let child = lead.derive_child(index)?;
-
-    let child_pk = child.public_key();
-    let child_pk_bech32 = encode_public_key(&child_pk)?;
-    let child_suffix = child.entity_id_suffix();
-    let entity_id = format!("swarm{index}_{child_suffix}");
-
-    // The database is opened below: none is opened, and nothing is made,
-    // where a node holds the data directory's lock (decision 2026-10-04
-    // §10.1, rule 6).
-    refuse_beside_its_node(&config)?;
-
-    // A directory that holds a key already is refused before anything is
-    // changed, its mode included.
-    let identity_path = data_dir.join("identity.key");
-    if identity_path.exists() {
-        anyhow::bail!(
-            "Identity already exists at {}. Use --force with `cordelia init` to overwrite.",
-            identity_path.display()
-        );
-    }
-    // Write child identity. The data directory is made its owner's alone
-    // (mode 0700), as `cordelia init` and the install script make it.
-    if let Some(says) = private_data_dir(&data_dir, owners_alone)? {
-        eprintln!("{says}");
-    }
-    // The database is opened before anything is written: one from a
-    // later version is refused, and nothing is changed (decision
-    // 2026-10-04 §10.1).
-    let db_path = data_dir.join("cordelia.db");
-    let conn = open_database(&db_path, &config)?;
-    std::fs::write(&identity_path, child.seed())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&identity_path, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    // Generate node token
-    let token = cordelia_crypto::generate_psk()?;
-    let token_hex = hex::encode(token);
-    let token_path = data_dir.join("node-token");
-    std::fs::write(&token_path, &token_hex)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600))?;
-    }
-
-    // Create channel-keys directory
-    std::fs::create_dir_all(data_dir.join("channel-keys"))?;
-
-    // Create persistent swarm channel
-    let swarm_ch_id = cordelia_storage::naming::swarm_channel_id(lead_entity_id);
-    let psk = cordelia_crypto::generate_psk()?;
-    let psk_hash = cordelia_crypto::sha256(&psk);
-    let now = chrono::Utc::now().to_rfc3339();
-    // Insert as protocol-type channel (scope=network)
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO channels (channel_id, channel_type, mode, access, scope, creator_id, psk_hash, created_at, updated_at)
-         VALUES (?1, 'named', 'realtime', 'invite_only', 'network', ?2, ?3, ?4, ?5)",
-        rusqlite::params![swarm_ch_id, child_pk.as_slice(), psk_hash.as_slice(), now, now],
-    );
-    let _ = conn.execute(
-        "INSERT OR IGNORE INTO channel_members (channel_id, entity_key, role, joined_at)
-         VALUES (?1, ?2, 'owner', ?3)",
-        rusqlite::params![swarm_ch_id, child_pk.as_slice(), now],
-    );
-
-    // Save PSK using the standard psk module (handles path encoding + 0600 permissions)
-    cordelia_storage::psk::write_psk(&data_dir, &swarm_ch_id, &psk)?;
-
-    // Create default ephemeral local channel
-    let local_ch_id = format!("cordelia:local:{}", uuid::Uuid::new_v4());
-    let local_psk = cordelia_crypto::generate_psk()?;
-    cordelia_storage::channels::create_local(&conn, &local_ch_id, &child_pk, Some(&local_psk))?;
-
-    // Save local PSK
-    cordelia_storage::psk::write_psk(&data_dir, &local_ch_id, &local_psk)?;
-
-    // Update config with swarm fields
-    config.identity.entity_id = entity_id.clone();
-    config.identity.public_key = child_pk_bech32.clone();
-    config.swarm.swarm_index = Some(index);
-    config.swarm.lead_identity_path = Some(lead_identity_path.to_string());
-    config.swarm.lead_entity_id = Some(lead_entity_id.to_string());
-    config.save(&config_file)?;
-
-    println!("Swarm node initialised:");
-    println!("  Entity:           {entity_id}");
-    println!("  Public key:       {child_pk_bech32}");
-    println!("  Derivation index: {index}");
-    println!("  Lead entity:      {lead_entity_id}");
-    println!("  Swarm channel:    {swarm_ch_id}");
-    println!("  Local channel:    {local_ch_id}");
-    println!("  Data directory:   {}", data_dir.display());
-
-    Ok(())
 }
 
 fn cmd_pubkey(config_path: &str) -> anyhow::Result<()> {
@@ -4642,7 +4428,7 @@ fn not_read_beside_another_version(
 }
 
 /// Refuse a command that opens the node's database itself and writes
-/// (`init` where it opens the database, `swarm-init`) where a node holds
+/// (`init` where it opens the database) where a node holds
 /// the lock on the data directory `data_dir` (decision 2026-10-04 §10.1,
 /// rule 6): opening runs the schema's steps, and would step the database
 /// under the node; and what the command writes would be written under it.
@@ -7939,12 +7725,10 @@ mod tests {
         assert!(refused.contains("could not be learned"), "{refused}");
     }
 
-    /// `cordelia stats` on a relay says the room of each kind of channel
-    /// against its cap, which is of one size for both (decision
-    /// 2026-10-04 §2.5): the older kind first, and then the channels from
-    /// their secrets, with how many it holds.
+    /// `cordelia stats` on a relay says its room against its cap
+    /// (decision 2026-10-04 §2.5), with how many channels it holds.
     #[test]
-    fn test_stats_says_the_room_of_each_kind_of_channel() {
+    fn test_stats_says_the_room_of_a_relay() {
         let held = EntriesHeld {
             used: 3 * 1_048_576,
             channels: 2,
@@ -7952,17 +7736,12 @@ mod tests {
             content_bytes: 7,
         };
         assert_eq!(
-            storage_lines(2048, 16 * 1_048_576, Some(&held)),
-            [
-                "Storage:          2.0 KB in use of 16.0 MB allowed, by channels of the older kind",
-                "                  3.0 MB in use of 16.0 MB allowed, by channels from their \
-                 secrets (2 held, 1 entry)",
-            ]
+            storage_line(16 * 1_048_576, &held),
+            "Storage:          3.0 MB in use of 16.0 MB allowed, by channels from their secrets \
+             (2 held, 1 entry)",
         );
         let more = EntriesHeld { entries: 5, ..held };
-        assert!(storage_lines(0, 1024, Some(&more))[1].ends_with("(2 held, 5 entries)"));
-        // A node that holds none of the new kind's tables says the one.
-        assert_eq!(storage_lines(2048, 4096, None).len(), 1);
+        assert!(storage_line(1024, &more).ends_with("(2 held, 5 entries)"));
     }
 
     /// Each system's service is restarted by its own command, as the

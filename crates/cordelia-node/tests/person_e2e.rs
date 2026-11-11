@@ -4907,7 +4907,7 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
 ///   status` says that the database was not read. Nothing is stepped:
 ///   the database is as it was, byte for byte.
 /// - **Beside a node that runs on the data directory,** `cordelia init
-///   --force` and `cordelia swarm-init` refuse, and write nothing; `stats`
+///   --force` refuses, and writes nothing; `stats`
 ///   and `channels` read the node's database, for reading only.
 #[test]
 fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
