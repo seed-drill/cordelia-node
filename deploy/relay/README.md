@@ -7,19 +7,20 @@ relays by name, so two devices always have somewhere to meet, even when
 they are never online at the same time (decision
 [2026-09-30-agent-memory-sync](../../docs/decisions/2026-09-30-agent-memory-sync.md) §4.6).
 
-**This version carries two kinds of channel,** and section 6 says what that
+**This version carries one kind of channel,** and section 6 says what that
 means for an upgrade:
 
 - **A channel from its secret**
   ([decision 2026-10-04](../../docs/decisions/2026-10-04-a-persons-devices.md)
-  §2.4, §2.5). Every channel of a person's devices is of this kind from this
-  version on. A relay stores an entry of one only if both of its signatures
-  hold, hands a channel only to a connection that has proved it holds the
-  channel's key, and tells nobody which channels it holds, the relays it
-  works with aside.
-- **The older kind,** which a relay goes on carrying as it did, for one
-  version more, so that a device that has not been upgraded is not cut off
-  in the middle.
+  §2.4, §2.5). Every channel of a person's devices is of this kind. A relay
+  stores an entry of one only if both of its signatures hold, hands a
+  channel only to a connection that has proved it holds the channel's key,
+  and tells nobody which channels it holds, the relays it works with aside.
+- **The older kind is carried by no node**
+  ([decision 2026-11-10](../../docs/decisions/2026-11-10-removing-the-older-kind.md),
+  rule 7). A relay answers what a peer asks of it with nothing, and refuses
+  what it is sent of it. What a relay of 0.2.0-alpha.19 left of that kind
+  stays in its database, unread, and nothing is added to it.
 
 Seed Drill operates two relays, `relay1.cordelia.seeddrill.ai` and
 `relay2.cordelia.seeddrill.ai`. They list each other, so they form a mesh,
@@ -188,13 +189,12 @@ what the relay holds and how much it is used, as counts only:
 - distinct peers seen in the last day and week, relays counted apart;
 - channels of the older kind that received an item in the last day and week.
 
-**Storage: two caps of one size.** `max_storage_bytes` (under `[node]` in
-the relay's config; 1 GiB if not set) is the most a relay holds of each kind
-of channel. The older kind is counted against it, and the channels from
-their secrets are counted against a cap of the same size, apart. Neither
-kind is refused or dropped to make room for the other. **So for the one
-version that carries both, a relay can hold twice its cap:** give the data
-volume room for that, and for the database's own overhead.
+**Storage.** `max_storage_bytes` (under `[node]` in the relay's config; 1
+GiB if not set) is the most a relay holds of channels from their secrets.
+What a relay of 0.2.0-alpha.19 left of the older kind is counted on the
+first line of `Storage:` against a cap of the same size, apart, and does not
+grow: give the data volume room for both, and for the database's own
+overhead.
 
 **What is counted.** Each entry counts as its encrypted content and 1 KB,
 for both kinds, and not as the pages of the database. So an entry that
@@ -232,14 +232,6 @@ held for 90 days (decision 2026-10-04 §2.3):
 - the log says how many entries went ("swept the deletes that this relay
   has held for 90 days").
 
-The older kind's deleted keys are collected on the same hourly timer, after
-the same 90 days, as before.
-
-**At its cap, for the older kind,** a relay takes no channel it does not
-already hold, and a write that takes it over makes it drop the channels it
-has held for the shortest time, until it is under. One channel may hold 16
-MB, and one address may make it take 16 new channels an hour.
-
 Nothing is lost for good by a drop while a device holds the channel: every
 device holds its channels whole, and sends a relay what it lacks. A relay
 that stays full needs a larger cap.
@@ -267,28 +259,18 @@ too, after `compose.yml`, or the container comes back at 512 MiB.
 
 Read the release's upgrade notes first.
 
-**Upgrading to this version: relays first, then devices.** A device on this
-version has only channels from their secrets, which a relay of the version
-before does not carry. A relay on this version carries both kinds, so a
-device that is still on the version before goes on through it as it did.
-(The whole order, for a person, is in section 10 of
-[decision 2026-10-04](../../docs/decisions/2026-10-04-a-persons-devices.md).)
+**Upgrading to this version, from 0.2.0-alpha.19: relays that list each
+other take it together.** A relay of alpha.19 that lists a relay of this
+version asks it each cycle for each channel of the older kind that it
+holds, and gets nothing; what it pushes of that kind is refused, and it
+tries again. Entries of channels from their secrets pass between the two as
+before, and devices of either version go on through either relay
+([decision 2026-11-10](../../docs/decisions/2026-11-10-removing-the-older-kind.md),
+rule 8).
 
-Before you upgrade a relay:
-
-1. **Check that the older kind fits its cap as it is now counted.** The
-   version before sets the cap against the pages of the database. This one
-   sets it against the items: each its encrypted content and 1 KB. A relay
-   with many small items can come out over its cap by that count. On the
-   version before, `cordelia stats` prints `Stored: N items, X of encrypted
-   content` (`items_stored` and `content_bytes_stored` with `--json`): N KB
-   and X together must be within `max_storage_bytes`. If they are not, raise
-   `max_storage_bytes` before the upgrade. A relay that is over its cap
-   drops the channels of the older kind that it has held for the shortest
-   time, at its next write, until it is under.
-2. **Give the volume room for twice the cap,** as above.
-3. **List by key each relay that this one works with** (section 7). A
-   default relay named without a key has the key that is compiled in.
+Before you upgrade a relay, **list by key each relay that this one works
+with** (section 7). A default relay named without a key has the key that is
+compiled in.
 
 The schema's steps are run when the relay starts, and change no row that is
 there. A relay makes no copy of its database and takes no step that empties
@@ -318,10 +300,8 @@ each device's config, for a relay of your own.
 The database on that volume can be lost, and nothing is lost for good while
 a device holds what it held. A relay is a cache: it pulls what it lacks from
 the relays it works with, and each device sends it what it has not been
-sent. For the older kind it also asks its devices, when they connect and
-every ten minutes after. It takes at most 256 new channels from their
-secrets an hour from one address (16 of the older kind), and 2 MB a minute
-from one device, so a large refill takes a while. A channel that comes back
+sent. It takes at most 256 new channels an hour from one address, and 2 MB
+a minute from one device, so a large refill takes a while. A channel that comes back
 is new from then: the relay has held it since it took it again, unless a
 relay it works with has held it longer.
 
@@ -394,11 +374,6 @@ should know:
 - **A relay that drops the phrase's channel and takes it again counts it as
   new from then.** It is otherwise the channel of a person's that a relay
   has held longest, and the last of theirs to go.
-- **The older kind of channel takes whatever any key signs.** That is why
-  the two kinds have a cap each: under one cap, whoever filled the older
-  channels would push out every upgraded person's new ones, and whoever
-  made new channels without end would push out everyone who had not yet
-  upgraded.
 
 A second relay is the way round a relay that is full or whose limits are
 used up, and it helps against a removed device only if it is one that

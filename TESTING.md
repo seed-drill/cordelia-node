@@ -77,45 +77,40 @@ tests here:
 cargo test -p cordelia-node --tests --no-fail-fast -- --ignored
 ```
 
-`CORDELIA_TEST_BINARY_BEFORE` names the binary of the release before
-messages between a person's agents (alpha.10), which
-`a_device_of_the_version_before_beside_one_of_this_version` in `msg_e2e.rs`
-runs beside this build. `CORDELIA_TEST_BINARY_BEFORE_SHARED` names the
-binary of the release before shared channels (alpha.17, at step 20, which
-the relays and devices run now), which `shared_e2e.rs` runs as the relay
-in `a_relay_carries_a_shared_channel_with_no_change`, and as a device in
-`a_device_of_the_version_before_ignores_shared_lists`. Main's workspace
-was at alpha.17 too until alpha.18, so the relay's test tells the
-binary from this build by its bytes, not by the version it prints. CI downloads each
-from the release that `ci.yml` names in `VERSION_BEFORE` and
-`VERSION_BEFORE_SHARED`, and checks each against the SHA-256 that
-`ci.yml` names beside it (`VERSION_BEFORE_SHA256`,
-`VERSION_BEFORE_SHARED_SHA256`), and not against a checksum taken from
-the same release, which would not catch an asset replaced there. The
-job's checkout keeps no token on disk while it runs. Where a variable is
-not set, the test says so and passes without running, but where `CI` is
-`true`, as GitHub sets it, it fails. To run the first here (the second
-likewise, with `v0.2.0-alpha.17`,
-`58fe2242347ecff805ca4528cb8aee65c4af93b1cace3a3c06978cd247d1f611` and
-`CORDELIA_TEST_BINARY_BEFORE_SHARED`):
+`CORDELIA_TEST_BINARY_BEFORE` names the binary of the version before:
+alpha.19, the one release this version works beside and takes over from
+(decision 2026-11-10 (older kind), rules 4 and 10). `devices_e2e.rs` runs
+it as a relay and as a device in
+`a_relay_of_the_version_before_and_one_of_this_build_list_each_other`, and
+`shared_e2e.rs` as the relay in
+`a_relay_carries_a_shared_channel_with_no_change`. Main's workspace may
+say the same version as the release before until the next release is
+cut, so the relay's test tells the binary from this build by its bytes,
+not by the version it prints. CI downloads it from the release that
+`ci.yml` names in `VERSION_BEFORE`, and checks it against the SHA-256
+that `ci.yml` names beside it (`VERSION_BEFORE_SHA256`), and not against
+a checksum taken from the same release, which would not catch an asset
+replaced there. The job's checkout keeps no token on disk while it runs.
+Where the variable is not set, each test says so and passes without
+running, but where `CI` is `true`, as GitHub sets it, it fails. To run
+them here:
 
 ```bash
-v=v0.2.0-alpha.10
-sha=cf53f451bf939bb218f3ee10cf9ac25c27e71536fa56d44a6d1feaf2d88ee5a8
+v=v0.2.0-alpha.19
+sha=e7f15e59c089a3d839ad77e25b21abd174cf99c1896c21f474822d765ede4bd6
 d=$(mktemp -d)
 base=https://github.com/seed-drill/cordelia-node/releases/download/$v
 curl -fsSL -o $d/cordelia-linux-amd64 $base/cordelia-linux-amd64
 echo "$sha  $d/cordelia-linux-amd64" | sha256sum -c - && chmod +x $d/cordelia-linux-amd64
 CORDELIA_TEST_BINARY_BEFORE=$d/cordelia-linux-amd64 \
-  cargo test -p cordelia-node --test msg_e2e a_device_of_the_version_before
+  cargo test -p cordelia-node --test devices_e2e a_relay_of_the_version_before
 ```
 
-Each pair of values changes together, at a release: when the release
-before messages is to be another, set `VERSION_BEFORE` to its tag and
-`VERSION_BEFORE_SHA256` to the SHA-256 of its `cordelia-linux-amd64` (and
-so `VERSION_BEFORE_SHARED` and its SHA-256),
-worked out from the binary downloaded and checked against the release's
-published `.sha256`, in one commit.
+The two values change together: when the version before is to be
+another, set `VERSION_BEFORE` to its tag and `VERSION_BEFORE_SHA256` to
+the SHA-256 of its `cordelia-linux-amd64`, worked out from the binary
+downloaded and checked against the release's published `.sha256`, in one
+commit.
 
 ```bash
 cargo test -p cordelia-node --test person_e2e
@@ -138,11 +133,11 @@ cargo test -p cordelia-node --test threat_model
 | `memory_e2e.rs` | Memory syncing between a person's devices, in channels from the person's secret, set up with the commands a person types: a phrase is made and the folders are published, and a second device's folders meet them; a removed device's later edit reaches nobody and the others go on syncing; an edit made before a device heard of a change arrives as an edit of the carried version; a device that was off during a removal, where a relay it reaches holds the change and where none does; a relay that is lost before the names went does not end the wait after a change |
 | `carry_e2e.rs` | A carry that a person asks for (decision 2026-10-04 §7.3): `cordelia sync carry` brings in what a device that never returned had sent to the relay; a device that comes to sync a name carries it first; what a removed device wrote comes in only by `--from`, at a terminal, with the phrase, and above a version only on a second yes; a generation that a device never held is read with `--phrase` |
 | `recover_e2e.rs` | `cordelia recover` (decision 2026-10-04 §9), on a machine that follows no phrase: a person who lost both devices recovers what either had sent, and no word of the phrase reaches the node, a log or a file; nothing of a device in someone else's hands comes in but by `--from`; a device that the person still has stops, and is added again; a recovery that was cut short is recovered from; two changes made apart are found and settled. A recovery's wait for the change at each relay and its judgement of the device it recovers from (decision 2026-10-19 §4, rules 9 and 10), with real processes and ignored for their length: a recovery ends with status 3 where a relay that lacks the change cannot be reached, and with 0 where every relay holds it; and it says before its yes where what was carried is at a relay that it did not read, with both endings |
-| `devices_e2e.rs` | Two devices of one person, driven through the command line and the local API: a phrase, `add-device` and `accept`, and what one publishes under a name that both hold reaches the other through the relay. Claude memory between two machines; home memory under any name; an edit overtaken while apart; the line of a memory that comes back; local history and its restore. Relays that are down, that lose their database and are filled again; a node's stopping on each signal; a personal node that listens on nothing. The older kind of channel as a relay carries it, shown with a stand-in that speaks its streams. A relay that cannot be reached from here, dialled as today until a change and amber after it (decision 2026-10-19 §6, rule 11), ignored for its length. And the harness itself: it starts no node that would dial another machine |
-| `relay_entries_e2e.rs` | A relay that carries channels from their secrets, beside the older kind (decision 2026-10-04 §2.4, §2.5). The test is the client: it opens the streams itself. A client with a channel's secret pushes, proves and pulls; one with only the channel's ID gets nothing; a show, whole and short; a relay near its cap; the allowance of new channels; the limits by address, counted for both kinds together; two relays that work together; a channel unused for 90 days; a personal node that answers none of these streams |
+| `devices_e2e.rs` | Two devices of one person, driven through the command line and the local API: a phrase, `add-device` and `accept`, and what one publishes under a name that both hold reaches the other through the relay. Claude memory between two machines; home memory under any name; an edit overtaken while apart; the line of a memory that comes back; local history and its restore. Relays that are down, that lose their database and are filled again; a node's stopping on each signal; a personal node that listens on nothing. No node carries the older kind of channel: a device and a relay answer what is asked of it with nothing, and a relay of alpha.19 and one of this build list each other and carry a device of each (decision 2026-11-10 (older kind), rules 7 and 10). A relay that cannot be reached from here, dialled as today until a change and amber after it (decision 2026-10-19 §6, rule 11), ignored for its length. And the harness itself: it starts no node that would dial another machine |
+| `relay_entries_e2e.rs` | A relay that carries channels from their secrets (decision 2026-10-04 §2.4, §2.5), and none of the older kind. The test is the client: it opens the streams itself. A client with a channel's secret pushes, proves and pulls; one with only the channel's ID gets nothing; a show, whole and short; a relay near its cap; the allowance of new channels; an entry over the size limit; the limits by address, and small entries counted for what they take; two relays that work together; a channel unused for 90 days; a personal node that answers none of these streams |
 | `device_entries_e2e.rs` | A device's side of its relays (decision 2026-10-04 §4.6, §7.3). The device is in the test's process: the node's own engine over real connections, with a clock of its own that a test runs ahead where a wait is tested. The relays are processes. The show, whole once and short after; leave, when it is given and when it ends; a device that wakes; a device that applies the change its relay holds before it sends anything; what a relay refuses for room; a hand-over that is dropped after two hours; the pair channel of a typed key; the door through which a carry reads a channel that was left; a read of a channel of the device's own with places of its own, round by round and outside the database's lock (decision 2026-10-17 §4.2); the sweep of the deletes that a device has held for 90 days; a node that is held up makes no pass. The pass of shared channels (decision 2026-10-10 §8.4), against a stand-in: a shared channel asked only at its relays that the device knows by key, after its own channels; the shared pass's own counter of requests; shared traffic that never refuses the device's own requests or bytes, pages in turn and the two byte shares; a shared request refused for now; and the door of a share pair channel against a relay. What a device knows of each relay (decision 2026-10-19 §1): each answer to a show that says whether the relay holds the change is kept, and every other is a failed attempt; a relay out of reach, refusing, or stuck, through the pass; for how long a relay has lacked the change, and when the device woke, as a status reads them (rule 11); and, with real processes and ignored for its length, a relay that lacks the change dialled every half minute |
 | `first_start_e2e.rs` | A node's first start on this version (decision 2026-10-04 §10.1): a personal node whose database is in the released version's form copies it and moves it on, once, after its port is bound; a relay makes no copy and keeps every older row, and removes the guard from a device's database; a node that cannot bind changes nothing; a second node on the same data directory says so and changes nothing; a node answers while the copy is being made; a first start that cannot be made holds the node up until it can; a database from a later version is refused; a device whose scope was stored on has the notice of what stopped, and its folders sync again once they are mapped |
-| `msg_e2e.rs` | Messages between a person's own agents (decision 2026-10-09 §3, §4, §6), each command run as an agent runs it, in a mapped folder: `cordelia msg send`, `msg summary` and `msg read` between two devices through a relay, and `msg log` run by a person at a terminal and into a pipe: every name at a terminal and the folder's agent anywhere else, the hold between two agents that only a yes at a terminal ends, and a message that arrives during its question; the summary announces once, marks only the lines it printed, counts the rest, prints nothing on any error and keeps to its 100 ms; the folder from Claude Code's variable, the hook's input and the working directory; the frame a body cannot close; the names `send` takes, a reply's recipient, the rates of a folder and of the device, a body that is too large or does not end; sync off, no phrase and a removed device; that a message changes nothing and reaches no file; the status's `messages` object; a statement, and what a removed device reads; the version before beside this one; the summary's help |
+| `msg_e2e.rs` | Messages between a person's own agents (decision 2026-10-09 §3, §4, §6), each command run as an agent runs it, in a mapped folder: `cordelia msg send`, `msg summary` and `msg read` between two devices through a relay, and `msg log` run by a person at a terminal and into a pipe: every name at a terminal and the folder's agent anywhere else, the hold between two agents that only a yes at a terminal ends, and a message that arrives during its question; the summary announces once, marks only the lines it printed, counts the rest, prints nothing on any error and keeps to its 100 ms; the folder from Claude Code's variable, the hook's input and the working directory; the frame a body cannot close; the names `send` takes, a reply's recipient, the rates of a folder and of the device, a body that is too large or does not end; sync off, no phrase and a removed device; that a message changes nothing and reaches no file; the status's `messages` object; a statement, and what a removed device reads; the summary's help |
 | `shared_e2e.rs` | Making, sharing and taking a shared channel (decision 2026-10-10, slice 6), each command run as a person runs it, at a terminal: `cordelia shared new`, `share`, `accept <key> --channel`, `label`, `shared list` and `id --words`, between two people's devices that know one relay by its key; a share and an accept in either order, and each device then holding the other's key from its empty anew record; a device added later holding the channel; the two `accept`s kept apart; nothing of the person's own shared; a name never both kinds on one device; a yes at a terminal for each command; the refusals on their streams; a channel only at its relays known by key; and, against a stand-in relay, two shares waiting that take none. Subscribing and messages (slice 7): `subscribe` and `unsubscribe`, the summary's one line and count, a folder that does not subscribe shown nothing, the frame of another person's agent and of the person's own device, a reply that needs its channel, `--to` and `--all` that never reach a shared channel, nothing of reading written in the channel, `log` with a body only at a terminal, no body in any file, and the messages record's routes unchanged. Making anew, moving, a removal and a recovery (slice 8). The status (slice 9): `cordelia status --json` carries the node's `shared` object and sets no level of it, and the device that makes a removal, having made each channel anew, is not amber for it |
 | `joining_e2e.rs` | Joining a repository's shared channel by pull request (decision 2026-11-06 (joining), section 12), run as people run it, at a terminal, with real nodes, a relay of the test's own, and real git clones. A bare repository on the disk stands for the host: a merge is a commit pushed there, and a person's `git fetch` brings it into a clone whose `origin` names `github.com/example/project`. The node reads the list from the clone only, and runs git through a script that writes down each command, so a test can say that the node fetched nothing. Each device reads its lists every few seconds, with `[members] read_interval_secs`, which only a test sets (configuration.md §2.13): a member's every 20, a joiner's every 5. Its seven tests are listed below the table. The git of a list's read has its own tests in `crates/cordelia-api/tests/git_list.rs`, against a server of git over HTTPS on loopback (`git http-backend`, in that crate's `tests/common`): a read at the remote's default branch only, never back, a partial clone read without a fetch, and nothing of the person's reaching git, so that nothing asks, at a terminal too. Both need `git` on the `PATH` |
 | `removal_e2e.rs` | A removal that fails safe (decision 2026-10-24 (removal), section 7), with relays of the test's own, devices set up with one relay or more, and the secrets a device holds read from its database: a removal made apart from a renewal takes effect without `settle` (test 1); relays that work together spread it (test 2); a removed device that shows old changes pushes no head out (test 5); a device that slept through changes made apart follows the clear one (test 4); a closed device shows every head at a relay that keeps heads, and none above the change followed at one that does not (test 18); nothing a removed device sends after its removal is taken by a device that knows, and what it wrote late is set aside (test 7); a record that hands a removed device the secret closes a device. The window before a device reads a removal is bounded to 90 seconds (test 6): ignored for its length, some minutes, and run in CI's job of the ignored tests |
