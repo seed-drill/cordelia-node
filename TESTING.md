@@ -151,8 +151,8 @@ cargo test -p cordelia-node --test threat_model
 
 **The seven tests of `joining_e2e.rs`,** each a part of section 12 of the joining record:
 
-- `two_people_join_by_a_merged_pull_request_alone`: the whole join, a message between the two, the join's amber until `shared seen`, the list from the clone only, and `unsubscribe` in a clone.
-- `a_device_that_follows_before_the_channel_is_named_waits_and_says_why`: order does not matter; a device that follows first waits, and says what for.
+- `two_people_join_by_a_merged_pull_request_alone`: the whole join, a message between the two, the amber of a key new on the list until `shared seen`, the list from the clone only, and `unsubscribe` in a clone, after which a new follow names the device already listed.
+- `a_device_that_follows_before_the_channel_is_named_waits_and_says_why`: order does not matter; a device that follows first waits, and says what for; its first list with a channel line names the member already listed.
 - `a_clone_behind_the_last_commit_read_gives_no_new_list_across_a_restart`: a read of the clone never goes back, across a restart too.
 - `only_the_named_channel_is_taken_and_only_keys_on_the_list_are_handed_it`: a share of another channel is not taken, and a key on a local branch or in the working tree is handed nothing.
 - `nine_new_keys_with_eight_off_the_ninth_is_handed_the_channel_at_the_third_read`: the turns of rule 4.2.

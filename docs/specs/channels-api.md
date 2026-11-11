@@ -1447,7 +1447,12 @@ never held, comes in only under **a word that the phrase signed:**
     fetched; `members`, each with `label`, `key`, `words` and `in` (null
     where this device does not hold the channel); the unread counts; and
     `lines`, each with a `word`, what it `says`, whether it is `amber`,
-    and a channel `line` to put in the list, where it says to. Each amber
+    and a channel `line` to put in the list, where it says to. A line whose
+    word is `joined`, the keys new on the list at one commit (decision
+    2026-11-06 (joining), rule 4.5, as the person ruled on 10 November),
+    also gives that `commit`, whole, and `devices`, each with `label`,
+    `key` and `words` as `members` gives them; its `says` names six labels
+    and how many more. Each amber
     line is a hold `shared_repository`; nothing else of `shared` but the
     hold of a removed device that holds a shared channel changes the
     level.

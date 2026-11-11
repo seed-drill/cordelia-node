@@ -2962,8 +2962,8 @@ pub const MEMBERS_ASKED_PER_PASS: usize = 32;
 pub const MEMBERS_COMMIT_SHOWN_CHARS: usize = 12;
 
 /// The labels of a list's members that the plain status shows of each
-/// repository before "and <n> more" (rule 7): `--json` and `shared list`
-/// give each.
+/// repository before "and <n> more" (rule 7), and of the keys new on the
+/// list at a commit (rule 4.5): `--json` and `shared list` give each.
 pub const MEMBERS_LABELS_SHOWN: usize = 6;
 
 // Checked at compile time (decision 2026-10-10 §14). The largest card is

@@ -372,60 +372,53 @@ fn noticed(
             })?;
         }
     }
-    joined(conn, identity, follow, list, commit, now)
+    joined(conn, identity, of, kept, list, commit, now)
 }
 
-/// Rule 4.5: each key the list names that this device first held an entry
-/// of in the channel the list names since the last read, and since the
-/// follow, gives a notice, once. The person's own devices give none, nor
-/// does a key that moved there with the person, sealed to by the offer
-/// that made the channel: it first writes there as it moves. Nor does a
-/// read just after this device came to hold the channel: every key it
-/// then first holds was there before it, as far as it can tell.
-fn joined(
+/// Rule 4.5, as the person ruled on 10 November ("by the list alone"): a
+/// read that counts, of `list` at `commit`, whose channel line names a
+/// channel, notices each key on it that the list kept before, `kept`, did
+/// not name, with its label and the channel the line names. Where there is
+/// no list kept, or it named no channel, every key on `list` is new: so a
+/// first follow, a follow made anew and the first list with a channel line
+/// name each. Only this device's own key and the person's other devices
+/// are left out, a twin counting as its key; a device of the person's that
+/// was removed is no longer theirs, so it is named. Nothing else is asked:
+/// not who wrote in the channel, nor when, nor whether this device holds
+/// it. A key dropped and listed again is new again. `of` is the follow's
+/// identity.
+pub(crate) fn joined(
     conn: &Connection,
     identity: &NodeIdentity,
-    follow: &Follow,
+    of: &str,
+    kept: Option<&Members>,
     list: &Members,
     commit: &str,
     now: i64,
 ) -> Result<(), PersonError> {
-    // A follow has a last read: one with none would not know since when.
-    let (Some(line), Some(last)) = (&list.channel, &follow.last) else {
+    let Some(line) = &list.channel else {
         return Ok(());
     };
-    let Some(row) = kept::channel(conn, &line.channel)? else {
-        return Ok(());
-    };
-    let since = last.at.max(follow.followed_at);
-    if row.first_held > since {
-        return Ok(());
-    }
+    let kept = kept.filter(|kept| kept.channel.is_some());
     let own = identity.public_key();
     let own_devices = crate::person::who_counts(conn)?.devices_held();
-    let moved: Holders = crate::shared_anew::moved_with(conn, &own, &line.channel)?
-        .into_iter()
-        .collect();
-    for key in kept::keys(conn, row.id)? {
-        if key.first_held.is_none_or(|first| first <= since)
-            || Holder::of(&key.key) == Holder::of(&own)
-            || own_devices.holds(&key.key)
-            || moved.holds(&key.key)
+    for device in &list.devices {
+        if kept.is_some_and(|kept| kept.lists(&device.key))
+            || Holder::of(&device.key) == Holder::of(&own)
+            || own_devices.holds(&device.key)
         {
             continue;
         }
-        if let Some(label) = list.label_of(&key.key) {
-            let notice = Notice {
-                of: NoticeOf::Joined {
-                    key: key.key,
-                    label: label.to_string(),
-                    channel: line.channel,
-                },
-                commit: commit.to_string(),
-                at: now,
-            };
-            follows::notice(conn, &follow.identity, &notice)?;
-        }
+        let notice = Notice {
+            of: NoticeOf::Joined {
+                key: device.key,
+                label: device.label.clone(),
+                channel: line.channel,
+            },
+            commit: commit.to_string(),
+            at: now,
+        };
+        follows::notice(conn, of, &notice)?;
     }
     Ok(())
 }

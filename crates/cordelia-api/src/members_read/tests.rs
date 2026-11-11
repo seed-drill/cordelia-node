@@ -718,48 +718,163 @@ fn nothing_is_handed_over_in_a_channel_made_anew_without_the_person_and_a_fault_
 
 // ── The notices (rules 4.5, 4.6 and 6) ───────────────────────────────
 
-/// A key the list names that first writes in the channel after the follow
-/// shows as joined, once (rule 4.5): one there before the follow does not,
-/// nor one the list does not name, nor a device of the person's own; and
-/// once seen it does not come back.
-#[test]
-fn a_listed_key_that_first_writes_after_the_follow_joined_once() {
-    let s = bob(2);
-    let now = s.now + 10;
-    let channel = holds(&s, 0, 7, "review", now);
-    let (alice, carol, dave) = (member(1), member(2), member(3));
-    write_in(&s, &channel, &[&alice], now);
-    let list = list_of(
-        Some((&channel.id, &[])),
-        &[
-            (alice.public_key(), "alice"),
-            (carol.public_key(), "carol"),
-            (s.key(1), "bob-desktop"),
-        ],
-    );
-    follows_at(&s, &list, &commit('a'), now + 1);
-    write_in(&s, &channel, &[&carol, &dave, &s[1].identity], now + 5);
-    reads(&s, &list, &commit('b'), now + READ);
-    assert_eq!(notices(&s), [format!("joined carol at {}", commit('b'))]);
-    reads(&s, &list, &commit('b'), now + 2 * READ);
-    assert_eq!(notices(&s).len(), 1, "once");
-    assert_eq!(follows::seen(&s[0].conn, REPOSITORY).unwrap(), 1);
-    reads(&s, &list, &commit('c'), now + 3 * READ);
-    assert!(notices(&s).is_empty(), "seen, it does not come back");
+/// The keys of device 0 that rule 4.5 names new on the list, as text: each
+/// label with its commit, by label.
+fn named_new(s: &Several) -> Vec<String> {
+    let mut joins: Vec<String> = notices(s)
+        .into_iter()
+        .filter(|notice| notice.starts_with("joined "))
+        .collect();
+    joins.sort();
+    joins
 }
 
-/// The keys that moved into a channel made anew, sealed to by the offer
-/// that made it, show no join as each first writes there: only a key the
-/// offer did not seal to does (rule 4.5; the review of slice 5a, M3).
+/// `label` new on the list at `commit`, as [`named_new`] says it.
+fn joined_at(label: &str, commit: &str) -> String {
+    format!("joined {label} at {commit}")
+}
+
+/// The person says yes on device 0 to follow the repository from its clone
+/// with the list `list` at `commit`, at `now`: a first follow, or a follow
+/// again (rule 2.5).
+fn subscribes(s: &Several, list: &str, commit: &str, now: i64) {
+    subscribes_as(s, REPOSITORY, None, list, commit, now);
+}
+
+/// [`subscribes`], to `repository`, replacing the follow of `replaces`,
+/// where it names one.
+fn subscribes_as(
+    s: &Several,
+    repository: &str,
+    replaces: Option<&str>,
+    list: &str,
+    commit: &str,
+    now: i64,
+) {
+    let following = crate::following::Following {
+        identity: repository.into(),
+        remote: "origin".into(),
+        clone: FOLDER.into(),
+        commit: commit.into(),
+        list: list.as_bytes().to_vec(),
+        fetched_at: None,
+        replaces: replaces.map(str::to_string),
+        agent: "project".into(),
+        then: crate::following::Then::Nothing,
+    };
+    crate::following::make(&s[0].conn, &s[0].identity, &following, now).unwrap();
+}
+
+/// A first follow names, at its yes, each key on the list but the person's
+/// own: this device and their other device, each as itself or its twin. A
+/// device of theirs that was removed is theirs no more, and is named. It
+/// asks nothing of the channel, which this device does not hold here.
+/// Following again names nothing; the node's next read names a key the
+/// list adds. After `unsubscribe`, a new follow names every key again.
 #[test]
-fn keys_that_moved_into_a_channel_made_anew_show_no_join() {
+fn a_first_follow_names_every_key_on_the_list_but_your_own() {
+    let mut s = bob(3);
+    s.change(0, &[0, 1], &[2]);
+    let now = s.now + 10;
+    let channel = Shared::of(7);
+    let (alice, carol, dave) = (member(1), member(2), member(3));
+    let mut devices = vec![
+        (alice.public_key(), "alice-laptop"),
+        (s.key(0), "bob-laptop"),
+        (twin(&s.key(1)), "bob-desktop"),
+        (s.key(2), "bob-old"),
+        (carol.public_key(), "carol-laptop"),
+    ];
+    let list = list_of(Some((&channel.id, &[])), &devices);
+    subscribes(&s, &list, &commit('a'), now);
+    let first = [
+        joined_at("alice-laptop", &commit('a')),
+        joined_at("bob-old", &commit('a')),
+        joined_at("carol-laptop", &commit('a')),
+    ];
+    assert_eq!(named_new(&s), first);
+    // The node's read just after it: the same list, nothing new.
+    reads(&s, &list, &commit('a'), now + 1);
+    assert_eq!(named_new(&s), first);
+
+    // Following again, with Dave on the list: nothing at the yes, and Dave
+    // at the node's next read, against the list kept.
+    devices.push((dave.public_key(), "dave-laptop"));
+    let with_dave = list_of(Some((&channel.id, &[])), &devices);
+    subscribes(&s, &with_dave, &commit('b'), now + 2);
+    assert_eq!(named_new(&s), first, "following again names nothing");
+    reads(&s, &with_dave, &commit('b'), now + 3);
+    assert!(named_new(&s).contains(&joined_at("dave-laptop", &commit('b'))));
+
+    // `unsubscribe`, and a new follow: every key again, with the twin of
+    // this device and the other device as itself.
+    follows::unfollow(&s[0].conn, REPOSITORY).unwrap();
+    let again = list_of(
+        Some((&channel.id, &[])),
+        &[
+            (twin(&s.key(0)), "bob-laptop"),
+            (s.key(1), "bob-desktop"),
+            (alice.public_key(), "alice-laptop"),
+            (dave.public_key(), "dave-laptop"),
+        ],
+    );
+    subscribes(&s, &again, &commit('c'), now + 4);
+    assert_eq!(
+        named_new(&s),
+        [
+            joined_at("alice-laptop", &commit('c')),
+            joined_at("dave-laptop", &commit('c')),
+        ]
+    );
+    let kept = follows::notices(&s[0].conn, REPOSITORY).unwrap();
+    assert!(kept.iter().any(|notice| notice.of
+        == NoticeOf::Joined {
+            key: alice.public_key(),
+            label: "alice-laptop".into(),
+            channel: channel.id,
+        }));
+}
+
+/// A clone that lags: a key whose entries this device held before its list
+/// named it is named at the read that first lists it. Who wrote in the
+/// channel, and when, counts for nothing.
+#[test]
+fn a_key_held_before_the_list_named_it_is_named_when_it_is_listed() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let (alice, carol) = (member(1), member(2));
+    let first = list_of(Some((&channel.id, &[])), &[(alice.public_key(), "alice")]);
+    follows_at(&s, &first, &commit('a'), now);
+    write_in(&s, &channel, &[&alice, &carol], now + 5);
+    reads(&s, &first, &commit('a'), now + READ);
+    assert!(named_new(&s).is_empty(), "Alice was on the list kept");
+    let both = list_of(
+        Some((&channel.id, &[])),
+        &[(alice.public_key(), "alice"), (carol.public_key(), "carol")],
+    );
+    reads(&s, &both, &commit('b'), now + 2 * READ);
+    assert_eq!(named_new(&s), [joined_at("carol", &commit('b'))]);
+}
+
+/// A channel made anew, and moved to, between two reads: a list that names
+/// the new channel with the same keys names none, and a key it lists for
+/// the first time is named.
+#[test]
+fn a_channel_made_anew_names_only_a_key_new_on_the_list() {
     let s = bob(1);
     let now = s.now + 10;
     let (conn, identity) = (&s[0].conn, &s[0].identity);
     let old = holds(&s, 0, 7, "review", now);
-    let (alice, carol, dave, eve) = (member(1), member(2), member(3), member(4));
-    write_in(&s, &old, &[&alice, &carol, &dave], now);
-    // Alice makes it anew without Dave, sealed to Carol and Bob; Bob moves.
+    let (alice, carol, eve) = (member(1), member(2), member(4));
+    write_in(&s, &old, &[&alice, &carol], now);
+    let devices = [(alice.public_key(), "alice"), (carol.public_key(), "carol")];
+    follows_at(
+        &s,
+        &list_of(Some((&old.id, &[])), &devices),
+        &commit('a'),
+        now,
+    );
     let sealed = [alice.public_key(), carol.public_key(), s.key(0)];
     stores(&s, 0, &offer_by(&alice, &old, 21, &sealed, now), now);
     let plan =
@@ -768,71 +883,206 @@ fn keys_that_moved_into_a_channel_made_anew_show_no_join() {
     crate::shared_anew::make_move(conn, identity, &plan.what, now).unwrap();
     let new = Shared::of(21);
     assert_eq!(plan.what.to.channel, new.id);
-    let list = list_of(
-        Some((&new.id, &[dave.public_key()])),
-        &[
-            (alice.public_key(), "alice"),
-            (carol.public_key(), "carol"),
-            (eve.public_key(), "eve"),
-        ],
-    );
-    follows_at(&s, &list, &commit('a'), now + 1);
     write_in(&s, &new, &[&alice, &carol, &eve], now + 5);
-    reads(&s, &list, &commit('a'), now + READ);
-    assert_eq!(notices(&s), [format!("joined eve at {}", commit('a'))]);
+    let same = list_of(Some((&new.id, &[])), &devices);
+    reads(&s, &same, &commit('b'), now + READ);
+    assert!(named_new(&s).is_empty(), "{:?}", notices(&s));
+    let with_eve = list_of(
+        Some((&new.id, &[])),
+        &[devices[0], devices[1], (eve.public_key(), "eve")],
+    );
+    reads(&s, &with_eve, &commit('c'), now + 2 * READ);
+    assert_eq!(named_new(&s), [joined_at("eve", &commit('c'))]);
 }
 
-/// Following again keeps when the list was last read (the review of slice
-/// 5a, L1): a key first held between that read and the yes shows as
-/// joined at the node's next read.
+/// A key dropped from the list and then listed again is named again, at
+/// the commit that lists it again: its notice not yet cleared takes that
+/// commit.
 #[test]
-fn following_again_notices_a_join_since_the_read_before_it() {
+fn a_key_dropped_and_listed_again_is_named_again() {
     let s = bob(1);
     let now = s.now + 10;
     let channel = holds(&s, 0, 7, "review", now);
-    let carol = member(2);
-    let list = list_of(Some((&channel.id, &[])), &[(carol.public_key(), "carol")]);
-    follows_at(&s, &list, &commit('a'), now);
-    write_in(&s, &channel, &[&carol], now + 5);
-    let again = crate::following::Following {
-        identity: REPOSITORY.into(),
-        remote: "origin".into(),
-        clone: FOLDER.into(),
-        commit: commit('b'),
-        list: list.as_bytes().to_vec(),
-        fetched_at: None,
-        replaces: None,
-        agent: "project".into(),
-        then: crate::following::Then::Nothing,
-    };
-    crate::following::make(&s[0].conn, &s[0].identity, &again, now + 10).unwrap();
-    assert_eq!(row(&s).unwrap().last.unwrap().at, now);
-    reads(&s, &list, &commit('b'), now + READ);
-    assert_eq!(notices(&s), [format!("joined carol at {}", commit('b'))]);
+    let (alice, carol) = (member(1), member(2));
+    let line = Some((&channel.id, &[][..]));
+    let alice_only = list_of(line, &[(alice.public_key(), "alice")]);
+    let both = list_of(
+        line,
+        &[(alice.public_key(), "alice"), (carol.public_key(), "carol")],
+    );
+    follows_at(&s, &alice_only, &commit('a'), now);
+    reads(&s, &both, &commit('b'), now + 1);
+    assert_eq!(named_new(&s), [joined_at("carol", &commit('b'))]);
+    reads(&s, &alice_only, &commit('c'), now + 2);
+    reads(&s, &both, &commit('d'), now + 3);
+    assert_eq!(named_new(&s), [joined_at("carol", &commit('d'))]);
+    assert_eq!(follows::seen(&s[0].conn, REPOSITORY).unwrap(), 1);
+    reads(&s, &alice_only, &commit('e'), now + 4);
+    reads(&s, &both, &commit('f'), now + 5);
+    assert_eq!(named_new(&s), [joined_at("carol", &commit('f'))]);
 }
 
-/// A device that comes to hold the channel after it followed takes none of
-/// the keys it then first holds for a join: they were there before it, as
-/// far as it can tell. A key that first writes after that read is noticed.
+/// A read that counts for nothing names nothing, whether it failed, was
+/// behind, or its list did not parse: the next read that counts names the
+/// key, against the list kept.
 #[test]
-fn a_device_that_comes_to_hold_the_channel_notices_no_join_of_those_there_before() {
+fn a_read_that_counts_for_nothing_names_nothing() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let first = list_with(Some((&channel.id, &[])), &listed(1..=1));
+    follows_at(&s, &first, &commit('a'), now);
+    let later = list_with(Some((&channel.id, &[])), &listed(1..=2));
+    let failed = CloneRead {
+        follow: row(&s).unwrap(),
+        read: Err(ListFailed::NoRemoteHead {
+            remote: "origin".into(),
+        }),
+    };
+    assert!(matches!(done(&s, &failed, now + 1), Done::NotRead(_)));
+    let behind = read_of(&s, &later, &commit('b'), false);
+    assert!(matches!(done(&s, &behind, now + 2), Done::NotRead(_)));
+    let not_a_list = format!("{later}not a key and a label\n");
+    assert!(matches!(
+        reads(&s, &not_a_list, &commit('b'), now + 3),
+        Done::NotRead(_)
+    ));
+    assert!(notices(&s).is_empty(), "{:?}", notices(&s));
+    reads(&s, &later, &commit('b'), now + 4);
+    assert_eq!(named_new(&s), [joined_at("m2", &commit('b'))]);
+}
+
+/// A key's twin is the same key (rule 4.5): a list that names the twin of
+/// a key the list kept names, in its place, names nothing new.
+#[test]
+fn a_twin_of_a_key_on_the_list_kept_is_not_new() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = holds(&s, 0, 7, "review", now);
+    let alice = member(1).public_key();
+    let line = Some((&channel.id, &[][..]));
+    follows_at(&s, &list_of(line, &[(alice, "alice")]), &commit('a'), now);
+    reads(
+        &s,
+        &list_of(line, &[(twin(&alice), "alice")]),
+        &commit('b'),
+        now + 1,
+    );
+    assert!(named_new(&s).is_empty(), "{:?}", notices(&s));
+}
+
+/// A first follow that replaces another, as a channel follows one
+/// repository (rule 2.5), names every key on its list but the person's own;
+/// the follow it replaces goes, with its notices.
+#[test]
+fn a_first_follow_that_replaces_another_names_every_key() {
     let s = bob(1);
     let now = s.now + 10;
     let channel = Shared::of(7);
     let (alice, carol) = (member(1), member(2));
-    let list = list_of(
+    let theirs = list_of(Some((&channel.id, &[])), &[(alice.public_key(), "alice")]);
+    subscribes_as(&s, OTHER, None, &theirs, &commit('a'), now);
+    assert_eq!(follows::notices(&s[0].conn, OTHER).unwrap().len(), 1);
+    let ours = list_of(
         Some((&channel.id, &[])),
-        &[(alice.public_key(), "alice"), (carol.public_key(), "carol")],
+        &[
+            (alice.public_key(), "alice"),
+            (s.key(0), "bob-laptop"),
+            (carol.public_key(), "carol"),
+        ],
     );
-    follows_at(&s, &list, &commit('a'), now);
-    let taken = now + READ / 2;
-    holds(&s, 0, 7, "review", taken);
-    write_in(&s, &channel, &[&alice], taken + 1);
-    reads(&s, &list, &commit('a'), now + READ);
+    subscribes_as(&s, REPOSITORY, Some(OTHER), &ours, &commit('b'), now + 1);
+    assert!(row_of(&s, OTHER).is_none());
+    assert!(follows::notices(&s[0].conn, OTHER).unwrap().is_empty());
+    assert_eq!(
+        named_new(&s),
+        [
+            joined_at("alice", &commit('b')),
+            joined_at("carol", &commit('b'))
+        ]
+    );
+}
+
+/// A list that does not parse at the yes names nothing; the next read of
+/// one that parses names every key on it, as no list was kept.
+#[test]
+fn a_list_that_does_not_parse_at_the_yes_names_nothing_until_one_does() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = Shared::of(7);
+    subscribes(&s, "not a key and a label\n", &commit('a'), now);
     assert!(notices(&s).is_empty(), "{:?}", notices(&s));
-    write_in(&s, &channel, &[&carol], now + READ + 1);
-    reads(&s, &list, &commit('a'), now + 2 * READ);
-    assert_eq!(notices(&s), [format!("joined carol at {}", commit('a'))]);
+    let list = list_with(Some((&channel.id, &[])), &listed(1..=2));
+    reads(&s, &list, &commit('b'), now + 1);
+    assert_eq!(
+        named_new(&s),
+        [joined_at("m1", &commit('b')), joined_at("m2", &commit('b'))]
+    );
+}
+
+/// A read that counts for nothing because its list names a channel that
+/// another follow names (rule 2.5) names nothing, though its list adds a
+/// key.
+#[test]
+fn a_read_of_a_channel_followed_elsewhere_names_nothing() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let review = holds(&s, 0, 7, "review", now);
+    let design = holds(&s, 0, 8, "design", now);
+    let alice = member(1).public_key();
+    let a = list_of(Some((&review.id, &[])), &[(alice, "alice")]);
+    let b = list_of(Some((&design.id, &[])), &[(alice, "alice")]);
+    follows_as(&s, REPOSITORY, &a, &commit('a'), now);
+    follows_as(&s, OTHER, &b, &commit('a'), now);
+    let names_review = list_of(
+        Some((&review.id, &[])),
+        &[(alice, "alice"), (member(2).public_key(), "carol")],
+    );
+    let read = reads_as(&s, OTHER, &names_review, &commit('b'), now + READ);
+    assert!(matches!(&read, Done::NotRead(not) if not.word == "followed_elsewhere"));
+    assert!(follows::notices(&s[0].conn, OTHER).unwrap().is_empty());
+}
+
+/// A list with no channel line names nothing; the first read whose list
+/// has one names every key on it but the person's own, those listed
+/// before included.
+#[test]
+fn the_first_list_with_a_channel_line_names_every_key() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let channel = Shared::of(7);
+    let (alice, carol) = (member(1), member(2));
+    let no_line = list_of(
+        None,
+        &[(alice.public_key(), "alice"), (s.key(0), "bob-laptop")],
+    );
+    follows_at(&s, &no_line, &commit('a'), now);
+    let with_carol = list_of(
+        None,
+        &[
+            (alice.public_key(), "alice"),
+            (s.key(0), "bob-laptop"),
+            (carol.public_key(), "carol"),
+        ],
+    );
+    reads(&s, &with_carol, &commit('b'), now + 1);
+    assert!(named_new(&s).is_empty());
+    let named = list_of(
+        Some((&channel.id, &[])),
+        &[
+            (alice.public_key(), "alice"),
+            (s.key(0), "bob-laptop"),
+            (carol.public_key(), "carol"),
+        ],
+    );
+    reads(&s, &named, &commit('c'), now + 2);
+    assert_eq!(
+        named_new(&s),
+        [
+            joined_at("alice", &commit('c')),
+            joined_at("carol", &commit('c'))
+        ]
+    );
 }
 
 /// A key in the channel that the list kept named and the latest does not
@@ -843,7 +1093,9 @@ fn a_device_that_comes_to_hold_the_channel_notices_no_join_of_those_there_before
 /// goes; a line changed only in its `without` names the same channel, a
 /// list with no line leaves the channel the one named before, and a line
 /// after a list with none is no change, as after `subscribe --new`. A
-/// dropped key's notice stays through `shared seen`.
+/// dropped key's notice stays through `shared seen`. Beside these, rule
+/// 4.5 names each key listed again, and every key of the first list with a
+/// line after one with none.
 #[test]
 fn a_key_dropped_from_the_list_and_a_changed_line_are_noticed() {
     let s = bob(1);
@@ -857,6 +1109,13 @@ fn a_key_dropped_from_the_list_and_a_changed_line_are_noticed() {
         (carol.public_key(), "carol"),
         (member(3).public_key(), "dave"),
     ];
+    // The notices but rule 4.5's.
+    let others = |s: &Several| -> Vec<String> {
+        notices(s)
+            .into_iter()
+            .filter(|notice| !notice.starts_with("joined "))
+            .collect()
+    };
     let line = Some((&channel.id, &[][..]));
     let all = list_of(line, &devices);
     follows_at(&s, &all, &commit('a'), now);
@@ -865,9 +1124,16 @@ fn a_key_dropped_from_the_list_and_a_changed_line_are_noticed() {
     reads(&s, &alice_only, &commit('a'), now + 1);
     assert_eq!(notices(&s), [format!("dropped carol at {}", commit('a'))]);
     reads(&s, &all, &commit('b'), now + 2);
-    assert!(notices(&s).is_empty(), "listed again");
+    assert!(others(&s).is_empty(), "listed again");
+    assert_eq!(
+        named_new(&s),
+        [
+            joined_at("carol", &commit('b')),
+            joined_at("dave", &commit('b'))
+        ]
+    );
     reads(&s, &alice_only, &commit('c'), now + 3);
-    assert_eq!(notices(&s), [format!("dropped carol at {}", commit('c'))]);
+    assert_eq!(others(&s), [format!("dropped carol at {}", commit('c'))]);
     follows::seen(&s[0].conn, REPOSITORY).unwrap();
     assert_eq!(notices(&s).len(), 1, "a drop is not seen away");
     // The line names only another `without`: the same channel.
@@ -879,13 +1145,15 @@ fn a_key_dropped_from_the_list_and_a_changed_line_are_noticed() {
     let no_line = list_of(None, &devices[..1]);
     reads(&s, &no_line, &commit('e'), now + 5);
     assert_eq!(notices(&s), [format!("dropped carol at {}", commit('c'))]);
-    // A line again, after none: no change is noticed.
+    // A line again, after none: no change is noticed, and each key on the
+    // list is new.
     reads(&s, &alice_only, &commit('f'), now + 6);
-    assert_eq!(notices(&s), [format!("dropped carol at {}", commit('c'))]);
+    assert_eq!(others(&s), [format!("dropped carol at {}", commit('c'))]);
+    assert_eq!(named_new(&s), [joined_at("alice", &commit('f'))]);
     // Another channel: Carol is not in it, so her notice goes.
     let moved_on = list_of(Some((&other.id, &[][..])), &devices[..1]);
     reads(&s, &moved_on, &commit('g'), now + 7);
-    assert_eq!(notices(&s), [format!("line changed at {}", commit('g'))]);
+    assert_eq!(others(&s), [format!("line changed at {}", commit('g'))]);
 }
 
 // ── The follow stopped (rule 2.5) ────────────────────────────────────

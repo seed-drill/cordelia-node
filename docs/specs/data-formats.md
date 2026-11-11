@@ -175,8 +175,8 @@
 >   last commit read, the last list read, and where the node's next turn
 >   of hand-overs starts), `shared_follow_typed` (the node's own typings
 >   of listed keys, apart from the person's) and `shared_follow_notices`
->   (a join and a changed channel line until `cordelia shared seen`, and a
->   key the list dropped until it leaves the channel). Columns are added
+>   (a key new on the list and a changed channel line until `cordelia
+>   shared seen`, and a key the list dropped until it leaves the channel). Columns are added
 >   to `shared_shares` (`by_node`: the node made the share) and to
 >   `shared_anew_made` (`left_out`, `line`, `cut` and `named_at`: what a
 >   making anew left out, the channel line it printed, and when a list

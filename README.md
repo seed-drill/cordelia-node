@@ -346,10 +346,13 @@ copy is; each member by label, in or not yet; and how many messages you
 and your agents have not read. If a join waits on something, the status
 says what.
 
-- When a device joins, each member's device that follows the repository
-  shows it in amber, with its label and the commit that added it. Check
-  that you expect that commit. Then run `cordelia shared seen <name>` to
-  clear it.
+- When a merged pull request adds a device to the list, each device that
+  follows the repository shows it in amber, with its label and the
+  commit its clone was at when it first listed the device. A clone that
+  lags can be past the merge by then. When you start to follow, each
+  device already on the list but your own shows the same way. Check that
+  you expect those commits. Then run `cordelia shared seen <name>` to
+  clear them.
 - `cordelia shared list` shows the same, with every member.
   `cordelia status --json` gives each repository under
   `shared.repositories`.
@@ -382,7 +385,7 @@ too, and prints each new `channel` line: put it in the list the same way.
 **Limits:**
 
 - Whoever can merge to the default branch can add any device, at once.
-  Each join shows in amber on each member's device that follows, with its
+  Each device added shows in amber on every device that follows, with its
   commit.
 - Your node reads only your clone, with git, and never the network. The
   list is as fresh as your last `git pull` or `git fetch`.

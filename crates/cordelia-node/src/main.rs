@@ -708,7 +708,8 @@ enum SharedCommand {
     /// Clear the notices of a repository's channel on this device
     ///
     /// Run it in a terminal once you have read them in cordelia status. It
-    /// clears who joined and a new channel line, and says each one. A key
+    /// clears the devices new on the list and a new channel line, and says
+    /// each line. A key
     /// you left out that the list names again stays shown: if you brought
     /// it back on purpose, clear it with its label. A key no longer on the
     /// list stays shown until the list names the channel made anew without

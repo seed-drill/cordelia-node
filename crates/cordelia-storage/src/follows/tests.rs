@@ -220,6 +220,20 @@ fn a_notice_is_kept_once_until_seen_and_a_dropped_key_until_it_leaves() {
     };
     assert!(notice(&conn, ID, &joined).unwrap());
     assert!(!notice(&conn, ID, &joined).unwrap(), "kept once");
+    // New on the list again, at a later commit, with another label: it
+    // takes the place of the one not yet cleared.
+    let again = Notice {
+        of: NoticeOf::Joined {
+            key: [5; 32],
+            label: "alice-desktop".into(),
+            channel: [8; 32],
+        },
+        commit: commit('f'),
+        at: 9,
+    };
+    assert!(notice(&conn, ID, &again).unwrap());
+    assert_eq!(notices(&conn, ID).unwrap(), vec![again]);
+    assert!(notice(&conn, ID, &joined).unwrap());
     assert!(notice(&conn, ID, &changed('b', 10)).unwrap());
     assert!(notice(&conn, ID, &dropped).unwrap());
     // A second change of the line takes the place of the first, not yet seen.

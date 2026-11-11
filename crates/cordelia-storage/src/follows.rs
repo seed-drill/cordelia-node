@@ -12,8 +12,8 @@
 //! - **The node's typings** (`shared_follow_typed`): the listed keys the node
 //!   looks for shares from (rule 4.4), apart from the person's own typings
 //!   (`shared_typed_keys`), with what became of each.
-//! - **The notices** (`shared_follow_notices`): a key that joined from the
-//!   list and a changed channel line, until a person clears them with
+//! - **The notices** (`shared_follow_notices`): a key new on the list and
+//!   a changed channel line, until a person clears them with
 //!   `cordelia shared seen` (rules 4.5 and 6); and a key the list dropped,
 //!   until it leaves the channel (rule 4.6). Each with its commit, and a
 //!   key's with its label, which its line may no longer give.
@@ -412,8 +412,10 @@ pub fn untype(conn: &Connection, identity: &str, key: &[u8; 32]) -> Result<(), C
 /// What a notice is of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NoticeOf {
-    /// A key that joined the channel from the list, with its label there
-    /// and the channel it joined (rule 4.5). Kept until a person clears it.
+    /// A key new on the list, with its label there and the channel the list
+    /// named (rule 4.5, as the person ruled on 10 November: by the list
+    /// alone). Kept until a person clears it; listed new again, it takes
+    /// the latest read's commit.
     Joined {
         key: [u8; 32],
         label: String,
@@ -435,9 +437,10 @@ pub struct Notice {
     pub at: i64,
 }
 
-/// A notice for `identity`. A key's notice already kept stays as it is;
-/// a changed line takes the place of one not yet cleared, with its commit.
-/// Returns whether anything was written.
+/// A notice for `identity`. A key new on the list again, and a changed
+/// line, take the place of one not yet cleared, at the latest read's
+/// commit, wherever it differs; a dropped key's notice already kept stays
+/// as it is. Returns whether anything was written.
 pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool, CordeliaError> {
     let (kind, key, label, channel): (i64, Vec<u8>, Option<&str>, Option<&[u8; 32]>) =
         match &notice.of {
@@ -450,8 +453,9 @@ pub fn notice(conn: &Connection, identity: &str, notice: &Notice) -> Result<bool
             NoticeOf::Dropped { key, label } => (3, key.to_vec(), Some(label), None),
         };
     let on_conflict = match kind {
-        2 => {
-            "DO UPDATE SET at_commit = excluded.at_commit, at = excluded.at
+        1 | 2 => {
+            "DO UPDATE SET label = excluded.label, at_commit = excluded.at_commit,
+                  at = excluded.at, channel = excluded.channel
                   WHERE at_commit != excluded.at_commit"
         }
         _ => "DO NOTHING",

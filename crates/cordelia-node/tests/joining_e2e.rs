@@ -696,13 +696,15 @@ fn removes_from_an_added(device: &Node, key: &str, words: &str) -> AtTerminal {
 /// key, with the agent of her clone subscribed. Her agent sends a message
 /// there, and Bob's agent reads it. Nobody runs `share` or `accept`: every
 /// share is the node's, and no key was typed by hand. Bob's status shows
-/// Alice's device joined, amber, by the list's label and the commit, until
-/// he runs `cordelia shared seen` at a terminal (rules 4.5 and 7). The list
+/// Alice's device new on the list, amber, by its label and the commit,
+/// until he runs `cordelia shared seen` at a terminal (rules 4.5 and 7, as
+/// the person ruled on 10 November). The list
 /// came from each clone, and the status says how old the clone's copy is:
 /// no command either node gave git reached the network. Last, `cordelia
 /// unsubscribe` in Alice's clone stops her device following the
 /// repository, and its channel and its agent's subscription stay; `cordelia
-/// subscribe` there follows it again (rule 2.5).
+/// subscribe` there follows it again (rule 2.5), a new follow, which names
+/// Bob's device, already on the list.
 #[test]
 fn two_people_join_by_a_merged_pull_request_alone() {
     let relay = relay_started();
@@ -762,10 +764,10 @@ fn two_people_join_by_a_merged_pull_request_alone() {
     let read = reads_next(&all, &bob, &bob_clone);
     assert!(read.contains("The build is green."), "{read}");
 
-    // Once Bob's device holds what Alice's wrote, his next read says she
-    // joined, until he clears it at a terminal.
+    // Bob's read of the merged list, his first with a channel line, named
+    // Alice's device new on it, until he clears it at a terminal.
     let joined = format!(
-        "alice-laptop joined {NAME} from the list at {}",
+        "New on the list of {NAME} at {}: alice-laptop",
         short(&merged)
     );
     shows(&all, &bob, "joined", &joined, true);
@@ -844,9 +846,15 @@ fn two_people_join_by_a_merged_pull_request_alone() {
         listed(&alice)["subscriptions"],
         json!([{ "agent": AGENT, "channel": NAME }])
     );
-    // `subscribe` there follows it again.
+    // `subscribe` there follows it again: a new follow, whose list names
+    // Bob's device new to it, and not hers.
     subscribes_in(&alice, &alice_clone, &[], "which you hold");
     assert_eq!(view_of(&alice)["identity"], REPOSITORY);
+    let bobs = format!(
+        "New on the list of {NAME} at {}: bob-desktop",
+        short(&merged)
+    );
+    shows(&all, &alice, "joined", &bobs, true);
 }
 
 /// Order does not matter (section 12): Alice's line is merged before
@@ -854,7 +862,9 @@ fn two_people_join_by_a_merged_pull_request_alone() {
 /// and her status says that the list names no channel yet. Then Bob makes
 /// the channel in his clone, and a pull request adds his lines. Alice's
 /// clone has the merge before any member's: she waits for a member's
-/// device, and says so (rule 6). Bob pulls, and she holds the channel.
+/// device, and says so (rule 6). Bob pulls, and she holds the channel. Her
+/// first list with a channel line named Bob's device new on it, amber, and
+/// not hers (rule 4.5, as the person ruled on 10 November).
 #[test]
 fn a_device_that_follows_before_the_channel_is_named_waits_and_says_why() {
     let relay = relay_started();
@@ -899,6 +909,17 @@ fn a_device_that_follows_before_the_channel_is_named_waits_and_says_why() {
         channel_of(&alice, NAME)
     });
     assert_eq!(taken["words"], channel_of(&bob, NAME).unwrap()["words"]);
+    let bobs = format!(
+        "New on the list of {NAME} at {}: bob-desktop",
+        short(&merged)
+    );
+    shows(&all, &alice, "joined", &bobs, true);
+    let status = status_json(&alice);
+    assert_eq!(status["level"], "amber", "{status}");
+    assert!(
+        holds_of(&status).contains(&"shared_repository".to_string()),
+        "{status}"
+    );
 }
 
 // ── Never back ───────────────────────────────────────────────────────
