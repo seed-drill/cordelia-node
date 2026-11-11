@@ -794,17 +794,12 @@ pub fn relay_run_by(bin: PathBuf) -> Node {
     relay
 }
 
-/// The variable that names the binary of the release before messages
-/// between a person's agents (alpha.10): what the messages upgrade test
-/// runs (`.github/workflows/ci.yml`, `VERSION_BEFORE`; TESTING.md).
+/// The variable that names the binary of the version before: alpha.19,
+/// the one release this version works beside and takes over from
+/// (decision 2026-11-10 (older kind), rules 4 and 10). The tests that run
+/// it as a relay or a device read it (`.github/workflows/ci.yml`,
+/// `VERSION_BEFORE`; TESTING.md).
 pub const BINARY_BEFORE: &str = "CORDELIA_TEST_BINARY_BEFORE";
-
-/// The variable that names the binary of the release before shared
-/// channels (alpha.17, at step 20, with messages): the version before of
-/// the shared channel's record, which the relays and devices run now, and
-/// which `shared_e2e.rs` runs as the relay and as a device (`ci.yml`,
-/// `VERSION_BEFORE_SHARED`; decision 2026-10-10 §14).
-pub const BINARY_BEFORE_SHARED: &str = "CORDELIA_TEST_BINARY_BEFORE_SHARED";
 
 /// Whether the tests run in CI, as GitHub says it: `CI` is `true`. A `CI`
 /// set to anything else (`false`, `0`, empty) is not CI.
@@ -829,15 +824,9 @@ pub fn binary_given(var: &str) -> Option<PathBuf> {
     Some(before)
 }
 
-/// The binary of the release before messages ([`BINARY_BEFORE`]).
+/// The binary of the version before ([`BINARY_BEFORE`]).
 pub fn binary_before() -> Option<PathBuf> {
     binary_given(BINARY_BEFORE)
-}
-
-/// The binary of the release before shared channels
-/// ([`BINARY_BEFORE_SHARED`]).
-pub fn binary_before_shared() -> Option<PathBuf> {
-    binary_given(BINARY_BEFORE_SHARED)
 }
 
 fn node_made(

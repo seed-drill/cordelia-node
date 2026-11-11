@@ -77,45 +77,38 @@ tests here:
 cargo test -p cordelia-node --tests --no-fail-fast -- --ignored
 ```
 
-`CORDELIA_TEST_BINARY_BEFORE` names the binary of the release before
-messages between a person's agents (alpha.10), which
-`a_device_of_the_version_before_beside_one_of_this_version` in `msg_e2e.rs`
-runs beside this build. `CORDELIA_TEST_BINARY_BEFORE_SHARED` names the
-binary of the release before shared channels (alpha.17, at step 20, which
-the relays and devices run now), which `shared_e2e.rs` runs as the relay
-in `a_relay_carries_a_shared_channel_with_no_change`, and as a device in
-`a_device_of_the_version_before_ignores_shared_lists`. Main's workspace
-was at alpha.17 too until alpha.18, so the relay's test tells the
-binary from this build by its bytes, not by the version it prints. CI downloads each
-from the release that `ci.yml` names in `VERSION_BEFORE` and
-`VERSION_BEFORE_SHARED`, and checks each against the SHA-256 that
-`ci.yml` names beside it (`VERSION_BEFORE_SHA256`,
-`VERSION_BEFORE_SHARED_SHA256`), and not against a checksum taken from
-the same release, which would not catch an asset replaced there. The
-job's checkout keeps no token on disk while it runs. Where a variable is
-not set, the test says so and passes without running, but where `CI` is
-`true`, as GitHub sets it, it fails. To run the first here (the second
-likewise, with `v0.2.0-alpha.17`,
-`58fe2242347ecff805ca4528cb8aee65c4af93b1cace3a3c06978cd247d1f611` and
-`CORDELIA_TEST_BINARY_BEFORE_SHARED`):
+`CORDELIA_TEST_BINARY_BEFORE` names the binary of the version before:
+alpha.19, the one release this version works beside and takes over from
+(decision 2026-11-10 (older kind), rules 4 and 10). `shared_e2e.rs` runs
+it as the relay in `a_relay_carries_a_shared_channel_with_no_change`.
+Main's workspace may
+say the same version as the release before until the next release is
+cut, so the relay's test tells the binary from this build by its bytes,
+not by the version it prints. CI downloads it from the release that
+`ci.yml` names in `VERSION_BEFORE`, and checks it against the SHA-256
+that `ci.yml` names beside it (`VERSION_BEFORE_SHA256`), and not against
+a checksum taken from the same release, which would not catch an asset
+replaced there. The job's checkout keeps no token on disk while it runs.
+Where the variable is not set, each test says so and passes without
+running, but where `CI` is `true`, as GitHub sets it, it fails. To run
+them here:
 
 ```bash
-v=v0.2.0-alpha.10
-sha=cf53f451bf939bb218f3ee10cf9ac25c27e71536fa56d44a6d1feaf2d88ee5a8
+v=v0.2.0-alpha.19
+sha=e7f15e59c089a3d839ad77e25b21abd174cf99c1896c21f474822d765ede4bd6
 d=$(mktemp -d)
 base=https://github.com/seed-drill/cordelia-node/releases/download/$v
 curl -fsSL -o $d/cordelia-linux-amd64 $base/cordelia-linux-amd64
 echo "$sha  $d/cordelia-linux-amd64" | sha256sum -c - && chmod +x $d/cordelia-linux-amd64
 CORDELIA_TEST_BINARY_BEFORE=$d/cordelia-linux-amd64 \
-  cargo test -p cordelia-node --test msg_e2e a_device_of_the_version_before
+  cargo test -p cordelia-node --test shared_e2e a_relay_carries_a_shared_channel
 ```
 
-Each pair of values changes together, at a release: when the release
-before messages is to be another, set `VERSION_BEFORE` to its tag and
-`VERSION_BEFORE_SHA256` to the SHA-256 of its `cordelia-linux-amd64` (and
-so `VERSION_BEFORE_SHARED` and its SHA-256),
-worked out from the binary downloaded and checked against the release's
-published `.sha256`, in one commit.
+The two values change together: when the version before is to be
+another, set `VERSION_BEFORE` to its tag and `VERSION_BEFORE_SHA256` to
+the SHA-256 of its `cordelia-linux-amd64`, worked out from the binary
+downloaded and checked against the release's published `.sha256`, in one
+commit.
 
 ```bash
 cargo test -p cordelia-node --test person_e2e

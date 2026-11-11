@@ -81,7 +81,7 @@ cargo test -p cordelia-node --test devices_e2e        # one test file
 cargo test -p cordelia-network <name> -- --nocapture  # one test, with output
 ```
 
-The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" job runs them. A few tests need the binary of an earlier release (`CORDELIA_TEST_BINARY_BEFORE`, `CORDELIA_TEST_BINARY_BEFORE_SHARED`); without it they pass without running, except in CI. TESTING.md has the rest.
+The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" job runs them. A few tests need the binary of the version before, alpha.19 (`CORDELIA_TEST_BINARY_BEFORE`); without it they pass without running, except in CI. TESTING.md has the rest.
 
 ## Public text
 
