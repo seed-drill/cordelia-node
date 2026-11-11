@@ -806,45 +806,9 @@ pub fn relay_made_by(bin: PathBuf) -> Node {
 /// A channel of the older kind: a group, as a relay of alpha.19 holds one.
 pub const OLDER_GROUP: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
 
-/// Put in the database of `n`, which is made and not running, a channel
-/// of the older kind with one item in it: what a relay of alpha.19 came to
-/// hold, and keeps on this version, unread. The rows are written in plain
-/// SQL, as [`older_items_held`] reads them. Step 34 drops these tables
-/// (decision 2026-11-10 (older kind), rule 5), and this goes with them.
-/// Returns the item's ID.
-pub fn holds_an_older_channel(n: &Node, channel: &str) -> String {
-    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
-    let now = "2026-11-01T00:00:00Z";
-    db.execute(
-        "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                               created_at, updated_at)
-         VALUES (?1, 'group', 'realtime', 'invite_only', ?2, ?3, ?3)",
-        rusqlite::params![channel, [0xAAu8; 32].as_slice(), now],
-    )
-    .unwrap();
-    let item_id = "ci_01JARV8XMHW8G9QZP0000000AA";
-    let blob = b"what alpha.19 held of the older kind";
-    db.execute(
-        "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
-                            content_hash, signature, encrypted_blob, content_length, seq)
-         VALUES (?1, ?2, ?3, 'memory', ?4, ?5, ?6, ?7, ?8, 1)",
-        rusqlite::params![
-            item_id,
-            channel,
-            [0xAAu8; 32].as_slice(),
-            now,
-            cordelia_crypto::sha256(blob).as_slice(),
-            [7u8; 64].as_slice(),
-            blob.as_slice(),
-            blob.len() as i64,
-        ],
-    )
-    .unwrap();
-    item_id.to_string()
-}
-
 /// How many items of the older kind the database of `n` holds, read
-/// while the node runs.
+/// while the node runs: none where it has no such table, as a database of
+/// this version has none (decision 2026-11-10 (older kind), rule 5).
 pub fn older_items_held(n: &Node) -> i64 {
     let db = rusqlite::Connection::open_with_flags(
         n.data_dir().join("cordelia.db"),
@@ -852,8 +816,19 @@ pub fn older_items_held(n: &Node) -> i64 {
     )
     .unwrap();
     db.busy_timeout(Duration::from_secs(10)).unwrap();
-    db.query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
-        .unwrap()
+    let has_items: bool = db
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'items')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    match has_items {
+        true => db
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap(),
+        false => 0,
+    }
 }
 
 /// Half a stream timeout: what "at once" is to a test that waits on a
@@ -2240,13 +2215,8 @@ pub fn stand_in_relay() -> StandIn {
     let key = cordelia_crypto::bech32::encode_public_key(&identity.public_key()).unwrap();
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
-    let manager = connection::ConnectionManager::new(
-        identity,
-        endpoint.clone(),
-        vec![],
-        vec!["relay".into()],
-        port,
-    );
+    let manager =
+        connection::ConnectionManager::new(identity, endpoint.clone(), vec!["relay".into()], port);
     let ctx = manager.connect_context();
     let relay = StandIn {
         port,

@@ -71,18 +71,13 @@ pub struct Facts {
     pub stands: String,
     /// Folders the last cycle synced or is waiting to sync.
     pub folders: usize,
-    /// Whether this device took this version with what an earlier one
-    /// held (decision 2026-10-04 §10.1): with no phrase it is then "not
-    /// added yet", and otherwise it is a new install.
-    pub moved_on: bool,
     /// What the node is held up by, as it says it, where it is (decision
-    /// 2026-10-04 §10.1): `first_start` while its first start on this
-    /// version is not done, or `later_database` where its database is
-    /// from a later version. It runs no cycle and no pass meanwhile.
+    /// 2026-10-04 §10.1): `later_database` where its database is from a
+    /// later version, `step_failed` where a step of its schema did not
+    /// finish, or `earlier_database` where it is from a Cordelia
+    /// before alpha.19 (decision 2026-11-10 (older kind), rule 6). It runs
+    /// no cycle and no pass meanwhile.
     pub held: Option<String>,
-    /// The notice of what stopped syncing, while the node stores one
-    /// (decision 2026-10-04 §10.1).
-    pub notice: Option<Stopped>,
     /// How many folders are mapped, as the node's settings have them.
     pub mapped: usize,
     /// For how long the node has run, in seconds, where it says.
@@ -450,21 +445,18 @@ fn stopped_says(stands: &str) -> Option<&'static str> {
 /// says it is held up by.
 fn held_says(by: &str) -> &'static str {
     match by {
-        "first_start" => "memory not syncing: the first start on this version is not done",
         "later_database" => "memory not syncing: the database is from a later version",
+        // Decision 2026-11-10 (older kind), rule 6.
+        "earlier_database" => "memory not syncing: the database is from before 0.2.0-alpha.19",
+        // Rule 9 of the same record.
+        "step_failed" => "memory not syncing: a step of the database did not finish",
         _ => "memory not syncing: the node is held up",
     }
 }
 
-/// What a device that follows no phrase says in the line: that it is not
-/// added yet, where it took this version with what an earlier one held,
-/// and that it has no recovery phrase yet, where it is a new install.
-fn no_phrase_says(moved_on: bool) -> &'static str {
-    match moved_on {
-        true => "memory: not added yet",
-        false => "memory stays here: no recovery phrase yet",
-    }
-}
+/// What a device that follows no phrase says in the line (decision
+/// 2026-11-10 (older kind), rule 9).
+const NO_PHRASE_SAYS: &str = "memory stays here: no recovery phrase yet";
 
 /// What the line says of a device that was answered with a change that
 /// it could not apply.
@@ -480,17 +472,14 @@ const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applie
 /// 1. this device has stopped: it was removed, or is in no list, or is
 ///    in a fork, or was answered with a change that it could not open or
 ///    apply;
-/// 2. the node is held up: its first start on this version has not
-///    succeeded, or its database is from a later version;
+/// 2. the node is held up: its database is from a later version, or
+///    from before alpha.19;
 /// 3. it follows no phrase, where something is mapped: nothing it holds
 ///    syncs until a person acts;
 /// 4. sync errors, a file that could not be synced among them;
 /// 5. a cycle that has stalled;
-/// 6. folders that stopped syncing (the notice), where there is no
-///    report yet or no folder is mapped;
-/// 7. conflict files;
-/// 8. files too large;
-/// 9. folders that stopped syncing.
+/// 6. conflict files;
+/// 7. files too large.
 ///
 /// **Amber,** in this order. What is about folders holds only with sync
 /// on, something mapped and a report: with none of them, nothing would
@@ -587,21 +576,15 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     if let Some(by) = f.held.as_deref() {
         red("held", held_says(by).into());
     }
-    let notice = f.notice.as_ref().filter(|notice| notice.counts());
-    // Where "starting" or "nothing mapped" would be said, the notice is.
-    let notice_first = !report || f.mapped == 0;
     if on {
         if f.stands == "no_phrase" && f.mapped > 0 {
-            red("no_phrase", no_phrase_says(f.moved_on).into());
+            red("no_phrase", NO_PHRASE_SAYS.into());
         }
         if !f.errors.is_empty() {
             red("errors", "memory sync error".into());
         }
         if stalled(f) {
             red("stalled", "memory sync stalled".into());
-        }
-        if let Some(notice) = notice.filter(|_| notice_first) {
-            red("stopped_syncing", notice.says());
         }
         if !f.conflicts.is_empty() {
             let conflicts = count(f.conflicts.len(), "conflict");
@@ -610,9 +593,6 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
         if !f.too_large.is_empty() {
             let files = count(f.too_large.len(), "file");
             red("too_large", format!("memory: {files} too large"));
-        }
-        if let Some(notice) = notice.filter(|_| !notice_first) {
-            red("stopped_syncing", notice.says());
         }
     }
 
@@ -916,36 +896,6 @@ pub fn shown(f: &Facts) -> Shown {
     }
 }
 
-/// The notice that a device whose stored scope was on is given: the
-/// folders that stopped syncing when only mapped folders came to sync.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Stopped {
-    /// How many folders it names that no mapping syncs now.
-    pub folders: usize,
-    /// Whether one of its records names no folder: what stopped then is
-    /// not known.
-    pub not_known: bool,
-}
-
-impl Stopped {
-    /// Whether it still asks for the person: while it names a folder
-    /// that is not mapped now, or a record of it names none. A notice
-    /// whose folders are all mapped does not.
-    pub fn counts(&self) -> bool {
-        self.folders > 0 || self.not_known
-    }
-
-    /// In a few words: how many folders stopped, counting those it names
-    /// that are not mapped now; or that folders did, where it names none
-    /// that is not.
-    pub fn says(&self) -> String {
-        match self.folders as u64 {
-            0 => "memory: folders stopped syncing".into(),
-            n => format!("memory: {n} {} stopped syncing", plural(n, "folder")),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     /// Connected, everything written here has reached a relay.
@@ -1028,16 +978,14 @@ pub fn derive(f: &Facts) -> (State, String) {
     // device that is not to be added turns sync off.
     let no_phrase = f.stands == "no_phrase";
     if no_phrase && f.sync_enabled && f.mapped > 0 {
-        return (Attention, no_phrase_says(f.moved_on).into());
+        return (Attention, NO_PHRASE_SAYS.into());
     }
     let (state, says) = of_its_folders(f);
     // With sync off, or nothing mapped, the state is what it would be
-    // without that, and the words still say it: "not added yet" where
-    // the device took this version with what an earlier one held, and "no
-    // recovery phrase yet" where it is a new install. What needs the
-    // person is said first.
+    // without that, and the words still say it. What needs the person is
+    // said first.
     if no_phrase && state != Attention {
-        return (state, no_phrase_says(f.moved_on).into());
+        return (state, NO_PHRASE_SAYS.into());
     }
     (state, says)
 }
@@ -1052,18 +1000,9 @@ fn of_its_folders(f: &Facts) -> (State, String) {
     if !f.errors.is_empty() {
         return (Attention, "memory sync error".into());
     }
-    // Folders that stopped syncing need the person (decision 2026-10-04
-    // §10.1): the notice is `attention`, so that a panel which draws from
-    // the state alone shows it. It is said in the place of "starting" and
-    // of "nothing mapped", and after a conflict and a file too large,
-    // which it never hides.
-    let stopped = f.notice.as_ref().filter(|notice| notice.counts());
     match f.report_age_secs {
         None => {
-            return match stopped {
-                Some(notice) => (Attention, notice.says()),
-                None => (Syncing, "memory sync starting".into()),
-            };
+            return (Syncing, "memory sync starting".into());
         }
         Some(_) if stalled(f) => {
             return (Attention, "memory sync stalled".into());
@@ -1072,10 +1011,7 @@ fn of_its_folders(f: &Facts) -> (State, String) {
     }
     // A conflict and a file too large are counted from every folder of
     // the report, so they are said where nothing syncs, as `holds` says
-    // them; with no mapping, the notice is ahead of them, as there.
-    if let Some(notice) = stopped.filter(|_| f.folders == 0 && f.mapped == 0) {
-        return (Attention, notice.says());
-    }
+    // them.
     if !f.conflicts.is_empty() {
         let n = f.conflicts.len() as u64;
         return (Attention, format!("memory: {n} {}", plural(n, "conflict")));
@@ -1088,13 +1024,7 @@ fn of_its_folders(f: &Facts) -> (State, String) {
         );
     }
     if f.folders == 0 {
-        return match stopped {
-            Some(notice) => (Attention, notice.says()),
-            None => (Off, "memory: nothing mapped".into()),
-        };
-    }
-    if let Some(notice) = stopped {
-        return (Attention, notice.says());
+        return (Off, "memory: nothing mapped".into());
     }
     if f.peers_hot == 0 {
         return match f.outbox_waiting {
@@ -1234,7 +1164,7 @@ mod tests {
 
     /// Each thing of the red list, alone: what makes it, its word, and
     /// what the line says of it.
-    const RED: [(Edit, &str, &str); 12] = [
+    const RED: [(Edit, &str, &str); 11] = [
         (
             &|f| f.stands = "removed".into(),
             "stopped",
@@ -1261,9 +1191,9 @@ mod tests {
             "memory not syncing: a change could not be applied",
         ),
         (
-            &|f| f.held = Some("first_start".into()),
+            &|f| f.held = Some("earlier_database".into()),
             "held",
-            "memory not syncing: the first start on this version is not done",
+            "memory not syncing: the database is from before 0.2.0-alpha.19",
         ),
         (
             &|f| f.stands = "no_phrase".into(),
@@ -1289,16 +1219,6 @@ mod tests {
             &|f| f.too_large = vec!["a.md".into()],
             "too_large",
             "memory: 1 file too large",
-        ),
-        (
-            &|f| {
-                f.notice = Some(Stopped {
-                    folders: 3,
-                    not_known: false,
-                })
-            },
-            "stopped_syncing",
-            "memory: 3 folders stopped syncing",
         ),
     ];
 
@@ -1440,14 +1360,6 @@ mod tests {
             assert!(shown.holds.is_empty(), "{says}");
             assert_eq!((shown.state, shown.summary.as_str()), (state, says));
         }
-        // A device that took this version with what an earlier one held
-        // is "not added yet".
-        let not_added = with(&|f| {
-            f.stands = "no_phrase".into();
-            f.moved_on = true;
-        });
-        assert_eq!(not_added.level, Some(Level::Red));
-        assert_eq!(not_added.summary, "memory: not added yet");
         // A node that is held up by a database from a later version.
         let later = with(&|f| f.held = Some("later_database".into()));
         assert_eq!(later.level, Some(Level::Red));
@@ -1506,7 +1418,6 @@ mod tests {
             "stalled",
             "conflicts",
             "too_large",
-            "stopped_syncing",
         ];
         let both: Vec<&str> = red.iter().chain(amber.iter()).copied().collect();
         assert_eq!(whats(&stopped), both);
@@ -1521,7 +1432,7 @@ mod tests {
         let mut red_with_no_phrase = red.to_vec();
         red_with_no_phrase[0] = "held";
         red_with_no_phrase[1] = "no_phrase";
-        assert_eq!(whats(&no_phrase)[..7], red_with_no_phrase);
+        assert_eq!(whats(&no_phrase)[..6], red_with_no_phrase);
         // Answered with a change that it could not apply, with nothing
         // else of the device's own: in the first place too.
         let not_applied = with(&|f| {
@@ -1837,22 +1748,22 @@ mod tests {
     }
 
     /// A node that is held up is red whatever sync says (decision
-    /// 2026-10-04 §10.1): its first start on this version has not
-    /// succeeded, or its database is of a later version. Nothing asks
-    /// whether sync is on first: a node that is held by a later database
-    /// refuses the request that would say so, and the command then knows
-    /// neither whether sync is on, nor what is mapped, nor where the
-    /// device stands.
+    /// 2026-10-04 §10.1): its database is of a later version, or from
+    /// before alpha.19 (decision 2026-11-10 (older kind), rule 6). Nothing
+    /// asks whether sync is on first: a node that is held refuses the
+    /// request that would say so, and the command then knows neither
+    /// whether sync is on, nor what is mapped, nor where the device
+    /// stands.
     #[test]
     fn a_node_that_is_held_up_is_red_whatever_sync_says() {
         for (by, says) in [
             (
-                "first_start",
-                "memory not syncing: the first start on this version is not done",
-            ),
-            (
                 "later_database",
                 "memory not syncing: the database is from a later version",
+            ),
+            (
+                "earlier_database",
+                "memory not syncing: the database is from before 0.2.0-alpha.19",
             ),
         ] {
             let held = |edit: &dyn Fn(&mut Facts)| {
@@ -1994,7 +1905,7 @@ mod tests {
                 "memory: 1 device added, not yet cleared"
             )
         );
-        // Sync off with a notice stored, errors, conflicts and no relay:
+        // Sync off with errors, conflicts and no relay:
         // nothing of folders holds, and the line says off.
         let off = with(&|f| {
             for (edit, _, _) in RED.iter().skip(7).chain(&AMBER[..2]).chain(&AMBER[7..]) {
@@ -2043,8 +1954,8 @@ mod tests {
             "memory not syncing: no change that lists this device is clear"
         );
         assert_eq!(
-            not_applied(&|f| f.held = Some("first_start".into())).1,
-            "memory not syncing: the first start on this version is not done"
+            not_applied(&|f| f.held = Some("earlier_database".into())).1,
+            "memory not syncing: the database is from before 0.2.0-alpha.19"
         );
         // Without it, synced.
         assert_eq!(derive(&synced()).0, State::Synced);
@@ -2135,7 +2046,7 @@ mod tests {
 
     /// With nothing mapped, or with no report yet, there is no amber of
     /// folders: nothing would move anyway (decision 2026-10-04 §10.1).
-    /// Red is red all the same: the notice, errors and a stalled cycle.
+    /// Red is red all the same: errors and a stalled cycle.
     #[test]
     fn with_nothing_mapped_or_no_report_yet_there_is_no_amber_of_folders() {
         let of_folders = |f: &mut Facts| {
@@ -2183,7 +2094,7 @@ mod tests {
             }
         }
 
-        // Red with nothing mapped: errors, a stalled cycle, the notice.
+        // Red with nothing mapped: errors, and a stalled cycle.
         for (edit, what) in [
             (
                 (&|f: &mut Facts| f.errors = vec!["x".into()]) as &dyn Fn(&mut Facts),
@@ -2192,15 +2103,6 @@ mod tests {
             (
                 &|f: &mut Facts| f.report_age_secs = Some(STALE_REPORT_SECS + 1),
                 "stalled",
-            ),
-            (
-                &|f: &mut Facts| {
-                    f.notice = Some(Stopped::default()).map(|mut n| {
-                        n.not_known = true;
-                        n
-                    })
-                },
-                "stopped_syncing",
             ),
         ] {
             let shown = with(&|f| {
@@ -2218,9 +2120,7 @@ mod tests {
     /// only with sync on and something mapped (decision 2026-10-04
     /// §10.1): nothing it holds syncs until a person acts. With sync off,
     /// or nothing mapped, the state is what it would be without that, and
-    /// the words still say it: "no recovery phrase yet" on a new install,
-    /// and "not added yet" where the device took this version with what
-    /// an earlier one held.
+    /// the words still say it: "no recovery phrase yet".
     #[test]
     fn no_phrase_is_red_only_with_sync_on_and_something_mapped() {
         let no_phrase = |edit: &dyn Fn(&mut Facts)| {
@@ -2256,15 +2156,6 @@ mod tests {
                 (off.level, off.state, off.summary.as_str()),
                 (None, State::Off, new_install)
             );
-            let moved_on = no_phrase(&|f| {
-                f.sync_enabled = false;
-                f.mapped = mapped;
-                f.moved_on = true;
-            });
-            assert_eq!(
-                (moved_on.level, moved_on.state, moved_on.summary.as_str()),
-                (None, State::Off, "memory: not added yet")
-            );
         }
         // Nothing mapped and no report yet: starting, as it would be.
         let starting = no_phrase(&|f| {
@@ -2285,124 +2176,11 @@ mod tests {
             (error.level, error.state, error.summary.as_str()),
             (Some(Level::Red), State::Attention, "memory sync error")
         );
-        // With nothing mapped and a notice: red, and the line says that
-        // folders stopped syncing.
-        let notice = with(&|f| {
-            f.stands = "no_phrase".into();
-            f.moved_on = true;
-            f.mapped = 0;
-            f.folders = 0;
-            f.report_age_secs = None;
-            f.notice = Some(Stopped {
-                folders: 2,
-                not_known: false,
-            });
-        });
-        assert_eq!(notice.level, Some(Level::Red));
-        assert_eq!(notice.summary, "memory: 2 folders stopped syncing");
-        assert_eq!(whats(&notice), ["stopped_syncing"]);
-        // With something mapped as well: "not added yet" comes first.
-        let both = with(&|f| {
-            f.stands = "no_phrase".into();
-            f.moved_on = true;
-            f.notice = Some(Stopped {
-                folders: 2,
-                not_known: false,
-            });
-        });
-        assert_eq!(both.summary, "memory: not added yet");
-        assert_eq!(whats(&both), ["no_phrase", "stopped_syncing"]);
-    }
-
-    /// The notice in the line (decision 2026-10-04 §10.1). With one
-    /// mapping in step: red, and the line says that folders stopped
-    /// syncing. With no mapping: the same, and not "nothing mapped". With
-    /// no report yet: the same, and not "starting". Beside a conflict:
-    /// the line says the conflict, and everything that holds has both.
-    /// With sync off, the line says off. A notice whose folders are all
-    /// mapped does not count.
-    #[test]
-    fn the_notice_is_red_and_never_hides_an_error_a_conflict_or_a_large_file() {
-        let notice = |f: &mut Facts| {
-            f.notice = Some(Stopped {
-                folders: 3,
-                not_known: false,
-            })
-        };
-        let says = "memory: 3 folders stopped syncing";
-        let in_step = with(&notice);
-        assert_eq!(
-            (in_step.level, in_step.summary.as_str()),
-            (Some(Level::Red), says)
-        );
-        let no_mapping = with(&|f| {
-            notice(f);
-            f.mapped = 0;
-            f.folders = 0;
-        });
-        assert_eq!(
-            (no_mapping.level, no_mapping.summary.as_str()),
-            (Some(Level::Red), says)
-        );
-        let no_report = with(&|f| {
-            notice(f);
-            f.report_age_secs = None;
-        });
-        assert_eq!(
-            (no_report.level, no_report.summary.as_str()),
-            (Some(Level::Red), says)
-        );
-        // Beside a conflict, and beside a file too large: after them.
-        let conflict = with(&|f| {
-            notice(f);
-            f.conflicts = vec!["a".into()];
-            f.too_large = vec!["b.md".into()];
-        });
-        assert_eq!(conflict.summary, "memory: 1 conflict");
-        assert_eq!(
-            whats(&conflict),
-            ["conflicts", "too_large", "stopped_syncing"]
-        );
-        // With no mapping, where "nothing mapped" would be said, it is
-        // ahead of a conflict that an earlier report still lists; an
-        // error and a stalled cycle are ahead of it.
-        let ahead = with(&|f| {
-            notice(f);
-            f.mapped = 0;
-            f.conflicts = vec!["a".into()];
-            f.errors = vec!["x".into()];
-            f.report_age_secs = Some(STALE_REPORT_SECS + 1);
-        });
-        assert_eq!(
-            whats(&ahead),
-            ["errors", "stalled", "stopped_syncing", "conflicts"]
-        );
-        // With sync off: off, and no level.
-        let off = with(&|f| {
-            notice(f);
-            f.sync_enabled = false;
-        });
-        assert_eq!((off.level, off.summary.as_str()), (None, "memory sync off"));
-        // A notice whose folders are all mapped does not count; one of
-        // whose records names none does.
-        let all_mapped = with(&|f| f.notice = Some(Stopped::default()));
-        assert_eq!(
-            (all_mapped.level, all_mapped.summary.as_str()),
-            (None, "memory synced")
-        );
-        let names_none = with(&|f| {
-            f.notice = Some(Stopped {
-                folders: 0,
-                not_known: true,
-            })
-        });
-        assert_eq!(names_none.level, Some(Level::Red));
-        assert_eq!(names_none.summary, "memory: folders stopped syncing");
     }
 
     /// A conflict and a file too large in a report whose folders do not
     /// sync: the state says them as the level does, and not "nothing
-    /// mapped". With no mapping, the notice is ahead of them in both.
+    /// mapped".
     #[test]
     fn the_state_says_a_conflict_where_no_folder_of_the_report_syncs() {
         let agree = |edit: &dyn Fn(&mut Facts), says: &str| {
@@ -2432,26 +2210,6 @@ mod tests {
                 "memory: 1 file too large",
             );
         }
-        let notice = Some(Stopped {
-            folders: 2,
-            not_known: false,
-        });
-        agree(
-            &|f| {
-                f.mapped = 0;
-                f.conflicts = vec!["x".into()];
-                f.notice = notice.clone();
-            },
-            "memory: 2 folders stopped syncing",
-        );
-        agree(
-            &|f| {
-                f.mapped = 1;
-                f.conflicts = vec!["x".into()];
-                f.notice = notice.clone();
-            },
-            "memory: 1 conflict",
-        );
     }
 
     /// The waits (decision 2026-10-04 §10.1). No relay: none at four
@@ -2687,23 +2445,15 @@ mod tests {
     }
 
     /// The state is worked out as it was, whatever the level (decision
-    /// 2026-10-04 §10.1), for a panel that draws from it alone: the
-    /// notice is `attention`; entries that relays refuse are `attention`,
-    /// though the level is amber; and a node of another version does not
-    /// change the state.
+    /// 2026-10-04 §10.1), for a panel that draws from it alone: entries
+    /// that relays refuse are `attention`, though the level is amber; and
+    /// a node of another version does not change the state.
     #[test]
     fn the_state_is_as_it_was_whatever_the_level() {
         let of = |edit: &dyn Fn(&mut Facts)| {
             let shown = with(edit);
             (shown.state, shown.level)
         };
-        let notice = of(&|f| {
-            f.notice = Some(Stopped {
-                folders: 1,
-                not_known: false,
-            })
-        });
-        assert_eq!(notice, (State::Attention, Some(Level::Red)));
         assert_eq!(
             of(&|f| f.other_version = true),
             (State::Synced, Some(Level::Amber))
@@ -2872,10 +2622,8 @@ mod tests {
         assert_eq!(stands("applied"), (State::Synced, "memory synced".into()));
         // A node that did not say where it stands is read as before.
         assert_eq!(stands(""), (State::Synced, "memory synced".into()));
-        // With no phrase the state is `attention`: a new install says
-        // that it has no recovery phrase yet, and a device that took
-        // this version with what an earlier one held, that it is not
-        // added yet (decision 2026-10-04 §10.1).
+        // With no phrase the state is `attention`, and it says that it
+        // has no recovery phrase yet (decision 2026-10-04 §10.1).
         assert_eq!(
             stands("no_phrase"),
             (
@@ -2883,16 +2631,6 @@ mod tests {
                 "memory stays here: no recovery phrase yet".into()
             )
         );
-        let mut moved_on = synced();
-        moved_on.stands = "no_phrase".into();
-        moved_on.moved_on = true;
-        assert_eq!(
-            state(&moved_on),
-            (State::Attention, "memory: not added yet".into())
-        );
-        // Under a phrase, having moved on changes nothing.
-        moved_on.stands = "applied".into();
-        assert_eq!(state(&moved_on), (State::Synced, "memory synced".into()));
         for (stopped, says) in [
             ("fork", "no change that lists this device is clear"),
             ("removed", "this device was removed"),
@@ -2939,22 +2677,22 @@ mod tests {
             edit(&mut f);
             state(&f)
         };
-        let first_start = (
+        let earlier = (
             State::Attention,
-            "memory not syncing: the first start on this version is not done".to_string(),
+            "memory not syncing: the database is from before 0.2.0-alpha.19".to_string(),
         );
-        assert_eq!(held("first_start", &|_| {}), first_start);
+        assert_eq!(held("earlier_database", &|_| {}), earlier);
         assert_eq!(
-            held("first_start", &|f| f.sync_enabled = false),
-            first_start
-        );
-        assert_eq!(
-            held("first_start", &|f| f.stands = "no_phrase".into()),
-            first_start
+            held("earlier_database", &|f| f.sync_enabled = false),
+            earlier
         );
         assert_eq!(
-            held("first_start", &|f| f.errors = vec!["x".into()]),
-            first_start
+            held("earlier_database", &|f| f.stands = "no_phrase".into()),
+            earlier
+        );
+        assert_eq!(
+            held("earlier_database", &|f| f.errors = vec!["x".into()]),
+            earlier
         );
         assert_eq!(
             held("later_database", &|f| f.sync_enabled = false),
@@ -2972,92 +2710,8 @@ mod tests {
         );
         // A node that is not running, or was not asked, says that first.
         assert_eq!(
-            held("first_start", &|f| f.running = false).0,
+            held("earlier_database", &|f| f.running = false).0,
             State::Stopped
-        );
-    }
-
-    /// The notice of what stopped syncing is `attention` (decision
-    /// 2026-10-04 §10.1), so that a panel which draws from the state
-    /// alone shows it. It is said where "starting" and "nothing mapped"
-    /// would be, and never over an error, a stalled cycle, a conflict or
-    /// a file too large. With sync off the state is off. A notice whose
-    /// folders are all mapped does not count.
-    #[test]
-    fn the_notice_of_what_stopped_needs_the_person() {
-        let stopped = |folders: usize, not_known: bool| Stopped { folders, not_known };
-        let with = |notice: Stopped, edit: &dyn Fn(&mut Facts)| {
-            let mut f = synced();
-            f.notice = Some(notice);
-            edit(&mut f);
-            state(&f)
-        };
-        let three = (
-            State::Attention,
-            "memory: 3 folders stopped syncing".to_string(),
-        );
-        // With a mapping in step.
-        assert_eq!(with(stopped(3, false), &|_| {}), three);
-        assert_eq!(
-            with(stopped(1, false), &|_| {}),
-            (State::Attention, "memory: 1 folder stopped syncing".into())
-        );
-        // Where it names none, and where it names some and one record
-        // names none.
-        assert_eq!(
-            with(stopped(0, true), &|_| {}),
-            (State::Attention, "memory: folders stopped syncing".into())
-        );
-        assert_eq!(with(stopped(3, true), &|_| {}), three);
-        // With no mapping: not "nothing mapped". With no report yet: not
-        // "starting".
-        assert_eq!(with(stopped(3, false), &|f| f.folders = 0), three);
-        assert_eq!(
-            with(stopped(3, false), &|f| f.report_age_secs = None),
-            three
-        );
-        // Offline, sending, joining: the notice is said first.
-        assert_eq!(with(stopped(3, false), &|f| f.peers_hot = 0), three);
-        assert_eq!(with(stopped(3, false), &|f| f.outbox_waiting = 2), three);
-        assert_eq!(with(stopped(3, false), &|f| f.projects_waiting = 1), three);
-        // It hides no error, no stalled cycle, no conflict and no file
-        // too large.
-        for (edit, says) in [
-            (
-                (&|f: &mut Facts| f.errors = vec!["x".into()]) as &dyn Fn(&mut Facts),
-                "memory sync error",
-            ),
-            (
-                &|f: &mut Facts| f.report_age_secs = Some(STALE_REPORT_SECS + 1),
-                "memory sync stalled",
-            ),
-            (
-                &|f: &mut Facts| f.conflicts = vec!["a".into()],
-                "memory: 1 conflict",
-            ),
-            (
-                &|f: &mut Facts| f.too_large = vec!["a.md".into()],
-                "memory: 1 file too large",
-            ),
-        ] {
-            assert_eq!(
-                with(stopped(3, false), edit),
-                (State::Attention, says.to_string())
-            );
-        }
-        // With sync off, the state is off.
-        assert_eq!(
-            with(stopped(3, false), &|f| f.sync_enabled = false),
-            (State::Off, "memory sync off".into())
-        );
-        // A notice whose folders are all mapped does not count.
-        assert_eq!(
-            with(stopped(0, false), &|_| {}),
-            (State::Synced, "memory synced".into())
-        );
-        assert_eq!(
-            with(stopped(0, false), &|f| f.folders = 0),
-            (State::Off, "memory: nothing mapped".into())
         );
     }
 

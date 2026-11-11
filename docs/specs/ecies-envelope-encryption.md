@@ -24,6 +24,13 @@
 > - **Signed metadata (§11.7)** gains optional `slot` and `rev`, present only
 >   on slotted items; test vector TV-C1 is unchanged.
 > - The TypeScript guidance (§9.2) applies to the SDK, which is deferred.
+> - **No node carries the older kind of channel** (the
+>   [decision record of 2026-11-10 (older kind)](../decisions/2026-11-10-removing-the-older-kind.md),
+>   rules 1 and 2): no node makes, hands, rotates or stores a channel's PSK,
+>   and none keeps a key file under `channel-keys/` (§2.3, §6, §14). The
+>   keys of a channel from its secret are derived from that secret
+>   (data-formats.md §9.1). A folder `channel-keys/` that an earlier version
+>   left is read by nothing (rule 9).
 
 ---
 

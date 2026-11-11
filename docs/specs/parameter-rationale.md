@@ -463,17 +463,17 @@ bound the test holds both to, is 93,600).
 
 **Rationale:** Application-level Keep-Alive sends Ping every 30s on each
 connection. This is SEPARATE from the QUIC transport keepalive (15s).
-Purpose: measure RTT for governor scoring, detect application-level
-unresponsiveness (QUIC connection alive but application frozen).
+Purpose: detect application-level unresponsiveness (QUIC connection alive
+but application frozen), and keep a peer from going stale. The governor
+scores no peer (decision 2026-11-10 (older kind), rule 2).
 
 **Reference:** Cardano uses 10-30s for TipSample on warm peers.
 
 **Derivation:** At 15 connections, 30s interval = 0.5 pings/s total. Each
 ping is ~50 bytes. Bandwidth: ~25 bytes/s per connection. Negligible.
 
-**If you increase to 60s:** RTT measurements are less frequent. Governor
-scoring reacts slower to latency changes. Dead detection takes 180s
-(3 × 60s) instead of 90s.
+**If you increase to 60s:** Dead detection takes 180s (3 × 60s) instead
+of 90s.
 
 ### keepalive_timeout = 90s (3 × ping_interval)
 
@@ -594,9 +594,10 @@ but effective against eclipse. May lose good peers unnecessarily.
 
 ### stale_threshold = 1800s (30 minutes)
 
-**Rationale:** Hot peers with no items_delivered for 30 minutes are
-priority-demoted (before scoring-based demotion). Indicates the peer
-is connected but not useful for any subscribed channel.
+**Rationale:** Hot peers that have answered no keep-alive for 30 minutes
+are demoted first when the hot set is over its size. There is no score
+after that: excess demotion orders by staleness alone (decision 2026-11-10
+(older kind), rule 2).
 
 **If you decrease to 300s (5 min):** Peers on quiet channels would be
 demoted during inactive periods. Too aggressive.
@@ -888,9 +889,9 @@ few retries, seconds apart, cover the passing kind. For the lasting kind,
 one small push every ten minutes costs nothing, and delivers the item
 within ten minutes of the reason going away.
 
-It stays, with its name and value, as the root of `RELAY_ASK_AGAIN_SECS`,
-`NO_ROOM_STANDS_SECS` and `FIRST_START_RETRY_MAX_SECS` (decision 2026-11-10
-(older kind), rule 2): the older outbox went.
+It stays, with its name and value, as the root of `RELAY_ASK_AGAIN_SECS`
+and `NO_ROOM_STANDS_SECS` (decision 2026-11-10 (older kind), rule 2): the
+older outbox went.
 
 ### outbox_batch_max_bytes = 195KB, outbox_batch_max_items = 500
 
@@ -1024,7 +1025,7 @@ as concurrency allows. This is safe because:
 1. Bootstrap peers are from **configured, trusted bootnodes** (operator-defined).
 2. The governor's urgent mode already bypasses `min_warm_tenure` for the
    same reason (trusted source, need fast mesh formation).
-3. Post-bootstrap, churn and scoring handle quality control for all peers
+3. Post-bootstrap, churn and dead detection handle quality control for all peers
    regardless of how they were initially promoted.
 4. Cardano follows the same model: topology-configured peers are immediately
    trusted; discovered peers go through the mini-protocol pipeline.
@@ -2693,28 +2694,15 @@ and 2 × `RECOVERY_MAX_NAMES` words (3,276,800 bytes); and that the longest
 word, a text or a delete, is an entry of `MIN_ENTRY_CONTENT_BYTES`, so that
 every word is counted at 1,280 bytes.
 
-### 12.11 The First Start
+### 12.11 The First Start, and the Lock
 
 #### FIRST_START_RETRY_BASE_SECS = 5, FIRST_START_RETRY_MAX_SECS = 600
 
-**Derivation:** The maximum is `OUTBOX_REFUSED_RETRY_MAX_SECS`: ten minutes,
-the longest wait before anything a relay refused is offered again.
-
-**Rationale:** How long a personal node waits before it tries its first
-start on this version again, after a try that failed (decision §10.1): the
-sync cycle's five seconds after the first, and twice as long after each
-further one, up to the maximum. A start that cannot succeed (no room for the
-copy, no leave to write) does not write its copy again every five seconds.
-And a person who has made room is not kept waiting for longer than ten
-minutes, and need not restart the node.
+Gone, with the first start (decision 2026-11-10 (older kind), rule 9).
 
 #### FIRST_START_RETRY_SLACK_SECS = 1
 
-**Rationale:** How much before its wait has passed a try at the first start
-is still made (decision §10.1). A try is made when a sync cycle would have
-run, and the first wait is a cycle long: without this, the timer's own
-jitter would put every try off by a whole cycle. `protocol.rs` asserts that
-it is less than the first wait.
+Gone, with the first start (decision 2026-11-10 (older kind), rule 9).
 
 #### NODE_LOCK_WAIT_MS = 500
 

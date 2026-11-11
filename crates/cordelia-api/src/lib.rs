@@ -56,7 +56,6 @@ pub mod commands;
 pub(crate) mod cut;
 pub use cut::{CutNow, may_have_dropped_links};
 pub mod error;
-pub mod first_start;
 pub mod following;
 pub mod found;
 pub mod git_list;
@@ -254,8 +253,7 @@ fn shared_routes(cfg: &mut web::ServiceConfig) {
             .route("/claude", web::post().to(sync::claude))
             .route("/map", web::post().to(sync::map))
             .route("/unmap", web::post().to(sync::unmap))
-            .route("/status", web::post().to(sync::sync_status))
-            .route("/seen", web::post().to(sync::seen)),
+            .route("/status", web::post().to(sync::sync_status)),
     );
     // Local history (decision 2026-09-30-agent-memory-sync §4.5b)
     cfg.service(

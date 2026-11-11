@@ -3,8 +3,7 @@
 //! A slot names "the current version of this key" without revealing the
 //! key: `slot = HMAC-SHA256(slot_key, "cordelia:slot:v1:" || key)`. Relays
 //! can match revisions of the same slot but learn nothing about the key.
-//! The channel's slot key is random, shared with members in channel
-//! states, and never rotated.
+//! The channel's slot key derives from its secret (`derive::slot_key`).
 
 use ring::hmac;
 
@@ -20,19 +19,6 @@ pub fn slot_id(slot_key: &[u8; 32], logical_key: &str) -> [u8; 32] {
     let mut out = [0u8; 32];
     out.copy_from_slice(tag.as_ref());
     out
-}
-
-/// AES-GCM associated data for an item: the channel ID, plus the slot and
-/// big-endian revision for a replaceable item. Binding them means an item
-/// cannot be moved to another channel or slot, or presented as another
-/// revision, without failing to decrypt.
-pub fn item_aad(channel_id: &str, slot: Option<&[u8]>, rev: Option<u64>) -> Vec<u8> {
-    let mut aad = channel_id.as_bytes().to_vec();
-    if let (Some(slot), Some(rev)) = (slot, rev) {
-        aad.extend_from_slice(slot);
-        aad.extend_from_slice(&rev.to_be_bytes());
-    }
-    aad
 }
 
 #[cfg(test)]
@@ -61,25 +47,5 @@ mod tests {
             hex::encode(slot_id(&[0u8; 32], "MEMORY.md")),
             "3c00145946c6dbac2bc3b99a5990c91966f2bf24c6fabeca42bd46362d90e168"
         );
-    }
-
-    #[test]
-    fn test_aad_binds_slot_and_rev() {
-        let psk = [0x33u8; 32];
-        let slot = [0x44u8; 32];
-        let aad = item_aad("grp_x", Some(&slot), Some(2));
-        let blob = crate::item_encrypt(&psk, b"hello", &aad).unwrap();
-
-        assert!(crate::item_decrypt(&psk, &blob, &aad).is_ok());
-        for wrong in [
-            item_aad("grp_x", Some(&slot), Some(3)),
-            item_aad("grp_x", Some(&[0x45; 32]), Some(2)),
-            item_aad("grp_y", Some(&slot), Some(2)),
-            item_aad("grp_x", None, None),
-        ] {
-            assert!(crate::item_decrypt(&psk, &blob, &wrong).is_err());
-        }
-        // Ordinary items keep the original associated data.
-        assert_eq!(item_aad("grp_x", None, None), b"grp_x".to_vec());
     }
 }

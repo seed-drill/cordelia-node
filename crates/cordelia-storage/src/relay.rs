@@ -3,9 +3,7 @@
 //!
 //! These are plain functions over a database connection. The clock is a
 //! parameter, and so is whoever asks. Nothing here opens a stream or reads
-//! one, and nothing here touches `items` or the channels of the older
-//! kind: the two kinds are counted apart, each against a cap of its own,
-//! and neither is refused or dropped to make room for the other (§2.5).
+//! one.
 //!
 //! ## Whose database
 //!
@@ -254,8 +252,7 @@ fn no_device_writes(conn: &Connection) -> Result<(), RelayError> {
 #[derive(Debug)]
 pub struct Room {
     /// The most the relay holds of channels from their secrets, in bytes
-    /// as entries are counted. It is this kind's own cap: what the relay
-    /// holds of the older kind is not counted against it.
+    /// as entries are counted.
     pub max_bytes: u64,
     /// The most one channel may hold, in bytes as entries are counted.
     pub max_channel_bytes: u64,
@@ -2369,17 +2366,6 @@ mod tests {
         );
         assert_eq!(ids(&conn, 1), [by_another.id(), elsewhere.id(), newer.id()]);
         assert_eq!(counted(&conn), 3 * SMALL);
-
-        // It needs no list of members and no state of the channel: the
-        // tables of the older kind hold nothing of it.
-        for table in ["channels", "channel_members", "items"] {
-            let rows: i64 = conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(rows, 0, "{table}");
-        }
     }
 
     /// An entry at the revision of one held from its author in its slot,
@@ -4324,14 +4310,6 @@ mod tests {
         uses.used(&channel(7), NOW + DAY);
         write_uses(&conn, &mut uses).unwrap();
         listed_relay_says(&conn, &channel(6), NOW - DAY).unwrap();
-        // What the relay holds of the older kind is no part of it.
-        conn.execute(
-            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                                   created_at, updated_at)
-             VALUES ('old_a', 'named', 'realtime', 'open', X'00', '2026-01-01', '2026-01-01')",
-            [],
-        )
-        .unwrap();
 
         let all = held_channels(&conn, &START, 100).unwrap();
         assert_eq!(all.len(), 7);
@@ -5880,87 +5858,6 @@ mod tests {
             [channel(2), channel(3), channel(4)]
         );
         assert_eq!(counted(&conn), 0);
-    }
-
-    // ── What the older kind left ─────────────────────────────────────
-
-    /// What a relay's database still holds of the older kind, as an
-    /// earlier version left it, is never counted against this kind's cap,
-    /// and never dropped to make room or as unused (decision 2026-11-10
-    /// (older kind), rule 3).
-    #[test]
-    fn test_what_the_older_kind_left_is_no_part_of_this_kinds_room() {
-        let (conn, mut room) = relay_of(2 * SMALL);
-        // What the relay holds of the older kind: two channels, far more
-        // than this kind's cap, in plain SQL.
-        let blob = vec![0x5au8; 8192];
-        for (n, channel_id) in ["old_a", "old_b"].into_iter().enumerate() {
-            conn.execute(
-                "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                                       created_at, updated_at)
-                 VALUES (?1, 'named', 'realtime', 'open', X'00', ?2, ?2)",
-                params![channel_id, format!("2026-01-0{}", n + 1)],
-            )
-            .unwrap();
-            for i in 0..4u8 {
-                conn.execute(
-                    "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
-                                        content_hash, signature, encrypted_blob, content_length)
-                     VALUES (?1, ?2, ?3, 'memory', '2026-01-01T00:00:00Z', ?4, ?5, ?6, ?7)",
-                    params![
-                        format!("ci_{channel_id}_{i}"),
-                        channel_id,
-                        device(1).public_key().as_slice(),
-                        [i + 16 * n as u8; 32].as_slice(),
-                        [0x02u8; 64].as_slice(),
-                        blob.as_slice(),
-                        blob.len() as i64,
-                    ],
-                )
-                .unwrap();
-            }
-        }
-        let older = |conn: &Connection| -> (i64, i64) {
-            conn.query_row(
-                "SELECT COUNT(*), COALESCE(SUM(content_length), 0) FROM items",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap()
-        };
-        let before = older(&conn);
-        assert_eq!(before, (8, 8 * 8192));
-
-        // None of it is counted against this kind's cap: the relay takes
-        // new channels up to it.
-        assert_eq!(used_bytes(&conn).unwrap(), 0);
-        for c in [1, 2] {
-            assert_eq!(
-                take(&conn, &mut room, &small(c, 1, 5), &from(1), NOW).unwrap(),
-                Taken::Stored
-            );
-        }
-        assert_eq!(counted(&conn), 2 * SMALL);
-        // At this kind's cap, a new channel of this kind is refused, and
-        // nothing of the older kind went to make room for it.
-        assert_eq!(
-            take(&conn, &mut room, &small(3, 1, 5), &from(1), NOW).unwrap(),
-            Taken::Refused(Refused::NoRoom)
-        );
-        assert_eq!(older(&conn), before);
-
-        // Over this kind's cap, since its cap came down, what is dropped
-        // to make room is of this kind, down to nothing: the older kind's
-        // channels are never among them.
-        assert_eq!(make_room(&conn, SMALL).unwrap(), [channel(2)]);
-        assert_eq!(held(&conn), [1]);
-        assert_eq!(make_room(&conn, 0).unwrap(), [channel(1)]);
-        assert!(make_room(&conn, 0).unwrap().is_empty());
-        assert_eq!(older(&conn), before);
-        // Nor does what nobody uses of this kind take any of the older.
-        take(&conn, &mut room, &small(2, 1, 5), &from(1), NOW + 20).unwrap();
-        assert_eq!(sweep_unused(&conn, NOW + 365 * DAY).unwrap(), [channel(2)]);
-        assert_eq!(older(&conn), before);
     }
 
     // ── Every head (decision 2026-10-24 (removal), rules 14 to 16) ───

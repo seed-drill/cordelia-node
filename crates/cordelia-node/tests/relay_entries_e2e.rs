@@ -89,7 +89,6 @@ async fn client_to(identity: Arc<NodeIdentity>, at: u16, key: [u8; 32]) -> Resul
     let mut manager = connection::ConnectionManager::new(
         identity.clone(),
         endpoint,
-        vec![],
         vec!["personal".into()],
         port,
     );
@@ -1920,13 +1919,8 @@ async fn stand_in_for_a_relay() -> (u16, tokio::sync::oneshot::Receiver<quinn::C
     let identity = Arc::new(NodeIdentity::generate().unwrap());
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
-    let manager = connection::ConnectionManager::new(
-        identity,
-        endpoint.clone(),
-        vec![],
-        vec!["relay".into()],
-        port,
-    );
+    let manager =
+        connection::ConnectionManager::new(identity, endpoint.clone(), vec!["relay".into()], port);
     let ctx = manager.connect_context();
     let (connected, connection) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {

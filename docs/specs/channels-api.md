@@ -261,7 +261,10 @@ Prometheus exposition format metrics endpoint. Bearer token authentication requi
 > kind), rule 3). A relay's `cordelia_channels_subscribed` counts the
 > channels it holds, and its `cordelia_items_stored` and
 > `cordelia_content_bytes_stored` the entries it stores, as a device counts
-> them; nothing of the older kind is counted on any node.
+> them; nothing of the older kind is counted on any node. Of the example
+> below, `cordelia_items_pushed_total` and `cordelia_items_synced_total`
+> (of the older kind's push and sync), `cordelia_replication_lag_seconds`
+> and `cordelia_bandwidth_bytes_total` are not served.
 
 **Response (200):** `text/plain; version=0.0.4`
 
@@ -486,8 +489,8 @@ of the device's own. Nothing of the older kind is read.
   and the threat model's T17).
 - **Every route here is `409` once the device was given a new key** and the
   node has not been started again.
-- **A node whose first start on this version is not done** (§3.18) answers
-  `devices/list` and refuses the rest.
+- **A node that is held up** (§3.18) answers none of them: it answers
+  `GET` requests alone, and these are `POST`.
 
 | Route | What it does |
 |-------|--------------|
@@ -622,9 +625,11 @@ never held, comes in only under **a word that the phrase signed:**
 
 ### 3.18 Sync, and a Node That Is Held Up
 
-> **v1 status.** `/api/v1/sync/{claude,map,unmap,status,seen}`, per the
+> **v1 status.** `/api/v1/sync/{claude,map,unmap,status}`, per the
 > decision record of 2026-09-30 §4.5, with what the decision record of
-> 2026-10-04 §10.1 changes.
+> 2026-10-04 §10.1 changes. `/api/v1/sync/seen` is gone, with the notice of
+> the folders that stopped syncing at an earlier version's first start, and
+> so is the first start itself (decision 2026-11-10 (older kind), rule 9).
 
 - **Only what is mapped syncs.** A folder syncs because `map` declared it,
   and for no other reason. A request to `sync/claude` that turns on a scope
@@ -637,11 +642,7 @@ never held, comes in only under **a word that the phrase signed:**
   the device comes to hold the name by it, it carries the name first
   (decision 2026-10-04 §7.3), and the answer has what was carried under
   `carried`, in the form that `/api/v1/carry` answers.
-- **`POST /api/v1/sync/seen`** takes the notice of what stopped syncing
-  away: a person has seen it. It is the one request that does. It changes no
-  setting, and answers as `sync/status` does. With no notice stored it does
-  nothing.
-- **`sync/status`** answers, as `claude`, `map`, `unmap` and `seen` do:
+- **`sync/status`** answers, as `claude`, `map` and `unmap` do:
 
   | Field | What it is |
   |-------|------------|
@@ -654,9 +655,10 @@ never held, comes in only under **a word that the phrase signed:**
   | `no_report_secs` | For how long the node has stored no report, by its own clock, which does not run while the machine sleeps: since the later of its start and the last report. A status says by it that the cycle has stalled |
   | `last_change_at` | When a cycle last sent or received a memory |
   | `stands` | Where the device stands under a recovery phrase: `no_phrase`, `applied`, or why it has stopped (`fork`: closed, it follows no clear change, decision 2026-10-24 (removal), rule 10; `closed`: it stands applied under a change whose secret a key it knows to be removed holds, rule 4; `removed`, `not_listed`, `not_opened`) |
-  | `held` | Why the node is held up, in words, where it is |
-  | `moved_on` | Whether the device took this version with what an earlier one held: with no phrase it is then "not added yet" |
-  | `notice` | The notice of the folders that stopped syncing, while one is stored, with sync on and with it off: `records`, one for each time a notice was stored (`at`, `dir`, and `folders`, how many it names, or null where which stopped is not known); `not_known`, whether some record names none; `dir`, the Claude Code directory that its folders are asked against; `folders`, each folder that the records name, once, as a found entry with `synced_under` (the Claude Code directory it synced under) and `at`; and `stopped`, how many of them no mapping syncs now |
+  | `held` | Why the node is held up, in words, where it is. It is not seen now: a node that is held up refuses this request (below) |
+
+  `moved_on` and `notice` are gone with the first start (decision
+  2026-11-10 (older kind), rule 9).
 
   **A found entry** is a folder that was found and is not mapped:
 
@@ -669,17 +671,17 @@ never held, comes in only under **a word that the phrase signed:**
   | `mappable` | Whether `map`, given the directory under `cwd`, would sync this folder |
   | `needs_name` | Present and true where it can be mapped only under a name that a person gives it |
   | `home` | Present and true where it is the home directory's own folder |
-  | `mapped` | Present and true where a mapping syncs it now, as a folder of a notice can be |
+  | `mapped` | Present and true where a mapping syncs it now. What a cycle's report lists as found never is |
   | `why_not` | Why `map` would not sync it, in a word: `another_claude_dir`, `laid_out_by_hand`, `no_directory`, `home_not_set`, `outside_home`, `path_too_long`, `directory_gone`, `through_a_link`, `git_not_run` or `memory_elsewhere` |
   | `says` | Why not, or why a name is needed, in words |
 - **`GET /api/v1/status`** answers `status`; `version`, so that a command
   can tell a node of another version; `uptime_secs`; `peers_hot` and
   `peers_warm`; `channels_subscribed` (the names a device holds, or the
   channels a relay holds); `sync_errors`; `outbox_waiting`; `held`, which
-  is null, or by what the node is held up
-  (`by`: `first_start` or `later_database`) and why (`why`);
-  `key_files_in_place`, how many key files of an older version were left in
-  place at this start because no copy holds them; `no_relay_secs`, for
+  is null, or by what the node is held up (`by`: `later_database`;
+  `earlier_database` for a database from before 0.2.0-alpha.19; or
+  `step_failed` for a step of the schema that did not finish) and why
+  (`why`); `no_relay_secs`, for
   how long no relay has been connected, by the node's own clock, or null
   while one is; and, on a personal node that stands applied and is not
   held up, `messages` (decision 2026-10-09 §8). Working it out gives
@@ -710,8 +712,7 @@ never held, comes in only under **a word that the phrase signed:**
   `devices/list` answers under `person`. Its `state` is one of seven names
   (`synced`, `syncing`, `offline`, `attention`, `off`, `stopped`,
   `uninitialised`). Where the node runs and sync is on, a device with a
-  folder mapped and no recovery phrase, and one with a notice of what
-  stopped at the first start, has the state `attention`, so that a panel
+  folder mapped and no recovery phrase has the state `attention`, so that a panel
   which draws from the state alone does not show it as synced. So has a
   device that has stopped, and a node that is held up, with sync on or off.
   - **`level`** is `red`, `amber`, or null where none holds (decision
@@ -724,13 +725,12 @@ never held, comes in only under **a word that the phrase signed:**
     Red:
     - `stopped`: this device has stopped syncing, and the line says why,
       such as that it was removed.
-    - `held`: the node is held up: its first start on this version is not
-      done, or its database is from a later version.
+    - `held`: the node is held up: its database is from a later version,
+      or from before 0.2.0-alpha.19.
     - `no_phrase`: a folder is mapped, and this device has no recovery
-      phrase yet, or is not added yet.
+      phrase yet.
     - `errors`: memory sync has an error.
     - `stalled`: memory sync has stopped reporting.
-    - `stopped_syncing`: the notice of what stopped at the first start.
     - `conflicts`: a memory folder holds conflict copies.
     - `too_large`: a memory file is too large to sync.
 
@@ -762,7 +762,7 @@ never held, comes in only under **a word that the phrase signed:**
       7).
   - Of the node: `running` (null where the command did not ask it, with why
     under `not_asked`); `version`, the command's own, and `node_version`;
-    `held` and `key_files_in_place`, where they are set; `uptime_secs`;
+    `held`, where it is set; `uptime_secs`;
     `no_relay_secs`; `peers`; `outbox_waiting`.
   - **`messages`,** at the top level, as the node gave it, where it gave
     it (decision 2026-10-09 §8). Only its `held_pairs` changes the
@@ -790,18 +790,20 @@ never held, comes in only under **a word that the phrase signed:**
     hold of a removed device that holds a shared channel changes the
     level.
   - Under `sync`: the settings; `projects`, one for each folder that syncs;
-    `unmapped`, the found entries; `available`; `stands` and `moved_on`;
+    `unmapped`, the found entries; `available`; `stands`;
     `publishes_nothing`, why nothing is published from this device where
-    nothing is; `conflicts` and `errors`; and `notice`, as `sync/status`
-    answers it, or null where the node stores none.
-- **A node whose first start on this version is not done** (decision
-  2026-10-04 §10.1) runs no cycle and no pass. It answers every `GET`,
-  `sync/status`, `devices/list`, `history/list`, `history/show`,
-  `channels/entries` and `channels/identity`, and a request to `sync/claude`
-  that turns sync off. It refuses every other request with `503`, the code
-  `held_up`, and why it is held up. A node whose database is from a later
-  version answers every `GET` and nothing else: it writes nothing, so there
-  even turning sync off is refused.
+    nothing is; and `conflicts` and `errors`.
+  - **Gone with the first start** (decision 2026-11-10 (older kind), rule
+    9): the red hold `stopped_syncing`, the node's `key_files_in_place`,
+    and `moved_on` and `notice` under `sync`.
+- **A node that is held up** (decision 2026-10-04 §10.1; decision
+  2026-11-10 (older kind), rule 6), by a database from a later version or
+  from before 0.2.0-alpha.19, runs no cycle and no pass, over a database of
+  its own in memory, and changes nothing in the one on disk. It answers
+  every `GET` and nothing else: every other request is refused with `503`,
+  the code `held_up`, and why it is held up, even one that turns sync off.
+  A relay or a bootnode is never held up: it does not start. The first
+  start of an earlier version, which held a node up too, is gone (rule 9).
 
 ---
 

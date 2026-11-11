@@ -136,12 +136,12 @@ pub(crate) async fn metrics_with(
          cordelia_peers_seen{{window=\"7d\",role=\"node\"}} {}\n\
          cordelia_peers_seen{{window=\"7d\",role=\"relay\"}} {}\n\
          \n\
-         # HELP cordelia_channels_active Channels that received an item in the window\n\
+         # HELP cordelia_channels_active Channels in which this node stored an entry in the window\n\
          # TYPE cordelia_channels_active gauge\n\
          cordelia_channels_active{{window=\"1d\"}} {}\n\
          cordelia_channels_active{{window=\"7d\"}} {}\n\
          \n\
-         # HELP cordelia_items_stored Items held by this node\n\
+         # HELP cordelia_items_stored Entries stored by this node\n\
          # TYPE cordelia_items_stored gauge\n\
          cordelia_items_stored {}\n\
          \n\
@@ -321,10 +321,6 @@ pub(crate) async fn status_with(
     let mut status = serde_json::json!({
         "status": "running",
         "held": held,
-        // How many key files of an older version were left in place at
-        // this start, since no copy holds them (decision 2026-10-04
-        // §10.1).
-        "key_files_in_place": state.held.key_files_in_place(),
         // So that a command can tell when the node is not the version it is.
         "version": env!("CARGO_PKG_VERSION"),
         "uptime_secs": uptime as u64,

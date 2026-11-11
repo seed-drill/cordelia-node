@@ -130,8 +130,7 @@ pub fn stored_of_channel(
 /// The usage counts of a node at `now` (unix seconds): the peers it has
 /// seen, and what it stores of channels from their secrets, as a device
 /// counts it. A relay counts so too (decision 2026-11-10 (older kind),
-/// rule 3). Nothing of the older kind of channel is counted: no node
-/// carries one, whatever its database once held.
+/// rule 3).
 pub fn snapshot_of_a_device(conn: &Connection, now: i64) -> Result<Usage, CordeliaError> {
     let (relays_1d, peers_1d) = peers_seen(conn, now - 86_400)?;
     let (relays_7d, peers_7d) = peers_seen(conn, now - 7 * 86_400)?;
@@ -180,24 +179,11 @@ mod tests {
 
     /// A device's usage counts are of the channels of its own: the
     /// entries it stores and the bytes of their content, and the channels
-    /// in which it stored one lately. Nothing that the table of the
-    /// older kind holds is counted (decision 2026-10-04 §10).
+    /// in which it stored one lately.
     #[test]
-    fn test_a_device_counts_the_entries_of_its_own_channels_and_nothing_older() {
+    fn test_a_device_counts_the_entries_of_its_own_channels() {
         let conn = db::open_in_memory().unwrap();
         let now = 1_800_000_000;
-        // Of the older kind: a channel with an item, which is not a
-        // device's to count.
-        conn.execute_batch(
-            "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                                   created_at, updated_at)
-             VALUES ('grp_a', 'group', 'realtime', 'invite_only', X'AA', '2026-01-01',
-                     '2026-01-01');
-             INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
-                                content_hash, signature, encrypted_blob, content_length)
-             VALUES ('ci_1', 'grp_a', X'AA', 'memory', '2026-01-01', X'01', X'02', X'0303', 2);",
-        )
-        .unwrap();
         assert_eq!(stored_of_own(&conn).unwrap(), (0, 0));
         let none = snapshot_of_a_device(&conn, now).unwrap();
         assert_eq!((none.items_stored, none.bytes_stored), (0, 0));

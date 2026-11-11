@@ -1,7 +1,7 @@
 # Decision: removing the older kind of channel, and one baseline for the schema
 
 **Date**: 2026-11-10
-**Status**: Accepted by the person on 10 November ("ok to remove older channels and schema"); reviewed, and its fixes checked, 10 November. To be built in the three slices of section 7.
+**Status**: Accepted by the person on 10 November ("ok to remove older channels and schema"); reviewed, and its fixes checked, 10 November. Built in the three slices of section 7.
 **Cited as**: "decision 2026-11-10 (older kind), rule 4". The numbers do not change.
 **Lines** are main's (c3cc5756, `v0.2.0-alpha.19`, whose code is alpha.19's); paths are under `crates/`.
 
@@ -64,7 +64,8 @@ A relay carries the older kind of channel (a random ID, a ring of keys, a list o
 
 - the data directory's lock (`main.rs:2405`), and rule 6's refusals with `refuse_while_held`;
 - `person::judge_kept` (decision 2026-10-24 (removal), rule 12), which the first start calls at every start (API `first_start.rs:250`): the node calls it then instead;
-- **one wording for a device that follows no phrase,** "no recovery phrase yet" (`look.rs:550`); "not added yet", which read the first start's mark (`look.rs:555`), goes.
+- **one wording for a device that follows no phrase,** "no recovery phrase yet" (`look.rs:550`); "not added yet", which read the first start's mark (`look.rs:555`), goes;
+- **a schema step that does not finish** (step 34 where the disk has too little room, as `secure_delete` writes what it frees to the log) changes nothing: a personal node stays up, held (`held.by` `step_failed`), with words that say so and that it needs free room of about the size of its database, and tries again at its next start; a relay or a bootnode does not start, and a command says the same.
 
 Also going: `sync.claude.all`, written only for earlier versions (`sync.rs:180-183`, and at every turn-on, `sync.rs:374`: removing `meta::SYNC_CLAUDE_ALL` lets the compiler find each), with `scope_off_at_start` (`sync.rs:187`); cost: none, as none opens this database. The notice of folders that stopped syncing (§10.1, rule 3), with `--seen` and `stopped_syncing`; cost: a device that has not cleared it stops naming them, and `cordelia sync status` still lists each folder found, with the command that maps it. The panels' `sync status --seen` action, shown only while the notice exists, goes with it.
 
@@ -83,7 +84,7 @@ Also going: `sync.claude.all`, written only for earlier versions (`sync.rs:180-1
 
 ## 6. Docs
 
-**Rule 11. Each slice makes true the docs it changes:** CLAUDE.md; the README (upgrade from alpha.19 only); the WHITEPAPER; a line at the head of decision 2026-10-04 §2.5 and §10 (other records are history); `channel-naming.md` to `docs/archive`; the specs (API, data formats, protocol, operations, parameters, configuration, ECIES, glossary); `threat-model.md` (rule 10); TESTING.md and `deploy/relay/README.md`.
+**Rule 11. Each slice makes true the docs it changes:** CLAUDE.md; the README (upgrade from alpha.19 only); the WHITEPAPER; a line at the head of decision 2026-10-04 §2.5 and §10 (other records are history); `channel-naming.md` deleted, as wholly of the older kind (it is at [c3cc5756](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md)); the specs (API, data formats, protocol, operations, parameters, configuration, ECIES, glossary); `threat-model.md` (rule 10); TESTING.md and `deploy/relay/README.md`.
 
 ## 7. Slices
 

@@ -19,8 +19,8 @@ means for an upgrade:
 - **The older kind is carried by no node**
   ([decision 2026-11-10](../../docs/decisions/2026-11-10-removing-the-older-kind.md),
   rule 7). A relay answers what a peer asks of it with nothing, and refuses
-  what it is sent of it. What a relay of 0.2.0-alpha.19 left of that kind
-  stays in its database, unread, and nothing is added to it.
+  what it is sent of it. What a relay of 0.2.0-alpha.19 held of that kind
+  goes when it starts on this version (section 6).
 
 Seed Drill operates two relays, `relay1.cordelia.seeddrill.ai` and
 `relay2.cordelia.seeddrill.ai`. They list each other, so they form a mesh,
@@ -191,9 +191,7 @@ what the relay holds and how much it is used, as counts only:
 
 **Storage.** `max_storage_bytes` (under `[node]` in the relay's config; 1
 GiB if not set) is the most a relay holds of channels from their secrets.
-What a relay of 0.2.0-alpha.19 left of the older kind is not counted, and
-does not grow: give the data volume room for it as well, and for the
-database's own overhead.
+Give the data volume room for the database's own overhead as well.
 
 **What is counted.** Each entry counts as its encrypted content and 1 KB,
 and not as the pages of the database. So an entry that replaces one of its
@@ -270,13 +268,18 @@ Before you upgrade a relay, **list by key each relay that this one works
 with** (section 7). A default relay named without a key has the key that is
 compiled in.
 
-The schema's steps are run when the relay starts, and change no row that is
-there. A relay makes no copy of its database and takes no step that empties
-what it holds of the older kind: that is what a personal node does at its
-first start on this version, and only a personal node. After the upgrade,
-`Storage:` in `cordelia stats` shows what the channels from their secrets
-are counted at, against the cap: what the relay holds of the older kind is
-no longer counted.
+**Only a relay of 0.2.0-alpha.19 is taken over**
+([decision 2026-11-10](../../docs/decisions/2026-11-10-removing-the-older-kind.md),
+rules 4 to 6). When it first starts on this version, one step of the
+schema (step 34) drops what it held of the older kind, in one transaction,
+and the log says how long it took. The database file keeps its size:
+SQLite uses the room again. A relay of an earlier release does not start
+on this version: it says so, and changes nothing. Upgrade it to
+0.2.0-alpha.19 first (`CORDELIA_VERSION=v0.2.0-alpha.19` and its
+`CORDELIA_SHA256`, which the Dockerfile needs both of), start it once, then
+upgrade it to this version. The step needs free room on the data volume of
+about the size of the database: without it, the relay changes nothing,
+says so, and stops.
 
 - **A data directory is one node's.** A relay takes a lock on its data
   directory when it starts (a file in it, `node.lock`). A second node that
@@ -284,10 +287,8 @@ no longer counted.
   nothing, and stops.
 - **A database from a later version is refused.** A relay that finds its
   database at a later schema version than its own names both versions,
-  changes nothing, and stops: install the later version again.
-- A relay that is started on a database which a personal node has used
-  removes the guard that the personal node set there (a trigger that refuses
-  a new channel of the older kind), and says so in its log.
+  changes nothing, and stops: install the later version again. One from
+  before 0.2.0-alpha.19 is refused the same way, as above.
 
 The identity stays on the `cordelia-relay1-data` volume. Do not delete that
 volume, and keep a copy of the key somewhere safe. Devices know a relay by

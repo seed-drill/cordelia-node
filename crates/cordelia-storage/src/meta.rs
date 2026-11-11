@@ -4,9 +4,6 @@ use rusqlite::{Connection, params};
 
 use cordelia_core::CordeliaError;
 
-/// Key under which the ID of this node's personal channel is stored.
-pub const PERSONAL_CHANNEL_ID: &str = "personal_channel_id";
-
 /// Claude Code directory to sync; sync is off when absent.
 pub const SYNC_CLAUDE_DIR: &str = "sync.claude.dir";
 
@@ -29,10 +26,6 @@ pub const SYNC_CLAUDE_HOME: &str = "sync.claude.home";
 /// and kept when home memory is turned off or unmapped, so that turning it
 /// on again maps it under the same name, into the same channel.
 pub const SYNC_CLAUDE_HOME_NAME: &str = "sync.claude.home_name";
-
-/// `"on"` when everything found syncs (home and git projects, now and
-/// later); `"off"` when only declared mappings sync.
-pub const SYNC_CLAUDE_ALL: &str = "sync.claude.all";
 
 /// JSON array of declared mappings, `[{"folder": "/abs/path", "name": "..."}]`:
 /// Claude's memory for sessions started in `folder` syncs under `name`.
@@ -152,17 +145,6 @@ pub const PERSON_JUDGE_KEPT: &str = "person.judge_kept";
 /// change says of the move. It goes when the device leaves its phrase.
 pub const PERSON_MOVED_FROM: &str = "person.moved_from";
 
-/// The mark that the first start on a version that carries no channel of
-/// the older kind is done, with whether the step was made and the version
-/// that wrote it (`crate::first_start`, decision 2026-10-04 §10.1).
-pub const FIRST_START: &str = "first_start.done";
-
-/// JSON array of what a device whose stored scope was on has been told:
-/// one record for each time, with the date, the Claude Code directory and
-/// the folders that stopped syncing (`crate::first_start::Notice`,
-/// decision 2026-10-04 §10.1).
-pub const SYNC_CLAUDE_NOTICE: &str = "sync.claude.notice";
-
 /// How many times in a row the device's list of what its agents read was
 /// written again for a relay's answer that it holds another at the
 /// revision pushed, since a list was last written for a mark it lacked
@@ -248,12 +230,9 @@ mod tests {
     #[test]
     fn test_get_set() {
         let conn = db::open_in_memory().unwrap();
-        assert_eq!(get(&conn, PERSONAL_CHANNEL_ID).unwrap(), None);
-        set(&conn, PERSONAL_CHANNEL_ID, "grp_a").unwrap();
-        set(&conn, PERSONAL_CHANNEL_ID, "grp_b").unwrap();
-        assert_eq!(
-            get(&conn, PERSONAL_CHANNEL_ID).unwrap().as_deref(),
-            Some("grp_b")
-        );
+        assert_eq!(get(&conn, SYNC_CLAUDE_DIR).unwrap(), None);
+        set(&conn, SYNC_CLAUDE_DIR, "/a").unwrap();
+        set(&conn, SYNC_CLAUDE_DIR, "/b").unwrap();
+        assert_eq!(get(&conn, SYNC_CLAUDE_DIR).unwrap().as_deref(), Some("/b"));
     }
 }

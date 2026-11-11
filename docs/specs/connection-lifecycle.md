@@ -4,6 +4,16 @@
 > establishment, state transition, and teardown path. All paths converge to the
 > same canonical sequence. No path may skip a step.
 
+> **v1 status.** No node carries the older kind of channel
+> ([decision record of 2026-11-10 (older kind)](../decisions/2026-11-10-removing-the-older-kind.md),
+> rules 1, 2 and 7): a peer made Hot is sent no Channel-Announce, and no
+> node pushes or syncs an item. Every node answers an Item-Sync (`0x05`)
+> with nothing, and refuses an Item-Push (`0x06`) and a Channel-Announce
+> (`0x04`), whatever the peer's state; a relay serves the streams of entries
+> (`0x10` to `0x14`) to a peer that is Warm or Hot (network-protocol.md
+> §5.4.2). §1.2.1, §2.1, §3.1 and §3.3 say so below. The four paths, the
+> canonical sequence, the checks, the limits and the teardown stand.
+
 **Motivation:** During Phase 1 development, features added to one connection path
 (e.g., relay role detection on accept) were missed on other paths (bootstrap,
 peer-sharing). The root cause: no single document enumerated all paths and their
@@ -38,7 +48,7 @@ ALL four paths MUST execute this exact sequence:
    roles = peer_conn.handshake.peer_roles
 
 2. ADD to governor
-   governor.add_peer(node_id, addrs, channels)
+   governor.add_peer(node_id, addrs)
 
 3. MARK relay role (if applicable)
    if roles.contains("relay"):
@@ -72,17 +82,16 @@ When the governor promotes a peer from Warm to Hot (§5.4 step 4, or step 6 in c
 ```
 1. UPDATE governor state
    peer.set_state(PeerState::Hot)
+```
 
-2. SEND Channel-Announce (§4.4)
-   For each subscribed channel, send ChannelJoined to the peer.
-   Must complete within 30s of promotion (§4.4.4).
+Nothing else follows from it. No node sends a Channel-Announce (gone:
+decision 2026-11-10 (older kind), rule 2), and no stream waits on the
+promotion: a relay serves the streams of entries to a Warm peer as to a Hot
+one (§2.1).
 
-3. BEGIN data protocols
-   The peer is now eligible for Item-Sync and Item-Push.
-   handle_peer_streams will accept 0x04-0x07 streams from this peer.
-``` If a path omits step 3 (relay marking), relays
-won't be in the hot set. If a path omits step 7 (stream handler), the peer's
-protocol messages won't be processed.
+If a path omits step 3 of §1.2 (relay marking), relays won't be in the hot
+set. If a path omits step 7 (stream handler), the peer's protocol messages
+won't be processed.
 
 ### 1.3 Pre-Connection Checks
 
@@ -160,22 +169,18 @@ fn handle_peer_streams(conn, peer_id, governor_state_fn, ...):
             // before it may be made hot, and gates nothing here.
             (PeerSharing,  Warm | Hot) => handle_peer_sharing(stream)
 
-            // Data protocols: Hot only
-            (ItemPush,        Hot) => handle_push(stream)
-            (ItemSync,        Hot) => handle_sync(stream)
-            (ChannelAnnounce, Hot) => handle_announce(stream)
-            (PskExchange,     Hot) => handle_psk(stream)
+            // The older kind: no node carries it, whatever the peer's
+            // state (decision 2026-11-10 (older kind), rule 7).
+            (ItemSync, _) => answer_with_nothing(stream)  // no channels, no items
+            (ItemPush | ChannelAnnounce, _) =>
+                stream.reset(ERR_RATE_LIMIT)             // refused at the byte
+            // PskExchange (0x07) and Pairing (0x08) have no messages, and
+            // are served by no node.
 
-            // Pairing: bootnode only (reject on non-bootnodes)
-            (Pairing, _) if node_role != "bootnode" =>
-                log WARN "pairing rejected: not a bootnode"
-                stream.reset(APP_ERROR_WRONG_ROLE)
-            (Pairing, _) => handle_pairing(stream)
-
-            // Reject data protocols from Warm peers
-            (ItemPush | ItemSync | ChannelAnnounce | PskExchange, Warm) =>
-                log WARN "rejected {protocol} from warm peer {peer_id}"
-                stream.reset(APP_ERROR_WRONG_STATE)
+            // Entries of a channel from its secret: a relay serves them
+            // to a Warm or Hot peer (network-protocol.md §4.9)
+            (EntryShow | ChannelProve | EntryPull | EntryPush | RelayEntries,
+             Warm | Hot) if node_role == "relay" => serve_entries(stream)
 
             // Reject unknown protocols
             (_, _) =>
@@ -183,10 +188,11 @@ fn handle_peer_streams(conn, peer_id, governor_state_fn, ...):
                 stream.reset(APP_ERROR_UNKNOWN_PROTOCOL)
 ```
 
-**Implementation note (session 92):** State gating is enforced in `p2p.rs`
-`handle_peer_streams`. ItemPush and ItemSync are rejected from non-Hot peers
-(data protocols require full trust). PeerSharing is allowed on Warm + Hot.
-KeepAlive and ChannelAnnounce are allowed on all active states. This closes
+**Implementation note:** State gating is enforced in `p2p.rs`
+`handle_peer_streams`. The streams of the older kind are answered or
+refused whatever the peer's state. A relay serves the streams of entries to
+Warm and Hot peers. PeerSharing is allowed on Warm + Hot. Gating by state
+first closed
 [spec-alignment-audit](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/reviews/spec-alignment-audit.md) gap #12 (ss8.1-8.4: protocol-per-state gating).
 
 ### 2.2 State Query Mechanism
@@ -228,8 +234,8 @@ peer_conn.governor_state: Arc<AtomicU8>  // 0=Cold, 1=Warm, 2=Hot
 | MAX_CONNECTIONS_PER_IP (5) | `accept_incoming` pre-check | Before QUIC handshake |
 | MAX_CONNECTIONS_PER_SUBNET (20) | `accept_incoming` pre-check | Before QUIC handshake |
 | MAX_MESSAGE_BYTES (1MB) | `read_frame` in codec | On every frame read |
-| MAX_ITEM_BYTES (64KB) | Publish API handler; item-push and item-sync handlers | On item creation, and before an item received from a peer is stored |
-| Rate limits (writes/min) | Protocol handler | On each inbound message |
+| MAX_ITEM_BYTES (64KB) | Where an entry is made, and where one is read: its content is a power of two up to this | On each entry |
+| Rate limits (requests/min) | `handle_peer_streams`, before a stream is served | On each inbound stream |
 
 ### 3.2 ConnectionTracker Integration
 
@@ -251,16 +257,23 @@ fn accept_incoming_with_limits(conn_mgr, tracker):
 ### 3.3 Rate Limit Integration
 
 ```
-fn handle_push(stream, peer_id, rate_limiter):
-    if rate_limiter.would_exceed(peer_id, "push"):
-        log WARN "rate limit exceeded for {peer_id}"
-        send PushAck { stored: 0, policy_rejected: items.len() }
-        governor.ban_peer(peer_id, "rate_limit", Transient)
-        return
+// In handle_peer_streams, for each inbound stream, before it is served:
+// At a relay, the requests of a relay it is set up with are not counted;
+// on the streams of entries, only those of a relay that the operator lists
+// by key are not.
+if counted and rates.request(peer_id, address, protocol) is over:
+    log WARN "rate limit exceeded"
+    stream.reset(ERR_RATE_LIMIT)   // the peer does not wait for an answer
+    if over.cut_off and the peer is not this node's own relay:
+        close the connection, and refuse its address for a time
+    continue
 
-    // Process normally
-    ...
+// Serve normally
+...
 ```
+
+The item push that this section showed is gone (decision 2026-11-10 (older
+kind), rule 2).
 
 ---
 

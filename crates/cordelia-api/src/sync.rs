@@ -58,152 +58,61 @@ fn store_exclusions(db: &rusqlite::Connection, list: &[String]) -> Result<(), Ap
 
 fn status(state: &AppState) -> Result<SyncStatusResponse, ApiError> {
     use cordelia_storage::person::State;
-    // What a stored notice names is asked of the disk and of git once
-    // the database's lock is let go.
-    let (mut status, notices, last_dir) = {
-        let db = state
-            .db
-            .lock()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let dir = meta::get(&db, meta::SYNC_CLAUDE_DIR)?;
-        let report =
-            meta::get(&db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
-        let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
-        let last_change_at = meta::get(&db, meta::SYNC_CLAUDE_LAST_CHANGE)?;
-        let stands = match crate::at_relays::stands(&db) {
-            Ok(crate::at_relays::Stands::NoPhrase) => "no_phrase",
-            Ok(crate::at_relays::Stands::Applied) => "applied",
-            Ok(crate::at_relays::Stands::Closed) => "closed",
-            Ok(crate::at_relays::Stands::Stopped(State::Fork)) => "fork",
-            Ok(crate::at_relays::Stands::Stopped(State::Removed)) => "removed",
-            Ok(crate::at_relays::Stands::Stopped(State::NotListed)) => "not_listed",
-            Ok(crate::at_relays::Stands::Stopped(_)) => "not_opened",
-            Err(e) => return Err(ApiError::Internal(e.to_string())),
-        };
-        let status = SyncStatusResponse {
-            enabled: dir.is_some(),
-            dir,
-            // Whatever is stored: only mapped folders sync.
-            all: false,
-            mappings: mappings(&db)?,
-            exclude: exclusions(&db)?,
-            home,
-            home_name: meta::get(&db, meta::SYNC_CLAUDE_HOME_NAME)?,
-            generation: state.sync_control.generation(),
-            report,
-            no_report_secs: state
-                .sync_control
-                .no_report_for(state.started_at, std::time::Instant::now())
-                .as_secs(),
-            last_change_at,
-            stands,
-            held: state.held.why().map(|held| held.says().to_string()),
-            moved_on: crate::look::moved_on(&db)?,
-            notice: None,
-            carried: None,
-            let_go: None,
-            let_go_alone: None,
-            let_go_versions: None,
-            reading: None,
-            not_let_go: None,
-            let_go_discarded: None,
-            let_go_stopped: None,
-            still_held: None,
-            still_held_stopped: None,
-        };
-        let notices = cordelia_storage::first_start::notices(&db)?;
-        let last_dir = meta::get(&db, meta::SYNC_CLAUDE_LAST_DIR)?;
-        (status, notices, last_dir)
+    let db = state
+        .db
+        .lock()
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let dir = meta::get(&db, meta::SYNC_CLAUDE_DIR)?;
+    let report =
+        meta::get(&db, meta::SYNC_CLAUDE_REPORT)?.and_then(|r| serde_json::from_str(&r).ok());
+    let home = meta::get(&db, meta::SYNC_CLAUDE_HOME)?.is_none_or(|v| v != "off");
+    let last_change_at = meta::get(&db, meta::SYNC_CLAUDE_LAST_CHANGE)?;
+    let stands = match crate::at_relays::stands(&db) {
+        Ok(crate::at_relays::Stands::NoPhrase) => "no_phrase",
+        Ok(crate::at_relays::Stands::Applied) => "applied",
+        Ok(crate::at_relays::Stands::Closed) => "closed",
+        Ok(crate::at_relays::Stands::Stopped(State::Fork)) => "fork",
+        Ok(crate::at_relays::Stands::Stopped(State::Removed)) => "removed",
+        Ok(crate::at_relays::Stands::Stopped(State::NotListed)) => "not_listed",
+        Ok(crate::at_relays::Stands::Stopped(_)) => "not_opened",
+        Err(e) => return Err(ApiError::Internal(e.to_string())),
     };
-    if !notices.is_empty() {
-        // Asked against the Claude Code directory that is set, or, with
-        // sync off, the one that turning sync on would use: the last one
-        // kept, or the default (decision 2026-10-04 §10.1).
-        let default = || {
-            std::env::var("HOME")
-                .map(|home| format!("{home}/.claude"))
-                .ok()
-        };
-        let against_dir = status
-            .dir
-            .clone()
-            .or(last_dir)
-            .or_else(default)
-            .unwrap_or_default();
-        let home = home_dir().ok();
-        let against = crate::found::Against {
-            claude_dir: std::path::Path::new(&against_dir),
-            home: home.as_deref(),
-            mappings: &status.mappings,
-        };
-        status.notice = crate::found::notice_shown(&notices, &against, &crate::found::Remembered);
-    }
-    Ok(status)
+    Ok(SyncStatusResponse {
+        enabled: dir.is_some(),
+        dir,
+        // Whatever is stored: only mapped folders sync.
+        all: false,
+        mappings: mappings(&db)?,
+        exclude: exclusions(&db)?,
+        home,
+        home_name: meta::get(&db, meta::SYNC_CLAUDE_HOME_NAME)?,
+        generation: state.sync_control.generation(),
+        report,
+        no_report_secs: state
+            .sync_control
+            .no_report_for(state.started_at, std::time::Instant::now())
+            .as_secs(),
+        last_change_at,
+        stands,
+        held: state.held.why().map(|held| held.says().to_string()),
+        carried: None,
+        let_go: None,
+        let_go_alone: None,
+        let_go_versions: None,
+        reading: None,
+        not_let_go: None,
+        let_go_discarded: None,
+        let_go_stopped: None,
+        still_held: None,
+        still_held_stopped: None,
+    })
 }
-
-/// A person has seen the notice of what stopped syncing (decision
-/// 2026-10-04 §10.1): it is taken away, every record of it. This is the
-/// one request that takes it away. It counts no change of settings: a
-/// cycle that is running goes on, and what a report was made under is
-/// still what stands. With no notice stored it does nothing, and answers
-/// as done.
-pub async fn seen(req: HttpRequest, state: web::Data<AppState>) -> Result<HttpResponse, ApiError> {
-    auth::check_bearer(&req, &state)?;
-    {
-        let db = state
-            .db
-            .lock()
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        if cordelia_storage::first_start::clear_notices(&db)? {
-            tracing::info!("sync: the notice of what stopped syncing was seen, and is put away");
-        }
-    }
-    Ok(HttpResponse::Ok().json(status(&state)?))
-}
-
-/// What is stored as the scope: that only mapped folders sync. There is
-/// no other scope (decision 2026-10-04 §10.1).
-const SCOPE_OFF: &str = "off";
 
 /// What a request that asks for everything found to sync is told. The
 /// command line says the same before it sends anything.
 pub const EVERYTHING_FOUND_IS_REFUSED: &str = "syncing everything found is no more: only mapped \
     folders sync, and nothing was changed. `cordelia sync status` lists what is found on this \
     machine, with the command that maps each folder (`cordelia sync map <folder>`).";
-
-/// The stored scope is off whenever sync is on (decision 2026-10-04
-/// §10.1): a node writes it so when it starts with sync on, whatever was
-/// stored, and where nothing was. Returns whether it wrote. With sync off
-/// nothing is written: the request that turns sync on writes it
-/// ([`set_claude`]).
-///
-/// Nothing reads the scope to say what syncs. It is written for what
-/// reads the settings as an earlier version did: there, a directory that
-/// is set with no scope stored is a scope that is on.
-///
-/// A node whose first start on this version is still to be made does not
-/// ask this: the step of the first start reads the scope as it is
-/// stored, and writes it off itself.
-pub fn scope_off_at_start(state: &AppState) -> Result<bool, ApiError> {
-    let db = state
-        .db
-        .lock()
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    if meta::get(&db, meta::SYNC_CLAUDE_DIR)?.is_none() {
-        return Ok(false);
-    }
-    let stored = meta::get(&db, meta::SYNC_CLAUDE_ALL)?;
-    if stored.as_deref() == Some(SCOPE_OFF) {
-        return Ok(false);
-    }
-    meta::set(&db, meta::SYNC_CLAUDE_ALL, SCOPE_OFF)?;
-    tracing::warn!(
-        "sync: what was stored said that everything found on this machine syncs. Only mapped \
-         folders sync: `cordelia sync status` lists what is found, with the command that maps \
-         each"
-    );
-    Ok(true)
-}
 
 /// A name a folder can sync under: `~` for home memory, or 1 to 200
 /// characters of lower-case letters, digits and `. _ - / ~ + % @`. That
@@ -365,13 +274,6 @@ pub fn set_claude(
         // Counted before anything is written (see `SyncControl::changed`).
         control.changed(db);
 
-        // The stored scope is off whenever sync is on (decision
-        // 2026-10-04 §10.1): it is written so at every request that
-        // turns sync on or leaves it on, whatever was stored. It is
-        // written before the directory that turns sync on, and the key
-        // is never removed: an earlier version reads a directory that is
-        // set, with no scope stored, as a scope that is on.
-        meta::set(db, meta::SYNC_CLAUDE_ALL, SCOPE_OFF)?;
         // Whether a folder stopped syncing by this request: the home
         // directory's, where home memory is turned off and it was mapped.
         // Nothing else that a request can set says what syncs.
@@ -524,52 +426,13 @@ pub fn names_follow(state: &AppState, db: &rusqlite::Connection, before: &[Strin
     state.own_channels.written();
 }
 
-/// Turn sync off on a node whose first start on this version is not done
-/// (decision 2026-10-04 §10.1): a request that turns sync off is never
-/// refused. The directory goes, and is kept as the last one.
-///
-/// Nothing else is touched, since the step is still to read it: the
-/// stored report, which a notice of what stopped is made from, and what
-/// folders had agreed, which the step forgets. A scope that was on by
-/// being absent with a directory set is written down as on first, so
-/// that the step still finds it so once the directory is gone.
-fn turn_off_while_held(control: &SyncControl, db: &rusqlite::Connection) -> Result<(), ApiError> {
-    control.changed(db);
-    if let Some(dir) = meta::get(db, meta::SYNC_CLAUDE_DIR)? {
-        if meta::get(db, meta::SYNC_CLAUDE_ALL)?.is_none() {
-            meta::set(db, meta::SYNC_CLAUDE_ALL, "on")?;
-        }
-        meta::set(db, meta::SYNC_CLAUDE_LAST_DIR, &dir)?;
-    }
-    meta::remove(db, meta::SYNC_CLAUDE_DIR)?;
-    tracing::info!("sync: turned off, while the first start on this version is not done");
-    Ok(())
-}
-
 /// Turn the adapter on or off, and set what it syncs (see [`set_claude`]).
-///
-/// A node that is held up takes this only where it turns sync off
-/// ([`turn_off_while_held`]), and refuses the rest with why it is held
-/// up.
 pub async fn claude(
     req: HttpRequest,
     state: web::Data<AppState>,
     body: web::Json<SyncClaudeRequest>,
 ) -> Result<HttpResponse, ApiError> {
     auth::check_bearer(&req, &state)?;
-    if let Some(held) = state.held.why() {
-        if body.enabled {
-            return Err(ApiError::Held(held.says().to_string()));
-        }
-        {
-            let db = state
-                .db
-                .lock()
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            turn_off_while_held(&state.sync_control, &db)?;
-        }
-        return Ok(HttpResponse::Ok().json(status(&state)?));
-    }
     let home = home_dir().ok();
     {
         let db = state
@@ -816,10 +679,8 @@ pub const SETTINGS_CHANGED_UNDER_MAP: &str = "the sync settings changed while th
     being checked: nothing was mapped. Run it again.";
 
 /// The folders that were found and are not mapped, as the last stored
-/// report lists them, and the folders that a stored notice names: each as
-/// Claude Code's folder, its directory, and the name it has. A folder
-/// with no directory is left out. Where a notice names a folder again,
-/// the later directory and name stand.
+/// report lists them: each as Claude Code's folder, its directory, and
+/// the name it has. A folder with no directory is left out.
 fn found_and_named(
     db: &rusqlite::Connection,
 ) -> Result<Vec<(String, String, Option<String>)>, ApiError> {
@@ -839,11 +700,6 @@ fn found_and_named(
             out.push((folder, directory, text(&entry["name"])));
         }
     }
-    for named in crate::found::named_in(&cordelia_storage::first_start::notices(db)?) {
-        if let Some(directory) = named.cwd {
-            out.push((named.folder, directory, named.name));
-        }
-    }
     Ok(out)
 }
 
@@ -860,7 +716,7 @@ pub struct MapAsked {
     mapping: SyncMapping,
     /// The mappings that are declared.
     mappings: Vec<SyncMapping>,
-    /// What was found, and what a notice names ([`found_and_named`]).
+    /// What was found ([`found_and_named`]).
     entries: Vec<(String, String, Option<String>)>,
     /// Whether a report of a cycle is stored: what was found is read
     /// from it. Where none is, the node looks itself.
@@ -909,8 +765,7 @@ pub fn map_asked(
 }
 
 /// Why the mapping that was asked for is refused, where it would sync
-/// another folder than one that was found, or that a notice names, with
-/// the directory it gives (decision 2026-10-04 §10.1): `map` checks
+/// another folder than one that was found, with the directory it gives (decision 2026-10-04 §10.1): `map` checks
 /// whenever it is run, however the request was come by
 /// ([`crate::found::in_the_way`]). The reason is the one that stands in
 /// the place of a command for that folder, as the one function gives it.
@@ -2389,97 +2244,6 @@ mod tests {
         assert_eq!(s.home_name().as_deref(), Some("~"));
     }
 
-    /// The stored scope is off whenever sync is on (decision 2026-10-04
-    /// §10.1). A start with sync on writes it off, from a stored `on` and
-    /// from no scope stored with a directory set; a start with sync off
-    /// writes nothing. A request that turns sync on, or leaves it on,
-    /// writes it off over whatever is stored. And the key is never
-    /// removed: read as an earlier version reads the settings, the scope
-    /// is off from the first time sync is turned on.
-    #[test]
-    fn test_the_stored_scope_is_off_whenever_sync_is_on() {
-        use crate::several::{Machine, state_of};
-        let stored = |db: &rusqlite::Connection| meta::get(db, meta::SYNC_CLAUDE_ALL).unwrap();
-        // As an earlier version reads the settings: on where the key says
-        // so, and where a directory is set and there is no key.
-        let on_as_it_was_read = |db: &rusqlite::Connection| {
-            let dir = meta::get(db, meta::SYNC_CLAUDE_DIR).unwrap();
-            stored(db).map_or(dir.is_some(), |scope| scope == "on")
-        };
-        let set = |db: &rusqlite::Connection, dir: Option<&str>, scope: Option<&str>| {
-            for (key, value) in [(meta::SYNC_CLAUDE_DIR, dir), (meta::SYNC_CLAUDE_ALL, scope)] {
-                match value {
-                    Some(value) => meta::set(db, key, value).unwrap(),
-                    None => meta::remove(db, key).unwrap(),
-                }
-            }
-        };
-
-        // At a start.
-        let state = state_of(Machine::new(1));
-        for (dir, scope, wrote, then) in [
-            (Some(DIR), Some("on"), true, Some("off")),
-            (Some(DIR), None, true, Some("off")),
-            (Some(DIR), Some("off"), false, Some("off")),
-            (Some(DIR), Some("something else"), true, Some("off")),
-            // Sync is off: nothing is written, whatever is stored.
-            (None, Some("on"), false, Some("on")),
-            (None, None, false, None),
-        ] {
-            set(&state.db.lock().unwrap(), dir, scope);
-            assert_eq!(
-                scope_off_at_start(&state).unwrap(),
-                wrote,
-                "{dir:?} {scope:?}"
-            );
-            let db = state.db.lock().unwrap();
-            assert_eq!(stored(&db).as_deref(), then, "{dir:?} {scope:?}");
-            assert_eq!(
-                on_as_it_was_read(&db),
-                then == Some("on"),
-                "{dir:?} {scope:?}"
-            );
-        }
-
-        // At a request that turns sync on, or leaves it on.
-        for (dir, scope) in [
-            (Some(DIR), Some("on")),
-            (Some(DIR), None),
-            (None, Some("on")),
-            (None, None),
-        ] {
-            let s = Settings {
-                db: cordelia_storage::db::open_in_memory().unwrap(),
-                control: SyncControl::default(),
-            };
-            set(&s.db, dir, scope);
-            s.claude(serde_json::json!({ "dir": DIR }));
-            assert_eq!(stored(&s.db).as_deref(), Some("off"), "{dir:?} {scope:?}");
-            assert!(!on_as_it_was_read(&s.db));
-        }
-
-        // Turned on for the first time on this version, the scope is
-        // stored, and off. Whatever is asked after, the key is there.
-        let s = Settings::on();
-        assert_eq!(stored(&s.db).as_deref(), Some("off"));
-        s.map(HOME, "team");
-        s.map("/home/sam/notes", "lab");
-        for request in [
-            serde_json::json!({ "reset": true }),
-            serde_json::json!({ "reset": true, "dir": DIR }),
-            serde_json::json!({ "home": false }),
-            serde_json::json!({ "all": false }),
-            serde_json::json!({ "exclude": ["x"] }),
-            serde_json::json!({ "enabled": false }),
-            serde_json::json!({ "enabled": true }),
-        ] {
-            s.claude(request.clone());
-            assert_eq!(stored(&s.db).as_deref(), Some("off"), "{request}");
-        }
-        s.unmap("lab");
-        assert_eq!(stored(&s.db).as_deref(), Some("off"));
-    }
-
     /// A handler counts its change before the first thing it writes. One
     /// that fails part-way has then still stopped the cycle that was
     /// running. Otherwise that cycle would go on from what it read before,
@@ -2720,10 +2484,6 @@ mod tests {
         assert_eq!(
             meta::get(&s.db, meta::SYNC_CLAUDE_DIR).unwrap().as_deref(),
             Some(DIR)
-        );
-        assert_eq!(
-            meta::get(&s.db, meta::SYNC_CLAUDE_ALL).unwrap().as_deref(),
-            Some("off")
         );
     }
 

@@ -501,64 +501,22 @@ mod tests {
 
     /// What a personal node says it has is what a device has now: the
     /// names that it holds, and the entries of its own channels (decision
-    /// 2026-10-04 §10). Its status, its identity and its metrics read
-    /// nothing of the older kind of channel, whatever its database holds
-    /// of one, and write nothing.
+    /// 2026-10-04 §10). Its status, its identity and its metrics write
+    /// nothing.
     #[actix_web::test]
     async fn test_a_devices_status_identity_and_metrics_count_nothing_of_the_older_kind() {
         let state = node();
-        // What an earlier version left: a channel of the older kind that
-        // this device is a member of, with an item in it, in plain SQL.
-        let own = state.identity.public_key();
-        {
-            let db = state.db.lock().unwrap();
-            let group = "grp_550e8400-e29b-41d4-a716-446655440000";
-            db.execute(
-                "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                                       created_at, updated_at)
-                 VALUES (?1, 'group', 'realtime', 'invite_only', ?2, '2026-10-01', '2026-10-01')",
-                rusqlite::params![group, own.as_slice()],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO channel_members (channel_id, entity_key, role, joined_at)
-                 VALUES (?1, ?2, 'owner', '2026-10-01')",
-                rusqlite::params![group, own.as_slice()],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
-                                    content_hash, signature, encrypted_blob, content_length)
-                 VALUES ('ci_01JARV8XMHW8G9QZP0000000AA', ?1, ?2, 'memory',
-                         '2026-10-01T00:00:00Z', ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    group,
-                    own.as_slice(),
-                    [1u8; 32].as_slice(),
-                    [7u8; 64].as_slice(),
-                    b"what an earlier version sealed".as_slice(),
-                    30i64,
-                ],
-            )
-            .unwrap();
-        }
         let everything = |state: &AppState| -> Vec<i64> {
             let db = state.db.lock().unwrap();
-            [
-                "channels",
-                "channel_members",
-                "items",
-                "node_meta",
-                "entries",
-            ]
-            .iter()
-            .map(|table| {
-                db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
+            ["node_meta", "entries"]
+                .iter()
+                .map(|table| {
+                    db.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
                 })
-                .unwrap()
-            })
-            .collect()
+                .collect()
         };
         let says = |state: &web::Data<AppState>| {
             let state = state.clone();

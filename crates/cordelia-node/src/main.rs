@@ -920,12 +920,7 @@ enum SyncCommand {
     /// - the memory folders found on this machine that do not sync;
     ///
     /// - the names that your other devices sync and this one does not.
-    Status {
-        /// Put away the notice about folders that stopped syncing, once
-        /// you have read it
-        #[arg(long)]
-        seen: bool,
-    },
+    Status,
     /// Sync home-folder memory on this device, or not: `on` maps the home
     /// directory, and `off` unmaps it
     Home {
@@ -1157,12 +1152,57 @@ fn from_a_later_version(db_path: &std::path::Path, found: u32, own: u32) -> Stri
     )
 }
 
+/// What is said of a database from a Cordelia before 0.2.0-alpha.19, in
+/// the words of decision 2026-11-10 (older kind), rule 6: that this
+/// version cannot open it and changed nothing, and the two ways on, with
+/// the data directory that holds it.
+fn from_an_earlier_version(data_dir: &std::path::Path) -> String {
+    format!(
+        "This database is from a Cordelia before 0.2.0-alpha.19. This version cannot open it, \
+         and changed nothing.\n\
+         To keep it: install 0.2.0-alpha.19 (`CORDELIA_VERSION=v0.2.0-alpha.19`, for the \
+         install command or a relay's image), start it once, then install this version \
+         again.\n\
+         Or start afresh: move {} aside and run `cordelia init`. Then run `cordelia phrase` on \
+         your first device, add this one from another of yours, or run `cordelia recover`.",
+        data_dir.display()
+    )
+}
+
+/// What is said where a step of the schema did not finish (decision
+/// 2026-11-10 (older kind), rule 9): that nothing was changed, and that
+/// the step needs free room of about the size of the database, which is
+/// what it most often lacked. The node tries again when it next starts.
+fn a_step_did_not_finish(db_path: &std::path::Path, step: u32, why: &str) -> String {
+    let bytes: u64 = ["", "-wal"]
+        .iter()
+        .filter_map(|ending| {
+            let file = format!("{}{ending}", db_path.display());
+            std::fs::metadata(file).ok().map(|found| found.len())
+        })
+        .sum();
+    format!(
+        "the database at {} could not be brought to this version: schema step {step} did not \
+         finish ({why}). Nothing was changed. The step needs free room on the disk of about \
+         the size of the database, {} MB. Make that room, then start the node again: it tries \
+         again when it starts.",
+        db_path.display(),
+        bytes.div_ceil(1_000_000).max(1),
+    )
+}
+
+/// The data directory that holds the database at `db_path`.
+fn data_dir_of(db_path: &std::path::Path) -> &std::path::Path {
+    db_path.parent().unwrap_or(db_path)
+}
+
 /// Open the node's database, as a command that opens it itself does, with
 /// the schema's steps run, and set on the connection, before they run,
 /// what a node of the role that `config` gives keeps
-/// ([`keeps_secure_delete`]). **A database
-/// from a later version is refused** (decision 2026-10-04 §10.1): the
-/// command names both versions, and changes nothing.
+/// ([`keeps_secure_delete`]). **A database from a later version is
+/// refused** (decision 2026-10-04 §10.1): the command names both
+/// versions, and changes nothing. **So is one from before alpha.19**
+/// (decision 2026-11-10 (older kind), rule 6), in that record's words.
 fn open_database(
     db_path: &std::path::Path,
     config: &Config,
@@ -1173,24 +1213,35 @@ fn open_database(
         Err(StorageError::LaterVersion { found, own }) => {
             anyhow::bail!("{}", from_a_later_version(db_path, found, own))
         }
+        Err(StorageError::EarlierVersion { .. }) => {
+            anyhow::bail!("{}", from_an_earlier_version(data_dir_of(db_path)))
+        }
+        Err(StorageError::StepFailed { step, why }) => {
+            anyhow::bail!("{}", a_step_did_not_finish(db_path, step, &why))
+        }
         Err(e) => Err(e.into()),
     }
 }
 
 /// Open the database as the node opens it when it starts (decision
-/// 2026-10-04 §10.1). One from a later version is refused: a personal
-/// node then stays up, over a database of its own in memory, with why
-/// (the second of what is returned); a node of any other role does not
-/// start without its database, and says why. The connection is set as a
+/// 2026-10-04 §10.1). One from a later version is refused, and so is one
+/// from before alpha.19 (decision 2026-11-10 (older kind), rule 6), and
+/// one whose schema step did not finish is left at the step before (rule
+/// 9): a personal node then stays up, over a database of its own in
+/// memory, held, with why (the second of what is returned), and tries the
+/// step again when it next starts; a node of any other role does not
+/// start without its database, and says why. The log says why once, and
+/// names the step an earlier database is at. The connection is set as a
 /// node of the role that `config` gives keeps it, before the schema's
-/// steps run ([`keeps_secure_delete`]); a relay's has the automatic
-/// checkpoint off, for it checkpoints on a timer of its own in a take of
-/// its lock of kind Checkpoint (issue #224; [`relay_entries::kept_by`],
-/// the same test that gives the node the relay's part that runs it).
+/// steps run ([`keeps_secure_delete`]); a relay's has the automatic checkpoint off,
+/// for it checkpoints on a timer of its own in a take of its lock of kind
+/// Checkpoint (issue #224; [`relay_entries::kept_by`], the same test that
+/// gives the node the relay's part that runs it).
 fn open_the_nodes_database(
     db_path: &std::path::Path,
     config: &Config,
-) -> anyhow::Result<(rusqlite::Connection, Option<String>)> {
+) -> anyhow::Result<(rusqlite::Connection, Option<cordelia_api::state::Held>)> {
+    use cordelia_api::state::Held;
     let role = config.network.role.as_str();
     let secure_delete = keeps_secure_delete(role);
     match cordelia_storage::db::open_as(db_path, secure_delete) {
@@ -1206,18 +1257,31 @@ fn open_the_nodes_database(
             }
             Ok((conn, None))
         }
-        Err(cordelia_storage::StorageError::LaterVersion { found, own }) => {
-            let why = from_a_later_version(db_path, found, own);
+        Err(e) => {
+            let held = match e {
+                cordelia_storage::StorageError::LaterVersion { found, own } => {
+                    Held::LaterDatabase(from_a_later_version(db_path, found, own))
+                }
+                cordelia_storage::StorageError::EarlierVersion { found } => {
+                    tracing::error!("the database is at schema step {found}");
+                    Held::EarlierDatabase(from_an_earlier_version(data_dir_of(db_path)))
+                }
+                cordelia_storage::StorageError::StepFailed { step, why } => {
+                    Held::StepFailed(a_step_did_not_finish(db_path, step, &why))
+                }
+                e => return Err(e.into()),
+            };
+            // Said once, here, for every role.
+            tracing::error!("{}", held.says());
             if role != "personal" {
-                anyhow::bail!("{why}");
+                anyhow::bail!("{}", held.says());
             }
             let conn = cordelia_storage::db::open_in_memory()?;
             if secure_delete {
                 cordelia_storage::db::secure_delete_on(&conn)?;
             }
-            Ok((conn, Some(why)))
+            Ok((conn, Some(held)))
         }
-        Err(e) => Err(e.into()),
     }
 }
 
@@ -1501,23 +1565,12 @@ fn init_with(
         println!("Database exists at {}", db_path.display());
     }
 
-    // 5. Create channel-keys directory
-    let keys_dir = data_dir.join("channel-keys");
-    if !keys_dir.exists() {
-        std::fs::create_dir_all(&keys_dir)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700))?;
-        }
-    }
-
     // No channel is made here. A device's channels are made from its
     // person's secret, once it follows a recovery phrase: `cordelia
     // phrase` on the first device, `add-device` there and `accept` here
     // on each one after (decision 2026-10-04 §5, §6).
 
-    // 6. Write config
+    // 5. Write config
     config.identity.entity_id = entity_id.clone();
     config.identity.public_key = pk_bech32.clone();
     if !config_file.exists() || force {
@@ -1696,12 +1749,6 @@ fn cmd_status(
         for e in &status.facts.errors {
             details.push(format!("Error: {e}"));
         }
-        // The folders that stopped syncing, with sync on or off.
-        if let Some(sync) = &status.sync {
-            for stopped in notice_details(&sync["notice"]) {
-                details.push(format!("Stopped syncing: {stopped}"));
-            }
-        }
         let text = indicator::bar(state, level, &summary, &details);
         if !text.is_empty() {
             println!("{text}");
@@ -1756,10 +1803,6 @@ fn cmd_status(
             // Why the node is held up, where it is: by what, and why.
             if !live["held"].is_null() {
                 out["held"] = live["held"].clone();
-            }
-            // Key files of an older version that were left in place.
-            if live["key_files_in_place"].as_u64() > Some(0) {
-                out["key_files_in_place"] = live["key_files_in_place"].clone();
             }
             // The node's own version: `version` above is this command's.
             out["node_version"] = live["version"].clone();
@@ -1834,15 +1877,9 @@ fn cmd_status(
                 // nothing is, and where it stands under a phrase.
                 "publishes_nothing": report["publishes_nothing"],
                 "stands": sync["stands"],
-                // Whether the device took this version with what an
-                // earlier one held: with no phrase it is not added yet.
-                "moved_on": sync["moved_on"],
                 "unsynced": report["unsynced"],
                 "excluded": report["excluded"],
                 "errors": status.facts.errors,
-                // The notice of the folders that stopped syncing, while
-                // the node stores one: null where it stores none.
-                "notice": sync["notice"],
             });
         }
         // The connected peers and this person's devices, for panels.
@@ -1960,14 +1997,6 @@ fn cmd_status(
             if let Some(why) = status.held() {
                 println!("  Held up:   {why}");
             }
-            // Key files of an older version that no copy holds are left
-            // where they are, and said (decision 2026-10-04 §10.1).
-            if let Some(files) = live["key_files_in_place"].as_u64().filter(|n| *n > 0) {
-                println!(
-                    "  Key files: {}",
-                    cordelia_api::first_start::key_files_in_place_says(files as usize)
-                );
-            }
             if config.network.role == "personal" {
                 // The hold of a shared channel is said on a line of its
                 // own, `Shared:`, and not under `Memory:` (decision
@@ -1991,19 +2020,6 @@ fn cmd_status(
                 }
                 for e in &status.facts.errors {
                     println!("    error:    {e}");
-                }
-                // The folders that stopped syncing, with sync on or off
-                // (decision 2026-10-04 §10.1).
-                let stopped = status
-                    .sync
-                    .as_ref()
-                    .map(|sync| notice_details(&sync["notice"]))
-                    .unwrap_or_default();
-                for folder in &stopped {
-                    println!("    stopped:  {folder}");
-                }
-                if !stopped.is_empty() {
-                    println!("              (`cordelia sync status` says how to map each)");
                 }
                 // What this device says of itself and its person's
                 // devices (decision 2026-10-04 §5.1, §5.2, §8).
@@ -2198,13 +2214,6 @@ fn gather_status(config_path: &str) -> GatheredStatus {
         out.facts.sync_enabled = sync["enabled"].as_bool().unwrap_or(false);
         out.facts.mapped = sync["mappings"].as_array().map_or(0, Vec::len);
         out.facts.stands = sync["stands"].as_str().unwrap_or_default().to_string();
-        out.facts.moved_on = sync["moved_on"].as_bool().unwrap_or(false);
-        // The notice of what stopped syncing, while the node stores one.
-        let notice = &sync["notice"];
-        out.facts.notice = notice.is_object().then(|| indicator::Stopped {
-            folders: notice["stopped"].as_u64().unwrap_or(0) as usize,
-            not_known: notice["not_known"].as_bool() == Some(true),
-        });
         out.facts.report_age_secs = report["at"]
             .as_str()
             .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
@@ -2473,23 +2482,6 @@ fn lock_data_dir(data_dir: &std::path::Path) -> anyhow::Result<Option<std::fs::F
     }
 }
 
-/// The free room on the volume that holds `folder`, in bytes, as far as
-/// whoever runs the node may use it: what the copy of the database at a
-/// first start is compared with before it is begun (decision 2026-10-04
-/// §10.1). None where it cannot be learned.
-fn room_on_volume(folder: &std::path::Path) -> Option<u64> {
-    #[cfg(unix)]
-    {
-        let volume = rustix::fs::statvfs(folder).ok()?;
-        Some(volume.f_bavail.saturating_mul(volume.f_frsize))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = folder;
-        None
-    }
-}
-
 /// What a node says where the port of its local API cannot be bound, on
 /// the system named. **Where the port is taken, a node is probably
 /// running already, as the service:** the words say so, and name
@@ -2565,14 +2557,15 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     }
 
     // Open database. One from a later version is refused (decision
-    // 2026-10-04 §10.1). A personal node then stays up, over a database
-    // of its own in memory, and says so in its status: nothing of the
-    // one on disk is read or changed, and under a service that restarts
-    // what stops, stopping would be a loop. A node of any other role
-    // carries what other nodes hand it, and does not start without its
-    // database: it says why, and stops.
+    // 2026-10-04 §10.1), and so is one from before alpha.19 (decision
+    // 2026-11-10 (older kind), rule 6). A personal node then stays up,
+    // over a database of its own in memory, and says so in its status:
+    // nothing of the one on disk is read or changed, and under a service
+    // that restarts what stops, stopping would be a loop. A node of any
+    // other role carries what other nodes hand it, and does not start
+    // without its database: it says why, and stops.
     let db_path = data_dir.join("cordelia.db");
-    let (conn, later) = open_the_nodes_database(&db_path, &config)?;
+    let (conn, open_held) = open_the_nodes_database(&db_path, &config)?;
 
     let version = env!("CARGO_PKG_VERSION");
     let role = &config.network.role;
@@ -2585,7 +2578,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     println!("Cordelia v{version}");
     println!("  Entity:    {}", config.identity.entity_id);
     println!("  Public key: {pk_bech32}");
-    println!("  HTTP API:  http://{listen_addr}/api/v1/channels/");
+    println!("  HTTP API:  http://{listen_addr}/api/v1/channels/identity");
     if config.network.accepts_inbound() {
         println!("  P2P port:  {p2p_port}/UDP");
     } else {
@@ -2605,19 +2598,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         "node starting"
     );
 
-    // No node writes anything of the older kind of channel (decision
-    // 2026-11-10 (older kind), rule 1): what a personal node holds of
-    // that kind goes at its first start on this version, below.
     let personal = config.network.role == "personal";
-    if !personal {
-        // The guard against a new channel of the older kind is a
-        // device's. A node of this role that is started on a database
-        // which a personal node moved on removes it (decision 2026-10-04
-        // §10.1).
-        if cordelia_storage::first_start::remove_guard(&conn)? {
-            tracing::info!("removed the guard that a personal node set on this database");
-        }
-    }
 
     // Build app state
     let identity_arc = std::sync::Arc::new(identity);
@@ -2648,36 +2629,20 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         .own_channels
         .set_per_folder_per_hour(config.messages.per_folder_per_hour as usize);
 
-    // A personal node makes its first start on this version here
-    // (decision 2026-10-04 §10.1): after the port of its local API is
-    // bound, before its sync loop and its first pass are started, and
-    // before anything else is written. Where a copy of the database is
-    // to be made, the node is held up here and the copy is made by the
-    // first turn of its sync loop, which runs no cycle before the step
-    // has succeeded: its server answers meanwhile, and its status says
-    // that a copy is being made. A relay and a bootnode make no copy and
-    // take no step: their databases are stepped as any version steps
-    // them, at the opening.
-    //
-    // A node whose database is from a later version makes none: it is
-    // held up for as long as it runs, and touches nothing.
-    match &later {
-        Some(why) => {
-            tracing::error!("{why}");
-            state
-                .held
-                .hold(cordelia_api::state::Held::LaterDatabase(why.clone()));
-        }
-        None if personal => {
-            cordelia_api::first_start::take_at_start(&state, version, &room_on_volume);
-        }
+    // A node whose database is from a later version, or from before
+    // alpha.19, is held up for as long as it runs, and touches nothing. A
+    // personal node that is not judges the change entries it kept, before
+    // its sync loop and its first pass are started (decision 2026-10-24
+    // (removal), rule 12; decision 2026-11-10 (older kind), rule 9).
+    let held = open_held.is_some();
+    match open_held {
+        Some(why) => state.held.hold(why),
+        None if personal => judge_kept_at_start(&state),
         None => {}
     }
 
-    // A personal node keeps local history of what sync replaces. It holds
-    // no channel of the older kind: no inbox is made for it, and nothing
-    // of that kind is read (decision 2026-10-04 §10).
-    if personal && later.is_none() {
+    // A personal node keeps local history of what sync replaces.
+    if personal && !held {
         start_history(&state, &config.history);
     }
 
@@ -2685,9 +2650,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     // personal channel once, with the lock let go, on a thread of its
     // own: a read of it under the lock then checks only what was stored
     // since, from the first one after start. A node that is held up
-    // reads nothing ahead here: with sync on, its first cycle reads
-    // ahead once it may run; with sync off, nothing does, and its first
-    // read under the lock checks every entry.
+    // reads nothing ahead.
     cordelia_api::names::read_ahead_at_start(state.clone().into_inner(), personal);
 
     // Start the tokio/actix runtime with graceful shutdown
@@ -2722,7 +2685,6 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         let conn_mgr = cordelia_network::connection::ConnectionManager::new(
             identity_arc.clone(),
             endpoint,
-            vec![], // no channel: the handshake says none (decision 2026-11-10 (older kind), rule 7)
             roles,
             advertised_port,
         );
@@ -2764,13 +2726,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
         // setting takes effect at once: it wakes the loop, and a cycle
         // that was already running stops (see `SyncControl`).
         if config.network.role == "personal" {
-            // The stored scope is off whenever sync is on (decision
-            // 2026-10-04 §10.1): it is written so at every start with
-            // sync on. Nothing is written of the settings while the
-            // first start is still to be made: the step reads the scope
-            // as it is stored, and writes it off itself.
             if state.held.why().is_none() {
-                scope_off(&state);
                 messages_at_start(&state);
             }
             tokio::spawn(run_sync_loop(state.clone()));
@@ -3111,18 +3067,39 @@ impl Every {
     }
 }
 
-/// Write the stored scope off, where sync is on and it is not stored so
-/// ([`cordelia_api::sync::scope_off_at_start`]): what a personal node
-/// does when it starts, once its first start on this version is done.
-fn scope_off(state: &cordelia_api::state::AppState) {
-    if let Err(e) = cordelia_api::sync::scope_off_at_start(state) {
-        tracing::warn!(error = %e, "sync: could not write the stored scope off");
+/// A personal node judges the change entries it kept, at every start
+/// that is not held up, before its sync loop and its first pass are
+/// started (decision 2026-10-24 (removal), rule 12; decision 2026-11-10
+/// (older kind), rule 9): where schema step 22 marked it, it notes the
+/// time of each, and a device in a fork applies rule 8 to the entry it
+/// kept apart: it goes on, moves (rule 9), or stays closed. Once: the
+/// mark goes with the judging. What it came to is said in the log. One
+/// that cannot be judged is said, and judged again at the next start. A
+/// device in a fork stays closed meanwhile, as a device in a fork is
+/// closed; one in no fork goes on as it was, with the times of its
+/// changes not yet noted, so that a cut finds no time and cuts all of a
+/// removed key's in such a generation, which fails safe (rule 2).
+fn judge_kept_at_start(state: &cordelia_api::state::AppState) {
+    let judged = {
+        let db = state.db.lock().unwrap_or_else(|e| e.into_inner());
+        cordelia_api::person::judge_kept(&db, &state.identity, chrono::Utc::now().timestamp())
+    };
+    match judged {
+        Ok(Some(shown)) => tracing::info!(
+            ?shown,
+            "the change kept apart is judged by what this device knows of removals"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(
+            error = %e,
+            "could not judge the change entries kept: they are judged again at the next start"
+        ),
     }
 }
 
-/// What a personal node does of messages at its start, once its first
-/// start on this version is done, before its first pass and before any
-/// route of messages answers (decision 2026-10-25, rules 1 and 2): the
+/// What a personal node does of messages at its start, where it is not
+/// held up, before its first pass and before any route of messages
+/// answers (decision 2026-10-25, rules 1 and 2): the
 /// start is counted, so that a bound set from now on is known to be of
 /// this start; and the lists of a person's reads and of bounds that the
 /// store held from before step 20 are read once, where the device stands
@@ -3147,30 +3124,11 @@ fn messages_at_start(state: &cordelia_api::state::AppState) {
     }
 }
 
-/// Whether the node may run a cycle now (decision 2026-10-04 §10.1). A
-/// node whose first start on this version is not done runs none: it
-/// tries the first start again when a cycle would have run, after a wait
-/// that doubles with each try that fails, and goes on only once that is
-/// done. A node whose database is from a later version runs none for as
-/// long as it runs.
+/// Whether the node may run a cycle now (decision 2026-10-04 §10.1): a
+/// node that is held up, by a database from a later version or from
+/// before alpha.19, runs none for as long as it runs.
 fn may_cycle(state: &cordelia_api::state::AppState) -> bool {
-    use cordelia_api::state::Held;
-    match state.held.why() {
-        None => true,
-        Some(Held::FirstStart(_)) => {
-            let done =
-                cordelia_api::first_start::take(state, env!("CARGO_PKG_VERSION"), &room_on_volume);
-            // The start that was held up is made now: the scope is
-            // written off as at any start with sync on.
-            if done {
-                scope_off(state);
-                messages_at_start(state);
-            }
-            done
-        }
-        // Nothing is tried on a database from a later version.
-        Some(Held::LaterDatabase(_)) => false,
-    }
+    state.held.why().is_none()
 }
 
 /// Every `CYCLE_SECS`, as soon as a sync setting changes, and as soon as
@@ -4223,7 +4181,7 @@ const VERSION_ASKED_FOR: std::time::Duration = std::time::Duration::from_secs(30
 /// to restart the node.
 ///
 /// The commands that change something are every `sync` command but
-/// `status` (its `--seen` included) and `off`, `restore`, `history
+/// `status` and `off`, `restore`, `history
 /// drop`, `init --new-key`, and
 /// each command of a person's devices but `devices` with no act. Turning
 /// sync off is sent to any node, and what only shows is answered beside
@@ -4373,6 +4331,23 @@ fn another_version_with_no_lock(config: &Config, lock: DirLock, known: Known) ->
     version_note(node["version"].as_str(), env!("CARGO_PKG_VERSION"))
 }
 
+/// Why the node at the configuration's port is held up, where it is held
+/// by a step of its schema that did not finish (decision 2026-11-10 (older
+/// kind), rule 9): what it says, asked once, or as it answered already.
+fn held_by_a_step(config: &Config, known: Known) -> Option<String> {
+    let asked;
+    let node = match known {
+        Known::Ask => {
+            asked = local_api(config, false, "/api/v1/status", VERSION_ASKED_FOR).ok()?;
+            &asked
+        }
+        Known::Answered(node) => node,
+        Known::NotAsked => return None,
+    };
+    let held = &node["held"];
+    (held["by"] == "step_failed").then(|| held["why"].as_str().map(str::to_string))?
+}
+
 /// What a command knows already of the node at its configuration's port,
 /// where the lock tells nothing ([`another_version_with_no_lock`]).
 #[derive(Debug, Clone, Copy)]
@@ -4465,9 +4440,10 @@ fn refuse_beside_its_node(config: &Config) -> anyhow::Result<()> {
 /// - **Where a node holds it,** it is opened for reading only, and none of
 ///   the schema's steps is run: nothing is written beside the node. It is
 ///   read only where it stands at this command's schema version, which
-///   the running node has stepped it to. One from a later version is
-///   refused, as any command refuses it ([`from_a_later_version`]); at an
-///   earlier one the node is of another version, and nothing is opened
+///   the running node has stepped it to. One from a later version, or from
+///   before alpha.19, is refused, as any command refuses it
+///   ([`from_a_later_version`], [`from_an_earlier_version`]); at alpha.19's
+///   the node is of another version, and nothing is opened
 ///   ([`not_read_beside_another_version`]).
 fn open_to_read(config: &Config) -> anyhow::Result<rusqlite::Connection> {
     open_to_read_knowing(config, Known::Ask)
@@ -4497,7 +4473,17 @@ fn open_to_read_knowing(config: &Config, known: Known) -> anyhow::Result<rusqlit
     if found > own {
         anyhow::bail!("{}", from_a_later_version(&db_path, found, own));
     }
+    // A node of this version holds a database from before alpha.19 as it
+    // found it (decision 2026-11-10 (older kind), rule 6).
+    if found < cordelia_storage::schema::ALPHA_19_VERSION {
+        anyhow::bail!("{}", from_an_earlier_version(&data_dir));
+    }
     if found != own {
+        // A node of this version whose step did not finish holds it at
+        // the step before, and says so (rule 9): the command says the same.
+        if let Some(why) = held_by_a_step(config, known) {
+            anyhow::bail!("{why}");
+        }
         anyhow::bail!(
             "{}",
             not_read_beside_another_version(&data_dir, found, own, std::env::consts::OS)
@@ -4849,7 +4835,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     // off is sent to any node, and what only shows is answered beside
     // one: each with the note, said first.
     match &what {
-        SyncCommand::Off | SyncCommand::Status { .. } => note_another_version(config_path),
+        SyncCommand::Off | SyncCommand::Status => note_another_version(config_path),
         _ => refuse_another_version(config_path)?,
     }
     let set = |body: serde_json::Value| api_post(config_path, "/api/v1/sync/claude", body);
@@ -5220,29 +5206,7 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
             );
             return Ok(());
         }
-        SyncCommand::Status { seen } => {
-            // The one act that takes the notice away: a request of its
-            // own, which changes no setting (decision 2026-10-04 §10.1).
-            // **It shows the notice that it is about to put away, and
-            // then puts it away:** what is put away is what was read.
-            if seen {
-                let status = serde_json::json!({});
-                if let Ok(stored) = api_post(config_path, "/api/v1/sync/status", status) {
-                    print_notice(&stored, Notice::BeingPutAway);
-                }
-                match api_post_told(
-                    config_path,
-                    "/api/v1/sync/seen",
-                    serde_json::json!({}),
-                    None,
-                )? {
-                    Told::Yes(_) => println!("{NOTICE_SEEN}\n"),
-                    // A node that has no such request is another
-                    // version: it must be restarted first.
-                    Told::No { status: 404, .. } => anyhow::bail!("{}", seen_is_not_known()),
-                    Told::No { message, .. } => anyhow::bail!("{message}"),
-                }
-            }
+        SyncCommand::Status => {
             since = None;
         }
         SyncCommand::Home { state } => {
@@ -5302,273 +5266,16 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
     print_sync_scope(config_path, since)
 }
 
-/// What `cordelia sync status --seen` says once the node has put the
-/// notice away, or had none.
-const NOTICE_SEEN: &str = "The notice of the folders that stopped syncing is put away.";
-
-/// What `cordelia sync status --seen` says of a node that has no such
-/// request: it runs another version, and must be restarted first.
-fn seen_is_not_known() -> String {
-    seen_is_not_known_on(std::env::consts::OS)
-}
-
-/// [`seen_is_not_known`], on the system named.
-fn seen_is_not_known_on(os: &str) -> String {
-    format!(
-        "the running node has no such request: it is another version than this command, and \
-         must be restarted first. Where it runs as the service that the install script set up, \
-         restart it with `{}`; otherwise stop it and start it again.",
-        restart_command(os)
-    )
-}
-
-/// One folder that the notice names, as `cordelia sync status` prints
-/// it: the command that maps it, or why no command does (decision
-/// 2026-10-04 §10.1). `None` for a folder that is mapped since: nothing
-/// is printed for it.
-///
-/// **A command is printed only where it maps the folder that stopped,**
-/// and it carries the folder's name, the one it synced under: `map` with
-/// no name takes the remote as it is now, which may be another. For a
-/// tree laid out by hand there is no command: the row says that the
-/// layout no longer syncs, where the memory is, and the name it synced
-/// under. A folder that is not under the Claude Code directory which
-/// sync is set to has none either, and says which directory it synced
-/// under.
-///
-/// What a row holds of the notice is printed as local history prints a
-/// name ([`printable_row`]).
-fn notice_row(named: &serde_json::Value) -> Option<Vec<String>> {
-    notice_row_as_stored(named).map(printable_row)
-}
-
 /// A row as it is safe to print (decision 2026-10-04 §16): each cell with
 /// its control characters, the marks that change the direction text is
 /// laid out in, and what cannot be seen and is no part of ordinary
 /// writing, shown as escapes, as local history prints a name. A
-/// folder, a directory and a name are whatever is on the disk, in a
-/// transcript or in a notice that an earlier version stored: none of them
-/// moves the cursor or hides a line.
+/// folder, a directory and a name are whatever is on the disk or in a
+/// transcript: none of them moves the cursor or hides a line.
 fn printable_row(row: Vec<String>) -> Vec<String> {
     row.iter()
         .map(|cell| history_cmd::printable(cell))
         .collect()
-}
-
-/// [`notice_row`], with every string as it is stored.
-fn notice_row_as_stored(named: &serde_json::Value) -> Option<Vec<String>> {
-    use cordelia_sync::claude::HOME_NAME;
-    let is = |key: &str| named[key].as_bool() == Some(true);
-    if is("mapped") {
-        return None;
-    }
-    let folder = named["folder"].as_str().unwrap_or_default();
-    let name = named["name"].as_str();
-    let says = named["says"].as_str();
-    let synced_as = match name {
-        Some(name) => format!("synced as {}", sync_label(name)),
-        None => "synced under no name that was kept".to_string(),
-    };
-    let Some(cwd) = named["cwd"].as_str().filter(|_| is("mappable")) else {
-        let directory = named["directory"].as_str().or(named["cwd"].as_str());
-        let place = directory.map_or_else(|| short_path(folder), short_path);
-        return Some(match named["why_not"].as_str() {
-            Some("laid_out_by_hand") => vec![
-                format!("{}/memory", short_path(folder)),
-                synced_as,
-                "this layout no longer syncs, and no command maps it".to_string(),
-            ],
-            Some("another_claude_dir") => vec![
-                place,
-                synced_as,
-                match named["synced_under"].as_str() {
-                    Some(under) => format!(
-                        "it synced under {}, which sync is not set to",
-                        short_path(under)
-                    ),
-                    None => "it synced under another Claude Code directory".to_string(),
-                },
-            ],
-            _ => vec![
-                place,
-                synced_as,
-                says.unwrap_or("the node does not say whether `cordelia sync map` would sync it")
-                    .to_string(),
-            ],
-        });
-    };
-    // In its one spelling, as `map` sends a name that is typed.
-    let tidied = name.map(cordelia_core::sync_name::tidy);
-    let (what, command) = if is("home") {
-        let command = match tidied.as_deref() {
-            None | Some(HOME_NAME) => "cordelia sync map ~ --home".to_string(),
-            Some(name) => format!("cordelia sync map ~ {} --home", shell_word(name)),
-        };
-        (synced_as, command)
-    } else if is("needs_name") {
-        (
-            says.unwrap_or("needs a name").to_string(),
-            format!("cordelia sync map {} <name>", shell_arg(cwd)),
-        )
-    } else {
-        let name = tidied.unwrap_or_default();
-        (
-            synced_as,
-            format!("cordelia sync map {} {}", shell_arg(cwd), shell_word(&name)),
-        )
-    };
-    Some(vec![short_path(cwd), what, command])
-}
-
-/// The day of a time written as RFC 3339, for a person to read.
-fn day_of(at: &str) -> &str {
-    at.get(..10).unwrap_or(at)
-}
-
-/// Whether a notice is printed as one that stays until it is said to
-/// have been seen, or as one that is being put away now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Notice {
-    /// `cordelia sync status`: it says how to put the notice away.
-    Stays,
-    /// `cordelia sync status --seen`: it is shown once more, and then
-    /// put away. Nothing says how to put it away.
-    BeingPutAway,
-}
-
-/// What `cordelia sync status` says of the notice, first, with sync on
-/// and with it off (decision 2026-10-04 §10.1): each folder it names
-/// that is not mapped now, in rows ([`notice_row`]), with what is said
-/// before them and after. Empty where the node carries none.
-fn notice_lines(
-    notice: &serde_json::Value,
-    sync_on: bool,
-    shown: Notice,
-) -> (Vec<String>, Vec<Vec<String>>, Vec<String>) {
-    let Some(named) = notice["folders"].as_array() else {
-        return Default::default();
-    };
-    let rows: Vec<Vec<String>> = named.iter().filter_map(notice_row).collect();
-    let not_known = notice["not_known"].as_bool() == Some(true);
-    let mut before = Vec::new();
-    let mut after = Vec::new();
-    if rows.is_empty() && !not_known {
-        before.push(match shown {
-            Notice::Stays => "Every folder that stopped syncing on this device is mapped \
-                              again. To put this notice away: cordelia sync status --seen"
-                .to_string(),
-            Notice::BeingPutAway => {
-                "Every folder that stopped syncing on this device is mapped again.".to_string()
-            }
-        });
-        return (before, rows, after);
-    }
-    let since = notice["records"][0]["at"]
-        .as_str()
-        .map(day_of)
-        .unwrap_or("an earlier day");
-    match rows.len() {
-        0 => before.push(format!(
-            "Folders stopped syncing on this device ({since}): only mapped folders sync, and \
-             they had synced because everything found did."
-        )),
-        1 => before.push(format!(
-            "1 folder stopped syncing on this device ({since}): only mapped folders sync, and \
-             it had synced because everything found did."
-        )),
-        n => before.push(format!(
-            "{n} folders stopped syncing on this device ({since}): only mapped folders sync, \
-             and they had synced because everything found did."
-        )),
-    }
-    if !rows.is_empty() {
-        before.push(
-            "These synced in the last whole cycle before that; a folder that had synced \
-             earlier, and not then, is not listed. To sync one again, map it:"
-                .to_string(),
-        );
-    }
-    if not_known {
-        let days: Vec<&str> = notice["records"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|record| record["folders"].as_u64().unwrap_or(0) == 0)
-            .filter_map(|record| record["at"].as_str().map(day_of))
-            .collect();
-        after.push(format!(
-            "What stopped on {} is not known: no report of the last cycle was kept. What is \
-             found on this machine is listed {}, with the command that maps each folder.",
-            match days.is_empty() {
-                true => "one day".to_string(),
-                false => days.join(" and on "),
-            },
-            match sync_on {
-                true => "below",
-                false => "by `cordelia sync status` once sync is on",
-            }
-        ));
-    }
-    if !sync_on {
-        after.push(
-            "Sync is off: turn it on first (`cordelia sync claude`). `cordelia sync map` is \
-             refused until then."
-                .to_string(),
-        );
-    }
-    if shown == Notice::Stays {
-        after.push("Once you have seen this: cordelia sync status --seen".to_string());
-    }
-    (before, rows, after)
-}
-
-/// Print the notice of what stopped syncing, where the node carries one
-/// ([`notice_lines`]).
-fn print_notice(status: &serde_json::Value, shown: Notice) {
-    let sync_on = status["enabled"].as_bool() == Some(true);
-    let (before, rows, after) = notice_lines(&status["notice"], sync_on, shown);
-    if before.is_empty() && rows.is_empty() && after.is_empty() {
-        return;
-    }
-    for line in &before {
-        println!("{line}");
-    }
-    print_columns(&rows);
-    for line in &after {
-        println!("{line}");
-    }
-    println!();
-}
-
-/// What a status says of the notice in a list of what holds: each folder
-/// that stopped syncing and is not mapped now, and that some are not
-/// known, where a record names none. For plain `cordelia status` and for
-/// a bar's tooltip.
-fn notice_details(notice: &serde_json::Value) -> Vec<String> {
-    let mut out: Vec<String> = notice["folders"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|named| named["mapped"].as_bool() != Some(true))
-        .map(|named| {
-            let place = named["cwd"]
-                .as_str()
-                .or(named["directory"].as_str())
-                .or(named["folder"].as_str())
-                .unwrap_or_default();
-            let said = match named["name"].as_str() {
-                Some(name) => format!("{} ({})", short_path(place), sync_label(name)),
-                None => short_path(place),
-            };
-            // As local history prints a name: nothing of it moves the
-            // cursor, or hides a line of a tooltip.
-            history_cmd::printable(&said)
-        })
-        .collect();
-    if notice["not_known"].as_bool() == Some(true) {
-        out.push("folders that are not known (no report of the last cycle was kept)".to_string());
-    }
-    out
 }
 
 /// What `--mapped-only` says: it is taken, and changes nothing that syncs.
@@ -5923,8 +5630,6 @@ fn map_would_sync_another(
 fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()> {
     let status = || api_post(config_path, "/api/v1/sync/status", serde_json::json!({}));
     let mut resp = status()?;
-    // What stopped syncing is said first, with sync on or off.
-    print_notice(&resp, Notice::Stays);
     if resp["enabled"].as_bool() != Some(true) {
         println!("Sync is off. Turn it on with `cordelia sync claude`.");
         return Ok(());
@@ -6381,9 +6086,9 @@ mod tests {
     use super::*;
 
     /// On a personal node `cordelia channels` says the names that the
-    /// device holds, each with what it stores of the name's channel, and
-    /// nothing of the older kind of channel (decision 2026-10-04 §10):
-    /// with none held, it says how one comes to be held.
+    /// device holds, each with what it stores of the name's channel
+    /// (decision 2026-10-04 §10): with none held, it says how one comes to
+    /// be held.
     #[test]
     fn test_channels_on_a_device_lists_the_names_it_holds() {
         let conn = cordelia_storage::db::open_in_memory().unwrap();
@@ -6398,15 +6103,6 @@ mod tests {
         cordelia_api::person::first_statement(&conn, &identity, &phrase, "desktop", now).unwrap();
         cordelia_api::person::hold_name(&conn, "team", now).unwrap();
         cordelia_api::person::hold_name(&conn, "lab", now).unwrap();
-        // A channel of the older kind in the same database is not listed.
-        conn.execute(
-            "INSERT INTO channels (channel_id, channel_name, channel_type, mode, access,
-                                   creator_id, created_at, updated_at)
-             VALUES ('older', 'older', 'named', 'realtime', 'open', X'AA', '2026-10-01',
-                     '2026-10-01')",
-            [],
-        )
-        .unwrap();
         let listed = names_held(&conn).unwrap();
         assert_eq!(listed.len(), 3, "{listed:?}");
         assert!(listed[0].starts_with("NAME"), "{listed:?}");
@@ -6415,7 +6111,6 @@ mod tests {
             "{listed:?}"
         );
         assert!(listed[2].starts_with("team "), "{listed:?}");
-        assert!(!listed.join("\n").contains("older"), "{listed:?}");
         // What it stores of a name's channel is counted.
         let team = cordelia_storage::person::channel_of_name(&conn, "team")
             .unwrap()
@@ -6738,15 +6433,14 @@ mod tests {
         );
     }
 
-    /// What is printed of a folder that was found, or that a notice
-    /// names, is printed as local history prints a name (decision
-    /// 2026-10-04 §16): a folder, a directory and a name are whatever is
-    /// on the disk, in a transcript or in a stored notice, and none of
-    /// them moves the cursor, hides a line or turns the text around. So
-    /// it is in the list of what is found, in the notice, in a tooltip
-    /// and in the refusal of `map`.
+    /// What is printed of a folder that was found is printed as local
+    /// history prints a name (decision 2026-10-04 §16): a folder, a
+    /// directory and a name are whatever is on the disk or in a
+    /// transcript, and none of them moves the cursor, hides a line or
+    /// turns the text around. So it is in the list of what is found and
+    /// in the refusal of `map`.
     #[test]
-    fn test_what_is_found_and_what_a_notice_names_is_printed_safely() {
+    fn test_what_is_found_is_printed_safely() {
         let clears = "\u{1b}[2J";
         let turns = "\u{202e}";
         let safe = |printed: &str| {
@@ -6782,22 +6476,6 @@ mod tests {
             // without the escape otherwise.
             let stored = found_row_as_stored(entry, None, &[]).join(" | ");
             assert!(stored.contains(clears), "{stored:?}");
-            // And each row of the notice.
-            let row = notice_row(entry).unwrap();
-            safe(&row.join(" | "));
-        }
-        let under_another = serde_json::json!({
-            "folder": folder, "cwd": null, "directory": directory, "name": name,
-            "mappable": false, "why_not": "another_claude_dir",
-            "synced_under": format!("/home/sam/.other{clears}"),
-        });
-        safe(&notice_row(&under_another).unwrap().join(" | "));
-        // What a tooltip and the plain status list.
-        let notice = serde_json::json!({ "folders": found, "not_known": false });
-        let details = notice_details(&notice);
-        assert_eq!(details.len(), found.len());
-        for line in &details {
-            safe(line);
         }
         // The refusal of `map`.
         let status = serde_json::json!({
@@ -7049,235 +6727,6 @@ mod tests {
         let listed = status(none, named);
         assert_eq!(map_would_sync_another(cn, cn, &listed, &there), None);
         assert_eq!(map_would_sync_another(cn, cn, &listed, &own_gone), None);
-    }
-
-    /// What `cordelia sync status` prints for the notice (decision
-    /// 2026-10-04 §10.1): a `map` command for each folder that can be
-    /// mapped, with the name it synced under; none for one that cannot,
-    /// with why; nothing for a folder that is mapped since; and with sync
-    /// off, to turn sync on first.
-    #[test]
-    fn test_the_notice_offers_map_for_each_folder_that_can_be_mapped() {
-        let home = real_home().display().to_string();
-        let claude = format!("{home}/.claude");
-        let folder = |name: &str| format!("{claude}/projects/{name}");
-        let named = serde_json::json!([
-            // Can be mapped: its command carries its name, tidied as
-            // `map` would send it.
-            { "folder": folder("-x-Work-cn"), "cwd": format!("{home}/Work/cn"),
-              "name": "github.com/o/cn.git", "mappable": true, "synced_under": claude,
-              "at": "2026-10-05T10:00:00Z" },
-            // Mapped since: nothing is printed for it.
-            { "folder": folder("-x-notes"), "cwd": null, "directory": format!("{home}/notes"),
-              "name": "lab", "mappable": false, "mapped": true },
-            // Needs a name: another folder is mapped under its own.
-            { "folder": folder("-x-src-cn"), "cwd": format!("{home}/src/cn"),
-              "name": "github.com/o/two", "mappable": true, "needs_name": true,
-              "says": "github.com/o/two already syncs from ~/two: give this one its own name, or unmap ~/two first" },
-            // The home directory's own folder, as `~` and under a name.
-            { "folder": folder("-x"), "cwd": home, "name": "~", "mappable": true, "home": true },
-            // A tree laid out by hand.
-            { "folder": folder("workspace"), "cwd": null, "directory": format!("{home}/Work/app"),
-              "name": "github.com/o/app", "mappable": false, "why_not": "laid_out_by_hand",
-              "says": "this layout cannot be mapped" },
-            // Under another Claude Code directory.
-            { "folder": "/srv/other/projects/-x-old", "cwd": null,
-              "directory": format!("{home}/old"), "name": "old", "mappable": false,
-              "why_not": "another_claude_dir", "synced_under": "/srv/other",
-              "says": "it is not under the Claude Code directory that sync is set to" },
-            // From a report of before mappings: no directory.
-            { "folder": folder("-x-before"), "cwd": null, "name": "github.com/o/before",
-              "mappable": false, "why_not": "no_directory", "says": "its directory is not known" },
-            // Its directory is gone.
-            { "folder": folder("-x-gone"), "cwd": null, "directory": format!("{home}/gone"),
-              "name": null, "mappable": false, "why_not": "directory_gone",
-              "says": "its directory is gone" },
-        ]);
-        let rows: Vec<Vec<String>> = named
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(notice_row)
-            .collect();
-        let want: Vec<Vec<&str>> = vec![
-            vec![
-                "~/Work/cn",
-                "synced as github.com/o/cn.git",
-                "cordelia sync map ~/Work/cn github.com/o/cn",
-            ],
-            vec![
-                "~/src/cn",
-                "github.com/o/two already syncs from ~/two: give this one its own name, or unmap ~/two first",
-                "cordelia sync map ~/src/cn <name>",
-            ],
-            vec!["~", "synced as home memory", "cordelia sync map ~ --home"],
-            vec![
-                "~/.claude/projects/workspace/memory",
-                "synced as github.com/o/app",
-                "this layout no longer syncs, and no command maps it",
-            ],
-            vec![
-                "~/old",
-                "synced as old",
-                "it synced under /srv/other, which sync is not set to",
-            ],
-            vec![
-                "~/.claude/projects/-x-before",
-                "synced as github.com/o/before",
-                "its directory is not known",
-            ],
-            vec![
-                "~/gone",
-                "synced under no name that was kept",
-                "its directory is gone",
-            ],
-        ];
-        assert_eq!(rows, want);
-        // Home under a name of its own: the command carries it.
-        let home_as = serde_json::json!({
-            "folder": folder("-x"), "cwd": home, "name": "team", "mappable": true, "home": true,
-        });
-        assert_eq!(
-            notice_row(&home_as).unwrap()[2],
-            "cordelia sync map ~ team --home"
-        );
-        // A name that a shell would read is quoted.
-        let odd = serde_json::json!({
-            "folder": folder("-x-odd"), "cwd": format!("{home}/odd"), "name": "a%b",
-            "mappable": true,
-        });
-        assert_eq!(
-            notice_row(&odd).unwrap()[2],
-            "cordelia sync map ~/odd 'a%b'"
-        );
-
-        // The whole of what is printed, with sync on.
-        let notice = serde_json::json!({
-            "records": [
-                { "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": 8 },
-            ],
-            "not_known": false,
-            "dir": claude,
-            "stopped": 7,
-            "folders": named,
-        });
-        let (before, printed, after) = notice_lines(&notice, true, Notice::Stays);
-        assert!(
-            before[0].starts_with("7 folders stopped syncing on this device (2026-10-05)"),
-            "{before:?}"
-        );
-        assert!(before[1].contains("in the last whole cycle"), "{before:?}");
-        assert_eq!(printed, rows);
-        assert_eq!(
-            after,
-            ["Once you have seen this: cordelia sync status --seen"]
-        );
-        // With sync off: to turn sync on first, since `map` is refused.
-        let (_, printed, after) = notice_lines(&notice, false, Notice::Stays);
-        assert_eq!(printed, rows);
-        assert!(
-            after[0].starts_with("Sync is off: turn it on first"),
-            "{after:?}"
-        );
-        assert!(after[1].ends_with("cordelia sync status --seen"));
-
-        // A record with the date alone: what stopped is not known, and
-        // what is found is listed for it.
-        let unknown = serde_json::json!({
-            "records": [{ "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": null }],
-            "not_known": true, "dir": claude, "stopped": 0, "folders": [],
-        });
-        let (before, printed, after) = notice_lines(&unknown, true, Notice::Stays);
-        assert!(
-            before[0].starts_with("Folders stopped syncing on this device"),
-            "{before:?}"
-        );
-        assert_eq!(before.len(), 1);
-        assert!(printed.is_empty());
-        assert!(
-            after[0].starts_with("What stopped on 2026-10-05 is not known"),
-            "{after:?}"
-        );
-        assert!(after[0].contains("listed below"), "{after:?}");
-        let (_, _, after) = notice_lines(&unknown, false, Notice::Stays);
-        assert!(after[0].contains("once sync is on"), "{after:?}");
-
-        // Every folder mapped since: only how to put it away.
-        let all_mapped = serde_json::json!({
-            "records": [{ "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": 1 }],
-            "not_known": false, "dir": claude, "stopped": 0,
-            "folders": [{ "folder": folder("-x-notes"), "cwd": null, "name": "lab",
-                          "mappable": false, "mapped": true }],
-        });
-        let (before, printed, after) = notice_lines(&all_mapped, true, Notice::Stays);
-        assert!(printed.is_empty() && after.is_empty());
-        assert!(before[0].contains("is mapped again"), "{before:?}");
-        assert!(before[0].ends_with("cordelia sync status --seen"));
-        // One folder is said as one.
-        let one = serde_json::json!({
-            "records": [{ "at": "2026-10-05T10:00:00Z", "dir": claude, "folders": 1 }],
-            "not_known": false, "dir": claude, "stopped": 1, "folders": [odd],
-        });
-        assert!(
-            notice_lines(&one, true, Notice::Stays).0[0].starts_with("1 folder stopped syncing")
-        );
-        // No notice: nothing.
-        let none = notice_lines(&serde_json::Value::Null, true, Notice::Stays);
-        assert!(none.0.is_empty() && none.1.is_empty() && none.2.is_empty());
-
-        // `cordelia sync status --seen` shows the notice that it is
-        // about to put away: the same folders, and nothing that says how
-        // to put it away.
-        let shown = notice_lines(&notice, true, Notice::BeingPutAway);
-        let stays = notice_lines(&notice, true, Notice::Stays);
-        assert_eq!((&shown.0, &shown.1), (&stays.0, &stays.1));
-        assert!(shown.2.is_empty(), "{:?}", shown.2);
-        for put_away in [
-            notice_lines(&notice, false, Notice::BeingPutAway),
-            notice_lines(&unknown, true, Notice::BeingPutAway),
-            notice_lines(&all_mapped, true, Notice::BeingPutAway),
-        ] {
-            let lines = put_away.0.iter().chain(&put_away.2);
-            assert!(put_away.0.len() + put_away.2.len() > 0);
-            assert!(
-                lines.clone().all(|line| !line.contains("--seen")),
-                "{put_away:?}"
-            );
-        }
-        let mapped_again = notice_lines(&all_mapped, true, Notice::BeingPutAway);
-        assert_eq!(
-            mapped_again.0,
-            ["Every folder that stopped syncing on this device is mapped again."]
-        );
-        let none = notice_lines(&serde_json::Value::Null, true, Notice::BeingPutAway);
-        assert!(none.0.is_empty() && none.1.is_empty() && none.2.is_empty());
-
-        // Plain `cordelia status` and a bar's tooltip name each folder
-        // that is not mapped now, and say where some are not known.
-        let details = notice_details(&notice);
-        assert_eq!(details.len(), 7, "{details:?}");
-        assert_eq!(details[0], "~/Work/cn (github.com/o/cn.git)");
-        assert_eq!(details[2], "~ (home memory)");
-        assert_eq!(details[6], "~/gone");
-        assert!(!details.iter().any(|line| line.contains("~/notes")));
-        let details = notice_details(&unknown);
-        assert_eq!(details.len(), 1);
-        assert!(details[0].starts_with("folders that are not known"));
-        assert!(notice_details(&all_mapped).is_empty());
-        assert!(notice_details(&serde_json::Value::Null).is_empty());
-    }
-
-    /// `cordelia sync status --seen` beside a node that has no such
-    /// request says that the node must be restarted, and how.
-    #[test]
-    fn test_seen_says_to_restart_a_node_that_has_no_such_request() {
-        let said = seen_is_not_known();
-        assert!(said.contains("has no such request"), "{said}");
-        assert!(said.contains("must be restarted first"), "{said}");
-        assert!(
-            said.contains(restart_command(std::env::consts::OS)),
-            "{said}"
-        );
     }
 
     /// A relay in the third state is not amber (decision 2026-10-19 §1,
@@ -7690,8 +7139,8 @@ mod tests {
         assert!(refuse_by_how_it_stands(&stands(serde_json::Value::Null)).is_ok());
         assert!(refuse_by_how_it_stands(&Ok(serde_json::json!({ "version": own }))).is_ok());
 
-        let why = "the first start on this version is not done: no room";
-        let held = stands(serde_json::json!({ "by": "first_start", "why": why }));
+        let why = "This database is from a Cordelia before 0.2.0-alpha.19.";
+        let held = stands(serde_json::json!({ "by": "earlier_database", "why": why }));
         let refused = refuse_by_how_it_stands(&held).unwrap_err().to_string();
         assert!(refused.starts_with(&format!("{why}\n")), "{refused}");
         assert!(
@@ -7706,7 +7155,7 @@ mod tests {
         // The version comes first.
         let another = Ok(serde_json::json!({
             "version": "0.0.0-another",
-            "held": { "by": "first_start", "why": why },
+            "held": { "by": "earlier_database", "why": why },
         }));
         let refused = refuse_by_how_it_stands(&another).unwrap_err().to_string();
         assert!(
@@ -7757,8 +7206,7 @@ mod tests {
     }
 
     /// On macOS, the version check of a status and of the commands that
-    /// are refused until the node is restarted, and `cordelia sync status
-    /// --seen` beside a node of another version, name the restart as two
+    /// are refused until the node is restarted name the restart as two
     /// commands on one line, word for word: the agent booted out, then
     /// bootstrapped from its plist. None names a kickstart, which starts
     /// the job as it was loaded, and under which launchd may refuse the
@@ -7791,20 +7239,10 @@ mod tests {
                  is version 0.2.0-alpha.12. {after}"
             )
         );
-        let seen = seen_is_not_known_on("macos");
-        assert_eq!(
-            seen,
-            format!(
-                "the running node has no such request: it is another version than this \
-                 command, and must be restarted first. Where it runs as the service that the \
-                 install script set up, restart it with `{restart}`; otherwise stop it and \
-                 start it again."
-            )
-        );
         let taken = std::io::Error::from(std::io::ErrorKind::AddrInUse);
         let listen = cannot_listen_says("127.0.0.1:9473", &taken, "macos");
         let read = not_read_beside_another_version(std::path::Path::new("/d"), 10, 19, "macos");
-        for said in [&other, &older, &seen, &listen, &read] {
+        for said in [&other, &older, &listen, &read] {
             assert!(said.contains(&restart), "{said}");
             assert!(!said.contains("kickstart"), "{said}");
             let bootout = said.find("launchctl bootout").unwrap();
@@ -7819,10 +7257,6 @@ mod tests {
                 "0.2.0-alpha.12",
                 std::env::consts::OS
             )
-        );
-        assert_eq!(
-            seen_is_not_known(),
-            seen_is_not_known_on(std::env::consts::OS)
         );
     }
 
@@ -8262,7 +7696,7 @@ mod tests {
     /// and keeps no lock.
     #[test]
     fn test_a_command_asks_the_lock_on_the_data_directory() {
-        use cordelia_storage::schema::{RELEASED_SCHEMA_VERSION, SCHEMA_VERSION};
+        use cordelia_storage::schema::{ALPHA_19_VERSION, SCHEMA_VERSION};
         let dir = tempfile::tempdir().unwrap();
         let mut config = Config::default();
         config.node.data_dir = dir.path().display().to_string();
@@ -8322,8 +7756,11 @@ mod tests {
         assert!(!dir.path().join(NODE_LOCK).exists());
         assert!(refuse_beside_its_node(&config).is_ok());
 
-        // A node holds the lock, over a database in the released form.
-        drop(cordelia_storage::first_start::released::database(&database).unwrap());
+        // A node holds the lock, over a database as alpha.19 left it.
+        cordelia_storage::schema::init_db_as_alpha_19(
+            &rusqlite::Connection::open(&database).unwrap(),
+        )
+        .unwrap();
         let held = lock_data_dir(dir.path())
             .unwrap()
             .expect("the lock is taken");
@@ -8337,12 +7774,12 @@ mod tests {
             refused,
             not_read_beside_another_version(
                 dir.path(),
-                RELEASED_SCHEMA_VERSION,
+                ALPHA_19_VERSION,
                 SCHEMA_VERSION,
                 std::env::consts::OS
             )
         );
-        assert_eq!(version(), RELEASED_SCHEMA_VERSION, "nothing was stepped");
+        assert_eq!(version(), ALPHA_19_VERSION, "nothing was stepped");
         // Asking took nothing: the node still holds it.
         assert_eq!(lock_of(dir.path()), DirLock::Held);
 
@@ -8370,6 +7807,16 @@ mod tests {
         assert_eq!(
             open_to_read(&config).unwrap_err().to_string(),
             from_a_later_version(&database, later, SCHEMA_VERSION)
+        );
+        // And one from before alpha.19, in the words of decision
+        // 2026-11-10 (older kind), rule 6.
+        rusqlite::Connection::open(&database)
+            .unwrap()
+            .pragma_update(None, "user_version", 32)
+            .unwrap();
+        assert_eq!(
+            open_to_read(&config).unwrap_err().to_string(),
+            from_an_earlier_version(dir.path())
         );
         drop(held);
 
@@ -9083,7 +8530,9 @@ mod tests {
             for file in ["identity.key", "node-token", "cordelia.db"] {
                 assert_eq!(mode(&data.join(file)), 0o600, "{file}");
             }
-            assert_eq!(mode(&data.join("channel-keys")), 0o700);
+            // No folder of key files: a channel's key is derived (decision
+            // 2026-11-10 (older kind), rule 9).
+            assert!(!data.join("channel-keys").exists());
             // Run again: the same key, and the same modes.
             let key = std::fs::read(data.join("identity.key")).unwrap();
             init();
@@ -9760,9 +9209,70 @@ mod tests {
             .unwrap();
         let (held, why) = open_the_nodes_database(&later, &as_a("personal")).unwrap();
         assert_eq!(secure_delete(&held), 1);
-        assert!(why.is_some_and(|why| why.contains("later version")));
+        assert!(why.is_some_and(|why| why.says().contains("later version")));
         assert!(open_the_nodes_database(&later, &as_a("relay")).is_err());
         assert!(open_database(&later, &as_a("personal")).is_err());
+
+        // And one from before alpha.19 (decision 2026-11-10 (older kind),
+        // rule 6).
+        let earlier = dir.path().join("earlier.db");
+        rusqlite::Connection::open(&earlier)
+            .unwrap()
+            .pragma_update(None, "user_version", 32)
+            .unwrap();
+        let (held, why) = open_the_nodes_database(&earlier, &as_a("personal")).unwrap();
+        assert_eq!(secure_delete(&held), 1);
+        assert_eq!(
+            why,
+            Some(cordelia_api::state::Held::EarlierDatabase(
+                from_an_earlier_version(dir.path())
+            ))
+        );
+        for role in ["relay", "bootnode"] {
+            let refused = open_the_nodes_database(&earlier, &as_a(role)).unwrap_err();
+            assert_eq!(refused.to_string(), from_an_earlier_version(dir.path()));
+        }
+        assert_eq!(
+            open_database(&earlier, &as_a("personal"))
+                .unwrap_err()
+                .to_string(),
+            from_an_earlier_version(dir.path())
+        );
+
+        // And alpha.19's, whose step 34 stops for a reason that is neither
+        // a full disk nor one of I/O (decision 2026-11-10 (older kind), rule
+        // 9): no role is held for it, and none starts; a command says the
+        // same. The database stays at step 33. (A full disk is held: see
+        // first_start_e2e.)
+        let stopped = dir.path().join("stopped.db");
+        {
+            let conn = rusqlite::Connection::open(&stopped).unwrap();
+            cordelia_storage::schema::init_db_as_alpha_19(&conn).unwrap();
+            conn.execute_batch(
+                "INSERT INTO node_meta (key, value) VALUES ('personal_channel_id', 'grp_x');
+                 CREATE TRIGGER a_stop BEFORE DELETE ON node_meta
+                 BEGIN SELECT RAISE(ABORT, 'stopped here'); END;",
+            )
+            .unwrap();
+        }
+        for role in ["personal", "relay", "bootnode"] {
+            let said = open_the_nodes_database(&stopped, &as_a(role))
+                .unwrap_err()
+                .to_string();
+            assert!(said.contains("stopped here"), "{role}: {said}");
+            assert!(!said.contains("free room"), "{role}: {said}");
+        }
+        assert!(
+            open_database(&stopped, &as_a("personal"))
+                .unwrap_err()
+                .to_string()
+                .contains("stopped here")
+        );
+        let version: u32 = rusqlite::Connection::open(&stopped)
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, cordelia_storage::schema::ALPHA_19_VERSION);
     }
 
     /// The connection a relay's node runs on has SQLite's automatic
@@ -9840,12 +9350,12 @@ mod tests {
 
     /// The node sets `secure_delete` on a personal node's store before
     /// the schema's steps run (decision 2026-10-09 §7.1, D10), where it
-    /// starts and where a command opens the store itself: a store of an
-    /// old step whose table the next step rewrites holds its text once
-    /// afterwards, and a relay's twice, the copy and what was freed.
+    /// starts and where a command opens the store itself: alpha.19's store,
+    /// whose older tables step 34 drops, holds nothing of what they held
+    /// afterwards, and a relay's holds it once, in pages that are free.
     #[test]
     fn a_personal_nodes_store_of_an_old_step_is_stepped_with_secure_delete_on() {
-        let words = "a descriptor of puffin-juniper-sextant";
+        let words = "an item of puffin-juniper-sextant";
         let dir = tempfile::tempdir().unwrap();
         let as_a = |role: &str| {
             let mut config = Config::default();
@@ -9855,11 +9365,18 @@ mod tests {
         let old_store = |name: &str| -> std::path::PathBuf {
             let path = dir.path().join(name);
             let conn = rusqlite::Connection::open(&path).unwrap();
-            cordelia_storage::schema::at_version_3(&conn).unwrap();
-            conn.execute(
+            cordelia_storage::schema::init_db_as_alpha_19(&conn).unwrap();
+            conn.execute_batch(
                 "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                                       descriptor, created_at, updated_at)
-                 VALUES ('c', 'group', 'batch', 'open', zeroblob(32), ?1, 't', 't')",
+                                       created_at, updated_at)
+                 VALUES ('c', 'group', 'batch', 'open', zeroblob(32), 't', 't')",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                                    content_hash, signature, encrypted_blob, content_length)
+                 VALUES ('i', 'c', zeroblob(32), 'memory', 't', zeroblob(32), zeroblob(64),
+                         ?1, 32)",
                 [words.as_bytes()],
             )
             .unwrap();
@@ -9873,7 +9390,7 @@ mod tests {
                 .filter(|at| *at == words.as_bytes())
                 .count()
         };
-        for (role, times) in [("personal", 1), ("relay", 2)] {
+        for (role, times) in [("personal", 0), ("relay", 1)] {
             let path = old_store(&format!("{role}-started.db"));
             let (started, later) = open_the_nodes_database(&path, &as_a(role)).unwrap();
             assert_eq!((held(&started, &path), later), (times, None), "{role}");
@@ -9881,6 +9398,22 @@ mod tests {
             let command = open_database(&path, &as_a(role)).unwrap();
             assert_eq!(held(&command, &path), times, "{role}");
         }
+    }
+
+    /// What is said of a database from before alpha.19 is the record's
+    /// words, line for line, with the data directory in its place
+    /// (decision 2026-11-10 (older kind), rule 6).
+    #[test]
+    fn a_database_from_before_alpha_19_is_said_in_the_records_words() {
+        const RECORD: &str =
+            include_str!("../../../docs/decisions/2026-11-10-removing-the-older-kind.md");
+        let said = from_an_earlier_version(std::path::Path::new("<data directory>"));
+        assert_eq!(said.lines().count(), 3, "{said}");
+        for line in said.lines() {
+            assert!(RECORD.contains(&format!("\n> {line}\n")), "{line}");
+        }
+        let said = from_an_earlier_version(std::path::Path::new("/home/sam/.cordelia"));
+        assert!(said.contains("move /home/sam/.cordelia aside"), "{said}");
     }
 
     #[test]

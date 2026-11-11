@@ -1147,17 +1147,12 @@ PeerInfo {
     node_id:         bytes(32)      // Ed25519 public key (verified by TLS)
     addrs:           [SocketAddr]   // Known addresses
     state:           PeerState      // Cold | Warm | Hot | Banned { until, reason }
-    channels:        [string]       // Channel IDs shared with this peer
     rtt_ms:          ?f64           // Latest RTT measurement
     last_activity:   Instant        // Last keepalive or item received
-    items_delivered:  u64           // Cumulative items received from this peer
-    items_relayed:   u64            // Items this peer has forwarded to us (§16.1.1)
-    items_requested: u64            // Items we have requested from this peer
     bytes_in:        u64            // Total bytes received
     bytes_out:       u64            // Total bytes sent
     probes_sent:     u32            // Probe items expected from this peer (§16.1.2)
     probes_received: u32            // Probe items actually received
-    score_ema:       f64            // Exponential moving average score
     state_changed_at: Instant       // When peer entered current state (for tenure checks)
     demoted_at:      ?Instant       // When last demoted (hysteresis)
     connection:      ?Connection    // Live QUIC connection handle (present for Warm + Hot)
@@ -1176,31 +1171,28 @@ GovernorTargets {
     warm_min:       usize     // Default: 3.  Below this, connect cold peers
     warm_max:       usize     // Default: 10. Maximum warm+hot peers
     cold_max:       usize     // Default: 50. Maximum known peer addresses
-    dial_policy:    DialPolicy // Default: "all". "all" | "relays_only" | "trusted_only"
+    dial_policy:    DialPolicy // "all" | "relays_only": by the role (below)
 }
 ```
 
 **`hot_min_relays`:** Independent target from `hot_min`. Ensures relay backbone connectivity. On each governor tick, if fewer than `hot_min_relays` relays are in the hot set, promote a random warm relay to Hot (bypassing the regular random selection for non-relay peers). This guarantees items reach the relay backbone for fan-out.
 
-**`dial_policy`:** Controls which peers the governor will connect to. `all` = any discovered peer. `relays_only` = only peers that identified as relay during handshake. `trusted_only` = only peers in `[[network.trusted_peers]]` config (secret keeper mode; that key is no longer read, §5.3.1).
+**`dial_policy`:** Controls which peers the governor will connect to. `all` = any discovered peer. `relays_only` = only peers that identified as relay during handshake. A personal node dials relays only, and every other role any peer: the role sets it, and no key of the configuration does. `trusted_only` is gone with the trusted peers (decision 2026-11-10 (older kind), rule 2).
 
 **Configuration validation (enforced on startup, node MUST refuse to start if violated):**
 ```
 hot_min >= 1
 hot_min <= hot_max
 hot_min_relays <= hot_max
-hot_max <= warm_max              (except: dial_policy = "trusted_only" exempts this)
-warm_min >= hot_min              (except: dial_policy = "trusted_only" allows warm_min = 0)
-cold_max >= warm_max             (except: dial_policy = "trusted_only" allows cold_max = 0)
+hot_max <= warm_max
+warm_min >= hot_min
+cold_max >= warm_max
 tick_interval_secs >= 1
 keepalive_timeout_secs >= 60     (>= 2x keep-alive interval of 30s)
 min_warm_tenure_secs >= 60
 hysteresis_secs >= tick_interval_secs
 churn_fraction in (0.0, 1.0]
-dial_policy in ("all", "relays_only", "trusted_only")
 ```
-
-**`trusted_only` exemption:** Secret keepers (§8.5) use `dial_policy = "trusted_only"` with no gossip discovery. They connect only to configured relays, so `warm_min=0` and `cold_max=0` are valid -- there are no peers to discover.
 
 ### 5.3.1 Trusted Peers
 
@@ -1216,8 +1208,8 @@ Executed in order:
 3. **Promote Cold→Warm**: If `warm_count < warm_min`, connect to cold peers. Prefer peers with channel overlap. **Failure tracking:** After `max_connection_retries` (default: 5) consecutive failures, stop trying until the peer's backoff expires (exponential, base 30s, cap 900s). Clear failure count after `clear_failure_delay` (default: 120s) of being Hot.
 4. **Promote Warm→Hot**: If `hot_count < hot_min`, promote from eligible warm peers. Guard: `min_warm_tenure_secs` (default: 300s) -- peer must be warm for 5 min, UNLESS `hot_count < hot_min` (bootstrap bypass). Guard: `hysteresis_secs` (default: 90s) -- recently demoted peers ineligible. **Anti-eclipse: promotion is RANDOM among eligible warm peers, not best-scoring.** This prevents an attacker from gaming their score to get promoted faster than honest peers (cf. Cardano's `simplePromotionPolicy`).
 4a. **Ensure relay connectivity**: If fewer than `hot_min_relays` relay peers are Hot, promote a random warm relay to Hot. This bypasses the regular random selection and the tenure guard (same urgency as `hot < hot_min`). Evaluated after step 4, independent of `hot_count`.
-5. **Demote Hot→Warm**: If `hot_count > hot_max`, demote worst-scoring hot peer. Stale peers (no items for `stale_threshold_secs`, default: 1800s) demoted first. Trusted peers are never demoted.
-6. **Churn (hot)**: Every `churn_interval_secs` (default: 3600s) plus a jitter drawn at random, uniform from 0 to `churn_jitter_secs` (default: 300s), once for each churn when the one before it runs, demote 1 random hot peer to Warm and promote 1 random warm peer to Hot in its place, so the hot count does not change. The peer demoted is chosen among hot peers that are not trusted: a trusted peer and a swarm member are never demoted by churn, and nor is a relay while no more than `hot_min_relays` relays are hot, so churn never leaves fewer hot relays than step 4a keeps. The peer promoted is chosen at random (as in step 4, anti-eclipse) among the warm peers that pass step 4's guards with none bypassed: `min_warm_tenure_secs` and `hysteresis_secs`, and no bootnode or swarm member. It is chosen before the demotion, so the peer just demoted is never the one promoted. A trusted warm peer may be promoted. If no hot peer may be demoted, or no warm peer passes, nothing moves: a demotion with no peer to take its place explores nothing and only shrinks the hot set, which step 4 refills only below `hot_min`. Churn runs only while `hot_count > hot_min`. Moving a peer between Hot and Warm opens and closes no connection, so a personal node keeps the relays it is set up with (decision 2026-10-17 §2). This forces hot-tier exploration and prevents topology ossification.
+5. **Demote Hot→Warm**: If `hot_count > hot_max`, demote hot peers until it is not. Stale peers (no keep-alive answer for `stale_threshold_secs`, default: 1800s) are demoted first; there is no score after that (§5.5).
+6. **Churn (hot)**: Every `churn_interval_secs` (default: 3600s) plus a jitter drawn at random, uniform from 0 to `churn_jitter_secs` (default: 300s), once for each churn when the one before it runs, demote 1 random hot peer to Warm and promote 1 random warm peer to Hot in its place, so the hot count does not change. The peer demoted is chosen among hot peers at random, but a relay is never demoted by churn while no more than `hot_min_relays` relays are hot, so churn never leaves fewer hot relays than step 4a keeps. The peer promoted is chosen at random (as in step 4, anti-eclipse) among the warm peers that pass step 4's guards with none bypassed: `min_warm_tenure_secs` and `hysteresis_secs`, and no bootnode. It is chosen before the demotion, so the peer just demoted is never the one promoted. If no hot peer may be demoted, or no warm peer passes, nothing moves: a demotion with no peer to take its place explores nothing and only shrinks the hot set, which step 4 refills only below `hot_min`. Churn runs only while `hot_count > hot_min`. Moving a peer between Hot and Warm opens and closes no connection, so a personal node keeps the relays it is set up with (decision 2026-10-17 §2). This forces hot-tier exploration and prevents topology ossification.
 7. **Churn (warm)**: Same interval, swap `churn_fraction` (default: 0.2) of warm peers with random cold peers. A personal node never closes, by churn, its connection to a relay it is set up with: each is one the person chose (decision 2026-10-17 §2).
 8. **Evict excess cold**: If `cold_count > cold_max`, remove peers with most connection failures first, then oldest-seen.
 
@@ -1251,6 +1243,12 @@ This prevents Sybil attacks: an attacker connecting many identities can only get
 > that its operator lists by key.
 
 ### 5.5 Peer Scoring
+
+> **v1 status.** The governor scores no peer: excess demotion orders by
+> staleness alone (§5.4 step 5). The score below was items delivered, which
+> was always 0 once no node carried the older kind, and it is gone, with
+> its key `ema_alpha` (decision 2026-11-10 (older kind), rule 2).
+> What follows is the design before.
 
 ```
 contribution_ratio = items_relayed / max(items_requested, 1)
@@ -1486,7 +1484,7 @@ The user's local node. Runs as a daemon on the user's machine. Its job is reliab
 #### 8.2.1 Push Policy
 
 Gone (decision 2026-11-10 (older kind), rule 2): no node pushes an item of
-the older kind. `push_policy` is not read.
+the older kind. The key `push_policy` is gone; a configuration that sets it loads.
 
 #### 8.2.2 Personal Area Network (Agent Swarm)
 
@@ -1546,9 +1544,9 @@ The `hot_min_relays=5` ensures each relay maintains connections to at least 5 ot
 > signatures hold, hands a channel only to a connection that proved the
 > channel's key, and tells nobody which channels it holds, the relays its
 > operator lists by key aside (§4.9). What it holds is counted against its
-> cap (`max_storage_bytes`); what its database still holds of the older
-> kind is neither read nor counted. Its room, and what is not defended, are
-> in the decision record of 2026-10-04, §2.5, and in
+> cap (`max_storage_bytes`). Its database holds nothing of the older kind:
+> step 34 of the schema drops it (rule 5). Its room, and what is not
+> defended, are in the decision record of 2026-10-04, §2.5, and in
 > `deploy/relay/README.md`.
 
 **Phase 2+:** Dynamic and explicit relay postures (accept only learned or explicitly configured channels).
@@ -1809,7 +1807,7 @@ kind's keys, items and announcements.
 | **Identity spoofing** | TLS certificate binds to Ed25519 key (§2.2). Application-layer verification (§4.1.6). | 1 |
 | **Metadata leakage** | Channel lists removed from peer-sharing (§4.3). Channel digest in handshake, not full list (§4.1.2). | 1 |
 | **DDoS** | Connection limits, bounded queues, per-peer fairness (§9). QUIC flow control. | 1 |
-| **Governor manipulation** | EMA scoring (§5.5). Min warm tenure. Hysteresis. Escalating bans. | 1 |
+| **Governor manipulation** | Random promotion (§5.4 step 4). Min warm tenure. Hysteresis. Escalating bans. | 1 |
 | **Relay compromise** | Relays see only ciphertext. No PSKs, no plaintext, no keys. Expendable by design. | 1 |
 | **Peer-sharing poisoning** | Address validation: reject private IPs, loopback, link-local, own address (§4.3). | 1 |
 | **Bootnode exhaustion** | Bootstrap rate limits per IP/subnet (§16.2.1). Bootnodes discovery-only (§8.2). | 1 |
@@ -1856,7 +1854,6 @@ public_key = "cordelia_pk1..."             # Ed25519 public key (Bech32, read-on
 listen_addr = "0.0.0.0:9474"              # P2P listen address
 api_addr = "127.0.0.1:9473"               # REST API listen address (127.0.0.1 or ::1 only, see below)
 role = "personal"                           # "personal" | "bootnode" | "relay" | "keeper"
-push_policy = "subscribers_only"           # "subscribers_only" | "pull_only" (personal nodes only, §8.1.1)
 bootstrap_timeout_secs = 10              # Per-bootnode connection timeout during bootstrap
 # All stream I/O uses STREAM_TIMEOUT (10s) at the codec layer.
 # One timeout, one layer. See parameter-rationale.md §6 and protocol.rs.
@@ -1881,7 +1878,6 @@ hot_min_relays = 1                     # Minimum relay peers in hot set (§5.3)
 warm_min = 3                           # Below this, connect cold peers
 warm_max = 10                          # Maximum warm+hot peers
 cold_max = 50                          # Maximum known peer addresses (discovery breadth)
-dial_policy = "all"                    # "all" | "relays_only" | "trusted_only"
 tick_interval_secs = 10                # Governor tick frequency
 churn_interval_secs = 3600             # Base churn interval (1 hour)
 churn_jitter_secs = 300                # Random jitter added to churn interval (0-300s)
@@ -1890,7 +1886,6 @@ min_warm_tenure_secs = 300             # Minimum time as Warm before Hot promoti
 hysteresis_secs = 90                   # Cooldown after demotion before re-promotion
 keepalive_timeout_secs = 90            # Dead detection threshold
 stale_threshold_secs = 1800            # 30 min no items → priority demotion
-ema_alpha = 0.1                        # Scoring EMA decay (§5.5)
 max_connection_retries = 5             # Stop connecting to a peer after this many consecutive failures
 clear_failure_delay_secs = 120         # Clear failure count after being Hot for this long
 ```
@@ -1901,10 +1896,7 @@ See §8.6 for role-specific profiles (Bootnode, Relay, Secret Keeper).
 
 ```toml
 [replication]
-sync_interval_realtime_secs = 10           # Phase 1 default (fast convergence). Production: 60s.
-sync_interval_batch_secs = 900
-tombstone_retention_days = 7
-max_batch_size = 100
+relay_ask_again_secs = 600                 # Relays only
 ```
 
 ### 12.4 Rate Limiting Section

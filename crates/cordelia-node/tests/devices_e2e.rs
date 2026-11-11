@@ -3334,38 +3334,6 @@ fn without_colour(log: &str) -> String {
     plain
 }
 
-/// A key file that cannot be removed does not stop the node. A personal
-/// node that ran an earlier version holds a channel of the older kind,
-/// and removes the key files of the older channels after its first start
-/// on this version (decision 2026-10-04 §10.1); where a slot key would be
-/// there is a directory, which cannot be removed as a file is. The node
-/// starts, and warns once that one could not be removed: how many, and
-/// not which.
-#[test]
-fn a_key_file_that_cannot_be_removed_does_not_stop_the_node() {
-    let mut a = node("stuck-canary", "personal", None);
-    holds_an_older_channel(&a, OLDER_GROUP);
-    let stuck = a
-        .data_dir()
-        .join("channel-keys")
-        .join(format!("{OLDER_GROUP}.slot"));
-    std::fs::create_dir_all(&stuck).unwrap();
-
-    a.start();
-    wait_for("node healthy", &[&a], 30, || healthy(&a));
-
-    assert!(stuck.is_dir());
-    let log = without_colour(&std::fs::read_to_string(a.log()).unwrap());
-    let warned: Vec<&str> = log
-        .lines()
-        .filter(|line| line.contains("could not remove every key file"))
-        .collect();
-    assert_eq!(warned.len(), 1, "{log}");
-    for said in ["WARN", "key_files=1", "of the older channels"] {
-        assert!(warned[0].contains(said), "{}", warned[0]);
-    }
-}
-
 /// Connect to `relay` as any node may, under `key`. The connection lasts
 /// as long as what is returned is kept.
 async fn client_of(
@@ -3379,7 +3347,7 @@ async fn client_of(
     let endpoint = transport::create_endpoint(&key, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
     let mut manager =
-        connection::ConnectionManager::new(key, endpoint, vec![], vec!["personal".into()], port);
+        connection::ConnectionManager::new(key, endpoint, vec!["personal".into()], port);
     let relay_id = manager
         .connect_to(format!("127.0.0.1:{}", relay.p2p).parse().unwrap())
         .await
@@ -3397,13 +3365,8 @@ fn relay_that_asks() -> (u16, std::sync::mpsc::Receiver<quinn::Connection>) {
     let identity = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
     let endpoint = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
     let port = endpoint.local_addr().unwrap().port();
-    let manager = connection::ConnectionManager::new(
-        identity,
-        endpoint.clone(),
-        vec![],
-        vec!["relay".into()],
-        port,
-    );
+    let manager =
+        connection::ConnectionManager::new(identity, endpoint.clone(), vec!["relay".into()], port);
     let ctx = manager.connect_context();
     let (made, connections) = std::sync::mpsc::channel();
     tokio::spawn(async move {
@@ -3471,44 +3434,8 @@ async fn asked_of_the_older_kind_answers_nothing(
     });
 }
 
-/// Put in the database of the running device `n` a channel of the older
-/// kind with one item in it, in plain SQL, as an earlier version left one.
-/// A database of this version refuses a new row of that kind, from its
-/// first start on (decision 2026-10-04 §10.1): the test takes that guard
-/// away first, and puts the rows where nothing of this version would.
-fn an_older_channel_in_a_running_device(n: &Node, channel: &str) {
-    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
-    db.busy_timeout(Duration::from_secs(10)).unwrap();
-    cordelia_storage::first_start::remove_guard(&db).unwrap();
-    let now = "2026-10-01T00:00:00Z";
-    db.execute(
-        "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
-                               created_at, updated_at)
-         VALUES (?1, 'group', 'realtime', 'invite_only', ?2, ?3, ?3)",
-        rusqlite::params![channel, [0xAAu8; 32].as_slice(), now],
-    )
-    .unwrap();
-    let blob = b"what an earlier version held of the older kind";
-    db.execute(
-        "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
-                            content_hash, signature, encrypted_blob, content_length, seq)
-         VALUES ('ci_01JARV8XMHW8G9QZP0000000AB', ?1, ?2, 'memory', ?3, ?4, ?5, ?6, ?7, 1)",
-        rusqlite::params![
-            channel,
-            [0xAAu8; 32].as_slice(),
-            now,
-            cordelia_crypto::sha256(blob).as_slice(),
-            [7u8; 64].as_slice(),
-            blob.as_slice(),
-            blob.len() as i64,
-        ],
-    )
-    .unwrap();
-}
-
 /// A device answers its relay with nothing of a channel of the older
-/// kind, though it holds the channel and an item in it: no node of this
-/// version carries one (decision 2026-11-10 (older kind), rule 7). The
+/// kind: no node of this version carries one (decision 2026-11-10 (older kind), rule 7). The
 /// test is the relay: it asks the device which channels it holds, and for
 /// that channel's entries by its ID, as a device that holds no such
 /// channel would be answered (decision 2026-10-04 §10.1); and it pushes
@@ -3522,8 +3449,6 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
     a.start();
     wait_for("node healthy", &[&a], 30, || healthy(&a));
     wait_for("connected to the relay", &[&a], 60, || has_hot_peer(&a));
-
-    an_older_channel_in_a_running_device(&a, OLDER_GROUP);
 
     // The control: the device answers its relay on a stream that it does
     // serve.
@@ -3541,25 +3466,21 @@ async fn a_device_answers_its_relay_with_nothing_of_a_swarm_channel() {
     asked_of_the_older_kind_answers_nothing(&a, &conn, OLDER_GROUP).await;
     assert!(answers_a_request_for_peers(&conn).is_some());
 
-    // The device's database holds the channel and its item all the while.
-    // (`cordelia channels` says nothing of them: on a personal node it
-    // lists the names that the device holds.)
-    assert_eq!(older_items_held(&a), 1);
+    // `cordelia channels` says nothing of it: on a personal node it lists
+    // the names that the device holds.
+    assert_eq!(older_items_held(&a), 0);
     let channels = a.cli(&["channels"]);
     assert!(!channels.contains(OLDER_GROUP), "{channels}");
 }
 
 /// A relay answers what is asked of the older kind with nothing, as a
-/// device does, though its database holds a channel of that kind with an
-/// item in it, as a relay of alpha.19 left it (decision 2026-11-10 (older
-/// kind), rule 7). A client asks it which channels it holds and for that
+/// device does (decision 2026-11-10 (older kind), rule 7). A client asks it which channels it holds and for that
 /// channel's entries, and is answered with nothing; it pushes a frame of
 /// the older kind, and announces one, and each is refused at once. Nothing
 /// is stored, and the client is still served on a stream of the relay's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_relay_answers_nothing_of_the_older_kind_and_takes_none_of_it() {
     let mut relay = node("relay", "relay", None);
-    holds_an_older_channel(&relay, OLDER_GROUP);
     relay.start();
     wait_for("relay healthy", &[&relay], 30, || healthy(&relay));
     let key = Arc::new(cordelia_crypto::identity::NodeIdentity::generate().unwrap());
@@ -3570,7 +3491,7 @@ async fn a_relay_answers_nothing_of_the_older_kind_and_takes_none_of_it() {
 
     asked_of_the_older_kind_answers_nothing(&relay, &conn, OLDER_GROUP).await;
     assert!(answers_a_request_for_peers(&conn).is_some());
-    assert_eq!(older_items_held(&relay), 1);
+    assert_eq!(older_items_held(&relay), 0);
 }
 
 /// Whether the node at the other end of `conn` answers a request for

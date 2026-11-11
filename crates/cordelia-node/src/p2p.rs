@@ -503,7 +503,7 @@ pub fn post_connect(
     }
 
     // Step 2: Add to governor
-    governor.add_peer(node_id.clone(), vec![], vec![]);
+    governor.add_peer(node_id.clone(), vec![]);
 
     // Step 3: Mark relay role
     if is_relay {
@@ -2404,7 +2404,7 @@ fn governor_for(
         DialPolicy::All
     };
     let targets = GovernorTargets::from_config(gov_config);
-    let governor = Governor::with_dial_policy(targets, vec![], dial_policy)
+    let governor = Governor::with_dial_policy(targets, dial_policy)
         .with_timeouts(GovernorTimeouts::from_config(gov_config));
     match personal {
         true => governor.keeping_its_relays(),
@@ -3948,7 +3948,7 @@ mod tests {
             let mut governor = governor_for(role, &config);
             for n in 1..=4u8 {
                 let id = NodeId([n; 32]);
-                governor.add_peer(id.clone(), vec![], vec![]);
+                governor.add_peer(id.clone(), vec![]);
                 governor.set_peer_relay(&id, true);
                 governor.mark_connected(&id);
             }
@@ -4463,7 +4463,6 @@ mod tests {
         let node_mgr = connection::ConnectionManager::new(
             node_id_key.clone(),
             node_end,
-            vec![],
             vec!["relay".into()],
             node_addr.port(),
         );
@@ -4537,7 +4536,6 @@ mod tests {
         let mut client_mgr = connection::ConnectionManager::new(
             client_key.clone(),
             transport::create_endpoint(&client_key, here).unwrap(),
-            vec![],
             vec![],
             9474,
         );
@@ -4717,7 +4715,6 @@ mod tests {
         let node_mgr = connection::ConnectionManager::new(
             node.clone(),
             node_end,
-            vec![],
             vec!["relay".into()],
             node_addr.port(),
         );
@@ -4764,7 +4761,6 @@ mod tests {
         let mut client_mgr = connection::ConnectionManager::new(
             client.clone(),
             transport::create_endpoint(&client, here).unwrap(),
-            vec![],
             vec![],
             9474,
         );
@@ -4955,7 +4951,6 @@ mod tests {
                 let node_mgr = connection::ConnectionManager::new(
                     node_id_key.clone(),
                     node_end,
-                    vec![],
                     vec!["relay".into()],
                     node_addr.port(),
                 );
@@ -5020,7 +5015,6 @@ mod tests {
                 let mut client_mgr = connection::ConnectionManager::new(
                     client_key.clone(),
                     transport::create_endpoint(&client_key, here).unwrap(),
-                    vec![],
                     vec![],
                     9474,
                 );
@@ -5965,13 +5959,7 @@ mod tests {
                 let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
                     let end = transport::create_endpoint(key, here).unwrap();
                     let port = end.local_addr().unwrap().port();
-                    connection::ConnectionManager::new(
-                        key.clone(),
-                        end,
-                        vec![],
-                        vec!["relay".into()],
-                        port,
-                    )
+                    connection::ConnectionManager::new(key.clone(), end, vec!["relay".into()], port)
                 };
                 let (node_key, relay_key, stranger_key) = (id(31), id(32), id(33));
                 let node = manager(&node_key);
@@ -6140,13 +6128,8 @@ mod tests {
             cordelia_crypto::identity::NodeIdentity::from_seed([1; 32]).unwrap(),
         );
         let end = transport::create_endpoint(&identity, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let conn_mgr = cordelia_network::connection::ConnectionManager::new(
-            identity,
-            end,
-            vec![],
-            vec![],
-            9474,
-        );
+        let conn_mgr =
+            cordelia_network::connection::ConnectionManager::new(identity, end, vec![], 9474);
         let set_up = [
             Relay {
                 host: "a.example:9474".into(),
@@ -6210,8 +6193,7 @@ mod tests {
         let (device, relay) = (identity(1), identity(2));
         let relay_end = transport::create_endpoint(&relay, here).unwrap();
         let relay_addr = relay_end.local_addr().unwrap();
-        let relay_mgr =
-            connection::ConnectionManager::new(relay.clone(), relay_end, vec![], vec![], 9474);
+        let relay_mgr = connection::ConnectionManager::new(relay.clone(), relay_end, vec![], 9474);
         let (accepts, as_relay) = (relay_mgr.endpoint(), relay_mgr.connect_context());
         let accepted = tokio::spawn(async move {
             let incoming = accepts.accept().await.unwrap();
@@ -6221,7 +6203,7 @@ mod tests {
         });
         let device_end = transport::create_endpoint(&device, here).unwrap();
         let mut conn_mgr =
-            connection::ConnectionManager::new(device.clone(), device_end, vec![], vec![], 9474);
+            connection::ConnectionManager::new(device.clone(), device_end, vec![], 9474);
         conn_mgr.connect_to(relay_addr).await.unwrap();
         let _accepted = accepted.await.unwrap();
 
@@ -6367,8 +6349,7 @@ mod tests {
         let (device, relay) = (identity(1), identity(2));
         let relay_end = transport::create_endpoint(&relay, here).unwrap();
         let relay_addr = relay_end.local_addr().unwrap();
-        let relay_mgr =
-            connection::ConnectionManager::new(relay.clone(), relay_end, vec![], roles, 9474);
+        let relay_mgr = connection::ConnectionManager::new(relay.clone(), relay_end, roles, 9474);
         let (accepts, as_relay) = (relay_mgr.endpoint(), relay_mgr.connect_context());
         let accepted = tokio::spawn(async move {
             let incoming = accepts.accept().await.unwrap();
@@ -6378,7 +6359,7 @@ mod tests {
         });
         let device_end = transport::create_endpoint(&device, here).unwrap();
         let mut conn_mgr =
-            connection::ConnectionManager::new(device.clone(), device_end, vec![], vec![], 9474);
+            connection::ConnectionManager::new(device.clone(), device_end, vec![], 9474);
         conn_mgr.connect_to(relay_addr).await.unwrap();
         let accepted = accepted.await.unwrap();
         (
@@ -7257,16 +7238,14 @@ mod tests {
         // The node, connected to two relays that listen.
         let node = identity(1);
         let node_end = transport::create_endpoint(&node, here).unwrap();
-        let mut conn_mgr =
-            connection::ConnectionManager::new(node.clone(), node_end, vec![], vec![], 9474);
+        let mut conn_mgr = connection::ConnectionManager::new(node.clone(), node_end, vec![], 9474);
         let mut relays = Vec::new();
         for seed in [2, 3] {
             let relay = identity(seed);
             let end = transport::create_endpoint(&relay, here).unwrap();
             let addr = end.local_addr().unwrap();
             let roles = vec!["relay".to_string()];
-            let mgr =
-                connection::ConnectionManager::new(relay.clone(), end, vec![], roles, addr.port());
+            let mgr = connection::ConnectionManager::new(relay.clone(), end, roles, addr.port());
             let (accepts, as_relay) = (mgr.endpoint(), mgr.connect_context());
             let accepted = tokio::spawn(async move {
                 let incoming = accepts.accept().await.unwrap();
@@ -7427,7 +7406,7 @@ mod tests {
         let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
             let end = transport::create_endpoint(key, here).unwrap();
             let port = end.local_addr().unwrap().port();
-            connection::ConnectionManager::new(key.clone(), end, vec![], vec!["relay".into()], port)
+            connection::ConnectionManager::new(key.clone(), end, vec!["relay".into()], port)
         };
         let (node_key, relay_key, other_key, impostor_key) = (id(21), id(22), id(23), id(24));
         let node = manager(&node_key);
@@ -7586,13 +7565,7 @@ mod tests {
                 let manager = |key: &std::sync::Arc<cordelia_crypto::identity::NodeIdentity>| {
                     let end = transport::create_endpoint(key, here).unwrap();
                     let port = end.local_addr().unwrap().port();
-                    connection::ConnectionManager::new(
-                        key.clone(),
-                        end,
-                        vec![],
-                        vec!["relay".into()],
-                        port,
-                    )
+                    connection::ConnectionManager::new(key.clone(), end, vec!["relay".into()], port)
                 };
                 let listing = |addr: std::net::SocketAddr, key: [u8; 32]| -> RelayAddrs {
                     std::sync::Arc::new(std::sync::RwLock::new(vec![RelayAddr {

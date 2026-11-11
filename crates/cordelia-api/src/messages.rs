@@ -4102,7 +4102,9 @@ mod tests {
         assert_eq!(said["messages"]["unread_by_an_agent"], 1, "{said}");
         let (_, said) = status_of(true).await;
         assert_eq!(said.get("messages"), None, "{said}");
-        state.held.hold(Held::FirstStart("a copy failed".into()));
+        state
+            .held
+            .hold(Held::LaterDatabase("a later database".into()));
         let (code, said) = status_of(false).await;
         assert_eq!(code, 200);
         assert_eq!(said.get("messages"), None, "{said}");
@@ -4134,7 +4136,9 @@ mod tests {
         let (status, _) = answer(announced(asked(), state.clone(), other).await).await;
         assert_eq!(status, 204);
         assert!(!held::is_announced(&db_of(&state), &id, "work").unwrap());
-        state.held.hold(Held::FirstStart("a copy failed".into()));
+        state
+            .held
+            .hold(Held::LaterDatabase("a later database".into()));
         let (status, _) =
             answer(summary(asked(), state.clone(), summary_asked("work", 100)).await).await;
         assert_eq!(status, 204);

@@ -4659,10 +4659,10 @@ mod tests {
     #[test]
     fn status_says_in_a_few_words_where_a_device_stands() {
         let (short, says) = status_lines(&json!({
-            "short": "not added yet",
+            "short": "no recovery phrase yet",
             "says": ["no recovery phrase yet: memory stays on this machine."],
         }));
-        assert_eq!(short, "not added yet");
+        assert_eq!(short, "no recovery phrase yet");
         assert_eq!(
             says,
             ["no recovery phrase yet: memory stays on this machine."]

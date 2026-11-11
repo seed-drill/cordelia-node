@@ -141,9 +141,6 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     let json: Value = serde_json::from_str(&laptop.cli(&["status", "--json"])).unwrap();
     assert_eq!(json["person"]["state"], "no_phrase");
     assert_eq!(json["person"]["short"], "no recovery phrase yet");
-    // It is a new install: it took this version with nothing that an
-    // earlier one held.
-    assert_eq!(json["sync"]["moved_on"], false, "{json}");
     let says = json["person"]["says"][0].as_str().unwrap();
     assert!(says.starts_with("no recovery phrase yet:"), "{json}");
     assert_eq!(
@@ -4557,16 +4554,16 @@ fn a_command_that_changes_anything_refuses_a_node_whose_version_it_cannot_learn(
 /// stands first, and shows no word and asks for none where the node is
 /// held up (decision 2026-10-04 §10.1): it says why the node is, and has
 /// asked the node for nothing but how it stands. Here the node is behind
-/// a stand-in that says it is held up for its first start.
+/// a stand-in that says it is held up by a database from before alpha.19.
 #[test]
 fn a_command_of_a_phrase_shows_no_word_where_the_node_is_held_up() {
     let mut laptop = node("laptop", "personal", None);
     laptop.start();
     wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
-    let why = "the first start on this version is not done: no room for the copy";
+    let why = "This database is from a Cordelia before 0.2.0-alpha.19.";
     let held = Answers::in_the_place_of(&laptop, move |path, answer| {
         if path == "/api/v1/status" {
-            answer["held"] = json!({ "by": "first_start", "why": why });
+            answer["held"] = json!({ "by": "earlier_database", "why": why });
         }
     });
     let other = cordelia_crypto::identity::NodeIdentity::generate().unwrap();
@@ -4615,7 +4612,7 @@ fn a_command_of_a_phrase_shows_no_word_where_the_node_is_held_up() {
 /// command but `status` and `off`, `restore`, `history drop`, `init
 /// --new-key`, and each command of a person's devices but `devices` with
 /// no act. Turning sync off is sent to any node. `cordelia status`,
-/// `cordelia sync status` (its `--seen` included), `cordelia devices`
+/// `cordelia sync status`, `cordelia devices`
 /// and `cordelia history` still answer beside such a node, with the
 /// note. And a look that says
 /// nothing of where the device stands is no look of this version: it is
@@ -4714,12 +4711,10 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
         assert_eq!(another.asked().len(), before, "{args:?} asked the node");
     }
 
-    // What only shows is answered, with the note: `cordelia sync
-    // status` with the act that puts its notice away among them.
-    let shows: [&[&str]; 6] = [
+    // What only shows is answered, with the note.
+    let shows: [&[&str]; 5] = [
         &["status"],
         &["sync", "status"],
-        &["sync", "status", "--seen"],
         &["devices"],
         &["history"],
         &["history", "notes"],
@@ -4898,15 +4893,14 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
 ///   place), the lock tells nothing, and the port of the command's
 ///   configuration is asked: a node of another version there
 ///   (here a stand-in that says it is) refuses `cordelia stats`, `cordelia
-///   channels` and `cordelia init --force`, and the database stays at the
-///   released version's schema, byte for byte.
+///   channels` and `cordelia init --force`, and the database stays at
+///   alpha.19's schema, byte for byte.
 /// - **Where the lock file is there and no node holds it,** a node on
 ///   another data directory never refuses them, whatever it answers at
 ///   the port: each goes on, and the opening steps the database; none of
 ///   them asks the node anything.
 /// - **Where the lock is held** (here by the test, in the place of a node
-///   of another version, over a database in the released version's
-///   form), `cordelia init --force` opens nothing and names the command
+///   of another version, over a database as alpha.19 left it), `cordelia init --force` opens nothing and names the command
 ///   that stops the node; `stats` and `channels` open nothing at a
 ///   schema that is not theirs, and name what to run instead; `cordelia
 ///   status` says that the database was not read. Nothing is stepped:
@@ -4916,7 +4910,7 @@ fn a_command_that_changes_anything_refuses_a_node_of_another_version() {
 ///   and `channels` read the node's database, for reading only.
 #[test]
 fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
-    use cordelia_storage::schema::{RELEASED_SCHEMA_VERSION, SCHEMA_VERSION};
+    use cordelia_storage::schema::{ALPHA_19_VERSION, SCHEMA_VERSION};
     let mut laptop = node("laptop", "personal", None);
     laptop.start();
     wait_for("the laptop is up", &[&laptop], 30, || healthy(&laptop));
@@ -4926,17 +4920,18 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         }
     });
 
-    // A data directory as the released version left one.
+    // A data directory as alpha.19 left one (decision 2026-11-10 (older
+    // kind), rule 10).
     let beside = laptop.dir.path().join("beside");
-    let released = || {
+    let as_alpha_19_left_it = || {
         let _ = std::fs::remove_dir_all(&beside);
         std::fs::create_dir(&beside).unwrap();
         for file in ["identity.key", "node-token"] {
             std::fs::copy(laptop.data_dir().join(file), beside.join(file)).unwrap();
         }
-        drop(
-            cordelia_storage::first_start::released::database(&beside.join("cordelia.db")).unwrap(),
-        );
+        let db = rusqlite::Connection::open(beside.join("cordelia.db")).unwrap();
+        cordelia_storage::schema::init_db_as_alpha_19(&db).unwrap();
+        drop(db);
     };
     let database = beside.join("cordelia.db");
     let schema_version = || -> u32 {
@@ -4948,7 +4943,7 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         db.pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap()
     };
-    const { assert!(RELEASED_SCHEMA_VERSION < SCHEMA_VERSION) };
+    const { assert!(ALPHA_19_VERSION < SCHEMA_VERSION) };
     let port = another.port.to_string();
     let directory = beside.to_str().unwrap();
     let through = [
@@ -4967,7 +4962,7 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
     // lock runs: the lock tells nothing, so the port is asked, and the
     // node of another version that answers there refuses each command.
     // Nothing is opened, and nothing is stepped.
-    released();
+    as_alpha_19_left_it();
     let as_it_was = std::fs::read(&database).unwrap();
     for args in opens {
         let before = another.asked().len();
@@ -4983,7 +4978,7 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
             another.asked().len() > before,
             "{args:?} did not ask the node"
         );
-        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION, "{args:?}");
+        assert_eq!(schema_version(), ALPHA_19_VERSION, "{args:?}");
         assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
     }
     assert!(!beside.join("node.lock").exists());
@@ -5006,7 +5001,7 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         let said = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(!out.status.success(), "{args:?}: {said}");
         assert!(said.contains(note), "{args:?}: {said}");
-        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION, "{args:?}");
+        assert_eq!(schema_version(), ALPHA_19_VERSION, "{args:?}");
         assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
     }
 
@@ -5015,9 +5010,9 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
     // command goes on, asks it nothing, and the opening steps the
     // database.
     for args in opens {
-        released();
+        as_alpha_19_left_it();
         std::fs::File::create(beside.join("node.lock")).unwrap();
-        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION);
+        assert_eq!(schema_version(), ALPHA_19_VERSION);
         let before = another.asked().len();
         let out = laptop.command_given(&through, args);
         let said = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -5028,7 +5023,7 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
     }
 
     // The lock on the data directory is held, as a node holds it.
-    released();
+    as_alpha_19_left_it();
     let as_it_was = std::fs::read(&database).unwrap();
     let key = std::fs::read(beside.join("identity.key")).unwrap();
     let lock = std::fs::File::create(beside.join("node.lock")).unwrap();
@@ -5063,7 +5058,7 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         let said = String::from_utf8_lossy(&out.stderr).into_owned();
         assert!(!out.status.success(), "{args:?}: {said}");
         assert!(said.contains(says.as_str()), "{args:?}: {said}");
-        assert_eq!(schema_version(), RELEASED_SCHEMA_VERSION, "{args:?}");
+        assert_eq!(schema_version(), ALPHA_19_VERSION, "{args:?}");
         assert_eq!(std::fs::read(&database).unwrap(), as_it_was, "{args:?}");
     }
     assert_eq!(std::fs::read(beside.join("identity.key")).unwrap(), key);

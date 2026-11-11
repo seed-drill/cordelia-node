@@ -149,12 +149,11 @@ The X25519 key is derived on demand and never persisted separately (ecies-envelo
 > | What it follows: the phrase's public key, the statement key, the ID of the phrase's channel; the statement applied; the change entry of the change it follows, and of each head it sets aside (decision 2026-10-24 (removal), rule 1); the keys it knows to be removed | The database (`person`, `person_change_entries`) | The statement key lets its holder read every later statement: who the person's devices are, by key and label |
 > | The recovery phrase | Nowhere on any device. Written down by the person | CRITICAL: a copy reads everything, through every removal, with no sign; without it no device can be removed and nothing recovered |
 >
-> A personal node has no file under `channel-keys/` from its first start on
-> this version: no channel of its own has a key file. (A key file of an older
-> channel that no copy beside the database holds is left where it is, and
-> `cordelia status` says how many: operations.md §10.5.) The move of the
-> device's key and the person secret to the operating system's keystore is
-> not in this version.
+> No channel has a key file: no node reads a file under `channel-keys/`. A
+> folder `channel-keys/` or `before-<version>` that an earlier version left
+> is read by nothing, and a person may remove it (decision 2026-11-10 (older
+> kind), rule 9; operations.md §10.5). The move of the device's key and the
+> person secret to the operating system's keystore is not in this version.
 
 The data directory `~/.cordelia/` has mode 0700. The node MUST warn on startup if key file permissions are too open and SHOULD refuse to start if key files are world-readable (mode & 0044 != 0) (operations.md SS5.4).
 

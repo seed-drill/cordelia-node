@@ -324,31 +324,6 @@ pub const BAN_THRESHOLD: u32 = 3;
 /// Primitive: rotate 20% per cycle; gradual turnover without disrupting connectivity.
 pub const CHURN_FRACTION: f64 = 0.2;
 
-/// Exponential moving average alpha for peer scoring (parameter-rationale.md §3).
-/// Primitive: 10% weight on current score, 90% on history. Slow-moving average
-/// prevents a single good/bad interaction from dominating the score.
-pub const EMA_ALPHA: f64 = 0.1;
-
-/// RTT normalisation denominator in ms. Score formula: 1 / (1 + rtt_ms / DENOM).
-/// Primitive: 100ms is the reference RTT. A 100ms peer scores 0.5x a local peer.
-/// Chosen as typical cross-region latency.
-pub const SCORE_RTT_DENOMINATOR_MS: f64 = 100.0;
-
-/// Default RTT factor when RTT is unknown (no measurement yet).
-/// Derived: equals 1/(1+1) = 0.5; assumes unknown RTT is equivalent to the
-/// reference RTT. Neither penalised nor favoured until measured.
-pub const SCORE_RTT_DEFAULT_FACTOR: f64 = 0.5;
-
-/// Minimum relay contribution factor (floor for non-contributing relays).
-/// Primitive: 10% floor. Even a non-contributing relay keeps minimal score
-/// to avoid thrashing connections; it's still providing connectivity.
-pub const SCORE_CONTRIBUTION_MIN: f64 = 0.1;
-
-/// Maximum relay contribution factor (cap for high-contributing relays).
-/// Primitive: 2x cap. High-contributing relays get a bonus but can't
-/// dominate the score to the point where other factors are irrelevant.
-pub const SCORE_CONTRIBUTION_MAX: f64 = 2.0;
-
 /// Maximum ban duration after escalation: 7 days.
 /// Primitive: absolute calendar-time cap. Even systematic abuse doesn't
 /// result in permanent exclusion; the peer can try again after a week.
@@ -469,44 +444,6 @@ const _: () = assert!(
         + 256
         <= ENTRY_OVERHEAD_BYTES
 );
-
-/// Whether an entry's fields other than its ciphertext are each within the
-/// size they must fit in. With the limit on ciphertext this makes an entry
-/// one size at most, whatever it carries: MAX_ITEM_BYTES and
-/// ENTRY_OVERHEAD_BYTES. The other fields are of fixed size.
-pub fn entry_fields_fit(
-    item_id: &str,
-    channel_id: &str,
-    item_type: &str,
-    published_at: &str,
-    parent_id: Option<&str>,
-) -> bool {
-    entry_field_over(item_id, channel_id, item_type, published_at, parent_id).is_none()
-}
-
-/// The first of an entry's fields that is over the size it must fit in,
-/// by name and with that size in bytes, if any is.
-pub fn entry_field_over(
-    item_id: &str,
-    channel_id: &str,
-    item_type: &str,
-    published_at: &str,
-    parent_id: Option<&str>,
-) -> Option<(&'static str, usize)> {
-    if item_id.len() > MAX_ITEM_ID_LEN {
-        Some(("ID", MAX_ITEM_ID_LEN))
-    } else if channel_id.len() > MAX_CHANNEL_ID_LEN {
-        Some(("channel", MAX_CHANNEL_ID_LEN))
-    } else if item_type.len() > MAX_ITEM_TYPE_LEN {
-        Some(("type", MAX_ITEM_TYPE_LEN))
-    } else if published_at.len() > MAX_TIMESTAMP_LEN {
-        Some(("time", MAX_TIMESTAMP_LEN))
-    } else if parent_id.is_some_and(|parent| parent.len() > MAX_ITEM_ID_LEN) {
-        Some(("parent", MAX_ITEM_ID_LEN))
-    } else {
-        None
-    }
-}
 
 /// Maximum items per batch fetch (demand-model.md §3.1).
 /// Primitive: 100 items per batch; balances throughput against memory
@@ -2056,27 +1993,6 @@ const _: () = assert!(PERSONAL_CHANNEL_WARN_BYTES < MAX_ENTRY_CHANNEL_BYTES_AT_R
 /// as an entry's text. What is cut is marked as cut.
 pub const FILE_NAME_SHOWN_CHARS: usize = 120;
 
-/// How long a personal node waits before it tries its first start on
-/// this version again, after a try that failed (decision 2026-10-04
-/// §10.1): the sync cycle's five seconds after the first, and twice as
-/// long after each further one, up to FIRST_START_RETRY_MAX_SECS. A
-/// start that cannot succeed (no room for the copy, no leave to write)
-/// does not write its copy again every five seconds.
-pub const FIRST_START_RETRY_BASE_SECS: u64 = 5;
-
-/// The longest that a personal node waits between two tries at its first
-/// start on this version (decision 2026-10-04 §10.1): ten minutes, the
-/// longest wait before anything a relay refused is offered again
-/// (OUTBOX_REFUSED_RETRY_MAX_SECS). A person who has made room is not
-/// kept waiting for longer than that, and need not restart the node.
-pub const FIRST_START_RETRY_MAX_SECS: u64 = OUTBOX_REFUSED_RETRY_MAX_SECS;
-
-/// How much before its wait has passed a try at the first start is still
-/// made (decision 2026-10-04 §10.1): one second. A try is made when a
-/// sync cycle would have run, and the first wait is a cycle long: without
-/// this, the timer's own jitter would put every try off by a whole cycle.
-pub const FIRST_START_RETRY_SLACK_SECS: u64 = 1;
-
 /// How long a node that finds the lock on its data directory held tries
 /// it again before it says that another node is running there (decision
 /// 2026-10-04 §10.1): half a second. A command that opens the database
@@ -3197,11 +3113,6 @@ mod tests {
         assert!((CHURN_FRACTION - 0.2).abs() < f64::EPSILON);
     }
 
-    #[test]
-    fn test_ema_alpha_parameter_rationale_3() {
-        assert!((EMA_ALPHA - 0.1).abs() < f64::EPSILON);
-    }
-
     // Backoff (parameter-rationale.md §3)
     #[test]
     fn test_backoff_base_parameter_rationale_3() {
@@ -3929,15 +3840,10 @@ mod tests {
         const { assert!(OUT_OF_REACH_SECS > BACKOFF_BASE_SECS) };
     }
 
-    /// The waits between the tries at a first start that keeps failing
-    /// (decision 2026-10-04 §10.1): from five seconds to ten minutes.
+    /// The wait for the lock on a data directory (decision 2026-10-04
+    /// §10.1): half a second.
     #[test]
-    fn test_the_tries_at_a_first_start_back_off_decision_2026_10_04_10_1() {
-        assert_eq!(FIRST_START_RETRY_BASE_SECS, 5);
-        assert_eq!(FIRST_START_RETRY_MAX_SECS, 600);
-        assert_eq!(FIRST_START_RETRY_MAX_SECS, OUTBOX_REFUSED_RETRY_MAX_SECS);
-        assert_eq!(FIRST_START_RETRY_SLACK_SECS, 1);
-        const { assert!(FIRST_START_RETRY_SLACK_SECS < FIRST_START_RETRY_BASE_SECS) };
+    fn test_the_wait_for_the_lock_on_a_data_directory_decision_2026_10_04_10_1() {
         assert_eq!(NODE_LOCK_WAIT_MS, 500);
     }
 

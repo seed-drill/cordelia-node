@@ -1236,7 +1236,6 @@ impl Client {
         let mut manager = cordelia_network::connection::ConnectionManager::new(
             identity,
             endpoint,
-            vec![],
             vec!["personal".into()],
             port,
         );
@@ -1488,7 +1487,6 @@ impl RelayBefore {
             let manager = connection::ConnectionManager::new(
                 identity,
                 endpoint.clone(),
-                vec![],
                 vec!["relay".into()],
                 port,
             );
@@ -1742,7 +1740,6 @@ impl HeldBackRelay {
             let manager = connection::ConnectionManager::new(
                 identity,
                 endpoint.clone(),
-                vec![],
                 vec!["relay".into(), "heads".into()],
                 port,
             );
@@ -2575,4 +2572,136 @@ fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_kn
         assert!(!read_it.status.success(), "(g) read");
     }
     let _ = p_notes;
+}
+
+/// Leave `node`'s database, which is stopped, as schema step 22 left a
+/// device in a fork (decision 2026-10-24 (removal), rule 12): its state
+/// `fork`, the mark that it is to judge what it kept, and no time of any
+/// change. The step is in alpha.19's baseline, and alpha.19 judged at its
+/// first start; a device that it had not judged is judged at its next
+/// start on this version.
+fn as_a_fork_to_judge(node: &Node) {
+    let conn = rusqlite::Connection::open(node.data_dir().join("cordelia.db")).unwrap();
+    conn.execute_batch(
+        "UPDATE person SET state = 'fork';
+         DELETE FROM person_change_times;
+         INSERT INTO node_meta (key, value) VALUES ('person.judge_kept', '1');",
+    )
+    .unwrap();
+}
+
+/// A device marked to judge the change entries it kept judges them when
+/// it starts (decision 2026-10-24 (removal), rule 12; decision 2026-11-10
+/// (older kind), rule 9): the node calls `person::judge_kept` at every
+/// start that is not held. The laptop and the desktop each make a change
+/// while the relay is out of reach; neither removes a device, so each is
+/// clear. The one that sees both is stopped, and its database is put in a
+/// fork, marked to judge. Started again, the device judges the entry it
+/// kept apart by rule 8: the change it follows is clear, so it goes on,
+/// with the other set aside (rule 11). The time of each change it keeps
+/// is noted, the mark is gone, and a second start judges nothing again.
+#[test]
+fn a_device_in_a_fork_judges_what_it_kept_when_it_starts() {
+    let mut relay = relay_started();
+    let mut laptop = device_started("laptop", &relay);
+    let mut desktop = device_started("desktop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    adds(&laptop, &desktop, "desktop");
+    let mut at = renews(&laptop, &["stays"], &words);
+    at.says("The change is made (change 2).");
+    drop(at);
+    has_applied(&desktop, 2, &[&relay, &laptop, &desktop]);
+
+    // Each makes a change while the relay is out of reach.
+    relay.stop();
+    for device in [&laptop, &desktop] {
+        let mut at = renews(device, &[], &words);
+        at.says("The change is made (change 3).");
+        drop(at);
+    }
+    relay.start();
+    wait_for("relay healthy again", &[&relay], 30, || healthy(&relay));
+    let sets_aside = |device: &Node| {
+        person_of(device)["set_aside"]
+            .as_array()
+            .is_some_and(|heads| !heads.is_empty())
+    };
+    wait_for(
+        "one device sees both changes",
+        &[&relay, &laptop, &desktop],
+        180,
+        || (sets_aside(&laptop) || sets_aside(&desktop)).then_some(()),
+    );
+    let forked = match sets_aside(&laptop) {
+        true => &mut laptop,
+        false => &mut desktop,
+    };
+    let kept_before = person_of(forked);
+    assert_eq!(kept_before["state"], "applied");
+
+    // In a fork, marked to judge.
+    forked.stop();
+    as_a_fork_to_judge(forked);
+    forked.start();
+    wait_for("the device answers again", &[&relay], 60, || {
+        answers(forked)
+    });
+
+    // It judged the entry it kept apart, and goes on.
+    let seen = person_of(forked);
+    assert_eq!(seen["state"], "applied", "{seen}");
+    assert_eq!(seen["cannot_go_on"], serde_json::Value::Null, "{seen}");
+    assert_eq!(seen["latest"], kept_before["latest"]);
+    let heads = seen["set_aside"].as_array().unwrap();
+    assert_eq!(heads.len(), 1);
+    assert_eq!(heads[0]["number"], 3);
+    assert_eq!(heads[0]["clear"], true);
+    let log = std::fs::read_to_string(forked.log()).unwrap();
+    assert!(
+        log.contains("the change kept apart is judged by what this device knows of removals"),
+        "{}",
+        forked.log_tail()
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        forked.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let marked: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM node_meta WHERE key = 'person.judge_kept'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marked, 0);
+    let times: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM person_change_times WHERE made_at IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(times >= 2, "{times}");
+    drop(db);
+
+    // A second start judges nothing again.
+    forked.stop();
+    forked.start();
+    wait_for("the device answers again", &[&relay], 60, || {
+        answers(forked)
+    });
+    // (The harness begins a node's log afresh at each start.)
+    let log = std::fs::read_to_string(forked.log()).unwrap();
+    assert!(
+        !log.contains("the change kept apart is judged"),
+        "{}",
+        forked.log_tail()
+    );
+    assert_eq!(person_of(forked)["state"], "applied");
+    assert_eq!(
+        person_of(forked)["set_aside"].as_array().map(Vec::len),
+        Some(1)
+    );
 }
