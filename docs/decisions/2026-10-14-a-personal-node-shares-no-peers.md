@@ -15,7 +15,7 @@ Words used throughout:
 
 A personal node answers every request for peers with an empty list. It does so whatever it is connected to, and whoever asks.
 
-It still answers. Peer-Sharing runs on every warm and hot peer ([`2026-03-15-peer-state-semantics.md`](2026-03-15-peer-state-semantics.md), consequence 3), so a relay that asks a device is answered as it is answered by any peer. It does not refuse the stream and does not close it. The answer simply names no peer.
+It still answers. Peer-Sharing runs on every warm and hot peer ([`2026-03-15-peer-state-semantics.md`](https://github.com/seed-drill/cordelia-node/blob/82f370f6/docs/decisions/2026-03-15-peer-state-semantics.md), consequence 3), so a relay that asks a device is answered as it is answered by any peer. It does not refuse the stream and does not close it. The answer simply names no peer.
 
 ## 2. Why
 

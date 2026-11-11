@@ -328,7 +328,7 @@ On-chain registration is optional. Unregistered channels work fine locally and a
 - **RFC 1035**: Domain Names -- Implementation and Specification (label syntax)
 - **specs/channels-api.md**: Channel API endpoints, ID format table (§4)
 - **[decisions/2026-03-10-identity-privacy-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-10-identity-privacy-model.md)**: Namespace model (§8), naming rules
-- **decisions/2026-03-09-architecture-simplification.md**: Channel encryption model
+- **[decisions/2026-03-09-architecture-simplification.md](https://github.com/seed-drill/cordelia-node/blob/82f370f6/docs/decisions/2026-03-09-architecture-simplification.md)**: Channel encryption model
 
 ---
 
