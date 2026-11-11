@@ -21,7 +21,7 @@ Words used throughout:
 
 The personal channel can outgrow what a relay holds of one channel. Each device writes one word for each name it syncs, and a relay counts each word at 1,280 bytes. 64 devices with 256 names each write 20 MiB against a cap of 16 MiB, and the relay refuses the last quarter. Nothing bounds the names.
 
-The exposure is small: the channel fills near 50 devices at 256 names each, or 4 devices at 3,274 names each. Each refusal added to the paths that write words (a map, the sync cycle, joining, a recovery, a statement) brought faults of its own (§9). So this record refuses nothing. It changes three things:
+The exposure is small: the channel fills near 50 devices at 256 names each, or 4 devices at 3,274 names each. Each refusal added to the paths that write words (a map, the sync cycle, joining, a recovery, a statement) brought faults of its own. So this record refuses nothing. It changes three things:
 
 1. **A warning.** The status turns amber where the channel's total passes a line 4 MiB below the cap. The total is taken in the read of the personal channel that each sync cycle already makes. The words say what fills it and what helps.
 2. **A true line for a refusal.** `cordelia devices` no longer says that a refused entry was for a new channel at a full relay, and says which of your channels it was.
@@ -170,7 +170,7 @@ That is the cap less the line, 4,194,304 bytes; the first three come to 3,276,80
 
 - **A bound on the names each device lists,** the first draft of this record. A stopped name's delete stays while any device syncs that name, so the bound could not be got back; a recovery carries every device's names onto one machine, and would have been cut; a person with four devices would have been held at 192 names each where 3,274 fit.
 - **A line on the total that refuses a new word,** the second draft. It needed a check on every path that writes a word, and each path brought a fault: a map stores the mapping before the word is written; the sync cycle would turn a refusal into an error on every cycle; a joining device writes before it has read; a recovery's statement would abort after the phrase signed.
-- **Opening every delete to tell a word,** in place of the slot rule. `find` already checks every delete; opening them too adds about 171 ms for 4,096 deletes (measured by the fourth review; this record's 1.1 s was checking and opening together), once for each start, with the lock let go. It is cheap, and exact; but for honest entries the slot rule is exact too (a device deletes only words and its own `left/` word), and opening constrains a device that misbehaves no more than texts in form do.
+- **Opening every delete to tell a word,** in place of the slot rule. `find` already checks every delete; opening them too adds about 171 ms for 4,096 deletes, once for each start, with the lock let go. It is cheap, and exact; but for honest entries the slot rule is exact too (a device deletes only words and its own `left/` word), and opening constrains a device that misbehaves no more than texts in form do.
 - **A larger room at a relay.** A relay cannot tell the personal channel from another channel of its kind, so every channel's room would go up, at every relay; a recovery would read for 1,111 seconds rather than 615 (`RECOVERY_READ_ON_MAX_SECS` is derived from the cap). And names stay unbounded.
 - **A smaller word.** A word is in the smallest size class already, and the 1,024 that every entry is counted with beyond its content is 16 MiB by itself at 64 × 256.
 - **A word that holds several names,** one entry for each device. It is the better form if names one day grow, but a device of alpha.12 does not read it.
@@ -224,67 +224,4 @@ The change would alter these sentences, and no record is changed by this one:
 
 ## 9. The four reviews, and where each finding stands
 
-**The first review** (of the bound for each device, `bade123`):
-
-| Finding | Severity | Where it stands |
-|---|---|---|
-| 1. The bound cut a recovery to 192 names | High | No longer applies: nothing is bounded, and a recovery carries 1,024 names as today. The headroom holds them (§2). |
-| 2. A stopped name can count for ever; the line promised a date | High | Settled in the words. §1 and §3 say a stopped name counts while any device syncs it, and 90 days after, and longer across a statement; the warning says "at least 90 days later" and promises no date. |
-| 3. The relay test asserted a refusal at 193 | Medium | Settled now; the third review found the second form still off. The test starts from 9,831 words, which a store can hold, and refuses the 717th word after the headroom's parts. |
-| 4. No "not running" branch; `hold_mapped` unbounded | Medium | No longer applies: no write path is checked. §1 lists every path that writes a word. |
-| 5. The sweep's gap was understated | Medium | No longer applies as a bound. A store that holds less than a relay is said in §3, "What a warning cannot see". |
-| 6. A device kept over the bound for ever; what fails at the cap unsaid | Medium | Settled. §3 says what a relay refuses at the cap and what each device shows. |
-| 7. The words a person reads | Low | Settled now; the third review found it partly so. Each form has "you" or a device as its subject, names the personal channel as what your devices keep at a relay, and points only at what exists. |
-| 8. Tests that pass with the rule taken out | Low | Settled. Each test of §7 names its rule and the sizes it asserts. |
-| 9. More than 64 authors; 320 records not proved; the total not weighed | Low | The total is what the warning reads. Authors that do not count are in §3; 320 is said to be a sizing. |
-
-**The second review** (of the line that refused a new word, `6a796c6`):
-
-| Finding | Severity | Where it stands |
-|---|---|---|
-| 1. A map stores the mapping before `say` runs, and swallows its error | High | No longer applies: nothing refuses. §1 gives the map's path as it is. |
-| 2. The sync cycle's `name_channel` was missing, and a refusal there is an error each cycle | High | No longer applies: nothing refuses. §1 names `name_channel`. |
-| 3. A joining device writes before it has read, and the 307 words did not bound it | Medium | Settled. The headroom holds a joining device with 1,024 folders mapped; past that the relay refuses, as §3 says. |
-| 4. A recovery breaks "the new channel holds no more than the old" | Medium | No longer applies: that sentence is gone. The headroom holds a recovery's 1,024 words. |
-| 5. A statement restarts the 90 days of deletes | Medium | Settled. §1 and §3 say so; the words promise no date, and say what a removal does to the 90 days. |
-| 6. A store total of the line less 1,279 cannot exist | Low | Settled now; the third review found the relay test still off. Every total in §7 is one a store can hold. |
-| 7. Tests that cannot fail; exempt entries and rule 5 untested | Low | Settled. With nothing refused, no entry is exempt; each test names its rule, and rule 7 adds no code. |
-| 8. The words blamed names when other entries fill the channel | Low | Settled, within what a rule can buy: rule 4's forms name a device where it signed most of what is not words, and say that only the names form shows in honest use, and that a device that misbehaves can dodge the others. |
-| 9. A refusal would abort a recovery's statement | Low | No longer applies: nothing refuses. |
-| 10. Where the sum is computed, and its cost | Low | Settled now, not when the third draft said so. On top of #170 the sum is taken in the one pass under the lock, measured at the cap's size (rule 1). |
-
-The second review also noted, as not of this record, that a mapped folder whose name is not in its one spelling fails in `name_channel` on every cycle and so stops `forget_other_folders` (`claude.rs:710`, `791`). This record does not touch it.
-
-**The third review** (of the warning, `1983c8a`):
-
-| Finding | Severity | Where it stands |
-|---|---|---|
-| 1. At the warning's sizes the cycle held the lock for seconds, and the status could not reach the report | High | Settled for the status by #170: at 16,452 entries the sync status answered in 25 to 121 ms, within its second (§1). Not for `msg summary`: the fourth review found the lock waited for up to 154 ms there, and §3 states that as a limit. |
-| 2. One SQL sum cannot tell words from what is not one | Medium | Settled. Rule 1 tells a text by the name #170 keeps, and a delete by the slot rule, with its cost measured (1.1 ms for 16,384 entries); opening deletes is set aside, with its cost. |
-| 3. The corrected line is false for a name's channel | Medium | Settled. A device keeps which channel was refused, and rule 6 has words for each; the e2e test refuses both. |
-| 4. The headroom's reasoning: nothing frees room in under 90 days | Medium | Settled, and restated after the fourth review: the 4 MiB is the budget left after the warning, until a removal (which frees room at once) or until stopped names come back. The third form says that a name added now may not reach the other devices. §3 puts adding no names first. |
-| 5. What a refused carry shows was omitted | Medium | Settled. §3 lists the lines that stand with no end, with their places, and says that a removal helps only where what the remaining devices carry fits. |
-| 6. The second form can be dodged, and can name this device | Low | Settled in part. Words are only names that `is_a_name` accepts; the command gives the key; this device has its own form. A device that writes words in form can still dodge it: §3 says so, and the sizes of rule 5 show who signed them. |
-| 7. The wordings: "cordelia devices" shows no sizes; "the list" undefined; subjects | Low | Settled. Rule 5 adds the sizes; the personal channel is called what your devices keep at a relay, defined above; each form has "you" or a device as its subject. |
-| 8. The relay test cannot start at 12 MiB of words; the table gives the last count with no warning | Low | Settled. The test starts from 9,831 words, and the column gives the count at which the warning shows. |
-| 9. Where the warning sits among the amber lines, and which devices show it | Low | Settled. Rule 3 places it just before "a relay has no room", and says which devices show it; §3 says that a recovered machine that maps nothing shows none. |
-| 10. Tests: the paths of rule 7, the edge of "more than half", the channel's filter | Low | Settled for the edge and the filter (§7). Left for the paths of rule 7: it adds no code to them, so a test of each would test what they already do. |
-
-**The fourth review** (of the warning on top of #170, `2cdb70d`):
-
-| Finding | Severity | Where it stands |
-|---|---|---|
-| 1. The margins do not reproduce at the size stated; the timed tests are ignored | Medium | Settled. §1 gives both runs, on 4 cores, at the size set by hand, and says the tests run as merged at 9,844 entries and are ignored in CI; §7 cites no timed test as a guard. The claim of `msg summary`'s 100 ms is dropped, and §3 states that a summary can find the lock busy, with the extra load under the lock named as a later improvement. |
-| 2. A refused carried word stops everything the device sends after it | Medium | Settled. §3 says so, with its place and its test, and qualifies the remedy of stopping names: it works only from devices that have sent all they carried. |
-| 3. The warning was placed below lines the overflow causes | Medium | Settled. Rule 3 places it first among the amber memory lines, and names each; §7 tests it against each. |
-| 4. A removal frees room at once; the third form did not say so | Low | Settled. "Why 12 MiB" says a removal frees room at once, the headroom is called a budget, and the third form adds "Or remove a device you no longer use". |
-| 5. Three of the four forms cannot show in honest use | Low | Settled. Rule 4 says so, and what the other forms buy; the second review's row 8 is restated. |
-| 6. Opening every delete costs 171 ms, not 1.1 s | Low | Settled. §4 corrects the figure, says it is off the lock, and gives the reason the slot rule stands. |
-| 7. One refusal for each relay; a pair channel; the let-go line | Low | Settled. Rule 6 says the personal channel's refusal is kept over another's in one pass, adds words for a pair channel, and lists the let-go line, left as it is. The e2e test refuses in two passes. |
-| 8. MB and MiB mixed | Low | Settled. Rule 5 uses MiB, as every size in the record does. |
-| 9. Tests: keys that no longer count, earlier bands, deletes under `added/` and another's `left/`, the gating, "said as today", the quarter's edge, a short cycle | Low | Settled. §7's first test holds each entry; the others test the gating, today's words, the quarter's edge, and a short cycle, which now carries the last total forward (rule 2). |
-| 10. The first cycle's time; the e2e test tests a full relay, not a channel's cap | Low | Settled. §1 gives 3.1 to 4.9 s across runs; §7 says the e2e test is of a full relay, and why the cap is tested in units only. |
-
-The fourth review also noted, as not of this record, that `msg send`, `msg log` and `cordelia devices` read the whole personal channel under the lock without `read_ahead` first, so that before the first cycle after a start each would check and open every entry under the lock. This record does not touch it.
-
-The third review also noted, as not of this record, that `listed` and `said_here` re-checked and opened every entry on each call. #170 settles that.
+The reviews of this record are in the pull requests that built it.

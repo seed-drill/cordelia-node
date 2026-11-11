@@ -1139,9 +1139,9 @@ No outstanding TODOs. Spec ready for Martin's review and implementation.
 - **NIST SP 800-38D**: AES-GCM specification
 - **cordelia-core/docs/design/encryption-specification.md**: Pre-pivot encryption architecture (reference)
 - **docs/reference/encryption-test-vectors.md**: Cryptographic test vectors (authoritative, remains valid)
-- **decisions/2026-03-10-phase1-design-decisions.md**: Node encryption boundary, greenfield build
+- **[decisions/2026-03-10-phase1-design-decisions.md](https://github.com/seed-drill/cordelia-node/blob/82f370f6/docs/decisions/2026-03-10-phase1-design-decisions.md)**: Node encryption boundary, greenfield build
 - **[decisions/2026-03-10-identity-privacy-model.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/decisions/2026-03-10-identity-privacy-model.md)**: Identity stack, Bech32 key usage in examples
-- **decisions/2026-03-09-architecture-simplification.md**: Architecture pivot, channel encryption model
+- **[decisions/2026-03-09-architecture-simplification.md](https://github.com/seed-drill/cordelia-node/blob/82f370f6/docs/decisions/2026-03-09-architecture-simplification.md)**: Architecture pivot, channel encryption model
 
 ---
 

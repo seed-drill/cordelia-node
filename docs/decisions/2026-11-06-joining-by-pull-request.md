@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Accepted by the person on 6 November ("go, yes to all three, leave the token for later"). Amended on 7 November by the person's rulings: the node reads the clone only, and a channel follows one repository (section 14). Amended on 8 November by the person's ruling that an offer "without you" stops hand-overs too (rule 4.1), after slice 8's tests. Amended on 10 November by the person's ruling that a join is judged by the list alone (rule 4.5). Revised five times after its reviews (section 13), and amended in building slice 7 and after its review (rules 2.7, 5 and 6). Built in slices 1 to 7 by the plan on issue #293, with the docs in slice 9; slice 8's real-process tests are in `crates/cordelia-node/tests/joining_e2e.rs`. For `v0.2.0-alpha.19`: the person ruled on 6 November that it comes now, not after R1.
+**Status**: Accepted on 6 November, and built for `v0.2.0-alpha.19`. Amended by the person's rulings of 7, 8 and 10 November (section 14); the last (rule 4.5) comes after alpha.19. It replaces the members record's command, and overturns property 16 of the shared channels record (section 7).
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -11,7 +11,7 @@ Words used throughout:
 - **The list** is a repository's `.cordelia/members`. **A repository channel** is the shared channel that a list names.
 - **A member** is a device that holds the channel. **In the channel**, for a key, means: in this device's table of the channel's keys, or not moved yet (#291).
 - **A read** is one reading of the list by a device that follows the repository (rule 3).
-- **Main** is commit 89b2397f. Examples say laptop and desktop, Alice and Bob, and `github.com/example/project`.
+- Examples say laptop and desktop, Alice and Bob, and `github.com/example/project`.
 
 ---
 
@@ -297,23 +297,18 @@ Real-process tests, with a git repository served over HTTPS on loopback, and a c
 
 ## 13. The reviews, and what they changed
 
-Five reviews, each checked in the code before its findings were taken. Each round's findings and what changed are on pull request #297. What changed most:
-- **The list names the channel** (`channel <ID> <relays>`). A share holds only a card, so nothing else said which channel was the repository's (first review).
-- **Nothing of the person's reaches git.** Their settings, helpers, `insteadOf` rules and environment could each make something ask (first and second reviews).
-- **A private repository is read from the clone,** never fetched. Every way of giving the node credentials can ask (first review).
-- **A left-out key is named in the `channel` line (`without`),** and a list that still lists it names no channel. An earlier rule needed every device to have read the offer itself, which a device that was off, or one that joined later, had not (second to fourth reviews).
-- **Every `channel` line ends with `without` and a count,** so a line cut short does not parse, and a following device's making anew carries the current `without` keys over (fifth review).
-- **Hand-overs go in turns, and takes come only within the hour of the latest read.** Eight places held by devices that were off, and a stale share, had each blocked or misled a join (first and second reviews).
+Each round's findings and what changed are on pull request #297. What changed most:
+- **The list names the channel** (`channel <ID> <relays>`). A share holds only a card, so nothing else said which channel was the repository's.
+- **A private repository is read from the clone,** never fetched. Every way of giving the node credentials can ask.
 - **The node reads the clone only** (the person, 7 November). Its own fetch of a public repository drew findings in three rounds of slice 2's review: it fetched a whole tree; a git older than 2.44 fetches lazily; and a host sends a blob asked for by its ID whatever the filter says, so a size bound needed a watch on the fetch.
-- **A channel follows one repository, and a key waits while any share of it does** (rules 2.5, 4.2 and 6). Two lists that named one channel, or one key, wrote over each other's shares (the review of slice 5a).
-- **Rule 1's gate binds only those who hand over** (rules 1, 4.1 and 4.4). A joiner holds no row of the channel, so every listed key after `without` looked out of it to the joiner, and kept it out for good, while the members saw that key write and handed the channel over (the review of slice 5b).
+- **A channel follows one repository, and a key waits while any share of it does** (rules 2.5, 4.2 and 6). Two lists that named one channel, or one key, wrote over each other's shares.
 
 ## 14. The person's answers (6 to 10 November)
 
-1. **`cordelia shared seen <name>`** clears the notice of a key new on the list (rule 4.5) and of a changed channel line (rule 6), on each device: yes. Rule 5's amber of a key left out has an act of its own, `cordelia shared seen <name> <label>` (slice 7's review).
+1. **`cordelia shared seen <name>`** clears the notice of a key new on the list (rule 4.5) and of a changed channel line (rule 6), on each device: yes. Rule 5's amber of a key left out has an act of its own, `cordelia shared seen <name> <label>`.
 2. **The default name is the repository's `owner/name`:** yes.
 3. **A private repository's list comes only from the person's own fetches.** A read-only token in the node's configuration is left for later: yes.
-4. **The node reads the clone only,** with no git of its own that reaches the network (7 November): yes. Its own fetch of a public repository was built and taken out (section 13).
+4. **The node reads the clone only,** with no git of its own that reaches the network (7 November): yes.
 5. **A channel follows one repository** (7 November): kept.
-6. **An offer "without you" stops hand-overs too** (8 November): a device hands over nothing in a channel in which it has read any offer that is no fault (rule 4.1). Slice 8's tests showed a device left out, still following, handing the old channel to a key listed while the new line waited to be merged.
-7. **A join is judged by the list alone** (10 November): "by the list alone". A key shows when a list that this device reads names it and the list read before did not (rule 4.5). Rule 4.5 had shown a key only when it first wrote in the channel after this device's last read, so a key already on the list never showed: one merged before a joiner took the channel, and every key there when a device that held the channel started to follow. Earlier the same day, the person had ruled for a first-read amber, a line of every key at a device's first read. An independent review of that build found two more ways a listed key joined unseen: a clone that lags, so the key's entries are held before the list that names it is read; and a channel made anew between two reads. This ruling replaces the first-read amber.
+6. **An offer "without you" stops hand-overs too** (8 November): a device hands over nothing in a channel in which it has read any offer that is no fault (rule 4.1).
+7. **A join is judged by the list alone** (10 November): "by the list alone". A key shows when a list that this device reads names it and the list read before did not (rule 4.5).
