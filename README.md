@@ -42,9 +42,18 @@ for a program: `cordelia-install: installed=... running=... restart=...`.
 Set `CORDELIA_NO_RESTART=1` to restart the node yourself.
 
 - If you run your own relay, upgrade it first, then your devices.
+- **The next version upgrades from `v0.2.0-alpha.19` only.** On an older
+  version, install `v0.2.0-alpha.19` first (`CORDELIA_VERSION=v0.2.0-alpha.19`,
+  for the command above or a relay's image) and start it once. The next
+  version will not open an older database: it says so and changes nothing.
+  Or start afresh: move `~/.cordelia` aside and run `cordelia init`, then
+  make your phrase, add the machine from another of yours, or recover.
 - An earlier version may not start on a database that a later one has
   changed. If you may want to go back, copy `~/.cordelia` before you
   upgrade.
+- After you upgrade to the next version, `~/.cordelia` may still hold a
+  folder `channel-keys` and folders named `before-...`, left by earlier
+  versions. Nothing reads them. You may remove them.
 
 ### Windows
 

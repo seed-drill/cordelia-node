@@ -1,7 +1,7 @@
 # Decision: removing the older kind of channel, and one baseline for the schema
 
 **Date**: 2026-11-10
-**Status**: Accepted by the person on 10 November ("ok to remove older channels and schema"); reviewed, and its fixes checked, 10 November. To be built in the three slices of section 7.
+**Status**: Accepted by the person on 10 November ("ok to remove older channels and schema"); reviewed, and its fixes checked, 10 November. Built in the three slices of section 7.
 **Cited as**: "decision 2026-11-10 (older kind), rule 4". The numbers do not change.
 **Lines** are main's (c3cc5756, `v0.2.0-alpha.19`, whose code is alpha.19's); paths are under `crates/`.
 
@@ -83,7 +83,7 @@ Also going: `sync.claude.all`, written only for earlier versions (`sync.rs:180-1
 
 ## 6. Docs
 
-**Rule 11. Each slice makes true the docs it changes:** CLAUDE.md; the README (upgrade from alpha.19 only); the WHITEPAPER; a line at the head of decision 2026-10-04 §2.5 and §10 (other records are history); `channel-naming.md` to `docs/archive`; the specs (API, data formats, protocol, operations, parameters, configuration, ECIES, glossary); `threat-model.md` (rule 10); TESTING.md and `deploy/relay/README.md`.
+**Rule 11. Each slice makes true the docs it changes:** CLAUDE.md; the README (upgrade from alpha.19 only); the WHITEPAPER; a line at the head of decision 2026-10-04 §2.5 and §10 (other records are history); `channel-naming.md` deleted, as wholly of the older kind (it is at [c3cc5756](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md)); the specs (API, data formats, protocol, operations, parameters, configuration, ECIES, glossary); `threat-model.md` (rule 10); TESTING.md and `deploy/relay/README.md`.
 
 ## 7. Slices
 

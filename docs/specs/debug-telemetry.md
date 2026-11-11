@@ -3,12 +3,25 @@
 > Defines the minimum observable telemetry that every Cordelia node MUST emit
 > to enable diagnosis of protocol failures from logs alone, without guessing.
 
+> **v1 status.** No node carries the older kind of channel
+> ([decision record of 2026-11-10 (older kind)](../decisions/2026-11-10-removing-the-older-kind.md),
+> rules 1, 2 and 7): the telemetry of Item-Push and Item-Sync (§3.1, §3.2)
+> and the trace of an item across nodes (§4) are gone, and the status counts
+> no items, pushes or syncs (§6). A node logs at DEBUG each stream that a
+> peer opens to it (`stream opened (inbound)`, with the protocol:
+> `entry_show`, `channel_prove`, `entry_pull`, `entry_push`,
+> `relay_entries`, `peer_share`, or for the older kind `item_sync`,
+> `item_push`, `channel_announce`), and `stream closed`, with
+> `duration_ms`, once it has served one. It logs at DEBUG that it answered
+> a sync of the older kind with nothing, or refused a push or an
+> announcement of it. The rules of §1, §2, §5 and §7 stand.
+
 **Motivation:** During Phase 1 E2E testing, BV-22 (relay re-push silently skipping peers)
 took hours to diagnose because the daemon produced no log output when `open_bi()` hung.
 The operator could not distinguish "task not spawned" from "task stuck" from "task failed silently."
 This spec exists to prevent that class of debugging failure.
 
-**Principle:** If an operator cannot determine what happened from a single `grep item_id` across
+**Principle:** If an operator cannot determine what happened from a single `grep` across
 all node logs, the telemetry is insufficient.
 
 ---
@@ -20,7 +33,7 @@ all node logs, the telemetry is insufficient.
 | ERROR | Unrecoverable failures requiring operator action | Always | DB corruption, bind failure |
 | WARN | Recoverable failures that may indicate problems | Always | Bootnode timeout, stream limit hit |
 | INFO | Lifecycle events (startup, connect, disconnect) | Default | "relays configured", "handshake complete (outbound)" |
-| DEBUG | Per-operation tracing (item-level, stream-level) | On request | "push delivered", "sync request served" |
+| DEBUG | Per-operation tracing (stream-level) | On request | "stream opened (inbound)", "stream closed" |
 | TRACE | Wire-level detail (frame bytes, CBOR dumps) | Never in production | Frame hex dumps |
 
 **Rule:** Every protocol operation MUST produce at least one DEBUG log on entry and one on exit (success, error, or timeout). If a spawned task can hang, it MUST log on spawn.
@@ -48,7 +61,7 @@ WARN bootnode connection timed out bootnode=<addr> timeout_secs=10
 Every stream open/close MUST be logged at DEBUG:
 
 ```
-DEBUG stream opened  peer=<node_id> direction=<outbound|inbound> protocol=<push|sync|peer_share|...> stream_id=<id>
+DEBUG stream opened  peer=<node_id> direction=<outbound|inbound> protocol=<entry_show|entry_pull|entry_push|peer_share|...> stream_id=<id>
 DEBUG stream closed  peer=<node_id> stream_id=<id> reason=<fin|rst|timeout|error> duration_ms=<ms>
 WARN  stream open timed out  peer=<node_id> protocol=<...> timeout_secs=<N>
 ```
@@ -69,51 +82,13 @@ This MUST be logged at least once per governor tick (every `tick_interval_secs`)
 
 ### 3.1 Item-Push (§4.6)
 
-**Publisher side (outbound push):**
-```
-DEBUG spawning push task    peer=<node_id> item=<item_id> channel=<channel_id>
-DEBUG push open_bi started  peer=<node_id> item=<item_id>
-DEBUG push delivered        peer=<node_id> item=<item_id> stored=<N>
-DEBUG push send failed      peer=<node_id> item=<item_id> error=<msg>
-WARN  push open_bi timed out peer=<node_id> item=<item_id> timeout_secs=<N>
-DEBUG item pushed to peers  item=<item_id> channel=<channel_id> total_peers=<N> pushed=<N> excluded=<N> skipped=<N>
-```
-
-**Receiver side (inbound push):**
-```
-DEBUG processed inbound push  peer=<node_id> stored=<N> dedup_dropped=<N> items=<N>
-DEBUG store failed            item=<item_id> error=<msg>
-WARN  content hash mismatch   item=<item_id>
-```
-
-**Relay re-push:**
-```
-DEBUG relay re-push queued   peer=<sender_id> item=<item_id> stored=<N>
-```
-
-**Silent skip rule:** If `get_connection()` returns None for a peer in `connected_peers()`, log:
-```
-WARN push skipped: connection not found  peer=<node_id> item=<item_id>
-```
-
-**Terminology:** In push logs, `excluded` = sender peer (relay re-push loop prevention), `skipped` = peer where get_connection() returned None (bug indicator). These are distinct: excluded is expected, skipped is unexpected.
+Gone (decision 2026-11-10 (older kind), rule 2): no node pushes an item, and
+every node refuses a stream of `0x06` at the byte (rule 7).
 
 ### 3.2 Item-Sync / Pull (§4.5)
 
-**Requester side:**
-```
-DEBUG sync request sent     peer=<node_id> channel=<channel_id>
-DEBUG sync response         peer=<node_id> channel=<channel_id> headers=<N> missing=<N>
-DEBUG fetch request sent    peer=<node_id> items=<N>
-DEBUG fetch response        peer=<node_id> stored=<N> dedup=<N>
-WARN  sync request timed out peer=<node_id> channel=<channel_id> timeout_secs=<N>
-```
-
-**Server side:**
-```
-DEBUG served sync request   peer=<node_id> channel=<channel_id> headers=<N>
-DEBUG served fetch request  peer=<node_id> items=<N>
-```
+Gone as a sync (decision 2026-11-10 (older kind), rule 7): no node fetches
+or serves an item, and every node answers a stream of `0x05` with nothing.
 
 ### 3.3 Peer-Sharing (§4.3)
 
@@ -139,33 +114,8 @@ WARN  another key answered at a relay's address; refusing it  relay=<host> answe
 
 ## 4. End-to-End Trace Example
 
-An operator should be able to trace an item's lifecycle with:
-```bash
-grep "ci_01ABC123" logs/p1.log logs/r1.log logs/p2.log
-```
-
-Expected output across nodes:
-
-```
-# P1 (publisher)
-p1: DEBUG item pushed to peers  item=ci_01ABC123 total_peers=3 pushed=2 excluded=0 skipped=0
-p1: DEBUG spawning push task    peer=<r1_id> item=ci_01ABC123
-p1: DEBUG spawning push task    peer=<p2_id> item=ci_01ABC123
-p1: DEBUG push delivered        peer=<r1_id> item=ci_01ABC123 stored=1
-p1: DEBUG push delivered        peer=<p2_id> item=ci_01ABC123 stored=1
-
-# R1 (relay)
-r1: DEBUG processed inbound push  peer=<p1_id> stored=1 dedup=0 items=1
-r1: DEBUG relay re-push queued    peer=<p1_id> item=ci_01ABC123 stored=1
-r1: DEBUG spawning push task      peer=<p2_id> item=ci_01ABC123
-r1: DEBUG push delivered          peer=<p2_id> item=ci_01ABC123 stored=0 (dedup)
-
-# P2 (receiver)
-p2: DEBUG processed inbound push  peer=<p1_id> stored=1 dedup=0 items=1
-p2: DEBUG processed inbound push  peer=<r1_id> stored=0 dedup=1 items=1 (dedup)
-```
-
-If any line is missing, the operator knows exactly which step failed.
+Gone (decision 2026-11-10 (older kind), rule 2): no node publishes or pushes
+an item to trace.
 
 ---
 
@@ -203,25 +153,20 @@ These are NOT codec operations and require explicit timeout wrappers:
 
 ## 6. Status Endpoint Telemetry
 
-The `/api/v1/status` endpoint MUST include:
+The `/api/v1/status` endpoint MUST include, among the rest that
+channels-api.md §3.18 lists:
 
 ```json
 {
-  "uptime_secs": 1234.5,
+  "uptime_secs": 1234,
   "peers_hot": 3,
   "peers_warm": 1,
-  "sync_errors": 0,
-  "items_stored": 42,
-  "items_pushed": 15,
-  "items_received": 27,
-  "streams_opened": 156,
-  "streams_active": 2,
-  "push_timeouts": 0,
-  "sync_timeouts": 0
+  "sync_errors": 0
 }
 ```
 
-Counters are cumulative since startup. `streams_active` is a gauge.
+Counters are cumulative since startup. It counts no items, pushes or syncs:
+no node pushes or syncs an item (decision 2026-11-10 (older kind), rule 2).
 
 ---
 
@@ -234,7 +179,6 @@ Before a protocol handler is considered complete, verify:
 - [ ] Every spawned task logs on error (DEBUG/WARN)
 - [ ] Every spawned task has a timeout and logs on timeout (WARN)
 - [ ] Silent skips (if-let None, continue) log what was skipped and why (WARN)
-- [ ] Item operations include `item=<item_id>` in all log lines
 - [ ] Connection operations include `peer=<node_id>` in all log lines
 - [ ] Stream operations include `protocol=<type>` in log lines
 - [ ] No `await` on network I/O without `tokio::time::timeout`

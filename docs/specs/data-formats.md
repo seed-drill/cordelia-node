@@ -7,31 +7,45 @@
 **Implements**: Storage layer for WP2, WP3, WP4, WP8
 **Depends on**: specs/ecies-envelope-encryption.md, specs/channels-api.md, [specs/channel-naming.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/channel-naming.md), [specs/search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md), specs/identity.md
 
-> **v1 status.** The schema is at version 18. There are two kinds of channel
-> in it, and each has tables of its own:
+> **v1 status.** **The schema is one baseline and the steps after it**
+> ([decision record of 2026-11-10 (older kind)](../decisions/2026-11-10-removing-the-older-kind.md),
+> rule 5; `crates/cordelia-storage/src/schema.rs`). Its version is 34.
 >
-> - **The older kind** (a random ID, a ring of keys, a list of members): §3
->   below, with steps 4 to 10. **No node reads or writes these tables**
->   (decision 2026-11-10 (older kind), rule 1): the code of that kind is gone,
->   and the tables stay in the schema until step 34 drops them (rule 5). A
->   personal node empties them at its first start on this version, after a
->   copy (§12).
+> - **The baseline is alpha.19's schema, exactly,** at step 33
+>   (`crates/cordelia-storage/src/baseline.sql`, made from alpha.19's own
+>   `cordelia init` with sqlite3, and never edited: a change is a step). It
+>   is what alpha.19's 33 steps left, as `sqlite_master` holds it, with the
+>   rows those steps put in an empty database (`counters`,
+>   `person_clear_mark`).
+> - **Step 34 drops the older kind of channel** (a random ID, a ring of
+>   keys, a list of members): the tables of §3 and the rest that only it
+>   read (rules 1 and 5; below, and §5.2).
+> - **A new database** runs the baseline, in one transaction that reads the
+>   version again, and then step 34. **A database at step 33**, as alpha.19
+>   left it, runs step 34 alone. **Any other is refused** (rules 4 and 6;
+>   §5.2).
 > - **A channel from its secret** (the
->   [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md)):
->   §9 to §11 below, with steps 11 to 18. A device's own channels are all of
->   this kind.
+>   [decision record of 2026-10-04](../decisions/2026-10-04-a-persons-devices.md))
+>   is the one kind of channel: its tables are in §9 to §11.
+>
+> The 33 steps are gone from the code. What each one added is below, as the
+> baseline holds it; what each table holds is said in full where alpha.19
+> made them, in [`schema.rs` at c3cc5756](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/crates/cordelia-storage/src/schema.rs).
 >
 > Steps 4 to 10, per the
 > [decision record of 2026-09-30](../decisions/2026-09-30-agent-memory-sync.md):
 >
 > - **v4:** `channels` admits type `inbox` and gains `epoch` and
 >   `epoch_author`; new tables `trusted_keys`, `invites` and `node_meta`.
+>   Step 34 drops all of these but `node_meta`.
 > - **v5:** `items` gains `seq` (arrival order), `slot`, `rev` and
->   `relayed_at` (the outbox), with a `counters` table.
+>   `relayed_at` (the outbox), with a `counters` table. Step 34 drops
+>   `items` and its counters; `counters` stays.
 > - **v6:** `sync_files`, the adapter's record of each file it has synced.
 > - **v7:** `peer_sightings`, a relay's keyed-hash record for usage counts.
 > - **v8:** `state_offers`, the newest channel state sent to each member of
 >   each channel, kept until the member is seen to hold it (decision §4.1).
+>   Step 34 drops it.
 > - **v9:** `sync_files` gains `author`: the key that signed the entry a
 >   folder agreed (32 bytes), or `NULL` in a row that does not say (decision
 >   §4.5; decision 2026-10-04 §16).
@@ -52,7 +66,8 @@
 >   `person_change_entries`, `person_additions`, `person_names`.
 > - **v13:** `relay_channels`, the channels a relay holds; `entries` gains
 >   `channel_place`; `person_hand_overs`; and the counters `item_count` and
->   `item_bytes`, kept by three triggers on `items`.
+>   `item_bytes`, kept by three triggers on `items`, which step 34 drops
+>   with `items`.
 > - **v14:** `at_relays` and `person_carried`: where a device stands at each
 >   relay in each channel of its own.
 > - **v15:** `person_typed_keys`, `person_left_out`, `person_cleared`: what a
@@ -95,8 +110,9 @@
 >   made apart as a head set aside at the step's time. `person_change_times`,
 >   empty: the time of each change a device applies or keeps. And
 >   `person.judge_kept` in `node_meta` on a device that follows a phrase: at
->   its first start on this version it notes the time of each entry it kept,
->   and a device in a fork judges the one it kept apart by rule 8 (rule 12).
+>   the next start that is not held up, the node notes the time of each
+>   entry it kept, and a device in a fork judges the one it kept apart by
+>   rule 8; the mark goes with the judging (rule 12).
 >
 > Step 23, per the same record (set out in §10.1 and §10.2):
 >
@@ -134,13 +150,8 @@
 >   file again clears them. `cordelia restore` puts back no version of a
 >   file cut but one of these texts. It was step 28 while rule 27 of that
 >   record was built; steps 26 and 27 held that rule's columns and tables,
->   and went with it, unreleased. A database of such a build at step 27 or
->   28 is refused: those are the shared channels' steps now, and it holds
->   none of them (`shared_lists` is missing). One at that build's step 26
->   (rule 27's columns and tables, and no `file_cut`) is taken as at step
->   26 and given the shared steps: a carry that would cut a file fails at
->   the missing table, so nothing is applied, and every restore is
->   refused. It fails closed, and no such build was released.
+>   and went with it, unreleased. A database of such a build, at step 26,
+>   27 or 28, is refused, as is every database before step 33 (§5.2).
 >
 > Steps 27 to 32, per the decision record of 2026-10-10 (a shared channel
 > for messages, section 14):
@@ -165,8 +176,7 @@
 > Each is empty at its step, and changes no older row. The shared channels'
 > build numbered them 21 to 26 before the removal build's steps came first;
 > no release made a database of that numbering, and one that a build of it
-> made, at 21 to 26 with `shared_lists`, is refused, and nothing in it is
-> changed. A database at alpha.17's step 20 steps through 21 to 32.
+> made is refused, as is every database before step 33 (§5.2).
 >
 > Step 33, per the decision record of 2026-11-06 (joining a repository's
 > shared channel by pull request):
@@ -185,16 +195,29 @@
 >   each new column is empty or 0; no older row changes otherwise. A relay
 >   keeps nothing in them.
 >
-> No step from 11 on changes a row of the older kind. A database at a later
-> version than the program's own is refused, and nothing in it is changed
-> (§5.2).
+> Step 34, per the decision record of 2026-11-10 (older kind), rule 5:
+>
+> - **v34:** the older kind of channel goes. Its tables are dropped,
+>   children first and `channels` last, as they refer to it with foreign
+>   keys on: `channel_members`, `channel_keys`, `dm_peers`, `items`,
+>   `search_content`, `search_fts` (the search index, with its FTS5
+>   tables), `invites`, `state_offers`, `trusted_keys`, `channels`. Each
+>   table's triggers and indexes go with it: among them the `items_counted_*`
+>   triggers, and the guard `moved_on_takes_no_channel` that an earlier
+>   version's first start set on `channels`. The `counters` rows `item_seq`,
+>   `item_count` and `item_bytes` are deleted (`entry_seq` stays), and so are
+>   the `node_meta` keys `personal_channel_id`,
+>   `membership.accepted_personal_from`, `first_start.done`,
+>   `sync.claude.all` and `sync.claude.notice` (§11). Nothing else changes.
+>   The node logs how long it took (`applied schema step 34`, in ms): on a
+>   relay that held many items of the older kind it may take seconds, and
+>   the file keeps its size.
 >
 > PSK envelope items (§4), and the sealed channel states that replaced them,
 > are gone with the older kind (decision 2026-11-10 (older kind)). The
 > search index (`search-indexing.md`, now in [`docs/archive/`](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/README.md))
 > was built from what was published through the Channels API of the older
-> kind, and v1 does not use it. No node serves that API (decision
-> 2026-11-10 (older kind), rule 2), and the step of §12 empties the index.
+> kind, and v1 does not use it: step 34 drops it.
 
 ---
 
@@ -227,138 +250,40 @@ The node checks `PRAGMA user_version` on startup and applies pending migrations 
 
 ## 3. Core Tables
 
-> **v1 status.** §3.1 to §3.5 are the tables of the older kind of channel.
-> No node reads or writes them (decision 2026-11-10 (older kind), rule 1):
-> what a relay of an earlier version held stays, unread, until step 34
-> drops them (rule 5). On a personal node they are empty from its first
-> start on this version (§12), and a trigger refuses a new row in
-> `channels` (§11.3). The tables of a channel from its secret are in §10.
+> **v1 status.** §3.1 to §3.5 were the tables of the older kind of channel.
+> **Step 34 drops them** (decision 2026-11-10 (older kind), rule 5), with
+> `search_content`, `search_fts`, `invites`, `state_offers` and
+> `trusted_keys`, and their triggers: no database of this version holds
+> them. A new database makes them in the baseline and drops them at once,
+> in step 34. What they held is at
+> [c3cc5756](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/data-formats.md).
+> The tables of a channel from its secret are in §10.
 
 ### 3.1 channels
 
-Channel metadata. One row per channel the node knows about (subscribed or observed via Channel-Announce).
-
-```sql
-CREATE TABLE channels (
-    channel_id    TEXT PRIMARY KEY,     -- hex SHA-256 (named), "dm_"+hex (DM), "grp_"+UUID (group)
-    channel_name  TEXT,                 -- human-readable name (NULL for DMs and unnamed groups)
-    channel_type  TEXT NOT NULL,        -- "named" | "dm" | "group"
-    mode          TEXT NOT NULL,        -- "realtime" | "batch"
-    access        TEXT NOT NULL,        -- "open" | "invite_only"
-    creator_id    BLOB NOT NULL,        -- Ed25519 public key (32 bytes)
-    key_version   INTEGER NOT NULL DEFAULT 1,  -- current PSK version
-    psk_hash      BLOB,                -- SHA-256 of current PSK (32 bytes). NULL if node does not hold PSK.
-    descriptor    BLOB,                -- CBOR-encoded signed ChannelDescriptor (network-protocol.md §4.4.6)
-    created_at    TEXT NOT NULL,        -- ISO 8601
-    updated_at    TEXT NOT NULL         -- ISO 8601, updated on descriptor change or key rotation
-);
-
-CREATE UNIQUE INDEX idx_channels_name ON channels(channel_name)
-    WHERE channel_name IS NOT NULL AND channel_type = 'named';
-```
-
-**Notes:**
-- `channel_name` is unique only for named channels. DMs and groups may have NULL or non-unique labels.
-- `psk_hash` is `SHA-256(psk)`, not the PSK itself. Used for descriptor verification (network-protocol.md §4.4.6). NULL means this node has observed the channel via Channel-Announce but does not hold the PSK (not subscribed).
-- `descriptor` stores the full signed CBOR descriptor.
+Gone (decision 2026-11-10 (older kind), rule 5): step 34 drops it.
 
 ### 3.2 channel_members
 
-Membership roster per channel. Local view — may lag behind the network during replication.
-
-```sql
-CREATE TABLE channel_members (
-    channel_id   TEXT NOT NULL REFERENCES channels(channel_id),
-    entity_key   BLOB NOT NULL,        -- Ed25519 public key (32 bytes)
-    role         TEXT NOT NULL,         -- "owner" | "admin" | "member"
-    posture      TEXT NOT NULL DEFAULT 'active',  -- "active" | "removed"
-    joined_at    TEXT NOT NULL,         -- ISO 8601
-    removed_at   TEXT,                  -- ISO 8601, set when posture = "removed"
-    PRIMARY KEY (channel_id, entity_key)
-);
-
-CREATE INDEX idx_members_entity ON channel_members(entity_key);
-```
-
-**Notes:**
-- `posture = "removed"` is a soft removal. Row retained for audit and PSK rotation history.
-- The local node's own membership is a row where `entity_key` matches the local Ed25519 public key.
-- `role` is set at join time and can be changed by the owner.
+Gone (decision 2026-11-10 (older kind), rule 5): step 34 drops it.
 
 ### 3.3 channel_keys
 
-Encrypted PSK storage. The node's own channel PSKs, encrypted at rest with the node's personal channel PSK. One row per channel the node is subscribed to.
-
-```sql
-CREATE TABLE channel_keys (
-    channel_id     TEXT PRIMARY KEY REFERENCES channels(channel_id),
-    encrypted_psk  BLOB NOT NULL,      -- AES-256-GCM encrypted PSK (iv || ct || tag = 12 + 32 + 16 = 60 bytes)
-    key_version    INTEGER NOT NULL DEFAULT 1,
-    created_at     TEXT NOT NULL DEFAULT (datetime('now'))
-);
-```
-
-**Encryption at rest:**
-- The channel PSK is encrypted using the personal channel PSK (the PSK of `__personal`).
-- Format: `iv (12 bytes) || ciphertext (32 bytes) || auth_tag (16 bytes)` = 60 bytes.
-- AAD: UTF-8 bytes of `channel_id` (same AAD pattern as item encryption, ecies-envelope-encryption.md §5.5).
-- The personal channel PSK is stored in `~/.cordelia/channel-keys/__personal.key` as raw 32 bytes (not in the database).
-
-**Why encrypted:** If the database file is compromised (stolen, leaked backup), the attacker cannot read channel PSKs without also possessing the personal channel PSK (which is in a separate file with 0600 permissions).
-
-**Relationship to filesystem PSK files:**
-- `~/.cordelia/channel-keys/<channel_id>.key` files (ecies-envelope-encryption.md §6.3) are the primary PSK store, used at runtime for fast access.
-- The `channel_keys` table is the durable store, used for recovery if key files are deleted but the database and personal PSK survive.
+Gone (decision 2026-11-10 (older kind), rule 5): step 34 drops it.
 
 ### 3.4 items
 
-All channel items (messages, PSK envelopes, attestations, descriptors, tombstones).
-
-```sql
-CREATE TABLE items (
-    item_id         TEXT PRIMARY KEY,     -- "ci_" + ULID (26 chars Crockford Base32)
-    channel_id      TEXT NOT NULL REFERENCES channels(channel_id),
-    author_id       BLOB NOT NULL,        -- Ed25519 public key (32 bytes)
-    item_type       TEXT NOT NULL,         -- "message", "event", "state", "psk_envelope", "kv", "attestation", "descriptor", "probe", "memory:entity", etc.
-    published_at    TEXT NOT NULL,         -- ISO 8601
-    is_tombstone    INTEGER NOT NULL DEFAULT 0,  -- 1 = soft-deleted
-    parent_id       TEXT,                  -- item_id of parent (threading). NULL if top-level.
-    key_version     INTEGER NOT NULL DEFAULT 1,  -- PSK version used for encryption. 0 = not PSK-encrypted (see §4).
-    content_hash    BLOB NOT NULL,         -- SHA-256 of encrypted_blob (32 bytes)
-    signature       BLOB NOT NULL,         -- Ed25519 signature over CBOR metadata envelope (64 bytes)
-    encrypted_blob  BLOB NOT NULL,         -- iv || ciphertext || auth_tag (normal items) OR raw ECIES envelope (PSK envelopes, §4)
-    content_length  INTEGER NOT NULL,      -- byte length of encrypted_blob. Node-internal, not exposed via REST API.
-    received_at     TEXT NOT NULL DEFAULT (datetime('now'))  -- local receipt timestamp (not replicated)
-);
-
-CREATE INDEX idx_items_channel_published ON items(channel_id, published_at);
-CREATE INDEX idx_items_channel_type      ON items(channel_id, item_type);
-CREATE INDEX idx_items_content_hash      ON items(content_hash);
-```
-
-**Notes:**
-- `item_id` uses ULID (Crockford Base32, 26 chars) prefixed with `ci_`. ULIDs are monotonic within the same millisecond on the same node.
-- `content_hash` is SHA-256 of the `encrypted_blob` column value (computed over ciphertext, not plaintext). Used for deduplication (below).
-- `received_at` is local-only. Not signed. Not replicated. Used for local diagnostics and GC.
-- `key_version = 0` is reserved for items not encrypted with the channel PSK. See §4.
+Gone (decision 2026-11-10 (older kind), rule 5): step 34 drops it.
 
 ### 3.5 dm_peers
 
-Maps DM channel IDs to the peer's public key for efficient lookup.
-
-```sql
-CREATE TABLE dm_peers (
-    channel_id   TEXT PRIMARY KEY REFERENCES channels(channel_id),
-    peer_key     BLOB NOT NULL         -- the other party's Ed25519 public key (32 bytes)
-);
-```
-
+Gone (decision 2026-11-10 (older kind), rule 5): step 34 drops it.
 
 ---
 
 ## 4. PSK Envelope Items
 
-Gone, with the older kind of channel (decision 2026-11-10 (older kind)): no node makes, reads or verifies a PSK envelope. What a database still holds of one is a row of `items` (§3.4).
+Gone, with the older kind of channel (decision 2026-11-10 (older kind)): no node makes, reads or verifies a PSK envelope, and step 34 drops `items`, which held them (§3.4).
 
 ---
 
@@ -389,30 +314,27 @@ On startup:
 > is set and no step is run, and whoever opened it is told both versions. A
 > relay or a bootnode then does not start. A personal node stays up over an
 > empty database in memory, writes nothing to the one on disk, and says so in
-> its status (decision 2026-10-04 §10.1). Each step from 9 on is run in one
+> its status (decision 2026-10-04 §10.1).
+>
+> **So is a database from before 0.2.0-alpha.19** (decision 2026-11-10
+> (older kind), rules 4 and 6): one at steps 1 to 32, or at step 0 with
+> anything in it. It is refused in the same way, before any pragma, and
+> nothing in it is changed. Whoever opened it is told so in the words of
+> rule 6 (operations.md §10.5); a personal node's status says `held.by`
+> `earlier_database`, and its log names the step ("the database is at
+> schema step N"). A file with nothing in it, at step 0, is a new database.
+>
+> **The steps** (§2.1): a new database runs the baseline, and a database at
+> step 33 does not; then step 34 runs on either. Each runs in one
 > transaction with its change of version, and reads the version again inside
 > it: the node and a command each open the database, and two that open it at
 > one moment run a step once.
 
 ### 5.3 Migration v1 (Initial Schema)
 
-The complete Phase 1 schema. Comprises all DDL from §3 and §4, plus the search tables from [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) §2.
-
-```sql
--- Migration v1: Phase 1 initial schema
-
--- Core tables (this spec, §3)
--- channels, channel_members, channel_keys, items, dm_peers
--- [DDL as defined in §3.1-§3.5 above]
-
--- Search tables (search-indexing.md §2)
--- search_content, search_fts, search_vec_map, search_vec, search_embedding_meta, search_index_state
--- [DDL as defined in search-indexing.md §2.2-§2.6]
-
-PRAGMA user_version = 1;
-```
-
-The full DDL is the concatenation of §3.1-§3.5 above and [search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) §2.2-§2.6. Both are authoritative for their respective tables.
+Gone (decision 2026-11-10 (older kind), rule 5): the steps are gone from the
+code, and a new database runs the baseline, alpha.19's schema at step 33,
+and then step 34 (§5.2).
 
 ### 5.4 Additive Migrations Only
 
@@ -420,9 +342,11 @@ Phase 1 migrations are additive (new tables, new columns with defaults, new inde
 
 If a future migration requires destructive changes, the release notes MUST state this and the rollback section MUST document the procedure.
 
-> **v1 status.** Steps 11 to 18 are additive. What a personal node does at its
-> first start on this version is not a step of the schema: it empties rows,
-> after a copy, and §12 and operations.md §10.5 say how to go back.
+> **v1 status.** Step 34 is not additive: it drops the tables of the older
+> kind (§3). alpha.19 refuses a database at step 34 as one from a later
+> version, and changes nothing in it. This version makes no copy of the
+> database: to be able to go back, copy the data directory before the
+> upgrade (operations.md §10.5).
 
 ---
 
@@ -1296,8 +1220,8 @@ CREATE TABLE sync_files (
   name to the name's new channel, with its rows of `index_lines`, and each
   revision in them is renumbered as §9.3 says. Local history is left as it
   is.
-- At a personal node's first start on this version both tables are emptied:
-  every folder forgets what it had agreed (§12).
+- Step 34 leaves both tables as they are: a device that takes this version
+  from alpha.19 keeps what each folder had agreed.
 - **Beside them (v24, decision 2026-10-24 (removal), rule 7):**
   `file_put_back (folder, channel_id, key)` marks a file that a carry left
   out: the record names the version the carry went back to (a NULL hash and
@@ -1553,7 +1477,7 @@ nothing in any of these tables.
 
 ---
 
-## 11. Stored Keys, Counters and the Guard
+## 11. Stored Keys and Counters
 
 ### 11.1 node_meta
 
@@ -1565,10 +1489,9 @@ nothing in any of these tables.
 | `sync.claude.mappings` | JSON array of declared mappings, `[{"folder": "/abs/path", "name": "..."}]` | Kept |
 | `sync.claude.home`, `sync.claude.home_name` | Whether home memory is off on this device, and the name that home memory syncs under or last did | Kept |
 | `sync.claude.exclude` | JSON array of the project names, and the folders, kept off this device while everything found synced. Only what is mapped syncs, so there is nothing left to exclude; what an older panel sends is still stored (decision §10.1, rule 5) | Kept |
-| `sync.claude.all` | The stored scope of everything found. It is written `off` at the first start, and is off whenever sync is on (decision §10.1, rule 2) | Kept, as `off` |
-| `sync.claude.report` | JSON report of the last sync cycle. Removed at the first start, and written again by the next cycle | |
-| `sync.claude.notice` | JSON array of what a device whose stored scope was on has been told: for each time, the date, the Claude Code directory, and the folders that stopped syncing (`null` where that is not known: there was no stored report, it could not be read, or it was of a cycle that failed before it came to a folder) | Decision §10.1 |
-| `first_start.done` | The mark that the first start on this version is done: `stepped by <version>`, or `nothing to step, marked by <version>`. Any mark means done, in this version and in every later one | Decision §10.1 |
+| `sync.claude.report` | JSON report of the last sync cycle, written again by each cycle | |
+| `sync.claude.last_change` | When a cycle last sent or received a memory (RFC 3339) | Kept: the sync loop writes it |
+| `sync.claude.activity` | JSON object, for each name that syncs, of when this device last received and last sent a memory under it | Kept: the sync loop writes it |
 | `person.not_carried` | JSON of the files whose record could not be carried when the device applied the statement it has applied: each as the name it syncs under and the file. Replaced at each statement applied. A file goes from it once it has met its channel (a folder has a record of it there at the end of a cycle), and a name's files go when the device stops the name | Decision §4.2 |
 | `person.removed_a_key` | Present where the statement that the device has applied removes a key that the statement it held before did not, as the device found it when it applied the statement. A renewal removes nobody, though its list of removed keys names every key removed so far. Written at each statement applied. A status shows a removal as not yet applied by every device only where it is present | Decision §10.1 |
 | `person.names_carried` | JSON array of the names that the device holds by a carry that a person asked for, or by a recovery, with no folder of its own mapped to them. It holds each, and lists it in the personal channel, whether or not sync is on. A name goes from the list when the device stops it | Decision §7.3, §9 |
@@ -1579,45 +1502,46 @@ nothing in any of these tables.
 | `person.moved_from` | JSON array of the moves the device made (decision 2026-10-24 (removal), rule 9), the latest last, up to eight (`MAX_CHANGE_HEADS`): each the change entry of the change it left, in hex (`from`), and what a command that waits after that change says of the move (`says`). The look gives it as `moved`, and `cordelia change-made` ends with status 3 where it names the change that the command made. It goes when the device leaves its phrase | Decision 2026-10-24 (removal), rule 9 |
 | `usage.sighting_secret` | The secret a node hashes peer keys with for its usage counts. It never leaves the node | Kept |
 
-Four keys are of the older kind, and a personal node's first start removes
-them: `personal_channel_id`, `membership.accepted_personal_from`,
-`sync.claude.last_change` and `sync.claude.activity`.
+Step 34 removes five keys that only the older kind and the first start of
+an earlier version read: `personal_channel_id`,
+`membership.accepted_personal_from`, `first_start.done`, `sync.claude.all`
+(the stored scope of everything found) and `sync.claude.notice` (the
+notice of the folders that stopped syncing at that first start) (decision
+2026-11-10 (older kind), rules 5 and 9).
 
 The four `person.*` keys that a device writes under a phrase, and
-`person.not_carried`, go when the device leaves its phrase. The notice
-(`sync.claude.notice`) goes only when a person says that it was seen
-(`cordelia sync status --seen`).
+`person.not_carried`, go when the device leaves its phrase.
 
 ### 11.2 counters
 
 | Name | Value |
 |---|---|
-| `item_seq` | The arrival order of `items` (v5) |
 | `entry_seq` | The order in which this node stored its `entries` (v11) |
-| `item_count`, `item_bytes` | How many rows `items` holds, and the bytes of their content together (v13). Three triggers on `items` keep them, in the write that changes a row |
 
-The counters stay at a personal node's first start: `item_seq` and
-`entry_seq` keep their values, and `item_count` and `item_bytes` come to 0
-as the items go.
+Step 34 deletes the counters of `items`: `item_seq` (v5), and `item_count`
+and `item_bytes` (v13), whose triggers go with `items`. `entry_seq` keeps
+its value.
 
 ### 11.3 The Guard
 
-A personal node's first start sets a trigger, `moved_on_takes_no_channel`,
-on the older kind's table of channels: `BEFORE INSERT ON channels`, it aborts
-with words that say the database was moved on, by which version, and where
-the copy is. It is set wherever the mark is written: on a database that had
-nothing to step, its words say which version marked it, and that no copy
-was made. A version from before this one makes a channel at every start;
-started on this database by mistake, it stops there with those words, and
-has changed nothing before it. A relay or a bootnode that is started on a
-database which a personal node stepped removes the trigger.
+Gone (decision 2026-11-10 (older kind), rule 9): no node sets it. Where an
+earlier version's first start set the trigger `moved_on_takes_no_channel`
+on `channels`, step 34 drops it with that table.
 
 ---
 
-## 12. The First Start of a Personal Node, and the Copy
+## 12. The Lock on a Data Directory
 
-Decision 2026-10-04 §10.1, as `crates/cordelia-storage/src/first_start.rs`
-has it. A relay and a bootnode make no copy and take no step.
+> **v1 status.** The first start of a personal node, and its copy, are gone
+> (decision 2026-11-10 (older kind), rule 9): no mark, no copy into
+> `before-<version>`, no step that empties rows, no guard and no handling of
+> key files. A database at step 33 has had it. Where it has not (a command
+> stepped it, or it was held for want of room), it has no copy, and step 34
+> drops its rows of the older kind (§5.2). A folder `channel-keys/` or
+> `before-<version>` that an earlier version left is read by nothing, and a
+> person may remove it. What this section said of the first start is at
+> [c3cc5756](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/specs/data-formats.md).
+> The lock stays.
 
 **The lock.** A data directory is one node's. A node of any role takes an
 advisory lock on a file in it, `node.lock` (mode 0600, and empty), after the
@@ -1627,78 +1551,9 @@ same directory says that another is running there, and stops, with nothing
 changed. On a volume that knows no such lock the node starts, and says so in
 its log.
 
-**When.** A personal node whose database has no mark (§11.1) makes it at its
-start: after the port of its local API is bound, so that a node which cannot
-bind changes nothing; after the lock is taken; and before its first cycle
-and its first pass. Where there is only a mark to write, it is written
-before anything else is started. Where a copy is to be made, the node is
-held up from its start, and the copy and the step are made by the first turn
-of its sync loop: its server answers meanwhile, and its status says that a
-copy is being made.
-
-**Who.** Where the device already follows a phrase, or the node holds no row
-of the older tables, none of the four older keys and nothing under the name
-of a key file of an older channel, the mark is written with the guard
-(§11.3), and nothing else. Otherwise:
-
-1. **The copy.** The database, as its opening left it, and the key files of
-   the older channels, into a folder beside them named `before-<version>`
-   (mode 0700, each file 0600). The database is copied with `VACUUM INTO`,
-   never by copying a file that is open, on a connection of its own that is
-   opened for reading only. The copy is made under a name that ends
-   `.partial`, flushed, opened again read-only and checked (it opens,
-   `PRAGMA integrity_check` says `ok`, and it is at this schema's version),
-   and only then renamed. A `.partial` that a start finds is removed and made
-   again. A whole folder that a start finds, with no mark in the database, is
-   kept as `before-<version>.earlier`, in the place of any before it, once
-   the new copy is checked: so there are at most two.
-   - **Before anything is written the free room on the volume is compared
-     with what the copy needs:** the database's pages (`page_count` ×
-     `page_size`) and the key files. Where there is less, no copy is begun.
-     Where the room cannot be learned the copy is tried.
-   - **Where the copy cannot be made, the step is not taken,** and the node
-     says why, with the bytes of room that a copy needs and the bytes there
-     are. What was written of a copy that failed is removed at once.
-   - A copy that was made and checked is used again by a later try of the
-     same start where only the step failed, and only where the database
-     (what the node notes for itself in `node_meta`, and how many rows each
-     older table and each of `sync_files` and `index_lines` has) and the key
-     files still hold what the copy holds. One that no longer does is
-     removed, and made again.
-   - The tries back off: five seconds after the first that failed, and twice
-     as long after each further one, up to ten minutes (parameter-rationale.md
-     §12.11).
-2. **The step, in one transaction, all of it or none.** `sync_files` and
-   `index_lines` are emptied. Every table of the older kind is emptied, in
-   this order: `channel_members`, `channel_keys`, `dm_peers`, `items`,
-   `search_content` (and the index over it), `invites`, `state_offers`,
-   `trusted_keys`, `channels`. The four older keys of §11.1 are removed.
-   Where the stored scope was on (or absent with a directory set) the notice
-   is stored, made from the report as it is stored, unless that report shows
-   that nothing stopped. The report is removed and
-   the scope is written `off`. The guard is set (§11.3). The mark is written.
-3. **After the commit, the key files of the older channels are removed.**
-   They are found by their place and their names: whatever is in the folder
-   `channel-keys` under a name that ends `.key`, `.ring.json` or `.slot`.
-   They are looked for again at every start of a personal node, whatever the
-   mark says. **At a start that makes no copy, one is removed only where a
-   whole `before-` folder beside the database holds a file of that name with
-   the same bytes:** any other is left where it is, and the status says how
-   many (`key_files_in_place`). One that cannot be removed is counted and
-   said, and the node goes on.
-
-**What stays:** the device's key, its token and its configuration, which are
-files and are not touched; its settings and its mappings; the counters;
-`peer_sightings`; every table of §10.1 to §10.5; and local history, which is
-in files of its own (§8).
-
-**What the copy holds.** What the device held: sealed entries, the keys of
-channels that relays keep for up to 90 days more, and also text in the clear
-(the search index of what was published through the local API, removed lines
-of the index, the names and paths of memory files). The version before opens
-it as it opens any database: it knows nothing of the tables added since and
-ignores them. It can be deleted once the person is content. Going back is in
-operations.md §10.5.
+**At each start that is not held up**, a personal node judges the change
+entries it kept (`person::judge_kept`; decision 2026-10-24 (removal), rule
+12), before its sync loop and its first pass are started.
 
 ---
 
@@ -1712,7 +1567,8 @@ operations.md §10.5.
 | [specs/search-indexing.md](https://github.com/seed-drill/cordelia-node/blob/c3cc5756/docs/archive/specs/search-indexing.md) | FTS5 + sqlite-vec DDL (§2), indexing pipeline |
 | specs/identity.md | Key types, entity ID format |
 | specs/network-protocol.md | The streams of entries (§4.9) |
-| decisions/2026-10-04-a-persons-devices.md | A channel from its secret, the statement, the change entry, adding, removing and recovery: what §9 to §12 are the forms of |
+| decisions/2026-10-04-a-persons-devices.md | A channel from its secret, the statement, the change entry, adding, removing and recovery: what §9 to §11 are the forms of |
+| decisions/2026-11-10-removing-the-older-kind.md | The baseline, step 34, and the refusal of a database from before alpha.19 (§3, §5) |
 | reference/step4-test-vectors.json | Vectors for the derivations of §9.1 |
 
 ---
