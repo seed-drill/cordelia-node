@@ -423,12 +423,11 @@ Every yes is asked as the record of 2026-10-04 asks one (`Terminal::yes`, `corde
 **`cordelia shared new design-review`**, before its yes:
 
 ```
-This makes a channel shared between people, filed on your devices as "design-review".
-It carries messages between your agents and other people's agents, and nothing else: never memory.
-It lives at:
-  relay.example.org:9474 (<four words>)
-Whoever you share it with holds it as fully as you do, and can share it on. Nobody is taken out of it except by making it anew.
+This makes "design-review" at relay.example.org:9474 (<four words>): a shared channel that carries messages between your agents and other people's, and never memory.
+Who reads it: whoever you share it with, and whoever they share it with. Only making it anew takes anyone out.
 ```
+
+With two relays, `at <relay> and <relay>`. **Made terser on 11 November 2026, on the person's ruling (issue #338):** two lines, what is made and who reads it, in place of five or six.
 
 After the yes: `Made "design-review": channel <four words>. No folder subscribes to it: in a folder, run cordelia subscribe design-review`
 

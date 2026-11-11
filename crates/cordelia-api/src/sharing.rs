@@ -106,6 +106,16 @@ pub fn relay_shown(relays: &[OwnRelay], key: &[u8; 32]) -> String {
     }
 }
 
+/// The relays of `relays`, each as [`relay_shown`] says it among `own`:
+/// `a`, or `a and b`.
+pub(crate) fn relays_said(own: &[OwnRelay], relays: &[OwnRelay]) -> String {
+    let shown: Vec<String> = relays
+        .iter()
+        .map(|relay| relay_shown(own, &relay.key))
+        .collect();
+    and(&shown)
+}
+
 /// `a`, or `a and b`.
 fn and(things: &[String]) -> String {
     match things {
@@ -734,16 +744,13 @@ pub fn new_plan(
     if filed(conn)?.len() >= SHARED_MAX_CHANNELS {
         return refused("too_many_channels", TOO_MANY_CHANNELS.into());
     }
-    let lives: Vec<String> = relays
-        .iter()
-        .map(|relay| format!("  {}", relay_shown(own, &relay.key)))
-        .collect();
+    // Two lines (made terser on 11 November 2026, issue #338): what is
+    // made, and who reads it.
     let asks = format!(
-        "This makes a channel shared between people, filed on your devices as \"{name}\".\nIt \
-         carries messages between your agents and other people's agents, and nothing else: never \
-         memory.\nIt lives at:\n{}\nWhoever you share it with holds it as fully as you do, and \
-         can share it on. Nobody is taken out of it except by making it anew.",
-        lives.join("\n")
+        "This makes \"{name}\" at {}: a shared channel that carries messages between your agents \
+         and other people's, and never memory.\nWho reads it: whoever you share it with, and \
+         whoever they share it with. Only making it anew takes anyone out.",
+        relays_said(own, &relays)
     );
     Ok(Plan {
         asks,

@@ -337,15 +337,12 @@ fn shared_new_makes_a_channel_at_your_relays_and_refuses_as_the_table_says() {
 
     let plan = new_plan(conn, &relays(), "review", &[]).unwrap();
     assert!(
-        plan.asks.contains("filed on your devices as \"review\""),
+        plan.asks
+            .starts_with("This makes \"review\" at relay.example.org:9474 ("),
         "{}",
         plan.asks
     );
-    assert!(
-        plan.asks.contains("  relay.example.org:9474 ("),
-        "{}",
-        plan.asks
-    );
+    assert_eq!(plan.asks.lines().count(), 2, "{}", plan.asks);
     let said = make_new(conn, &s[0].identity, &plan.what, now).unwrap();
     assert!(said.starts_with("Made \"review\": channel "), "{said}");
     let filing = &filed(conn).unwrap()[0];
@@ -764,7 +761,7 @@ async fn the_routes_ask_their_yes_and_refuse_a_field_they_do_not_know() {
     )
     .await;
     let asks = looked["asks"].as_str().unwrap().to_string();
-    assert!(asks.contains("  relay.example.org:9474 ("), "{asks}");
+    assert!(asks.contains(" at relay.example.org:9474 ("), "{asks}");
     assert!(!asks.contains("nokey.example.org"), "{asks}");
     assert!(filed(&state.db.lock().unwrap()).unwrap().is_empty());
     // A yes to another text does nothing.

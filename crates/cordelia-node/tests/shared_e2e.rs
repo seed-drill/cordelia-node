@@ -59,7 +59,7 @@ fn channel_of(n: &Node, name: &str) -> Option<serde_json::Value> {
 /// `extra` arguments. Returns the channel's four words.
 fn makes(n: &Node, name: &str, extra: &[&str]) -> String {
     let mut at = n.at_terminal(&[&["shared", "new", name], extra].concat());
-    at.says("This makes a channel shared between people")
+    at.says(&format!("This makes \"{name}\" at "))
         .says("Type yes to go on")
         .types("yes");
     let said = at.done();
