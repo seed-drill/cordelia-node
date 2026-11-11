@@ -807,34 +807,40 @@ pub fn relay_made_by(bin: PathBuf) -> Node {
 pub const OLDER_GROUP: &str = "grp_550e8400-e29b-41d4-a716-446655440000";
 
 /// Put in the database of `n`, which is made and not running, a channel
-/// of the older kind with one item in it, which the node signed: what a
-/// relay of alpha.19 came to hold, and keeps on this version until a
-/// later step drops it. Returns the item's ID.
+/// of the older kind with one item in it: what a relay of alpha.19 came to
+/// hold, and keeps on this version, unread. The rows are written in plain
+/// SQL, as [`older_items_held`] reads them. Step 34 drops these tables
+/// (decision 2026-11-10 (older kind), rule 5), and this goes with them.
+/// Returns the item's ID.
 pub fn holds_an_older_channel(n: &Node, channel: &str) -> String {
-    use cordelia_storage::{channels, items};
-    let own = cordelia_crypto::bech32::decode_public_key(&key_of(n)).unwrap();
-    let db = cordelia_storage::db::open(&n.data_dir().join("cordelia.db")).unwrap();
-    channels::ensure_group(&db, channel, None, "realtime", &own).unwrap();
-    channels::add_member(&db, channel, &own, "owner").unwrap();
-    let blob = b"what alpha.19 held of the older kind".to_vec();
-    let item_id = items::generate_item_id();
-    let item = items::NewItem {
-        item_id: &item_id,
-        channel_id: channel,
-        author_id: &own,
-        item_type: "memory",
-        published_at: "2026-11-01T00:00:00Z",
-        parent_id: None,
-        key_version: 1,
-        content_hash: &cordelia_crypto::sha256(&blob),
-        signature: &[7u8; 64],
-        encrypted_blob: &blob,
-        is_tombstone: false,
-        slot: None,
-        rev: None,
-    };
-    assert!(items::insert_item(&db, &item).unwrap());
-    item_id
+    let db = rusqlite::Connection::open(n.data_dir().join("cordelia.db")).unwrap();
+    let now = "2026-11-01T00:00:00Z";
+    db.execute(
+        "INSERT INTO channels (channel_id, channel_type, mode, access, creator_id,
+                               created_at, updated_at)
+         VALUES (?1, 'group', 'realtime', 'invite_only', ?2, ?3, ?3)",
+        rusqlite::params![channel, [0xAAu8; 32].as_slice(), now],
+    )
+    .unwrap();
+    let item_id = "ci_01JARV8XMHW8G9QZP0000000AA";
+    let blob = b"what alpha.19 held of the older kind";
+    db.execute(
+        "INSERT INTO items (item_id, channel_id, author_id, item_type, published_at,
+                            content_hash, signature, encrypted_blob, content_length, seq)
+         VALUES (?1, ?2, ?3, 'memory', ?4, ?5, ?6, ?7, ?8, 1)",
+        rusqlite::params![
+            item_id,
+            channel,
+            [0xAAu8; 32].as_slice(),
+            now,
+            cordelia_crypto::sha256(blob).as_slice(),
+            [7u8; 64].as_slice(),
+            blob.as_slice(),
+            blob.len() as i64,
+        ],
+    )
+    .unwrap();
+    item_id.to_string()
 }
 
 /// How many items of the older kind the database of `n` holds, read

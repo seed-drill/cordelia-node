@@ -4024,13 +4024,17 @@ fn a_message_goes(all: &[&Node], from: &Node, to: &Node, name: &str, body: &str)
 /// one stream (64), made through its own `/api/v1/channels/subscribe`, and
 /// publishes an item in each through its own `/api/v1/channels/publish`,
 /// which its outbox pushes to the relays it lists. A laptop of this build
-/// uses both relays, and a desktop of alpha.19 the relay of this build.
+/// uses the relay of alpha.19 alone, and a desktop of alpha.19 the relay
+/// of this build alone.
 ///
-/// A file and a message go each way between the two devices. What the
-/// relay of alpha.19 asks of the older kind, of the relay of this build and
-/// of the laptop, is answered with nothing, and what it pushes of that kind
-/// is refused: the relay of this build holds none of it. The two relays
-/// stay connected, and neither cuts the other off.
+/// A file and a message go each way between the two devices, so each
+/// crosses between the two relays (0x14), as before. What the relay of
+/// alpha.19 asks of the older kind, of the relay of this build and of the
+/// laptop, is answered with nothing; past 63 requests on one stream the
+/// stream ends, and the relay of alpha.19 says that a sync request failed.
+/// What it pushes of that kind is refused: the relay of this build holds
+/// none of it. The two relays stay connected, and neither cuts the other
+/// off.
 #[test]
 fn a_relay_of_the_version_before_and_one_of_this_build_list_each_other() {
     const NOTES: &str = "lab";
@@ -4078,10 +4082,7 @@ fn a_relay_of_the_version_before_and_one_of_this_build_list_each_other() {
     let mut laptop = node_with_relays(
         "laptop",
         "personal",
-        &[
-            (older_at.clone(), Some(older_key.clone())),
-            (relay_at.clone(), Some(relay_key.clone())),
-        ],
+        &[(older_at.clone(), Some(older_key.clone()))],
     );
     laptop.start();
     let mut desktop = node_run_by(before, "desktop", relay.p2p);
@@ -4090,8 +4091,8 @@ fn a_relay_of_the_version_before_and_one_of_this_build_list_each_other() {
     let all = [&older, &relay, &laptop, &desktop];
     wait_for("laptop healthy", &all, 30, || healthy(&laptop));
     wait_for("desktop healthy", &all, 30, || healthy(&desktop));
-    wait_for("the laptop reaches both relays", &all, 60, || {
-        (peer_keys(&laptop).len() == 2).then_some(())
+    wait_for("the laptop reaches its relay", &all, 60, || {
+        has_hot_peer(&laptop)
     });
     wait_for("the desktop reaches its relay", &all, 60, || {
         has_hot_peer(&desktop)
@@ -4128,7 +4129,8 @@ fn a_relay_of_the_version_before_and_one_of_this_build_list_each_other() {
     };
     let (laptop_memory, desktop_memory) = (memory_of(&laptop), memory_of(&desktop));
 
-    // A file each way.
+    // A file each way: the laptop and the desktop share no relay, so each
+    // crosses between the two.
     for (from, to, file) in [
         (&laptop_memory, &desktop_memory, "from-the-laptop.md"),
         (&desktop_memory, &laptop_memory, "from-the-desktop.md"),
@@ -4168,6 +4170,20 @@ fn a_relay_of_the_version_before_and_one_of_this_build_list_each_other() {
             let log = without_colour(&std::fs::read_to_string(relay.log()).ok()?);
             log.lines()
                 .any(|line| line.contains(refused) && line.contains("protocol=\"item_push\""))
+                .then_some(())
+        },
+    );
+    // It asked for more channels than are answered on one stream: past 63
+    // the stream ends, and it says so of the relay of this build.
+    let relay_id = hex::encode(cordelia_crypto::bech32::decode_public_key(&relay_key).unwrap());
+    wait_for(
+        "the relay of alpha.19 finds the stream ended",
+        &all,
+        90,
+        || {
+            let log = without_colour(&std::fs::read_to_string(older.log()).ok()?);
+            log.lines()
+                .any(|line| line.contains("sync request failed") && line.contains(&relay_id))
                 .then_some(())
         },
     );

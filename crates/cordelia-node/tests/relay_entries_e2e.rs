@@ -1497,7 +1497,7 @@ async fn a_relay_refuses_an_entry_over_the_size_limit_and_says_which() {
 /// counts each entry as its content and what an entry takes beyond it, a
 /// kilobyte: so as many entries of the smallest size (256 bytes) as fit in
 /// two megabytes at that count are stored, and a push of one more is
-/// refused whole. Counted at their content alone, eight times as many
+/// refused whole. Counted at their content alone, five times as many
 /// would be taken.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn small_entries_count_for_what_they_take() {
