@@ -5136,26 +5136,14 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     );
                 }
                 // `map` says what it did, and not what syncs: `sync status`
-                // lists that. Once its node has looked under the new
-                // mapping, it says what fails: that this device sends
-                // nothing, and why, or what of the folder does not sync.
+                // lists that. A device that sends nothing says so, with
+                // why, once its node has looked under the new mapping.
                 let generation = settings["generation"].as_u64();
                 let after = sync_status_since(config_path, generation)?;
-                if !report_since(&after, generation) {
-                    println!("{STILL_WORKING}");
-                    return Ok(());
-                }
-                let report = &after["report"];
-                if let Some(why) = report["publishes_nothing"].as_str() {
+                if report_since(&after, generation)
+                    && let Some(why) = after["report"]["publishes_nothing"].as_str()
+                {
                     println!("Nothing is sent from this device: {why}");
-                }
-                let row = report["folders"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .find(|f| f["cwd"].as_str() == Some(mapped_folder.as_str()));
-                if let Some(says) = row.and_then(mapped_folder_says) {
-                    println!("{says}");
                 }
                 return Ok(());
             }
@@ -5708,32 +5696,6 @@ fn sync_status_since(config_path: &str, since: Option<u64>) -> anyhow::Result<se
     Ok(resp)
 }
 
-/// What a sync command says where no report under its change came in
-/// time.
-const STILL_WORKING: &str = "(still working on it: try `cordelia sync status` in a few seconds)";
-
-/// What `cordelia sync map` says of the folder it mapped, from its row
-/// in the first report under the mapping: why it does not sync, or how
-/// many of its files do not. `None` where all of it syncs, or where it
-/// waits for its channel and has not been looked at yet.
-fn mapped_folder_says(folder: &serde_json::Value) -> Option<String> {
-    if let Some(error) = folder["error"].as_str() {
-        return Some(format!("error: {error}"));
-    }
-    let count = |v: &serde_json::Value| v.as_array().map_or(0, Vec::len) as u64;
-    let files = count(&folder["skipped"])
-        + count(&folder["too_large"])
-        + count(&folder["failed"])
-        + folder["failed_more"].as_u64().unwrap_or(0);
-    match files {
-        0 => None,
-        1 => Some("1 file of it does not sync: `cordelia sync status` names it.".into()),
-        n => Some(format!(
-            "{n} files of it do not sync: `cordelia sync status` names them."
-        )),
-    }
-}
-
 /// Print what syncs on this device, what was found and is not syncing, and
 /// what this person's other devices sync, from a report made under the
 /// settings generation `since` where one comes in time
@@ -5754,7 +5716,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
     );
     let report = &resp["report"];
     if !report_since(&resp, since) {
-        println!("  {STILL_WORKING}");
+        println!("  (still working on it: try `cordelia sync status` in a few seconds)");
         return Ok(());
     }
 
@@ -9306,40 +9268,6 @@ mod tests {
             says(Made::default()),
             "This device has its key and database already: nothing changed."
         );
-    }
-
-    /// `cordelia sync map` says what of the folder it mapped does not
-    /// sync, from its row in the first report under the mapping: its
-    /// error, or a count of its files that do not sync, of every kind. A
-    /// folder that syncs whole, or still waits for its channel, says
-    /// nothing.
-    #[test]
-    fn test_map_says_what_of_its_folder_does_not_sync() {
-        use serde_json::json;
-        assert_eq!(
-            mapped_folder_says(&json!({ "error": "no such folder" })).as_deref(),
-            Some("error: no such folder")
-        );
-        assert_eq!(
-            mapped_folder_says(&json!({ "too_large": ["big.md"], "skipped": [] })).as_deref(),
-            Some("1 file of it does not sync: `cordelia sync status` names it.")
-        );
-        let every_kind = json!({
-            "skipped": ["a.bin"],
-            "too_large": ["big.md"],
-            "failed": [{ "file": "c.md", "why": "it could not be read" }],
-            "failed_more": 2,
-        });
-        assert_eq!(
-            mapped_folder_says(&every_kind).as_deref(),
-            Some("5 files of it do not sync: `cordelia sync status` names them.")
-        );
-        for whole in [
-            json!({ "skipped": [], "too_large": [], "failed": [], "failed_more": 0 }),
-            json!({ "waiting": true }),
-        ] {
-            assert_eq!(mapped_folder_says(&whole), None, "{whole}");
-        }
     }
 
     /// `PRAGMA secure_delete` reads 1 on the connection a personal node

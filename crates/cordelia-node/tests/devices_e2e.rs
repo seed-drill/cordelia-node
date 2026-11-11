@@ -2056,7 +2056,15 @@ fn a_map_with_no_name_whose_git_does_not_give_the_remote_is_refused_in_time() {
     let mut laptop = node("laptop", "personal", None);
     laptop.start();
     wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
-    sync_on(&laptop);
+    // Nothing is mapped, and nothing was found: turning sync on says how
+    // a folder comes to sync.
+    let on = sync_on(&laptop);
+    assert!(!on.contains("Found on this machine"), "{on}");
+    assert!(
+        on.contains("Nothing syncs yet.")
+            && on.contains("Only mapped folders sync. `cordelia sync map <folder>` syncs one."),
+        "{on}"
+    );
     let repo = clone_at(&laptop.home(), "work/tools");
     let path_var = git_that_hangs_for_get_url(laptop.dir.path());
 
