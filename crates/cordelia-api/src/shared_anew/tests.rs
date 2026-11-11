@@ -949,6 +949,12 @@ fn another_persons_offer_pauses_this_device_until_it_moves_or_stays() {
         not_moved_yet(conn, &s.key(0), &new_channel).unwrap(),
         vec![dave.public_key()]
     );
+    // A command that writes there says so, on a line of its own (§5.4).
+    let dave_form = sender_form(conn, &held, &s.key(0), &dave.public_key()).unwrap();
+    assert_eq!(
+        after_who_wrote(conn, &held, &s.key(0), &new_channel, "review").unwrap(),
+        [format!("not moved yet: {dave_form}")]
+    );
     stores(&s, 0, &anew(&dave, &new, 1), now);
     assert!(
         not_moved_yet(conn, &s.key(0), &new_channel)

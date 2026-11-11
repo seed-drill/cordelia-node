@@ -592,7 +592,8 @@ pub fn counted(n: u64, noun: &str) -> String {
 /// The lines of §5.4 for the shared channel `channel`, filed as `name`:
 /// which keys came to write there since this device last wrote there, or
 /// for `send`, since the folder whose agent is `agent` last wrote there, by
-/// what it saw itself; nothing where none came. Never who reads it.
+/// what it saw itself; nothing where none came, or where that last write
+/// is not known. Never who reads it, and never a device of the person's.
 pub fn who_wrote(
     conn: &Connection,
     held: &Held,
@@ -625,36 +626,40 @@ pub fn who_wrote(
             .map(|stored| stored.stored_at)
             .max(),
     };
-    let since = last.unwrap_or(row.first_held);
-    let mut changes = Vec::new();
-    for key in kept::keys(conn, row.id)? {
-        if key.key == *own {
-            continue;
-        }
-        if let Some(first) = key.first_held.filter(|first| *first > since) {
-            changes.push(format!(
-                "  new: {}, first held on this device on {}",
-                sender_form(conn, held, own, &key.key)?,
-                date_of(first)
-            ));
-        }
-        if let Some(first) = key.first_refused.filter(|first| *first > since) {
-            changes.push(format!(
-                "  refused for room: {}, first refused on this device on {}, key {}",
-                sender_form(conn, held, own, &key.key)?,
-                date_of(first),
-                encode_public_key(&key.key)?
-            ));
-        }
-    }
     let mut lines = Vec::new();
-    if !changes.is_empty() {
-        lines.push(format!(
-            "New in \"{}\" since {}:",
-            crate::messages::cleaned(name),
-            date_of(since)
-        ));
-        lines.extend(changes);
+    // Where the last write is not known, every key held since this device
+    // first held the channel would be said as new: nothing is said.
+    if let Some(since) = last {
+        let own_devices = crate::person::who_counts(conn)?.devices_held();
+        let mut changes = Vec::new();
+        for key in kept::keys(conn, row.id)? {
+            if key.key == *own || own_devices.holds(&key.key) {
+                continue;
+            }
+            if let Some(first) = key.first_held.filter(|first| *first > since) {
+                changes.push(format!(
+                    "  new: {}, first held on this device on {}",
+                    sender_form(conn, held, own, &key.key)?,
+                    date_of(first)
+                ));
+            }
+            if let Some(first) = key.first_refused.filter(|first| *first > since) {
+                changes.push(format!(
+                    "  refused for room: {}, first refused on this device on {}, key {}",
+                    sender_form(conn, held, own, &key.key)?,
+                    date_of(first),
+                    encode_public_key(&key.key)?
+                ));
+            }
+        }
+        if !changes.is_empty() {
+            lines.push(format!(
+                "New in \"{}\" since {}:",
+                crate::messages::cleaned(name),
+                date_of(since)
+            ));
+            lines.extend(changes);
+        }
     }
     lines.extend(crate::shared_anew::after_who_wrote(
         conn, held, own, channel, name,

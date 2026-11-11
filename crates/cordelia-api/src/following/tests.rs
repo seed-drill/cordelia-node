@@ -32,8 +32,9 @@ fn relay() -> [u8; 32] {
 const HANDS_YOU: &str = "This follows example.org/team/project. A member's device hands you its \
                          channel once it reads the list. cordelia status shows how it goes.";
 const NO_CHANNEL_YET: &str = "The list of example.org/team/project names no channel yet.";
-const ONCE_TAKEN: &str =
-    "The agent of this folder, project, is subscribed to it once this device takes it.";
+const ONCE_TAKEN: &str = "The agent of this folder, project, is subscribed to it once this \
+                          device takes it. Anyone in it can hand it on, and a device that only \
+                          reads shows nowhere.";
 
 fn own_relays() -> Vec<OwnRelay> {
     vec![OwnRelay {

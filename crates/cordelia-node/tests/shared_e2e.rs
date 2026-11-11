@@ -191,8 +191,19 @@ fn a_share_and_an_accept_in_either_order() {
             )),
             "{said}"
         );
-        // Only a key that came since is said (§5.4): nothing, or a key new.
-        assert!(!said.contains("unchanged since"), "{said}");
+        // After it, only keys that came since are said (§5.4): nothing, or
+        // a key new.
+        let after: Vec<&str> = said
+            .lines()
+            .skip_while(|line| !line.starts_with("Taken: "))
+            .skip(1)
+            .collect();
+        assert!(
+            after
+                .iter()
+                .all(|line| line.starts_with("New in ") || line.starts_with("  new: ")),
+            "{said}"
+        );
     }
     let taken = holds_in_the_end(&all, &bob, "review-with-alice");
     assert_eq!(taken["words"], words.as_str());

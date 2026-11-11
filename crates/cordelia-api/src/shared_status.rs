@@ -257,8 +257,9 @@ fn channel_of(
         .iter()
         .filter(|key| key.first_held.is_some() && key.key != own)
         .collect();
-    // Since this device last wrote there, as `share` and `accept` say it
-    // (§5.4): its latest entry the store holds, or when it first held it.
+    // Since this device last wrote there (§5.4): its latest entry the
+    // store holds, or, where it holds none, when it first held the
+    // channel. The lines of §5.4 say nothing then; this count still does.
     let last_written = cordelia_storage::entries::author_entries(conn, &filing.channel, &own)
         .map_err(PersonError::Storage)?
         .iter()
