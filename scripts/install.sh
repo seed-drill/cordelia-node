@@ -433,10 +433,11 @@ finish() {
 
 # ── PATH setup ──────────────────────────────────────────────────────
 
-# PATH_ADDED is set where this run added the line to a shell's file: a
-# terminal opened before then does not find `cordelia`.
+# NOT_ON_PATH is set where the directory is not on this shell's PATH: a
+# terminal opened before its line was added to a shell's file does not
+# find `cordelia`, and the closing words say so.
 setup_path() {
-    PATH_ADDED=""
+    NOT_ON_PATH=""
     CORDELIA_BIN="$INSTALL_DIR"
     PATH_LINE="export PATH=\"${CORDELIA_BIN}:\$PATH\""
 
@@ -444,6 +445,7 @@ setup_path() {
     case ":$PATH:" in
         *":${CORDELIA_BIN}:"*) return ;;
     esac
+    NOT_ON_PATH=yes
 
     # Detect shell and RC file
     SHELL_NAME=$(basename "${SHELL:-/bin/sh}")
@@ -460,9 +462,7 @@ setup_path() {
     echo "" >> "$RC_FILE"
     echo "# Cordelia" >> "$RC_FILE"
     echo "$PATH_LINE" >> "$RC_FILE"
-    PATH_ADDED=yes
     echo "Added ${CORDELIA_BIN} to PATH in ${RC_FILE}"
-    echo "  Run: source ${RC_FILE}  (or open a new terminal)"
 }
 
 # ── System service ──────────────────────────────────────────────────
@@ -573,9 +573,8 @@ SERVICE
     # Check for lingering (required for user services to run without active session)
     if command -v loginctl >/dev/null 2>&1; then
         if ! loginctl show-user "$(whoami)" 2>/dev/null | grep -q "Linger=yes"; then
-            echo ""
-            echo "  Note: run 'sudo loginctl enable-linger $(whoami)' to keep"
-            echo "  the service running after logout."
+            echo "Note: run 'sudo loginctl enable-linger $(whoami)' to keep"
+            echo "the service running after logout."
         fi
     fi
 }
@@ -661,7 +660,7 @@ main() {
     else
         next_steps
     fi
-    if [ -n "$PATH_ADDED" ]; then
+    if [ -n "$NOT_ON_PATH" ]; then
         echo ""
         echo "Open a new terminal first if 'cordelia' is not found."
     fi

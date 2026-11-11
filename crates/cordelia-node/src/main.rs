@@ -62,7 +62,8 @@ enum Commands {
         name: Option<String>,
 
         /// For a script that starts the node itself, such as the install
-        /// script. Print nothing when it works
+        /// script. Print nothing when it works, unless asked for the token
+        /// with --show-secrets
         #[arg(long)]
         non_interactive: bool,
 
@@ -1298,16 +1299,36 @@ fn keeps_secure_delete(role: &str) -> bool {
 struct Made {
     key: bool,
     database: bool,
-    token: bool,
-    config: bool,
+    token: Wrote,
+    config: Wrote,
+}
+
+/// Whether `cordelia init` wrote a file: where there was none, or again
+/// in the place of the one there (`--force`).
+#[derive(Clone, Copy, Default, PartialEq)]
+enum Wrote {
+    #[default]
+    No,
+    New,
+    Again,
+}
+
+impl Wrote {
+    /// A file written, where one `was_there` or not.
+    fn over(was_there: bool) -> Self {
+        match was_there {
+            true => Wrote::Again,
+            false => Wrote::New,
+        }
+    }
 }
 
 /// What `cordelia init` says when it succeeds. Run by a script
 /// (`--non-interactive`), as the install script runs it: nothing, since
 /// the script starts the node itself, as the service it sets up, and
 /// says how in its own closing words. Run by a person: one line, of what
-/// it made and how the node is started, or that nothing changed. `dir`
-/// is the data directory.
+/// it made or wrote again and how the node is started, or that nothing
+/// changed. `dir` is the data directory.
 fn init_says(made: Made, dir: &str, by_a_script: bool) -> Option<String> {
     if by_a_script {
         return None;
@@ -1318,22 +1339,32 @@ fn init_says(made: Made, dir: &str, by_a_script: bool) -> Option<String> {
             "Made this device's key and database in {dir}. {start}"
         ));
     }
-    let things: Vec<String> = [
-        (made.key, "key"),
-        (made.database, "database"),
-        (made.token, "node token"),
-        (made.config, "configuration file"),
-    ]
-    .into_iter()
-    .filter(|(made, _)| *made)
-    .map(|(_, what)| what.to_string())
-    .collect();
-    Some(match things.is_empty() {
-        true => "This device has its key and database already: nothing changed.".to_string(),
-        false => format!(
-            "Made this device's {}. {start}",
-            cordelia_api::look::joined(&things)
-        ),
+    let mut new: Vec<String> = Vec::new();
+    let mut again: Vec<String> = Vec::new();
+    for (it, what) in [(made.key, "key"), (made.database, "database")] {
+        if it {
+            new.push(format!("this device's {what}"));
+        }
+    }
+    match made.token {
+        Wrote::New => new.push("this device's node token".into()),
+        Wrote::Again => new.push("a new node token".into()),
+        Wrote::No => {}
+    }
+    match made.config {
+        Wrote::New => new.push("this device's configuration file".into()),
+        Wrote::Again => again.push("this device's configuration file".into()),
+        Wrote::No => {}
+    }
+    let (new, again) = (
+        cordelia_api::look::joined(&new),
+        cordelia_api::look::joined(&again),
+    );
+    Some(match (new.is_empty(), again.is_empty()) {
+        (true, true) => "This device has its key and database already: nothing changed.".into(),
+        (false, true) => format!("Made {new}. {start}"),
+        (true, false) => format!("Wrote {again} again. {start}"),
+        (false, false) => format!("Made {new}, and wrote {again} again. {start}"),
     })
 }
 
@@ -1564,7 +1595,7 @@ fn init_with(
     let token_hex = if token_path.exists() && !force {
         std::fs::read_to_string(&token_path)?.trim().to_string()
     } else {
-        made.token = true;
+        made.token = Wrote::over(token_path.exists());
         let token_bytes = cordelia_crypto::generate_psk()?; // 32 random bytes
         let hex_str = hex::encode(token_bytes);
         if let Some(parent) = token_path.parent() {
@@ -1599,7 +1630,7 @@ fn init_with(
     config.identity.entity_id = entity_id.clone();
     config.identity.public_key = pk_bech32.clone();
     if !config_file.exists() || force {
-        made.config = true;
+        made.config = Wrote::over(config_file.exists());
         config.save(config_file)?;
         // The file that this wrote is its owner's alone to read. Where
         // it was written through a link, the file is kept elsewhere, and
@@ -5105,11 +5136,26 @@ fn cmd_sync(config_path: &str, what: SyncCommand) -> anyhow::Result<()> {
                     );
                 }
                 // `map` says what it did, and not what syncs: `sync status`
-                // lists that. A device that sends nothing says so, with
-                // why, once its node has looked under the new mapping.
-                let after = sync_status_since(config_path, settings["generation"].as_u64())?;
-                if let Some(why) = after["report"]["publishes_nothing"].as_str() {
+                // lists that. Once its node has looked under the new
+                // mapping, it says what fails: that this device sends
+                // nothing, and why, or what of the folder does not sync.
+                let generation = settings["generation"].as_u64();
+                let after = sync_status_since(config_path, generation)?;
+                if !report_since(&after, generation) {
+                    println!("{STILL_WORKING}");
+                    return Ok(());
+                }
+                let report = &after["report"];
+                if let Some(why) = report["publishes_nothing"].as_str() {
                     println!("Nothing is sent from this device: {why}");
+                }
+                let row = report["folders"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|f| f["cwd"].as_str() == Some(mapped_folder.as_str()));
+                if let Some(says) = row.and_then(mapped_folder_says) {
+                    println!("{says}");
                 }
                 return Ok(());
             }
@@ -5662,6 +5708,32 @@ fn sync_status_since(config_path: &str, since: Option<u64>) -> anyhow::Result<se
     Ok(resp)
 }
 
+/// What a sync command says where no report under its change came in
+/// time.
+const STILL_WORKING: &str = "(still working on it: try `cordelia sync status` in a few seconds)";
+
+/// What `cordelia sync map` says of the folder it mapped, from its row
+/// in the first report under the mapping: why it does not sync, or how
+/// many of its files do not. `None` where all of it syncs, or where it
+/// waits for its channel and has not been looked at yet.
+fn mapped_folder_says(folder: &serde_json::Value) -> Option<String> {
+    if let Some(error) = folder["error"].as_str() {
+        return Some(format!("error: {error}"));
+    }
+    let count = |v: &serde_json::Value| v.as_array().map_or(0, Vec::len) as u64;
+    let files = count(&folder["skipped"])
+        + count(&folder["too_large"])
+        + count(&folder["failed"])
+        + folder["failed_more"].as_u64().unwrap_or(0);
+    match files {
+        0 => None,
+        1 => Some("1 file of it does not sync: `cordelia sync status` names it.".into()),
+        n => Some(format!(
+            "{n} files of it do not sync: `cordelia sync status` names them."
+        )),
+    }
+}
+
 /// Print what syncs on this device, what was found and is not syncing, and
 /// what this person's other devices sync, from a report made under the
 /// settings generation `since` where one comes in time
@@ -5682,7 +5754,7 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
     );
     let report = &resp["report"];
     if !report_since(&resp, since) {
-        println!("  (still working on it: try `cordelia sync status` in a few seconds)");
+        println!("  {STILL_WORKING}");
         return Ok(());
     }
 
@@ -5794,9 +5866,9 @@ fn print_sync_scope(config_path: &str, since: Option<u64>) -> anyhow::Result<()>
         print_columns(&elsewhere);
     }
 
-    // Said only where a folder was found that does not sync: there is
-    // then one to map.
-    if !unmapped.is_empty() {
+    // Said only where nothing syncs, or a folder was found that does not:
+    // there is then one to map.
+    if folders.is_empty() || !unmapped.is_empty() {
         println!();
         println!("Only mapped folders sync. `cordelia sync map <folder>` syncs one.");
     }
@@ -9201,15 +9273,19 @@ mod tests {
         let all = Made {
             key: true,
             database: true,
-            token: true,
-            config: true,
+            token: Wrote::New,
+            config: Wrote::New,
         };
         let forced = Made {
-            token: true,
-            config: true,
+            token: Wrote::Again,
+            config: Wrote::Again,
             ..Made::default()
         };
-        for made in [all, forced, Made::default()] {
+        let a_database_put_back = Made {
+            database: true,
+            ..Made::default()
+        };
+        for made in [all, forced, a_database_put_back, Made::default()] {
             assert_eq!(init_says(made, "~/.cordelia", true), None);
         }
         let says = |made| init_says(made, "~/.cordelia", false).unwrap();
@@ -9219,13 +9295,51 @@ mod tests {
         );
         assert_eq!(
             says(forced),
-            "Made this device's node token and configuration file. Run `cordelia start` to \
-             begin."
+            "Made a new node token, and wrote this device's configuration file again. Run \
+             `cordelia start` to begin."
+        );
+        assert_eq!(
+            says(a_database_put_back),
+            "Made this device's database. Run `cordelia start` to begin."
         );
         assert_eq!(
             says(Made::default()),
             "This device has its key and database already: nothing changed."
         );
+    }
+
+    /// `cordelia sync map` says what of the folder it mapped does not
+    /// sync, from its row in the first report under the mapping: its
+    /// error, or a count of its files that do not sync, of every kind. A
+    /// folder that syncs whole, or still waits for its channel, says
+    /// nothing.
+    #[test]
+    fn test_map_says_what_of_its_folder_does_not_sync() {
+        use serde_json::json;
+        assert_eq!(
+            mapped_folder_says(&json!({ "error": "no such folder" })).as_deref(),
+            Some("error: no such folder")
+        );
+        assert_eq!(
+            mapped_folder_says(&json!({ "too_large": ["big.md"], "skipped": [] })).as_deref(),
+            Some("1 file of it does not sync: `cordelia sync status` names it.")
+        );
+        let every_kind = json!({
+            "skipped": ["a.bin"],
+            "too_large": ["big.md"],
+            "failed": [{ "file": "c.md", "why": "it could not be read" }],
+            "failed_more": 2,
+        });
+        assert_eq!(
+            mapped_folder_says(&every_kind).as_deref(),
+            Some("5 files of it do not sync: `cordelia sync status` names them.")
+        );
+        for whole in [
+            json!({ "skipped": [], "too_large": [], "failed": [], "failed_more": 0 }),
+            json!({ "waiting": true }),
+        ] {
+            assert_eq!(mapped_folder_says(&whole), None, "{whole}");
+        }
     }
 
     /// `PRAGMA secure_delete` reads 1 on the connection a personal node

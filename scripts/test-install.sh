@@ -218,9 +218,10 @@ PATH=$(printf '%s' "$PATH" | sed 's|^[^:]*:||')
 exec sleep "$@"
 STUB
 
+# loginctl: the user lingers, unless the test says that they do not.
 cat > "$STUBS/loginctl" << 'STUB'
 #!/bin/sh
-echo "Linger=yes"
+if [ -f "$HOME/.fake/no_linger" ]; then echo "Linger=no"; else echo "Linger=yes"; fi
 STUB
 
 cat > "$STUBS/uname" << 'STUB'
@@ -356,6 +357,7 @@ setup() { :; }
 run "a-first-install"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 first_install_says "systemctl --user enable --now cordelia"
+has_not "enable-linger"
 private
 has_not "could be read, written or entered by others"
 
@@ -675,6 +677,27 @@ check "the copy kept" "$(cat "$HOME_DIR/.cordelia/bin/cordelia.prev")" "the one 
 again "the-version-before-is-kept-at-a-second-run"
 expect "installed=$NEW running=none restart=not-needed" 0 0
 check "the copy kept after a second run" "$(cat "$HOME_DIR/.cordelia/bin/cordelia.prev")" "the one before"
+# The first run added Cordelia to PATH in the shell's file, and this
+# shell's PATH still lacks it: the closing words say so again.
+has "Open a new terminal first if 'cordelia' is not found."
+
+# Where this shell's PATH has the directory already, nothing is said of
+# a new terminal.
+setup() { :; }
+run "a-first-install-with-cordelia-on-path" \
+    PATH="$WORK/home-a-first-install-with-cordelia-on-path/.cordelia/bin:$STUBS:$PATH"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+has "Next steps:"
+has_not "Open a new terminal"
+has_not "to PATH in"
+
+# A user who does not linger is told how to keep the node running after
+# logout: they must act, or the service stops when they log out.
+setup() { touch "$HOME/.fake/no_linger"; }
+run "a-first-install-of-a-user-who-does-not-linger"
+expect "installed=$NEW running=none restart=not-needed" 0 0
+has "Note: run 'sudo loginctl enable-linger $(whoami)' to keep
+the service running after logout."
 
 # A data directory that an earlier run left open to others, and the
 # configuration file in it, are set to their owner's alone: with a node
