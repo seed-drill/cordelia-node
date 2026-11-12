@@ -560,8 +560,8 @@ fn the_shared_commands_say_what_this_record_says() {
     assert_eq!(
         crate::shared_anew::not_clean_line("review-with-alice"),
         says(
-            "\"<name>\" is not clean: after a removal, each shared channel is made anew once \
-             on this device before it sends there. Run cordelia shared reset <name>",
+            "\"<name>\" has not been reset on this device since you removed a device, so this \
+             device sends nothing there until you reset it: cordelia shared reset <name>",
             &["review-with-alice", "review-with-alice"]
         )
     );

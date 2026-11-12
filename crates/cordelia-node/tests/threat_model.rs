@@ -1317,7 +1317,10 @@ async fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not(
     let moved_to = name_secret_of(&a, PROJECT);
     assert_ne!(channel_of(&left), channel_of(&moved_to));
     let said = at.done();
-    assert!(said.contains("this machine may be closed"), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
 
     // R hears that it was removed, and stops: what it writes now, its own
     // node refuses, and writes nowhere.
@@ -1476,7 +1479,7 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
     assert!(waiting.unwrap() >= 1, "{}", person_of(&a));
     let said = a.cli(&["devices"]);
     assert!(
-        said.contains("does not hold the latest change yet"),
+        said.contains("does not have the latest change to your devices yet"),
         "{said}"
     );
     let offered_while_refused = relay.pushes_of(&item);
@@ -1555,7 +1558,7 @@ fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
     let mut at = removes(&a, &r_key, &["stays"], &words);
     at.says("The change is made (change 2)");
     let said = at.done();
-    assert!(said.contains("holds the change"), "{said}");
+    assert!(said.contains("has the change"), "{said}");
     assert!(said.contains("has not applied the change yet"), "{said}");
     // The relay loses everything it held.
     relay.stop();

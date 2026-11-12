@@ -187,7 +187,7 @@ fn a_members_view_says_the_list_its_members_and_who_it_hands_the_channel_to() {
         lines(&view),
         [(
             "handing".to_string(),
-            "Handing review to carol-laptop: waiting for that device to take it.".to_string(),
+            "Sharing review with carol-laptop: waiting for that device to receive it.".to_string(),
             false
         )]
     );
@@ -691,8 +691,8 @@ fn a_member_says_why_it_hands_nothing_over() {
         lines(&view_now(&s, now + 1)),
         [(
             "offer_read".to_string(),
-            "review was made anew by alice-laptop: nothing is handed over until the list names \
-             the new channel."
+            "review was reset by alice-laptop: this device shares it with no one new until the \
+             list names the new channel."
                 .to_string(),
             false
         )]
@@ -727,7 +727,9 @@ fn a_member_whose_channel_is_not_reached_says_so() {
         lines(&views[0]),
         [(
             "not_reached".to_string(),
-            "review is not reached at its relays: nothing is handed over until then.".to_string(),
+            "review is not reached at its relays: this device shares it with no one new until \
+             then."
+                .to_string(),
             false
         )]
     );
@@ -751,8 +753,8 @@ fn rule_1s_gate_is_amber_on_a_member() {
     let list = list_named(&channel.id, &[carol.public_key()], &devices);
     follows_at(&s, &list, &commit('a'), now);
     reads(&s, &list, &commit('a'), now + 1);
-    let gate = "carol-laptop is on the list of review but was left out of it: delete its line in \
-                a pull request, or wait for that device to write in the channel";
+    let gate = "carol-laptop is on the list of review but was left out of the channel: delete its \
+                line in a pull request, or wait for that device to write in the channel";
     assert_eq!(
         lines(&view_now(&s, now + 1)),
         [("left_out".to_string(), gate.to_string(), true)]
@@ -837,8 +839,8 @@ fn the_notices_are_amber_and_seen_clears_the_new_keys_and_the_changed_line_alone
                 "New on the list of review at {}: dave-laptop",
                 short_of('b')
             ),
-            "carol-laptop is no longer on the list of review: make it anew with cordelia shared \
-             reset review"
+            "carol-laptop is no longer on the list of review, but can still read new messages \
+             there. To stop that: cordelia shared reset review"
                 .to_string(),
         ]
     );
@@ -871,11 +873,11 @@ fn the_notices_are_amber_and_seen_clears_the_new_keys_and_the_changed_line_alone
         seen_on(&s, "notes").unwrap(),
         [
             format!(
-                "Cleared: New on the list of notes at {}: dave-laptop",
+                "Marked seen: New on the list of notes at {}: dave-laptop",
                 short_of('b')
             ),
             format!(
-                "Cleared: The list of {REPOSITORY} names a new channel for notes at {}.",
+                "Marked seen: The list of {REPOSITORY} names a new channel for notes at {}.",
                 short_of('c')
             ),
             DROPPED_STAYS.to_string(),
@@ -893,7 +895,7 @@ fn the_notices_are_amber_and_seen_clears_the_new_keys_and_the_changed_line_alone
     // By its identity too; and a second time, nothing is left to clear.
     assert_eq!(
         seen_on(&s, REPOSITORY).unwrap()[0],
-        "Nothing to clear for example.org/team/project on this device."
+        "Nothing to mark seen for example.org/team/project on this device."
     );
 }
 
@@ -959,12 +961,15 @@ fn the_keys_new_at_a_commit_are_one_line_by_label() {
     // and none of these.
     assert_eq!(
         seen_key(&s, "review", "m2"),
-        ["Nothing to clear for m2 in review on this device."]
+        ["Nothing to mark seen for m2 in review on this device."]
     );
     assert_eq!(ambers(&view_now(&s, now + 2)), [eight.clone(), one.clone()]);
     assert_eq!(
         seen_on(&s, "review").unwrap(),
-        [format!("Cleared: {eight}"), format!("Cleared: {one}")]
+        [
+            format!("Marked seen: {eight}"),
+            format!("Marked seen: {one}")
+        ]
     );
     assert!(ambers(&view_now(&s, now + 3)).is_empty());
     reads(&s, &ten, &commit('d'), now + 4);
@@ -1087,8 +1092,8 @@ fn a_making_anew_here_shows_its_line_and_then_each_key_left_out_the_line_does_no
         lines(&view),
         [(
             "put_the_line".to_string(),
-            "review was made anew here: put its new channel line in .cordelia/members, in a pull \
-             request"
+            "review was reset on this device: put its new channel line in .cordelia/members, in a \
+             pull request"
                 .to_string(),
             true
         )]
@@ -1119,7 +1124,7 @@ fn a_making_anew_here_shows_its_line_and_then_each_key_left_out_the_line_does_no
     // new on the list (rule 4.5), and he is handed the channel.
     let back = list_of_line_at(&new.id, &[carol.public_key()], &[devices[0], devices[2]]);
     reads(&s, &back, &commit('c'), now + 7);
-    let gone_amiss = "dave-laptop was left out of review, and its channel line does not say so: \
+    let gone_amiss = "dave-laptop was left out of review, but its channel line does not say so: \
                       add it after without, or delete its line";
     let new_on =
         |c: char, label: &str| format!("New on the list of review at {}: {label}", short_of(c));
@@ -1157,19 +1162,19 @@ fn a_making_anew_here_shows_its_line_and_then_each_key_left_out_the_line_does_no
     assert_eq!(
         seen_on(&s, "review").unwrap(),
         [
-            format!("Cleared: {}", new_on('c', "dave-laptop")),
-            format!("Cleared: {}", new_on('d', "carol-laptop")),
+            format!("Marked seen: {}", new_on('c', "dave-laptop")),
+            format!("Marked seen: {}", new_on('d', "carol-laptop")),
             still_shown_line("dave-laptop", "review"),
         ]
     );
     assert_eq!(ambers(&view_now(&s, now + 11))[1..], [gone_amiss]);
     assert_eq!(
         seen_key(&s, "review", "carol-laptop"),
-        ["Nothing to clear for carol-laptop in review on this device."]
+        ["Nothing to mark seen for carol-laptop in review on this device."]
     );
     assert_eq!(
         seen_key(&s, "review", "dave-laptop"),
-        [format!("Cleared: {gone_amiss}")]
+        [format!("Marked seen: {gone_amiss}")]
     );
     assert_eq!(
         follows::made_lines(&s[0].conn).unwrap()[0].left_out,
@@ -1187,7 +1192,7 @@ fn a_making_anew_here_shows_its_line_and_then_each_key_left_out_the_line_does_no
     // out.
     assert_eq!(
         seen_on(&s, "review").unwrap(),
-        ["Nothing to clear for review on this device."]
+        ["Nothing to mark seen for review on this device."]
     );
     assert_eq!(
         follows::made_lines(&s[0].conn).unwrap()[0].left_out,
@@ -1284,7 +1289,7 @@ fn seen_clears_a_changed_line_and_never_a_key_left_out_which_its_label_clears() 
         seen_on(&s, "review").unwrap(),
         [
             format!(
-                "Cleared: The list of {REPOSITORY} names a new channel for review at {}.",
+                "Marked seen: The list of {REPOSITORY} names a new channel for review at {}.",
                 short_of('b')
             ),
             still_shown_line("carol-laptop", "review"),
@@ -1296,12 +1301,12 @@ fn seen_clears_a_changed_line_and_never_a_key_left_out_which_its_label_clears() 
     );
     assert_eq!(
         seen_key(&s, "review", "carol-laptop"),
-        [format!("Cleared: {not_said}")]
+        [format!("Marked seen: {not_said}")]
     );
     assert!(ambers(&view_now(&s, now + 5)).is_empty());
     assert_eq!(
         seen_key(&s, "review", "carol-laptop"),
-        ["Nothing to clear for carol-laptop in review on this device."]
+        ["Nothing to mark seen for carol-laptop in review on this device."]
     );
 }
 
@@ -1488,7 +1493,8 @@ fn a_making_anew_at_a_removal_shows_its_line_until_the_list_names_the_new_channe
         amber,
         [(
             "made_anew_at_removal".to_string(),
-            "review was made anew at a removal: put its new channel line in .cordelia/members"
+            "review was reset when you removed a device: put its new channel line in \
+             .cordelia/members"
                 .to_string(),
             true
         )]
@@ -1540,10 +1546,11 @@ fn the_record_says_each_line() {
     }
     // The table's line of a member who cannot, in its parts.
     for part in [
-        "not clean",
+        "has not been reset since you removed",
+        "To reset it: cordelia shared reset <name>",
         "not reached at its relays",
         "full",
-        "nothing is handed over until then.",
+        "this device shares it with no one new until then.",
     ] {
         assert!(RECORD.contains(part), "{part}");
     }

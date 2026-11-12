@@ -477,7 +477,8 @@ JSON output (`--json`):
 > - **Red,** in this order. Whatever sync is set to: this device has stopped
 >   (it was removed, or is in no list of the last change, or is closed: no
 >   change that lists it is clear of a removed device, which the line says
->   as "no change that lists this device is clear", or the change it
+>   as "a device you removed has the secret of each change that includes
+>   this device", or the change it
 >   follows has a secret that a removed device holds, decision 2026-10-24
 >   (removal), rule 10; or was answered with a change that it could not
 >   open or apply); the node
@@ -583,7 +584,7 @@ System channels (prefixed `__`) are hidden by default. Use `--all` to include th
 > (decision 2026-10-04 §2.5):
 >
 > ```
-> Storage:          <in use> in use of <allowed> allowed, by channels from their secrets (<n> held, <m> entries)
+> Storage:          <used> used of <allowed> allowed (<n> channels, <m> entries)
 > ```
 >
 > That is what the entries of the channels from their secrets are counted
@@ -1191,7 +1192,7 @@ database by mistake stops at its first write, with SQLite's words.
 > | `another node is running on the data directory ...` | A data directory is one node's: the node that runs holds the lock on it | Stop that node first, or give this one a directory of its own. Nothing was changed |
 > | `the database at ... is from a later version of Cordelia than this one` | The database was stepped by a later version | Install the later version again; or put back a copy of the data directory made before that upgrade |
 > | `This database is from a Cordelia before 0.2.0-alpha.19` | This version takes over only alpha.19's database (§10.5) | Install 0.2.0-alpha.19, start it once, then this version again; or start afresh, as the message says |
-> | `cordelia status` says `Held up:` | The database is from a later version, or from before 0.2.0-alpha.19 | As the two rows above |
+> | `cordelia status` says `Problem:   the node cannot go on:` | The database is from a later version, or from before 0.2.0-alpha.19 | As the two rows above |
 
 ### 11.2 No Peers Connecting
 

@@ -39,8 +39,8 @@
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{
-    MEMBERS_FILE_MAX_BYTES, SEALED_SECRET_BYTES, SHARED_MAX_DROPPED, SHARED_MAX_KEYS,
-    SHARED_OFFER_DELIVERED_SECS,
+    MEMBERS_FILE_MAX_BYTES, SEALED_SECRET_BYTES, SHARED_MAX_CHANNELS, SHARED_MAX_DROPPED,
+    SHARED_MAX_KEYS, SHARED_OFFER_DELIVERED_SECS,
 };
 use cordelia_crypto::acts::{Came, Filing};
 use cordelia_crypto::bech32::encode_public_key;
@@ -740,12 +740,28 @@ fn made_anew_line(name: &str, new: &[u8; 32], left: LeftOut) -> String {
 /// The line of a channel that a removal left not clean, since this device
 /// does not reach its relays (decision 2026-10-24, rules 24 and 25).
 pub fn unreached_line(name: &str) -> String {
+    unreached_named_line(name, &[])
+}
+
+/// [`unreached_line`], naming `devices`, the removed devices that still
+/// have the channel, each as [`crate::look::named_device`] names one
+/// (decision 2026-11-11 (plain words), rule 2).
+pub fn unreached_named_line(name: &str, devices: &[String]) -> String {
     let word = crate::shared_routes::shell_word(name);
-    format!(
-        "\"{}\" was held by a device that was removed, and is not reached from this device: make \
-         it anew with cordelia shared reset {word} on a device of yours that reaches its relays",
-        crate::messages::cleaned(name)
-    )
+    let shown = crate::messages::cleaned(name);
+    match devices.is_empty() {
+        true => format!(
+            "\"{shown}\" has not been reset since you removed a device, and this device cannot \
+             reach its relays: run cordelia shared reset {word} on a device of yours that reaches \
+             them"
+        ),
+        false => format!(
+            "\"{shown}\": {}, which you removed, can still read new messages there, and this \
+             device cannot reach its relays. To stop that, run cordelia shared reset {word} on a \
+             device of yours that reaches them",
+            crate::look::named_few(devices, devices.len(), "", "devices")
+        ),
+    }
 }
 
 /// Make each shared channel the person holds anew, as `shared anew` does,
@@ -871,8 +887,9 @@ pub fn made_anew_past_a_bound_line(name: &str, new: &[u8; 32], left: LeftOut) ->
 /// person's holds it to make it anew.
 pub fn unreached_past_a_bound_line(name: &str) -> String {
     format!(
-        "\"{}\" was past a bound and is not reached from this device, so it is not made anew: \
-         ask someone in it to make it anew without the device removed.",
+        "\"{}\" was pushed off your list of {SHARED_MAX_CHANNELS} shared channels, and this device \
+         cannot reach it, so it is not reset: ask someone in it to reset it without the device \
+         you removed.",
         crate::messages::cleaned(name)
     )
 }
@@ -883,8 +900,8 @@ pub fn unreached_past_a_bound_line(name: &str) -> String {
 /// cannot reach it.
 pub fn not_made_anew_past_a_bound_line(name: &str) -> String {
     format!(
-        "\"{}\" was past a bound and is not made anew: ask someone in it to make it anew \
-         without the device removed.",
+        "\"{}\" was pushed off your list of {SHARED_MAX_CHANNELS} shared channels, so it is not \
+         reset: ask someone in it to reset it without the device you removed.",
         crate::messages::cleaned(name)
     )
 }
@@ -2741,37 +2758,42 @@ pub(crate) fn notices(conn: &Connection) -> Result<Vec<Told>, PersonError> {
         let Some(row) = st(kept::channel(conn, &channel.channel))? else {
             continue;
         };
+        // Each names the removed devices that still have the channel, as
+        // the status's line of it does (decision 2026-11-11 (plain words),
+        // rule 2).
+        let devices = removed_at_named(conn, channel.since)?;
         told.push((
             notice_of_channel(&channel.channel, removed),
             "not_clean",
             match (row.state == State::NotInForce, channel.unreached) {
                 (true, true) => unreached_past_a_bound_line(&row.name),
                 (true, false) => not_made_anew_past_a_bound_line(&row.name),
-                (false, true) => unreached_line(&row.name),
-                (false, false) => not_clean_line(&row.name),
+                (false, true) => unreached_named_line(&row.name, &devices),
+                (false, false) => not_clean_named_line(&row.name, &devices),
             },
         ));
     }
     let removed = crate::look::removed_labels(conn)?;
     for named in acts_of_removed(conn)? {
-        let device = match removed.iter().find(|(key, _)| *key == named.maker) {
-            Some((_, label)) if !label.is_empty() => format!(
-                "\"{}\" ({})",
-                crate::messages::cleaned(label),
-                cordelia_crypto::fingerprint::shown(&named.maker)
-            ),
-            _ => format!("({})", cordelia_crypto::fingerprint::shown(&named.maker)),
-        };
-        told.push((
-            named.id,
-            "removed_act",
-            format!(
-                "the removed device {device} made this, still in force: {}",
-                named.line()
-            ),
-        ));
+        let label = removed
+            .iter()
+            .find(|(key, _)| *key == named.maker)
+            .map_or(String::new(), |(_, label)| crate::messages::cleaned(label));
+        let device =
+            crate::look::named_device(&label, &cordelia_crypto::fingerprint::shown(&named.maker));
+        told.push((named.id, "removed_act", removed_act_line(&device, &named)));
     }
     Ok(told)
+}
+
+/// The notice of an act of a removed device in force (§3.5): the device,
+/// named as [`crate::look::named_device`] names one, what it did, and what
+/// undoes it (decision 2026-11-11 (plain words), rule 2).
+pub fn removed_act_line(device: &str, named: &Named) -> String {
+    format!(
+        "{device}, which you removed, did this, and it still counts: {}",
+        named.line()
+    )
 }
 
 /// What this device made anew at the removal it applied at `applied_at`,
@@ -2851,14 +2873,60 @@ pub(crate) fn made_anew_past_a_bound(
 
 /// The line of a channel not yet clean (decision 2026-10-24, rules 23 and
 /// 25): true of every such channel, whether a removed device held it or
-/// it came to be held after the removal.
+/// it came to be held after the removal. This device sends nothing there
+/// until it is reset here.
 pub fn not_clean_line(name: &str) -> String {
+    not_clean_named_line(name, &[])
+}
+
+/// [`not_clean_line`], naming `devices`, the removed devices that still
+/// have the channel, each as [`crate::look::named_device`] names one: who
+/// can still read there, and the one command (decision 2026-11-11 (plain
+/// words), rules 2 and 3). The status says it so too, word for word.
+pub fn not_clean_named_line(name: &str, devices: &[String]) -> String {
     let word = crate::shared_routes::shell_word(name);
-    format!(
-        "\"{}\" is not clean: after a removal, each shared channel is made anew once on this \
-         device before it sends there. Run cordelia shared reset {word}",
-        crate::messages::cleaned(name)
-    )
+    let shown = crate::messages::cleaned(name);
+    match devices.is_empty() {
+        true => format!(
+            "\"{shown}\" has not been reset on this device since you removed a device, so this \
+             device sends nothing there until you reset it: cordelia shared reset {word}"
+        ),
+        false => format!(
+            "\"{shown}\": {}, which you removed, can still read new messages there, and this \
+             device sends nothing there until you reset it. To stop that: cordelia shared reset \
+             {word}",
+            crate::look::named_few(devices, devices.len(), "", "devices")
+        ),
+    }
+}
+
+/// The removed devices that still have `channel`, not yet clean on this
+/// device, by its mark ([`removed_at_named`]); none where it is clean.
+pub fn not_clean_named(conn: &Connection, channel: &[u8; 32]) -> Result<Vec<String>, PersonError> {
+    match st(rows::not_clean_of(conn, channel))? {
+        Some(mark) => removed_at_named(conn, mark.since),
+        None => Ok(Vec::new()),
+    }
+}
+
+/// The removed devices that a mark of a channel not yet clean, made at
+/// `since`, names: those the removal of that time removed, each by the
+/// name this device knew it by and its words
+/// ([`crate::look::named_device`]). None for a mark of no removal's time:
+/// a channel first held after it (issue #279).
+pub fn removed_at_named(conn: &Connection, since: i64) -> Result<Vec<String>, PersonError> {
+    let labels = crate::look::removed_labels(conn)?;
+    Ok(removed_at(conn, since)?
+        .unwrap_or_default()
+        .iter()
+        .map(|key| {
+            let label = labels
+                .iter()
+                .find(|(of, _)| of == key)
+                .map_or(String::new(), |(_, label)| crate::messages::cleaned(label));
+            crate::look::named_device(&label, &cordelia_crypto::fingerprint::shown(key))
+        })
+        .collect())
 }
 
 /// What a removal names of the shared channels before its yes: the names

@@ -696,9 +696,21 @@ fn a_channel_not_yet_clean_is_written_in_by_nobody() {
         removed_device_holds(&s, 1, now),
         serde_json::json!([["review"]])
     );
-    // `cordelia devices` names it.
+    // `cordelia devices` names it, with the removed device that still
+    // has it, by its words and name, and the command (decision 2026-11-11
+    // (plain words), rules 2 to 4).
     let seen = crate::look::look(conn, identity, &Default::default(), now).unwrap();
-    let line = not_clean_line("review");
+    let tablet =
+        crate::look::named_device("device 2", &cordelia_crypto::fingerprint::shown(&s.key(2)));
+    let line = not_clean_named_line("review", std::slice::from_ref(&tablet));
+    assert_eq!(
+        line,
+        format!(
+            "\"review\": {tablet}, which you removed, can still read new messages there, and \
+             this device sends nothing there until you reset it. To stop that: cordelia shared \
+             reset review"
+        )
+    );
     let notice = seen
         .notices
         .iter()
@@ -1513,6 +1525,8 @@ fn a_removal_leaves_a_channel_it_does_not_reach_not_clean() {
     }];
     let said = anew_at_removal(conn, identity, &elsewhere, now).unwrap();
     assert_eq!(said, vec![unreached_line("review")]);
+    let tablet =
+        crate::look::named_device("device 2", &cordelia_crypto::fingerprint::shown(&s.key(2)));
     assert!(is_not_clean(conn, &channel.id).unwrap());
     assert_eq!(sharing::filed(conn).unwrap()[0].channel, channel.id);
     assert!(
@@ -1529,14 +1543,15 @@ fn a_removal_leaves_a_channel_it_does_not_reach_not_clean() {
     assert!(
         seen.notices
             .iter()
-            .any(|notice| notice.says == unreached_line("review")),
+            .any(|notice| notice.says
+                == unreached_named_line("review", std::slice::from_ref(&tablet))),
         "{:?}",
         seen.notices
     );
-    assert!(unreached_line("review").ends_with(
-        "make it anew with cordelia shared reset review on a device of yours that reaches its \
-         relays"
-    ));
+    assert!(
+        unreached_line("review")
+            .ends_with("run cordelia shared reset review on a device of yours that reaches them")
+    );
 }
 
 /// The subscriptions a move moves do not fill the room of the old ones
@@ -1729,13 +1744,12 @@ fn a_notice_of_a_channel_not_clean_is_named_again_at_a_later_removal() {
     s.pass(0, 1);
     let now = s.now + 20;
     assert!(is_not_clean(&s[1].conn, &channel.id).unwrap());
-    let line = not_clean_line("review");
     let named = |s: &Several| {
         crate::look::look(&s[1].conn, &s[1].identity, &Default::default(), now)
             .unwrap()
             .notices
             .into_iter()
-            .find(|notice| notice.says == line)
+            .find(|notice| notice.kind == "not_clean" && notice.says.starts_with("\"review\""))
     };
     let notice = named(&s).unwrap();
     let id: [u8; 32] = hex::decode(&notice.id).unwrap().try_into().unwrap();

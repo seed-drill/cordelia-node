@@ -3789,7 +3789,10 @@ mod tests {
         held_rows::set_state(conn, State::Fork).unwrap();
         assert_eq!(
             said(Refused::NotApplied),
-            json!({ "why": "two changes were made apart" })
+            json!({
+                "why": "two changes to your devices were made separately, neither knowing of the \
+                        other"
+            })
         );
         assert_eq!(said(Refused::SyncOff), json!({}));
         let none = Several::new(1);

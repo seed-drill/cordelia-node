@@ -326,7 +326,10 @@ fn a_database_from_a_later_version_is_refused_by_the_node_and_by_each_command() 
         "memory not syncing: the database is from a later version",
     );
     let said = device.cli(&["status"]);
-    assert!(said.contains("Held up:   the database at"), "{said}");
+    assert!(
+        said.contains("Problem:   the node cannot go on: the database at"),
+        "{said}"
+    );
     for refused in [
         &["sync", "off"][..],
         &["sync", "claude"],

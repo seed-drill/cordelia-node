@@ -309,16 +309,21 @@ pub fn not_read_line(identity: &str, not: &NotRead) -> String {
 /// Rule 6's line of a member who cannot hand the channel over (rule 4.1),
 /// for `why`, but rule 1's gate, which is said by [`gate_line`].
 fn not_handing_line(why: &NotHanding, name: &str, list: &Members, identity: &str) -> String {
-    let until = "nothing is handed over until then.";
+    let until = "this device shares it with no one new until then.";
     match why {
         NotHanding::NoChannel => no_channel_line(identity),
         NotHanding::LeftOut(_) => String::new(),
-        NotHanding::NotHeld => format!("{name} is not held on this device: {until}"),
+        NotHanding::NotHeld => format!("{name} is not on this device: {until}"),
         NotHanding::MovedFrom => MOVED_FROM.into(),
-        NotHanding::NotClean => format!("{name} is not clean: {until}"),
+        NotHanding::NotClean(devices) => format!(
+            "{name} has not been reset since you removed {}: {until} To reset it: cordelia \
+             shared reset {}",
+            crate::look::named_few(devices, devices.len().max(1), "a device", "devices"),
+            shell_word(name)
+        ),
         NotHanding::MadeAnew { maker } => format!(
-            "{name} was made anew by {}: nothing is handed over until the list names the new \
-             channel.",
+            "{name} was reset by {}: this device shares it with no one new until the list names \
+             the new channel.",
             list.label_of(maker).unwrap_or("a device not on the list")
         ),
         NotHanding::NotReached => format!("{name} is not reached at its relays: {until}"),
@@ -330,15 +335,15 @@ fn not_handing_line(why: &NotHanding, name: &str, list: &Members, identity: &str
 /// names after `without`, and that is not in the channel.
 pub fn gate_line(label: &str, name: &str) -> String {
     format!(
-        "{label} is on the list of {name} but was left out of it: delete its line in a pull \
-         request, or wait for that device to write in the channel"
+        "{label} is on the list of {name} but was left out of the channel: delete its line in a \
+         pull request, or wait for that device to write in the channel"
     )
 }
 
 /// Rule 6's line of a member's node that handed the channel to `label`,
 /// which has not taken it yet.
 pub fn handing_line(name: &str, label: &str) -> String {
-    format!("Handing {name} to {label}: waiting for that device to take it.")
+    format!("Sharing {name} with {label}: waiting for that device to receive it.")
 }
 
 /// Rule 4.5's line, amber, until a person clears it: the keys new on the
@@ -361,7 +366,8 @@ pub fn joined_line(name: &str, commit: &str, labels: &[&str], shown: usize) -> S
 /// list names the channel made anew without it, or is listed again.
 pub fn dropped_line(label: &str, name: &str) -> String {
     format!(
-        "{label} is no longer on the list of {name}: make it anew with cordelia shared reset {}",
+        "{label} is no longer on the list of {name}, but can still read new messages there. To \
+         stop that: cordelia shared reset {}",
         shell_word(name)
     )
 }
@@ -381,11 +387,12 @@ pub fn line_changed_line(identity: &str, name: &str, commit: &str) -> String {
 pub fn put_the_line(name: &str, at_removal: bool) -> String {
     match at_removal {
         true => format!(
-            "{name} was made anew at a removal: put its new channel line in .cordelia/members"
+            "{name} was reset when you removed a device: put its new channel line in \
+             .cordelia/members"
         ),
         false => format!(
-            "{name} was made anew here: put its new channel line in .cordelia/members, in a pull \
-             request"
+            "{name} was reset on this device: put its new channel line in .cordelia/members, in a \
+             pull request"
         ),
     }
 }
@@ -394,7 +401,7 @@ pub fn put_the_line(name: &str, at_removal: bool) -> String {
 /// names, and that its channel line does not name after `without`.
 pub fn not_said_line(label: &str, name: &str) -> String {
     format!(
-        "{label} was left out of {name}, and its channel line does not say so: add it after \
+        "{label} was left out of {name}, but its channel line does not say so: add it after \
          without, or delete its line"
     )
 }
@@ -905,7 +912,7 @@ pub fn not_followed_line(name: &str) -> String {
 /// amber still shows: it is cleared on its own.
 pub fn still_shown_line(label: &str, name: &str) -> String {
     format!(
-        "Still shown: {}. If you brought it back on purpose, run cordelia shared seen {} {label}.",
+        "Still shown: {}. If you added it back on purpose, run cordelia shared seen {} {label}.",
         not_said_line(label, name),
         shell_word(name)
     )
@@ -913,8 +920,8 @@ pub fn still_shown_line(label: &str, name: &str) -> String {
 
 /// What `cordelia shared seen <name>` says where a key no longer on the
 /// list is still shown.
-pub const DROPPED_STAYS: &str = "A key no longer on the list stays shown until the list names \
-                                 the channel made anew without it.";
+pub const DROPPED_STAYS: &str = "A device no longer on the list stays shown until the list \
+                                 names the new channel, reset without it.";
 
 /// `cordelia shared seen <name>`, and with `label`, `cordelia shared seen
 /// <name> <label>` (rules 4.5, 5 and 6), in one write, for each repository
@@ -1001,12 +1008,12 @@ pub fn seen(
     }
     let mut said: Vec<String> = cleared
         .iter()
-        .map(|line| format!("Cleared: {line}"))
+        .map(|line| format!("Marked seen: {line}"))
         .collect();
     if said.is_empty() {
         said.push(match label {
-            Some(label) => format!("Nothing to clear for {label} in {shown} on this device."),
-            None => format!("Nothing to clear for {shown} on this device."),
+            Some(label) => format!("Nothing to mark seen for {label} in {shown} on this device."),
+            None => format!("Nothing to mark seen for {shown} on this device."),
         });
     }
     said.extend(still);

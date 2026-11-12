@@ -783,7 +783,7 @@ fn channels_names_no_command_that_does_not_exist() {
     let relay = node("relay", "relay", None);
     let said = relay.cli(&["channels"]);
     let lines: Vec<&str> = said.lines().collect();
-    assert_eq!(lines, ["Channels:  0 held"], "{said}");
+    assert_eq!(lines, ["Channels:  0 stored"], "{said}");
     assert!(!said.contains("subscribe"), "{said}");
 }
 
@@ -2212,14 +2212,12 @@ fn claude_memory_syncs_between_two_machines() {
     // devices holds all the same (decision 2026-10-04 §10.1): the device
     // that was added, and that nobody has cleared, is amber on each of
     // the two, and the line says it.
-    for n in [&a, &b] {
+    let b_named = named_in_a_line(&b, "b");
+    for (n, added) in [(&a, Some(b_named.as_str())), (&b, None)] {
         let s = state(n);
         assert_eq!(s["state"], "off", "{s}");
         assert_eq!(s["level"], "amber", "{s}");
-        assert_eq!(
-            s["summary"], "memory: 1 device added, not yet cleared",
-            "{s}"
-        );
+        assert_eq!(s["summary"], added_says(added), "{s}");
         assert_eq!(s["holds"].as_array().unwrap().len(), 1, "{s}");
     }
     let s = state(&a);
@@ -2400,18 +2398,22 @@ fn claude_memory_syncs_between_two_machines() {
     // the last change, and nobody has cleared it: that is amber on each
     // device, with a mark of its own in the line and a class of its own
     // in the bar, and the state is as it was.
-    for n in [&a, &b] {
+    let b_named = named_in_a_line(&b, "b");
+    for (n, added) in [(&a, Some(b_named.as_str())), (&b, None)] {
         let s = state(n);
         assert_eq!(
             (&s["state"], &s["level"]),
             (&serde_json::json!("synced"), &serde_json::json!("amber"))
         );
-        assert_eq!(s["summary"], "memory: 1 device added, not yet cleared");
+        assert_eq!(s["summary"], added_says(added), "{s}");
         assert_eq!(s["holds"][0]["what"], "added", "{s}");
         assert_eq!(s["holds"].as_array().unwrap().len(), 1, "{s}");
     }
     let line = a.cli(&["status", "--line"]);
-    assert!(line.contains("◆ memory: 1 device added"), "{line}");
+    assert!(
+        line.contains(&format!("◆ memory: {b_named} was added")),
+        "{line}"
+    );
     let bar: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--waybar"])).unwrap();
     assert_eq!(
         bar["class"],
@@ -4082,8 +4084,10 @@ fn says_a_relay_lacks_the_change(node: &Node) -> bool {
         serde_json::from_str(&node.cli(&["status", "--json"])).unwrap_or_default();
     let holds = status["holds"].as_array().cloned().unwrap_or_default();
     holds.iter().any(|holds| {
-        holds["says"] == "memory: a relay not known to hold the latest change"
-            || holds["says"] == "memory: a relay out of reach, not known to hold the latest change"
+        holds["says"] == "memory: a relay may not have the latest change to your devices"
+            || holds["says"]
+                == "memory: a relay is out of reach and may not have the latest change to your \
+                    devices"
     })
 }
 

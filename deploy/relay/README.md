@@ -175,7 +175,7 @@ what the relay holds and how much it is used, as counts only:
 - the database size;
 - **the room it holds against its cap** (`Storage:`):
   ```
-  Storage:          3.0 MB in use of 16.0 MB allowed, by channels from their secrets (2 held, 1 entry)
+  Storage:          3.0 MB used of 16.0 MB allowed (2 channels, 1 entry)
   ```
   The line also says how many channels from their secrets the relay holds,
   and how many entries. With `--json` they are under `entries`:

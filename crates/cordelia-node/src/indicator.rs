@@ -153,14 +153,14 @@ impl Channel {
         };
         let other = self.by.iter().filter(|s| !s.this_device).find(filled);
         if let Some(other) = other {
-            let label = match other.label.is_empty() {
-                true => "a device",
-                false => other.label.as_str(),
-            };
+            // By the name you gave it, or by its words where you gave
+            // none: `remove-device` shows the words before its yes
+            // (decision 2026-11-11 (plain words), rule 4).
             return format!(
-                "memory: {label} ({}) has filled most of what your devices keep at a relay. If it \
-                 is not yours, or you no longer use it, remove it: cordelia remove-device {}",
-                other.words_of_key, other.key
+                "memory: {} has filled most of what your devices keep at a relay. If it is not \
+                 yours, or you no longer use it, remove it: cordelia remove-device {}",
+                device_named(&other.label, &other.words_of_key),
+                other.key
             );
         }
         if self.by.iter().filter(|s| s.this_device).any(|s| filled(&s)) {
@@ -195,6 +195,9 @@ pub struct Devices {
     /// in seconds, since this device applied it. `None` where none does,
     /// or where this device does not know since when.
     pub removal_not_applied_secs: Option<u64>,
+    /// The devices that removal removed, as a line names them
+    /// ([`device_named`]): empty where the node does not say which.
+    pub removed_named: Vec<String>,
     /// The device goes on with a head set aside (decision 2026-10-24
     /// (removal), rule 11): how long ago, in seconds, it set aside the
     /// newest. `None` where it sets none aside, or is closed.
@@ -202,6 +205,16 @@ pub struct Devices {
     /// How many devices were added since the last change and are not
     /// cleared.
     pub added_not_cleared: usize,
+    /// Those devices, but this one, as a line names them
+    /// ([`device_named`]), where the node names them: the line names them,
+    /// and not a count (decision 2026-11-11 (plain words), rule 2).
+    pub added_named: Vec<String>,
+    /// Whether this device is among them: it was added, and is told so.
+    pub added_this_device: bool,
+    /// What the node's look says first of where this device stands
+    /// (`short`), where it says: which way on a device that has stopped
+    /// has ([`stopped_says`]).
+    pub short: String,
     /// How many devices have said that they left.
     pub said_left: usize,
     /// Each relay that is not known to hold the latest change (decision
@@ -240,20 +253,43 @@ pub struct Devices {
     pub carried_to_go: usize,
     /// For how long the first of those has waited, in seconds.
     pub carried_to_go_secs: Option<u64>,
+    /// Those names, where the node gives them.
+    pub carried_named: Vec<String>,
     /// How long ago, in seconds, this device applied a statement that
     /// removed a key that held a shared channel which the person still
     /// holds and has not made anew and moved from, or dropped: a channel
     /// not yet clean (decision 2026-10-10 §9; decision 2026-10-24, rule
     /// 25). The latest such, where there are several. `None` where none.
     pub removed_holds_shared_secs: Option<u64>,
-    /// How many shared channels not yet clean the line names: those of a
-    /// removal applied within the seven days.
-    pub removed_holds_shared: usize,
+    /// The shared channels not yet clean that the status names, each with
+    /// the removed devices that still have it: those of a removal applied
+    /// within the seven days. The status says one line for each (decision
+    /// 2026-11-11 (plain words), rules 2 and 3).
+    pub removed_holds_shared: Vec<HeldShared>,
     /// What each amber line of a repository this device follows says
     /// (decision 2026-11-06 (joining), rules 4.5 to 4.7, 5 and 6): the
     /// joining record's ambers, by the person's ruling of 6 November.
     pub repository_ambers: Vec<String>,
 }
+
+/// A shared channel not yet clean, as the status names it: by its name,
+/// with each removed device that still has it, as a line names a device
+/// ([`device_named`]). No device where the node names none: the channel
+/// was first held after the removal (issue #279).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HeldShared {
+    pub channel: String,
+    pub devices: Vec<String>,
+}
+
+// A device in a line of the status, as every line of it names one: by
+// its fingerprint words, then the name you gave it, quoted, or by its
+// words alone where you gave none. A line names a device it tells of, a
+// removed one, one added or one that fills the room, always so: each is a
+// device you decide about, and its name may be another's (decision
+// 2026-11-11 (plain words), rule 4). And things a line names, a few and
+// then how many more (rule 2).
+pub use cordelia_api::look::{named_device as device_named, named_few};
 
 /// A relay that is not known to hold the latest change, as a status goes
 /// by it (decision 2026-10-19, rule 11).
@@ -312,15 +348,43 @@ pub fn without_memory(says: &str) -> &str {
 }
 
 /// What the line says of the one fact of a shared channel that sets a
-/// level (decision 2026-10-10 §9): `n` shared channels are not made anew
-/// on this device since a removal, each of which is made anew once
-/// (decision 2026-10-24, rule 23).
-pub fn removed_holds_shared_says(n: usize) -> String {
+/// level (decision 2026-10-10 §9), for one channel not reset on this
+/// device since a removal, each of which is made anew once (decision
+/// 2026-10-24, rule 23): which removed devices can still read there, that
+/// this device sends nothing there, and the one command (decision
+/// 2026-11-11 (plain words), rules 2 and 3). The words are the node's
+/// notice of the channel, word for word, which the plain status then says
+/// once. A channel first held after the removal names no device.
+pub fn removed_holds_shared_says(held: &HeldShared) -> String {
     format!(
-        "shared: {n} shared {} not made anew since a removal: make each anew once with cordelia \
-         shared reset <name>",
-        plural(n as u64, "channel")
+        "shared: {}",
+        cordelia_api::shared_anew::not_clean_named_line(&held.channel, &held.devices)
     )
+}
+
+/// The same, short, for the line where it is the summary (`--line`, and a
+/// panel's header): who can still read there, the first removed device
+/// and how many more, and the one command; that this device sends nothing
+/// there is said in the status and its notice.
+pub fn removed_holds_shared_summary(held: &HeldShared) -> String {
+    let shown = cordelia_api::messages::cleaned(&held.channel);
+    let word = cordelia_api::shared_routes::shell_word(&held.channel);
+    match held.devices.first() {
+        Some(first) => format!(
+            "shared: \"{shown}\": {}, which you removed, can still read new messages there. To \
+             stop that: cordelia shared reset {word}",
+            named_few(
+                std::slice::from_ref(first),
+                held.devices.len(),
+                "",
+                "devices"
+            )
+        ),
+        None => format!(
+            "shared: \"{shown}\" has not been reset since you removed a device. To reset it: \
+             cordelia shared reset {word}"
+        ),
+    }
 }
 
 /// The word of that hold, which the plain status says on a line of its
@@ -370,7 +434,9 @@ pub struct Shown {
     pub state: State,
     /// The gravest level that holds, or none.
     pub level: Option<Level>,
-    /// The first thing of that level; with no level, what the state says.
+    /// The first thing of that level, a shared channel's short
+    /// ([`removed_holds_shared_summary`]); with no level, what the state
+    /// says.
     pub summary: String,
     /// Everything that holds, red first, each list in its order.
     pub holds: Vec<Holds>,
@@ -425,18 +491,38 @@ fn stalled(f: &Facts) -> bool {
 }
 
 /// Why a device that has stopped syncs nothing, as the line says it:
-/// `stands` is where the node says it stands. `None` where it has not
-/// stopped.
-fn stopped_says(stands: &str) -> Option<&'static str> {
-    Some(match stands {
-        // Decision 2026-10-24 (removal), rule 10: closed, stored as a
-        // fork was.
-        "fork" => "memory not syncing: no change that lists this device is clear",
+/// `f.stands` is where the node says it stands, and the look's few words
+/// (`f.devices.short`) say which way on there is, as `cordelia devices`
+/// says it: `renew` where a device you removed has the secret, `settle`
+/// where changes were made separately, and none where this device itself
+/// was removed (`init --new-key`, which `Devices:` says). Where the look
+/// does not say, no command. `None` where it has not stopped.
+fn stopped_says(f: &Facts) -> Option<&'static str> {
+    use cordelia_api::look::{CLOSED_SHORT, REMOVED_AS_KNOWN_SHORT, short_why};
+    let short = f.devices.short.as_str();
+    let renew = "memory not syncing: a device you removed still has the secret this device uses; \
+                 run cordelia renew";
+    Some(match f.stands.as_str() {
+        // Decision 2026-10-24 (removal), rules 2, 4 and 10: closed, stored
+        // as a fork was, or applied under a change that is not clear.
+        "fork" | "closed" if short == REMOVED_AS_KNOWN_SHORT => {
+            "memory not syncing: this device was removed"
+        }
+        "fork" | "closed" if short == CLOSED_SHORT => renew,
+        "fork" if short == short_why(cordelia_storage::person::State::Fork) => {
+            "memory not syncing: two changes to your devices were made separately; run cordelia \
+             settle"
+        }
+        "fork" => {
+            "memory not syncing: a device you removed has the secret of each change that includes \
+             this device"
+        }
+        "closed" => {
+            "memory not syncing: a device you removed still has the secret this device uses"
+        }
         "removed" => "memory not syncing: this device was removed",
-        "not_listed" => "memory not syncing: not in the last change",
-        "not_opened" => "memory not syncing: a change could not be opened",
-        // Decision 2026-10-24 (removal), rule 10.
-        "closed" => "memory not syncing: a removed device holds this change's secret",
+        "not_listed" => "memory not syncing: not in the last change to your devices",
+        "not_opened" => "memory not syncing: a change to your devices could not be opened",
         _ => return None,
     })
 }
@@ -450,7 +536,7 @@ fn held_says(by: &str) -> &'static str {
         "earlier_database" => "memory not syncing: the database is from before 0.2.0-alpha.19",
         // Rule 9 of the same record.
         "step_failed" => "memory not syncing: a step of the database did not finish",
-        _ => "memory not syncing: the node is held up",
+        _ => "memory not syncing: the node cannot go on",
     }
 }
 
@@ -460,7 +546,8 @@ const NO_PHRASE_SAYS: &str = "memory stays here: no recovery phrase yet";
 
 /// What the line says of a device that was answered with a change that
 /// it could not apply.
-const NOT_APPLIED_SAYS: &str = "memory not syncing: a change could not be applied";
+const NOT_APPLIED_SAYS: &str =
+    "memory not syncing: a change to your devices could not be used here";
 
 /// Everything that holds, of the two lists, in their order: red first
 /// (decision 2026-10-04 §10.1). None before any level: on a device that
@@ -568,7 +655,7 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     // Whatever sync says: a device that has stopped, and a node that is
     // held up. Nothing here asks whether sync is on: a node that is held
     // up refuses the request that would say so.
-    if let Some(says) = stopped_says(&f.stands) {
+    if let Some(says) = stopped_says(f) {
         red("stopped", says.into());
     } else if f.devices.not_applied {
         red("stopped", NOT_APPLIED_SAYS.into());
@@ -629,9 +716,15 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
         if d.removal_not_applied_secs
             .is_some_and(|secs| secs <= REMOVAL_SHOWN_SECS)
         {
+            let removed = named_few(
+                &d.removed_named,
+                d.removed_named.len().max(1),
+                "a device",
+                "devices",
+            );
             amber(
                 "removal_not_applied",
-                "memory: a removal not yet applied by every device".into(),
+                format!("memory: not every device knows yet that you removed {removed}"),
             );
         }
         if d.set_aside_secs
@@ -639,7 +732,7 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
         {
             amber(
                 "set_aside",
-                "memory: a change made apart is set aside".into(),
+                "memory: a change to your devices was made separately, and put aside".into(),
             );
         }
         // The one fact of a shared channel that sets a level (decision
@@ -647,18 +740,37 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
         // shared channel that the person has not made anew, for seven days
         // from when this device applied the removal. A fact about the
         // person's own removal, and about nothing a shared channel holds.
-        if d.removed_holds_shared > 0
-            && d.removed_holds_shared_secs
-                .is_some_and(|secs| secs <= REMOVAL_SHOWN_SECS)
+        if d.removed_holds_shared_secs
+            .is_some_and(|secs| secs <= REMOVAL_SHOWN_SECS)
         {
-            amber(
-                "shared_removed_device_holds",
-                removed_holds_shared_says(d.removed_holds_shared),
-            );
+            for held in &d.removed_holds_shared {
+                amber(SHARED_HOLD, removed_holds_shared_says(held));
+            }
         }
-        if d.added_not_cleared > 0 {
-            let devices = count(d.added_not_cleared, "device");
-            amber("added", format!("memory: {devices} added, not yet cleared"));
+        // Said from this device's view: where it alone was added, that it
+        // was; else the others, by name.
+        let others =
+            d.added_not_cleared - usize::from(d.added_this_device).min(d.added_not_cleared);
+        if others > 0 {
+            let devices = named_few(&d.added_named, others, "a device", "devices");
+            let (was, them) = match others {
+                1 => ("was", "it"),
+                _ => ("were", "them"),
+            };
+            amber(
+                "added",
+                format!(
+                    "memory: {devices} {was} added. If you did not add {them}, remove {them}; if \
+                     you did, run cordelia devices --clear"
+                ),
+            );
+        } else if d.added_not_cleared > 0 {
+            amber(
+                "added",
+                "memory: this device was added to your devices. To mark that seen: cordelia \
+                 devices --clear"
+                    .into(),
+            );
         }
         match d.said_left {
             0 => {}
@@ -669,8 +781,11 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
         // not yet sent: no folder is mapped to those names, so nothing
         // of them turns on what sync says.
         if d.carried_to_go > 0 && d.carried_to_go_secs.as_ref().is_some_and(long) {
-            let names = count(d.carried_to_go, "name");
-            amber("carried", format!("memory: {names} carried, not yet sent"));
+            let names = named_few(&d.carried_named, d.carried_to_go, "1 name", "names");
+            amber(
+                "carried",
+                format!("memory: {names} copied over, not yet sent"),
+            );
         }
         // A relay that lacks the change, connected or not: nothing else
         // stands once the command that made the change has ended
@@ -693,20 +808,23 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
         // Each that is out of reach is said so (decision 2026-10-24, rule
         // 7): the count, its place and its days do not change.
         let out = lacking.iter().filter(|relay| relay.out_of_reach).count();
+        // Which relays, and how many, `cordelia devices` says (decision
+        // 2026-11-11 (plain words), rule 4).
         let said = match (lacking.len(), out) {
             (0, _) => None,
-            (1, 0) => Some("memory: a relay not known to hold the latest change".to_string()),
-            (n, 0) => Some(format!(
-                "memory: {n} relays not known to hold the latest change"
+            (1, 0) => Some(format!("memory: a relay may not have {LATEST}")),
+            (_, 0) => Some(format!("memory: some relays may not have {LATEST}")),
+            (1, _) => Some(format!(
+                "memory: a relay is out of reach and may not have {LATEST}"
             )),
-            (1, _) => Some(
-                "memory: a relay out of reach, not known to hold the latest change".to_string(),
-            ),
             (n, out) if out == n => Some(format!(
-                "memory: {n} relays out of reach, not known to hold the latest change"
+                "memory: some relays are out of reach and may not have {LATEST}"
             )),
-            (n, out) => Some(format!(
-                "memory: {n} relays not known to hold the latest change, {out} out of reach"
+            (_, 1) => Some(format!(
+                "memory: some relays may not have {LATEST}, and one of them is out of reach"
+            )),
+            (_, _) => Some(format!(
+                "memory: some relays may not have {LATEST}, and some of them are out of reach"
             )),
         };
         if let Some(said) = said {
@@ -736,6 +854,9 @@ pub fn holds(f: &Facts) -> Vec<Holds> {
     }
     out
 }
+
+/// What a relay may lack, as the lines of relays say it.
+const LATEST: &str = "the latest change to your devices";
 
 /// The hold of agents that wait for their person (decision 2026-10-25,
 /// rule 4).
@@ -777,10 +898,7 @@ fn folders_after(f: &Facts, out: &mut Vec<Holds>) {
     let not_sent = of_folders_to_go > 0 && d.to_go_secs.as_ref().is_some_and(long);
     if not_listed {
         let names = count(d.names_not_listed, "name");
-        amber(
-            "names",
-            format!("memory: {names} not yet listed by a device"),
-        );
+        amber("names", format!("memory: {names} synced by no device yet"));
     } else if not_sent {
         let names = count(of_folders_to_go, "name");
         amber("names", format!("memory: {names} not yet sent"));
@@ -850,7 +968,7 @@ pub fn shared(devices: &mut Devices, shared: &serde_json::Value, now: i64) {
         .filter_map(|line| line["says"].as_str().map(str::to_string))
         .collect();
     let mut latest: Option<u64> = None;
-    let mut named: Vec<&str> = Vec::new();
+    let mut named: Vec<HeldShared> = Vec::new();
     for holds in shared["removed_device_holds"]
         .as_array()
         .into_iter()
@@ -867,16 +985,41 @@ pub fn shared(devices: &mut Devices, shared: &serde_json::Value, now: i64) {
         if ago > REMOVAL_SHOWN_SECS {
             continue;
         }
+        // Each removed device alone, by the name the person gave it
+        // (decision 2026-11-11 (plain words), rule 2).
+        let devices: Vec<String> = holds["devices"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|device| {
+                device_named(
+                    device["label"].as_str().unwrap_or_default(),
+                    device["words"].as_str().unwrap_or_default(),
+                )
+            })
+            .collect();
         for channel in holds["channels"].as_array().into_iter().flatten() {
-            if let Some(channel) = channel.as_str()
-                && !named.contains(&channel)
-            {
-                named.push(channel);
+            let Some(channel) = channel.as_str() else {
+                continue;
+            };
+            // A channel named twice is said once, with each device.
+            match named.iter_mut().find(|held| held.channel == channel) {
+                Some(held) => {
+                    for device in &devices {
+                        if !held.devices.contains(device) {
+                            held.devices.push(device.clone());
+                        }
+                    }
+                }
+                None => named.push(HeldShared {
+                    channel: channel.to_string(),
+                    devices: devices.clone(),
+                }),
             }
         }
     }
     devices.removed_holds_shared_secs = latest;
-    devices.removed_holds_shared = named.len();
+    devices.removed_holds_shared = named;
 }
 
 /// What `cordelia status` shows (see the module's documentation): the
@@ -888,10 +1031,21 @@ pub fn shown(f: &Facts) -> Shown {
     let holds = holds(f);
     let first = |level: Level| holds.iter().find(|holds| holds.level == level);
     let gravest = first(Level::Red).or_else(|| first(Level::Amber));
+    // The hold of a shared channel is said short there: the first of
+    // them is of the first channel (decision 2026-11-11 (plain words)).
+    let summary = match gravest {
+        Some(holds) if is_shared(holds) => f
+            .devices
+            .removed_holds_shared
+            .first()
+            .map_or_else(|| holds.says.clone(), removed_holds_shared_summary),
+        Some(holds) => holds.says.clone(),
+        None => of_the_state,
+    };
     Shown {
         state,
         level: gravest.map(|holds| holds.level),
-        summary: gravest.map_or(of_the_state, |holds| holds.says.clone()),
+        summary,
         holds,
     }
 }
@@ -964,7 +1118,7 @@ pub fn derive(f: &Facts) -> (State, String) {
     // is in a fork, or was answered with a change that it could not open
     // or apply. It is one of the person's devices whatever it syncs, and
     // is never said to be synced, or resting.
-    if let Some(says) = stopped_says(&f.stands) {
+    if let Some(says) = stopped_says(f) {
         return (Attention, says.into());
     }
     if f.devices.not_applied {
@@ -1173,22 +1327,23 @@ mod tests {
         (
             &|f| f.stands = "not_listed".into(),
             "stopped",
-            "memory not syncing: not in the last change",
+            "memory not syncing: not in the last change to your devices",
         ),
         (
             &|f| f.stands = "fork".into(),
             "stopped",
-            "memory not syncing: no change that lists this device is clear",
+            "memory not syncing: a device you removed has the secret of each change that \
+             includes this device",
         ),
         (
             &|f| f.stands = "not_opened".into(),
             "stopped",
-            "memory not syncing: a change could not be opened",
+            "memory not syncing: a change to your devices could not be opened",
         ),
         (
             &|f| f.devices.not_applied = true,
             "stopped",
-            "memory not syncing: a change could not be applied",
+            "memory not syncing: a change to your devices could not be used here",
         ),
         (
             &|f| f.held = Some("earlier_database".into()),
@@ -1240,12 +1395,13 @@ mod tests {
         (
             &|f| f.devices.removal_not_applied_secs = Some(3_600),
             "removal_not_applied",
-            "memory: a removal not yet applied by every device",
+            "memory: not every device knows yet that you removed a device",
         ),
         (
             &|f| f.devices.added_not_cleared = 1,
             "added",
-            "memory: 1 device added, not yet cleared",
+            "memory: a device was added. If you did not add it, remove it; if you did, run \
+             cordelia devices --clear",
         ),
         (
             &|f| f.devices.said_left = 1,
@@ -1259,12 +1415,12 @@ mod tests {
                 f.devices.carried_to_go_secs = Some(400);
             },
             "carried",
-            "memory: 1 name carried, not yet sent",
+            "memory: 1 name copied over, not yet sent",
         ),
         (
             &|f| f.devices.not_known_to_hold = lacking_for(&[10, 400]),
             "relay_without_latest",
-            "memory: a relay not known to hold the latest change",
+            "memory: a relay may not have the latest change to your devices",
         ),
         (
             &|f| f.devices.no_room_secs = vec![30],
@@ -1277,7 +1433,7 @@ mod tests {
                 f.devices.applied_secs = Some(400);
             },
             "names",
-            "memory: 2 names not yet listed by a device",
+            "memory: 2 names synced by no device yet",
         ),
         (
             &|f| {
@@ -1377,9 +1533,10 @@ mod tests {
         assert_eq!(
             says,
             [
-                "memory: 3 devices added, not yet cleared",
+                "memory: 3 devices were added. If you did not add them, remove them; if you did, \
+                 run cordelia devices --clear",
                 "memory: 2 devices have left",
-                "memory: 2 relays not known to hold the latest change",
+                "memory: some relays may not have the latest change to your devices",
             ]
         );
     }
@@ -1457,7 +1614,7 @@ mod tests {
         assert_eq!(
             says[says.len() - 2..],
             [
-                "memory: 2 names not yet listed by a device",
+                "memory: 2 names synced by no device yet",
                 "memory: a relay out of reach for 7 minutes"
             ]
         );
@@ -1467,9 +1624,9 @@ mod tests {
 
     /// The four forms of the warning, word for word (decision 2026-10-19
     /// §2, rule 4).
-    const ANOTHER_FILLED: &str = "memory: laptop (able bake cold dune) has filled most of what \
-        your devices keep at a relay. If it is not yours, or you no longer use it, remove it: \
-        cordelia remove-device cordelia1laptopkey";
+    const ANOTHER_FILLED: &str = "memory: (able bake cold dune) \"laptop\" has filled most of \
+        what your devices keep at a relay. If it is not yours, or you no longer use it, remove \
+        it: cordelia remove-device cordelia1laptopkey";
     const THIS_FILLED: &str = "memory: this device has filled most of what your devices keep \
         at a relay. If you no longer use it, remove it from another of your devices.";
     const NAMES_FILL: &str = "memory: you sync nearly as many names as a relay can keep for \
@@ -1627,13 +1784,25 @@ mod tests {
         let neither = channel_of(8_000 * WORD - WORD, 4_000 * WORD, 4_000 * WORD);
         assert!(2 * neither.words < neither.total);
         assert_eq!(neither.warning(), NEARLY_FULL);
-        // A device with no label is named by the words of its key.
+        // A device with no name from you is named by the words of its
+        // key; one with a name, by its words and then its name, quoted, as
+        // no words can be forged in it (decision 2026-11-11 (plain words),
+        // rule 4): `remove-device` asks of it.
         let mut no_label = another.clone();
         no_label.by[1].label.clear();
         assert!(
             no_label
                 .warning()
-                .starts_with("memory: a device (able bake cold dune) has")
+                .starts_with("memory: the device (able bake cold dune) has")
+        );
+        let mut forged = another.clone();
+        forged.by[1].label = "x\" (acid baby cage dart".into();
+        assert!(
+            forged
+                .warning()
+                .starts_with("memory: (able bake cold dune) \"x\\\" (acid baby cage dart\" has"),
+            "{}",
+            forged.warning()
         );
         // And the status says it.
         let shown = with(&|f| f.channel = Some(another.clone()));
@@ -1902,7 +2071,8 @@ mod tests {
             (
                 State::Off,
                 Some(Level::Amber),
-                "memory: 1 device added, not yet cleared"
+                "memory: a device was added. If you did not add it, remove it; if you did, run \
+                 cordelia devices --clear"
             )
         );
         // Sync off with errors, conflicts and no relay:
@@ -1926,7 +2096,7 @@ mod tests {
     /// first.
     #[test]
     fn a_device_that_could_not_apply_a_change_is_attention_and_not_synced() {
-        let says = "memory not syncing: a change could not be applied";
+        let says = "memory not syncing: a change to your devices could not be used here";
         let not_applied = |edit: &dyn Fn(&mut Facts)| {
             let mut f = synced();
             f.devices.not_applied = true;
@@ -1951,7 +2121,8 @@ mod tests {
         );
         assert_eq!(
             not_applied(&|f| f.stands = "fork".into()).1,
-            "memory not syncing: no change that lists this device is clear"
+            "memory not syncing: a device you removed has the secret of each change that \
+             includes this device"
         );
         assert_eq!(
             not_applied(&|f| f.held = Some("earlier_database".into())).1,
@@ -2314,7 +2485,7 @@ mod tests {
         assert_eq!(
             says,
             [
-                "memory: 2 names carried, not yet sent",
+                "memory: 2 names copied over, not yet sent",
                 "memory: 1 name not yet sent"
             ]
         );
@@ -2344,7 +2515,10 @@ mod tests {
         assert_eq!(set_aside(7 * day + 1), None);
         let aside = with(&|f| f.devices.set_aside_secs = Some(60));
         assert_eq!(whats(&aside), ["set_aside"]);
-        assert_eq!(aside.summary, "memory: a change made apart is set aside");
+        assert_eq!(
+            aside.summary,
+            "memory: a change to your devices was made separately, and put aside"
+        );
         // After a removal not yet applied by every device, and before a
         // device added since.
         let three = with(&|f| {
@@ -2632,15 +2806,53 @@ mod tests {
             )
         );
         for (stopped, says) in [
-            ("fork", "no change that lists this device is clear"),
+            (
+                "fork",
+                "a device you removed has the secret of each change that includes this device",
+            ),
             ("removed", "this device was removed"),
-            ("not_listed", "not in the last change"),
-            ("not_opened", "a change could not be opened"),
-            ("closed", "a removed device holds this change's secret"),
+            ("not_listed", "not in the last change to your devices"),
+            ("not_opened", "a change to your devices could not be opened"),
+            (
+                "closed",
+                "a device you removed still has the secret this device uses",
+            ),
         ] {
             assert_eq!(
                 stands(stopped),
                 (State::Attention, format!("memory not syncing: {says}"))
+            );
+        }
+        // The way on, by what the look says first (`short`), as `Devices:`
+        // says it: none where this device itself was removed.
+        use cordelia_api::look::{CLOSED_SHORT, REMOVED_AS_KNOWN_SHORT, short_why};
+        let fork = short_why(cordelia_storage::person::State::Fork);
+        for (stopped, short, says) in [
+            (
+                "closed",
+                CLOSED_SHORT,
+                "a device you removed still has the secret this device uses; run cordelia renew",
+            ),
+            ("closed", REMOVED_AS_KNOWN_SHORT, "this device was removed"),
+            (
+                "fork",
+                CLOSED_SHORT,
+                "a device you removed still has the secret this device uses; run cordelia renew",
+            ),
+            ("fork", REMOVED_AS_KNOWN_SHORT, "this device was removed"),
+            (
+                "fork",
+                fork,
+                "two changes to your devices were made separately; run cordelia settle",
+            ),
+        ] {
+            let mut f = synced();
+            f.stands = stopped.into();
+            f.devices.short = short.into();
+            assert_eq!(
+                state(&f),
+                (State::Attention, format!("memory not syncing: {says}")),
+                "{stopped} {short}"
             );
         }
         // With sync off, a device with no phrase is off, and still
@@ -2705,7 +2917,7 @@ mod tests {
             held("something that a later node says", &|_| {}),
             (
                 State::Attention,
-                "memory not syncing: the node is held up".into()
+                "memory not syncing: the node cannot go on".into()
             )
         );
         // A node that is not running, or was not asked, says that first.
@@ -2969,7 +3181,7 @@ mod tests {
         let mut edits: Vec<Edit> = RED.iter().map(|(edit, _, _)| *edit).collect();
         edits.extend(AMBER.iter().map(|(edit, _, _)| *edit));
         let shared: Edit = &|f| {
-            f.devices.removed_holds_shared = 1;
+            f.devices.removed_holds_shared = vec![HeldShared::default()];
             f.devices.removed_holds_shared_secs = Some(60);
         };
         edits.push(shared);
@@ -3024,7 +3236,7 @@ mod tests {
             .collect()
     }
 
-    const NOT_KNOWN: &str = "memory: a relay not known to hold the latest change";
+    const NOT_KNOWN: &str = "memory: a relay may not have the latest change to your devices";
 
     /// A relay that lacks the change for more than five minutes.
     fn lacking(f: &mut Facts) {
@@ -3086,7 +3298,7 @@ mod tests {
         });
         assert_eq!(
             two.summary,
-            "memory: 2 relays not known to hold the latest change"
+            "memory: some relays may not have the latest change to your devices"
         );
     }
 
@@ -3167,7 +3379,7 @@ mod tests {
         assert_eq!(
             details,
             [
-                "To know: a relay not known to hold the latest change",
+                "To know: a relay may not have the latest change to your devices",
                 "To know: a relay has no room",
             ]
         );
@@ -3260,20 +3472,22 @@ mod tests {
         };
         assert_eq!(
             with_relays(&[true, true]).summary,
-            "memory: 2 relays out of reach, not known to hold the latest change"
+            "memory: some relays are out of reach and may not have the latest change to your \
+             devices"
         );
         assert_eq!(
             with_relays(&[true, false]).summary,
-            "memory: 2 relays not known to hold the latest change, 1 out of reach"
+            "memory: some relays may not have the latest change to your devices, and one of them \
+             is out of reach"
         );
         assert_eq!(
             with_relays(&[true]).summary,
-            "memory: a relay out of reach, not known to hold the latest change"
+            "memory: a relay is out of reach and may not have the latest change to your devices"
         );
         assert_eq!(with_relays(&[false]).summary, NOT_KNOWN);
         assert_eq!(
             with_relays(&[false, false]).summary,
-            "memory: 2 relays not known to hold the latest change"
+            "memory: some relays may not have the latest change to your devices"
         );
         // Not before five minutes, out of reach or not.
         let soon = with(&|f| {
@@ -3292,7 +3506,7 @@ mod tests {
         });
         assert_eq!(
             both.summary,
-            "memory: a relay out of reach, not known to hold the latest change"
+            "memory: a relay is out of reach and may not have the latest change to your devices"
         );
         assert_eq!(whats(&both), ["relay_without_latest", "relay_out_of_reach"]);
         assert_eq!(
@@ -3514,13 +3728,22 @@ mod tests {
     /// of the removed key still in force, with no channel held, is not amber.
     /// It holds with sync off and with nothing mapped, as every fact of the
     /// person's devices does, and not on a device that follows no phrase.
+    /// Each channel is a line of its own, which names the channel and each
+    /// removed device by the name you gave it, or by its words where you
+    /// gave none, and gives the one command (decision 2026-11-11 (plain
+    /// words), rules 2 and 3).
     #[test]
     fn a_removed_device_that_holds_a_shared_channel_makes_the_line_amber_for_seven_days() {
         let now = 2_000_000_000;
         let day = 24 * 60 * 60;
+        let tablet = serde_json::json!({ "key": "k1", "label": "tablet", "words": "a b c d" });
+        let phone = serde_json::json!({ "key": "k2", "label": "phone", "words": "e f g h" });
         let holding = |days: i64, channels: &[&str]| {
             shared_at_its_worst(serde_json::json!([
-                { "device": "tablet", "channels": channels, "since": before(now, days * day) },
+                {
+                    "device": "\"tablet\" (a b c d)", "devices": [tablet],
+                    "channels": channels, "since": before(now, days * day),
+                },
             ]))
         };
         let with_shared = |shared: &serde_json::Value, edit: Edit| {
@@ -3529,29 +3752,75 @@ mod tests {
             super::shared(&mut f.devices, shared, now);
             shown(&f)
         };
+        // It says that the device was removed, by its words and name: a
+        // device of yours may have its name (decision 2026-11-11 (plain
+        // words), rule 4).
+        let review = "shared: \"review\": (a b c d) \"tablet\", which you removed, can still read \
+                      new messages there, and this device sends nothing there until you reset \
+                      it. To stop that: cordelia shared reset review";
         let six = with_shared(&holding(6, &["review", "design"]), &|_| {});
         assert_eq!(six.level, Some(Level::Amber));
-        assert_eq!(whats(&six), [SHARED_HOLD]);
-        assert_eq!(
-            six.summary,
-            "shared: 2 shared channels not made anew since a removal: make \
-             each anew once with cordelia shared reset <name>"
-        );
+        assert_eq!(whats(&six), [SHARED_HOLD, SHARED_HOLD]);
+        assert_eq!(six.holds[0].says, review);
+        // The line where it is the summary says it short: the first
+        // device and how many more, and the command.
+        let short = "shared: \"review\": (a b c d) \"tablet\", which you removed, can still read \
+                     new messages there. To stop that: cordelia shared reset review";
+        assert_eq!(six.summary, short);
+        assert!(six.summary.chars().count() < 160, "{}", six.summary);
+        assert_eq!(six.holds[1].says, review.replace("review", "design"));
         let one = with_shared(&holding(6, &["review"]), &|_| {});
-        assert_eq!(
-            one.summary,
-            "shared: 1 shared channel not made anew since a removal: make \
-             each anew once with cordelia shared reset <name>"
-        );
-        // A channel named by two removals counts once.
+        assert_eq!(one.summary, short);
+        assert_eq!(one.holds[0].says, review);
+        assert_eq!(whats(&one), [SHARED_HOLD]);
+        // A channel named by two removals is one line, which names each
+        // device.
         let twice = with_shared(
             &shared_at_its_worst(serde_json::json!([
-                { "device": "tablet", "channels": ["review"], "since": before(now, 2 * day) },
-                { "device": "phone", "channels": ["review"], "since": before(now, day) },
+                { "devices": [tablet], "channels": ["review"], "since": before(now, 2 * day) },
+                { "devices": [phone], "channels": ["review"], "since": before(now, day) },
             ])),
             &|_| {},
         );
-        assert_eq!(twice.summary, one.summary);
+        assert_eq!(whats(&twice), [SHARED_HOLD]);
+        assert_eq!(
+            twice.summary,
+            short.replace("\"tablet\"", "\"tablet\" and 1 more")
+        );
+        assert_eq!(
+            twice.holds[0].says,
+            review.replace(
+                "(a b c d) \"tablet\"",
+                "(a b c d) \"tablet\" and (e f g h) \"phone\""
+            )
+        );
+        // A device with no name from you is named by its words; a channel
+        // first held after the removal names none, and this device writes
+        // nothing there until it is reset; a name the shell would read is
+        // quoted in the command.
+        let unnamed = serde_json::json!({ "key": "k3", "label": "", "words": "i j k l" });
+        let others = with_shared(
+            &shared_at_its_worst(serde_json::json!([
+                { "devices": [unnamed], "channels": ["design review"], "since": before(now, day) },
+                { "devices": [], "channels": ["later"], "since": before(now, day / 2) },
+            ])),
+            &|_| {},
+        );
+        assert_eq!(
+            others
+                .holds
+                .iter()
+                .map(|holds| holds.says.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "shared: \"design review\": the device (i j k l), which you removed, can still \
+                 read new messages there, and this device sends nothing there until you reset \
+                 it. To stop that: cordelia shared reset 'design review'",
+                "shared: \"later\" has not been reset on this device since you removed a device, \
+                 so this device sends nothing there until you reset it: cordelia shared reset \
+                 later",
+            ]
+        );
         // Of eight days, it is in `cordelia devices` only.
         let eight = with_shared(&holding(8, &["review"]), &|_| {});
         assert_eq!((eight.level, eight.holds.len()), (None, 0));
@@ -3560,7 +3829,10 @@ mod tests {
         // facts.
         for (days, amber) in [(6, true), (8, false)] {
             let shown = with(&|f| {
-                f.devices.removed_holds_shared = 1;
+                f.devices.removed_holds_shared = vec![HeldShared {
+                    channel: "review".into(),
+                    devices: vec![device_named("tablet", "a b c d")],
+                }];
                 f.devices.removed_holds_shared_secs = Some(days * day as u64);
             });
             assert_eq!(whats(&shown).contains(&SHARED_HOLD), amber, "{days} days");
@@ -3572,15 +3844,12 @@ mod tests {
         assert_eq!((none.level, none.holds.len()), (None, 0));
         // Of two removals, the channels of the one within the seven days.
         let two = shared_at_its_worst(serde_json::json!([
-            { "device": "phone", "channels": ["old"], "since": before(now, 9 * day) },
-            { "device": "tablet", "channels": ["review"], "since": before(now, day) },
+            { "devices": [phone], "channels": ["old"], "since": before(now, 9 * day) },
+            { "devices": [tablet], "channels": ["review"], "since": before(now, day) },
         ]));
         let two = with_shared(&two, &|_| {});
-        assert!(
-            two.summary.contains("1 shared channel not made anew"),
-            "{}",
-            two.summary
-        );
+        assert_eq!(two.summary, short);
+        assert_eq!(whats(&two), [SHARED_HOLD]);
         // With sync off, and with nothing mapped: still amber.
         for edit in [(&|f: &mut Facts| f.sync_enabled = false) as Edit, &|f| {
             f.mapped = 0;
@@ -3603,9 +3872,8 @@ mod tests {
         assert_eq!(whats(&both), ["removal_not_applied", SHARED_HOLD, "added"]);
         // The plain status says it on a line of its own, without its word.
         assert_eq!(
-            without_shared(&six.summary),
-            "2 shared channels not made anew since a removal: make each anew once with cordelia \
-             shared reset <name>"
+            without_shared(&six.holds[0].says),
+            review.strip_prefix("shared: ").unwrap()
         );
         assert!(is_shared(&six.holds[0]));
     }

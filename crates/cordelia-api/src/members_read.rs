@@ -506,7 +506,9 @@ pub enum NotHanding {
     /// The person moved from it, to a channel made anew.
     MovedFrom,
     /// A removal came, and it was not made anew: it is not clean here.
-    NotClean,
+    /// The removed devices that still have it, each named as a line names
+    /// one ([`crate::shared_anew::not_clean_named`]).
+    NotClean(Vec<String>),
     /// An offer read there, by `maker`, made it anew: one that seals to
     /// this person, or one "without you". Only a fault does not count.
     MadeAnew { maker: [u8; 32] },
@@ -524,7 +526,7 @@ impl NotHanding {
             NotHanding::LeftOut(_) => "left_out",
             NotHanding::NotHeld => "not_held",
             NotHanding::MovedFrom => "moved",
-            NotHanding::NotClean => "not_clean",
+            NotHanding::NotClean(_) => "not_clean",
             NotHanding::MadeAnew { .. } => "offer_read",
             NotHanding::NotReached => "not_reached",
             NotHanding::Full => "channel_full",
@@ -594,7 +596,9 @@ pub(crate) fn acts_in_with<'a>(
         return Ok(Err(NotHanding::NotHeld));
     };
     if crate::shared_anew::is_not_clean(conn, &line.channel)? {
-        return Ok(Err(NotHanding::NotClean));
+        return Ok(Err(NotHanding::NotClean(
+            crate::shared_anew::not_clean_named(conn, &line.channel)?,
+        )));
     }
     // Any offer read there that is no fault made the channel anew, an
     // offer "without you" too: a device left out hands a newcomer nothing
