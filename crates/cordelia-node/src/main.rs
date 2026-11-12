@@ -9063,12 +9063,19 @@ mod tests {
         };
         f.devices.removed_holds_shared = vec![held("design-review")];
         f.devices.removed_holds_shared_secs = Some(3_600);
-        let line = indicator::shown(&f).summary;
+        let shown = indicator::shown(&f);
+        let line = shown.holds[0].says.clone();
         assert_eq!(
             line,
             "shared: \"design-review\": (a b c d) \"old laptop\", which you removed, can still \
              read new messages there, and this device sends nothing there until you reset it. To \
              stop that: cordelia shared reset design-review"
+        );
+        // The summary (`--line`) says it short.
+        assert_eq!(
+            shown.summary,
+            "shared: \"design-review\": (a b c d) \"old laptop\", which you removed, can still \
+             read new messages there. To stop that: cordelia shared reset design-review"
         );
         let (memory, shared) = memory_and_shared(&f);
         assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
@@ -9797,8 +9804,18 @@ mod tests {
             said.iter()
                 .filter(|line| line.contains(not_clean.as_str()))
                 .count(),
-            // The `Shared:` line, the status line and the tooltip.
-            3,
+            // The `Shared:` line and the tooltip; the status line says it
+            // short, under 160 characters for one device.
+            2,
+            "{said:#?}"
+        );
+        let summary = indicator::shown(&held).summary;
+        assert!(
+            summary.chars().count() < 160 && !summary.contains("sends nothing"),
+            "{summary}"
+        );
+        assert!(
+            said.iter().any(|line| line.ends_with(summary.as_str())),
             "{said:#?}"
         );
         assert!(

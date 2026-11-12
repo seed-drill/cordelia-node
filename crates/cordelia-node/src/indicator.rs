@@ -362,6 +362,31 @@ pub fn removed_holds_shared_says(held: &HeldShared) -> String {
     )
 }
 
+/// The same, short, for the line where it is the summary (`--line`, and a
+/// panel's header): who can still read there, the first removed device
+/// and how many more, and the one command; that this device sends nothing
+/// there is said in the status and its notice.
+pub fn removed_holds_shared_summary(held: &HeldShared) -> String {
+    let shown = cordelia_api::messages::cleaned(&held.channel);
+    let word = cordelia_api::shared_routes::shell_word(&held.channel);
+    match held.devices.first() {
+        Some(first) => format!(
+            "shared: \"{shown}\": {}, which you removed, can still read new messages there. To \
+             stop that: cordelia shared reset {word}",
+            named_few(
+                std::slice::from_ref(first),
+                held.devices.len(),
+                "",
+                "devices"
+            )
+        ),
+        None => format!(
+            "shared: \"{shown}\" has not been reset since you removed a device. To reset it: \
+             cordelia shared reset {word}"
+        ),
+    }
+}
+
 /// The word of that hold, which the plain status says on a line of its
 /// own, `Shared:`, and not under `Memory:` (decision 2026-10-10 §9; the
 /// words of a change, rule 5).
@@ -409,7 +434,9 @@ pub struct Shown {
     pub state: State,
     /// The gravest level that holds, or none.
     pub level: Option<Level>,
-    /// The first thing of that level; with no level, what the state says.
+    /// The first thing of that level, a shared channel's short
+    /// ([`removed_holds_shared_summary`]); with no level, what the state
+    /// says.
     pub summary: String,
     /// Everything that holds, red first, each list in its order.
     pub holds: Vec<Holds>,
@@ -1004,10 +1031,21 @@ pub fn shown(f: &Facts) -> Shown {
     let holds = holds(f);
     let first = |level: Level| holds.iter().find(|holds| holds.level == level);
     let gravest = first(Level::Red).or_else(|| first(Level::Amber));
+    // The hold of a shared channel is said short there: the first of
+    // them is of the first channel (decision 2026-11-11 (plain words)).
+    let summary = match gravest {
+        Some(holds) if is_shared(holds) => f
+            .devices
+            .removed_holds_shared
+            .first()
+            .map_or_else(|| holds.says.clone(), removed_holds_shared_summary),
+        Some(holds) => holds.says.clone(),
+        None => of_the_state,
+    };
     Shown {
         state,
         level: gravest.map(|holds| holds.level),
-        summary: gravest.map_or(of_the_state, |holds| holds.says.clone()),
+        summary,
         holds,
     }
 }
@@ -3723,10 +3761,17 @@ mod tests {
         let six = with_shared(&holding(6, &["review", "design"]), &|_| {});
         assert_eq!(six.level, Some(Level::Amber));
         assert_eq!(whats(&six), [SHARED_HOLD, SHARED_HOLD]);
-        assert_eq!(six.summary, review);
+        assert_eq!(six.holds[0].says, review);
+        // The line where it is the summary says it short: the first
+        // device and how many more, and the command.
+        let short = "shared: \"review\": (a b c d) \"tablet\", which you removed, can still read \
+                     new messages there. To stop that: cordelia shared reset review";
+        assert_eq!(six.summary, short);
+        assert!(six.summary.chars().count() < 160, "{}", six.summary);
         assert_eq!(six.holds[1].says, review.replace("review", "design"));
         let one = with_shared(&holding(6, &["review"]), &|_| {});
-        assert_eq!(one.summary, review);
+        assert_eq!(one.summary, short);
+        assert_eq!(one.holds[0].says, review);
         assert_eq!(whats(&one), [SHARED_HOLD]);
         // A channel named by two removals is one line, which names each
         // device.
@@ -3740,6 +3785,10 @@ mod tests {
         assert_eq!(whats(&twice), [SHARED_HOLD]);
         assert_eq!(
             twice.summary,
+            short.replace("\"tablet\"", "\"tablet\" and 1 more")
+        );
+        assert_eq!(
+            twice.holds[0].says,
             review.replace(
                 "(a b c d) \"tablet\"",
                 "(a b c d) \"tablet\" and (e f g h) \"phone\""
@@ -3799,7 +3848,7 @@ mod tests {
             { "devices": [tablet], "channels": ["review"], "since": before(now, day) },
         ]));
         let two = with_shared(&two, &|_| {});
-        assert_eq!(two.summary, review);
+        assert_eq!(two.summary, short);
         assert_eq!(whats(&two), [SHARED_HOLD]);
         // With sync off, and with nothing mapped: still amber.
         for edit in [(&|f: &mut Facts| f.sync_enabled = false) as Edit, &|f| {
@@ -3823,7 +3872,7 @@ mod tests {
         assert_eq!(whats(&both), ["removal_not_applied", SHARED_HOLD, "added"]);
         // The plain status says it on a line of its own, without its word.
         assert_eq!(
-            without_shared(&six.summary),
+            without_shared(&six.holds[0].says),
             review.strip_prefix("shared: ").unwrap()
         );
         assert!(is_shared(&six.holds[0]));
