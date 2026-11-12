@@ -2602,6 +2602,41 @@ mod tests {
         );
     }
 
+    /// A look names the keys that the change removed and the statement
+    /// before had not, each as `removed` shows it (decision 2026-11-11
+    /// (plain words), slice 0): on the device that made the change and on
+    /// one that applies it; none at a renewal; the later removal's key
+    /// alone, not every key removed so far; and none where an earlier
+    /// version kept only that a key was removed.
+    #[test]
+    fn a_look_names_the_keys_the_change_removed() {
+        use crate::look::Shown;
+        let mut s = Several::of_one_person(3);
+        let seen = |s: &Several, n: usize| {
+            look(&s[n].conn, &s[n].identity, &AtRelays::default(), 0).unwrap()
+        };
+        let shown = |s: &Several, n: usize| Shown::of(&s.key(n), &format!("device {n}")).unwrap();
+        assert!(seen(&s, 0).newly_removed.is_empty());
+        let removal = s.change(0, &[0, 1], &[2]);
+        assert_eq!(seen(&s, 0).newly_removed, [shown(&s, 2)]);
+        let now = s.tick();
+        take(&s[1].conn, &s[1].identity, &removal, now).unwrap();
+        assert_eq!(seen(&s, 1).newly_removed, [shown(&s, 2)]);
+        // A renewal removes nobody.
+        s.change(0, &[0, 1], &[]);
+        assert!(seen(&s, 0).newly_removed.is_empty());
+        // A later removal: its own key alone.
+        s.change(0, &[0], &[1]);
+        let later = seen(&s, 0);
+        assert_eq!(later.removed.len(), 2);
+        assert_eq!(later.newly_removed, [shown(&s, 1)]);
+        // What an earlier version kept: that a key was removed, not which.
+        meta::set(&s[0].conn, meta::PERSON_REMOVED_A_KEY, "1").unwrap();
+        let earlier = seen(&s, 0);
+        assert!(earlier.removed_a_key);
+        assert!(earlier.newly_removed.is_empty());
+    }
+
     /// A device that applies a removal after it was behind sees the key
     /// removed against the statement it held (decision 2026-10-04 §10.1):
     /// where it comes to a renewal that was made after a removal it never

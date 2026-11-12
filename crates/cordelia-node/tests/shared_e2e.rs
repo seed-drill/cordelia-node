@@ -635,6 +635,8 @@ fn a_shared_channel_lives_only_at_its_relays_that_are_your_own() {
     wait_for("Alice holds Bob's key", &all, 300, || {
         (channel_of(&alice, "review")?["keys"] == 1).then_some(())
     });
+    // By `anew`, the hidden alias of `shared reset`, which works as before
+    // (decision 2026-11-11 (plain words) §3).
     let mut at = alice.at_terminal(&["shared", "anew", "review", "--relay", &at_two]);
     at.says(LABEL_FIRST)
         .says("Does (")
@@ -1721,12 +1723,12 @@ const LABEL_FIRST: &str = "A key you label is listed first, before keys you have
 const PUT_THE_LINE: &str = "If this channel follows a repository's list, put this line in place \
                             of its channel line, in a pull request:";
 
-/// `cordelia shared anew <name>` on `n`, at a terminal: it lists every key
+/// `cordelia shared reset <name>` on `n`, at a terminal: it lists every key
 /// first; each key it asks about is answered as `answers` says of the key
 /// the question names, after typing each of `again` first, which must each
 /// be asked again; then its yes. What it said.
 fn makes_anew(n: &Node, name: &str, answers: &[(String, &str)], again: &[&str]) -> String {
-    let mut at = n.at_terminal(&["shared", "anew", name]);
+    let mut at = n.at_terminal(&["shared", "reset", name]);
     at.says(LABEL_FIRST);
     let questions: Vec<String> = answers
         .iter()
@@ -2421,7 +2423,7 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     );
     at.says("The wait has ended.").says(
         "\"review\" was held by a device that was removed, and is not reached from this \
-         device: make it anew with cordelia shared anew review on a device of yours that \
+         device: make it anew with cordelia shared reset review on a device of yours that \
          reaches its relays",
     );
     drop(at);
@@ -2463,7 +2465,7 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     assert!(
         err.contains(
             "\"review\" is not clean: after a removal, each shared channel is made anew once \
-             on this device before it sends there. Run cordelia shared anew review"
+             on this device before it sends there. Run cordelia shared reset review"
         ),
         "{err}"
     );
@@ -2531,7 +2533,7 @@ fn removed_device_holds_review(n: &Node, removed: &str, named: Named) {
     assert!(
         plain.contains(
             "  Shared:    1 shared channel not made anew since a removal: make \
-             each anew once with cordelia shared anew <name>"
+             each anew once with cordelia shared reset <name>"
         ),
         "{plain}"
     );

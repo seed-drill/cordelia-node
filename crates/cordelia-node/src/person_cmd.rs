@@ -1978,7 +1978,7 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
         lines.push(format!(
             "\nThese shared channels are not reached from this device, so they are not made anew \
              in this change: {}. Your devices send nothing in each until you make it anew with \
-             cordelia shared anew <name> on a device of yours that reaches its relays.",
+             cordelia shared reset <name> on a device of yours that reaches its relays.",
             names.join(", ")
         ));
     }

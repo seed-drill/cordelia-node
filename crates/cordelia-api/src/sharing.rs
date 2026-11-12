@@ -940,7 +940,7 @@ pub(crate) fn may_share(
             "channel_full",
             format!(
                 "\"{name}\" shows 64 keys on this device, which is the most: make it anew without \
-                 some (cordelia shared anew)."
+                 some (cordelia shared reset)."
             ),
         );
     }

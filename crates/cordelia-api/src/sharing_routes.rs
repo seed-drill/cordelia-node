@@ -224,9 +224,14 @@ pub async fn accept(
         |conn, own, now| sharing::accept_plan(conn, identity, own, &body.key, &body.name, now),
         |conn, _, typed, now| {
             let until = sharing::type_for_a_channel(conn, typed, now)?;
+            // The name the person gave the key, empty where none, for a
+            // line that names it (decision 2026-11-11 (plain words), rule
+            // 2).
+            let label = sharing::label_given(conn, &typed.key)?.unwrap_or_default();
             Ok(json!({
                 "key": encode_public_key(&typed.key)?,
                 "words": sharing::six_words(&typed.key),
+                "label": label,
                 "typed_at": now,
                 "until": until,
             }))

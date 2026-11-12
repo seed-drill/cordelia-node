@@ -718,23 +718,30 @@ enum SharedCommand {
         #[arg(long, value_name = "FOUR WORDS")]
         words: Option<String>,
     },
-    /// Make a shared channel anew, choosing who stays, key by key
+    /// Reset a shared channel: make a new channel, and choose who stays,
+    /// device by device. It is what `cordelia renew` does for your own
+    /// channels.
     ///
-    /// Run it in a terminal. It lists every key this device has held or
-    /// refused in the channel, and asks of each whether it stays. Those
-    /// who stay move with `cordelia shared move` on one of their devices.
+    /// Run it in a terminal. It lists every device this device knows in
+    /// the channel, those refused for lack of room among them, and asks of
+    /// each whether it stays. Those who stay move with `cordelia shared
+    /// move` on one of their devices.
     ///
-    /// It prints the new channel line, which names the keys it left out.
-    /// If the channel is a repository's, put that line in place of the
+    /// It prints the new channel line, which names the devices it left
+    /// out. If the channel is a repository's, put that line in place of the
     /// old one in `.cordelia/members`, in a pull request.
+    // `anew`, its name before, stays a hidden alias, working as before. It
+    // goes only once no version in use lacks `reset` (decision 2026-11-11
+    // (plain words) §3).
+    #[command(name = "reset", alias = "anew")]
     Anew {
         name: String,
         /// A relay of yours for the new channel, as your configuration
         /// names it (host:port); with none, the old channel's
         #[arg(long = "relay", value_name = "RELAY")]
         relays: Vec<String>,
-        /// The channel's four words, where two shared channels of yours
-        /// have one name
+        /// The channel's four fingerprint words, to tell apart two shared
+        /// channels of yours with one name
         #[arg(long, value_name = "FOUR WORDS")]
         words: Option<String>,
     },
@@ -8980,7 +8987,7 @@ mod tests {
         assert_eq!(
             line,
             "shared: 1 shared channel not made anew since a removal: make \
-             each anew once with cordelia shared anew <name>"
+             each anew once with cordelia shared reset <name>"
         );
         let (memory, shared) = memory_and_shared(&f);
         assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
@@ -8988,7 +8995,7 @@ mod tests {
         assert_eq!(
             shared_line(&shared.unwrap().says),
             "  Shared:    1 shared channel not made anew since a removal: make \
-             each anew once with cordelia shared anew <name>"
+             each anew once with cordelia shared reset <name>"
         );
         // Beside another amber hold: that one is under `Memory:`.
         f.devices.said_left = 1;
@@ -9311,6 +9318,53 @@ mod tests {
         assert!(
             log.contains("A device of yours on an older version does not hear of it."),
             "{log}"
+        );
+    }
+
+    /// `cordelia shared reset` resets a shared channel, and `anew`, its
+    /// name before, is a hidden alias that works as before (decision
+    /// 2026-11-11 (plain words) §3): both run the one command, and the
+    /// help lists `reset` alone.
+    #[test]
+    fn shared_reset_is_the_command_and_anew_its_hidden_alias() {
+        use clap::CommandFactory;
+        for typed in ["reset", "anew"] {
+            let line = ["cordelia", "shared", typed, "review", "--relay", "a:1"];
+            match super::Cli::try_parse_from(line).map(|cli| cli.command) {
+                Ok(Some(super::Commands::Shared {
+                    what:
+                        super::SharedCommand::Anew {
+                            name,
+                            relays,
+                            words,
+                        },
+                })) => assert_eq!(
+                    (name.as_str(), relays, words),
+                    ("review", vec!["a:1".to_string()], None),
+                    "{typed}"
+                ),
+                Ok(_) => panic!("{typed} is not shared reset"),
+                Err(e) => panic!("{typed}: {e}"),
+            }
+        }
+        let mut cli = Cli::command();
+        let shared = cli
+            .find_subcommand_mut("shared")
+            .expect("shared is a command");
+        let help = shared.render_long_help().to_string();
+        let listed = |command: &str| {
+            help.lines()
+                .any(|line| line.trim_start().starts_with(&format!("{command} ")))
+        };
+        assert!(listed("reset") && !listed("anew"), "{help}");
+        let reset = shared
+            .find_subcommand_mut("reset")
+            .expect("shared reset is a command")
+            .render_long_help()
+            .to_string();
+        assert!(
+            reset.starts_with("Reset a shared channel: make a new channel, and choose who stays"),
+            "{reset}"
         );
     }
 

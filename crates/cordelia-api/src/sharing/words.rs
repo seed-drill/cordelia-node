@@ -561,7 +561,7 @@ fn the_shared_commands_say_what_this_record_says() {
         crate::shared_anew::not_clean_line("review-with-alice"),
         says(
             "\"<name>\" is not clean: after a removal, each shared channel is made anew once \
-             on this device before it sends there. Run cordelia shared anew <name>",
+             on this device before it sends there. Run cordelia shared reset <name>",
             &["review-with-alice", "review-with-alice"]
         )
     );

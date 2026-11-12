@@ -262,6 +262,11 @@ pub struct Notice {
     /// `added`, `left` or `left_out`.
     pub kind: &'static str,
     pub says: String,
+    /// The device an `added` notice says was added: its key, the label
+    /// its record of addition gives it, and its words, for a line that
+    /// names it (decision 2026-11-11 (plain words), rule 2). `None` for
+    /// every other kind.
+    pub device: Option<Shown>,
 }
 
 /// A key that a person typed at `cordelia accept`.
@@ -422,6 +427,12 @@ pub struct Look {
     pub devices: Vec<Listed>,
     pub added: Vec<AddedSince>,
     pub removed: Vec<Shown>,
+    /// Of `removed`, the keys that the statement applied removed and the
+    /// one this device held before it did not: those `removed_a_key` says
+    /// there are, for a line that names them (decision 2026-11-11 (plain
+    /// words), rule 2). Empty where it removed none, or where this device
+    /// applied it before it kept which (a value `1` of an earlier version).
+    pub newly_removed: Vec<Shown>,
     pub left_out: Vec<LeftOutKey>,
     /// The first head the device sets aside, as `cordelia settle` joins
     /// it: the highest number (decision 2026-10-24 (removal), rule 1).
@@ -558,6 +569,7 @@ pub fn look(
             devices: Vec::new(),
             added: Vec::new(),
             removed: Vec::new(),
+            newly_removed: Vec::new(),
             left_out: Vec::new(),
             apart: None,
             set_aside: Vec::new(),
@@ -650,7 +662,11 @@ fn of_its_person(
     // It left the generation before when it applied this one.
     let left = held_rows::secrets(conn)?;
     look.applied_at = left.iter().filter_map(|secret| secret.left_at).max();
-    look.removed_a_key = meta::get(conn, meta::PERSON_REMOVED_A_KEY)?.is_some();
+    let removed_a_key = meta::get(conn, meta::PERSON_REMOVED_A_KEY)?;
+    look.removed_a_key = removed_a_key.is_some();
+    let newly: Vec<String> = removed_a_key
+        .and_then(|keys| serde_json::from_str(&keys).ok())
+        .unwrap_or_default();
     look.latest = Some(hex::encode(followed_entry(conn)?.id()));
     look.moved = crate::person::moves_made(conn)?;
     look.phrase_words = Some(fingerprint::shown(&held.following.phrase_key));
@@ -678,8 +694,11 @@ fn of_its_person(
     let labels = removed_labels(conn)?;
     for key in &statement.removed {
         let label = labels.iter().find(|(known, _)| known == key);
-        look.removed
-            .push(Shown::of(key, label.map_or("", |(_, label)| label))?);
+        let shown = Shown::of(key, label.map_or("", |(_, label)| label))?;
+        if newly.contains(&hex::encode(key)) {
+            look.newly_removed.push(shown.clone());
+        }
+        look.removed.push(shown);
     }
 
     // Those added since: for each key that the statement does not list,
@@ -1208,13 +1227,21 @@ pub(crate) fn note_not_shown(conn: &Connection, keys: &[[u8; 32]]) -> Result<(),
 
 /// Keep whether the statement that this device has just applied removes
 /// a key that the statement before did not, for a status to go by
-/// (decision 2026-10-04 §10.1). What was kept at the statement before is
-/// replaced.
-pub(crate) fn note_removed_a_key(conn: &Connection, removes: bool) -> Result<(), PersonError> {
-    match removes {
-        true => meta::set(conn, meta::PERSON_REMOVED_A_KEY, "1")?,
-        false => meta::remove(conn, meta::PERSON_REMOVED_A_KEY)?,
+/// (decision 2026-10-04 §10.1): `removed`, those keys, kept in hex for a
+/// line that names them (decision 2026-11-11 (plain words), rule 2). What
+/// was kept at the statement before is replaced.
+pub(crate) fn note_removed_a_key(
+    conn: &Connection,
+    removed: &[[u8; 32]],
+) -> Result<(), PersonError> {
+    if removed.is_empty() {
+        meta::remove(conn, meta::PERSON_REMOVED_A_KEY)?;
+        return Ok(());
     }
+    let keys: Vec<String> = removed.iter().map(hex::encode).collect();
+    let keys = serde_json::to_string(&keys)
+        .map_err(|e| PersonError::Held(format!("the keys a change removed: {e}")))?;
+    meta::set(conn, meta::PERSON_REMOVED_A_KEY, &keys)?;
     Ok(())
 }
 
@@ -1518,6 +1545,7 @@ fn told(
             id: hex::encode(id),
             kind,
             says,
+            device: None,
         },
         id,
         left_out,
@@ -1529,15 +1557,14 @@ fn told(
     for record in kept.iter().filter(|record| !statement.lists(&record.key)) {
         let read = SignedAddition::from_bytes(&record.record)?.addition;
         let by = Shown::of(&record.adder, &reader.label(&record.adder))?;
+        let added = Shown::of(&record.key, &read.device.label)?;
         let says = match record.key == own {
             true => format!("this device was added from {}", by.named()),
-            false => format!(
-                "new device: {}, added from {}",
-                Shown::of(&record.key, &read.device.label)?.named(),
-                by.named()
-            ),
+            false => format!("new device: {}, added from {}", added.named(), by.named()),
         };
-        all.push(tell(added_notice(&record.record), "added", says, None));
+        let mut told = tell(added_notice(&record.record), "added", says, None);
+        told.notice.device = Some(added);
+        all.push(told);
     }
     // Each device that has said it left (§5.2): of the statement, or
     // added since.
@@ -2338,6 +2365,17 @@ mod tests {
             format!("this device was added from ({}) \"device 0\"", words(0))
         );
         assert!(seen(&s, 2).says.contains(&seen(&s, 2).notices[1].says));
+        // Each notice gives the device it says was added, alone (decision
+        // 2026-11-11 (plain words), slice 0): on the device that added it,
+        // and on the new device, of itself.
+        let device = |n: usize| Some(Shown::of(&s.key(n), &format!("device {n}")).unwrap());
+        let devices: Vec<Option<Shown>> = seen(&s, 0)
+            .notices
+            .into_iter()
+            .map(|notice| notice.device)
+            .collect();
+        assert_eq!(devices, [device(1), device(2)]);
+        assert_eq!(seen(&s, 1).notices[0].device, device(1));
 
         // Cleared on device 0, it is shown there no more, and on every
         // other device still.
@@ -2514,6 +2552,8 @@ mod tests {
         assert_eq!(look.left_out[0].words, fingerprint::shown(&s.key(2)));
         assert_eq!(look.left_out[0].number, 2);
         assert_eq!(kinds(&look), ["left_out"]);
+        // Only an `added` notice gives a device.
+        assert_eq!(look.notices[0].device, None);
         assert_eq!(
             look.notices[0].says,
             format!(
@@ -2596,6 +2636,7 @@ mod tests {
             give(&mut s, n, &word);
             let look = seen(&s, n);
             assert_eq!(kinds(&look), ["left"], "{n}");
+            assert_eq!(look.notices[0].device, None, "{n}");
             assert!(look.devices[2].left);
             assert!(!look.devices[1].left);
             assert_eq!(

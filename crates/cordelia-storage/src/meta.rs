@@ -59,7 +59,9 @@ pub const PERSON_EDITS_SET_ASIDE: &str = "person.edits_set_aside";
 /// that the statement it held before did not (decision 2026-10-04
 /// §10.1), as the device found it at the moment it applied the
 /// statement: a renewal removes nobody, though its list of removed keys
-/// names every key removed so far. Written at each statement applied.
+/// names every key removed so far. Written at each statement applied. Its
+/// value is the JSON array of those keys in hex (decision 2026-11-11
+/// (plain words), slice 0); `1`, an earlier version's, names none.
 pub const PERSON_REMOVED_A_KEY: &str = "person.removed_a_key";
 
 /// JSON array of the names that this device holds by a carry that a
