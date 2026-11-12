@@ -971,11 +971,16 @@ pub fn to_ask(conn: &Connection, now: i64) -> Result<Vec<Typing>, PersonError> {
 
 /// Whether the node's `typing` reads now, as rule 1 of §3.2 says of a
 /// person's (rule 4.4): the node typed its key for its follow at that
-/// time, within the hour, and has not asked for it since.
+/// time or later, within the hour, and has not asked for it since.
+///
+/// A read that types the key again while a pass asks for it does not end
+/// that ask (#336): the ask goes on, and what became of it is kept for the
+/// later typing too. Else reads that meet every pass would leave the key
+/// never asked for.
 pub fn reads_now(conn: &Connection, typing: &Typing, now: i64) -> Result<bool, PersonError> {
     Ok(follows::typed(conn, &typing.of)?.iter().any(|typed| {
         typed.key == typing.key
-            && typed.typed_at == typing.typed_at
+            && typed.typed_at >= typing.typed_at
             && typed.became.is_none()
             && crate::adding::within_its_hour(typed.typed_at, now)
     }))

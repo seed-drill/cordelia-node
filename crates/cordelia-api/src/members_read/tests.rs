@@ -1713,6 +1713,36 @@ fn a_share_older_than_the_hour_of_the_latest_read_is_not_taken() {
     );
 }
 
+/// A read that types the keys again while a pass asks for them does not
+/// end those asks (#336): the share the pass finds is taken, and a key that
+/// handed nothing is asked for again only after the next read.
+#[test]
+fn a_read_while_a_pass_asks_for_a_key_does_not_end_the_ask() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (channel, list) = joins(&s, 7, now);
+    let (alice, carol) = (member(1), member(2));
+    let read = now + READ;
+    reads(&s, &list, &commit('a'), read);
+    // The pass takes both typings to ask for, and a read types both keys
+    // again while it asks.
+    let at = read + 10;
+    let (alices, carols) = (typing_of(&s, &alice, at), typing_of(&s, &carol, at));
+    reads(&s, &list, &commit('a'), at + 1);
+
+    assert_eq!(handed_to(&s, &carols, &[], at + 2), Became::Nothing);
+    assert_eq!(
+        became_of(&s, &carol.public_key()),
+        (Some(ASKED.into()), None)
+    );
+    let share = share_of(&s, &alice, 7, read - 60);
+    assert_eq!(
+        handed_to(&s, &alices, &[share], at + 2),
+        Became::Taken(channel.id)
+    );
+    assert!(asked_for(&s, at + 2).is_empty());
+}
+
 /// Nothing is taken where the list names no channel, its channel line
 /// names this device after `without`, the list does not name this
 /// device's key, or names only its twin, or a relay of its line is not one

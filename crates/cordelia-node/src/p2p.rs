@@ -844,8 +844,8 @@ pub async fn p2p_loop(
     // node's key, as it did while it re-pushed the older kind (decision
     // 2026-11-10 (older kind), rule 3), so nodes do not all begin at once.
     // It only shifts the reads of the lists a device follows against its
-    // whole passes; it does not keep them apart. A read that types a key
-    // again while a pass asks for it leaves that key unasked (#336).
+    // whole passes, and they need not be kept apart: a read that types a
+    // key again while a pass asks for it does not end that ask (#336).
     let start_after = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
