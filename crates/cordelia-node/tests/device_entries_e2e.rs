@@ -5872,12 +5872,12 @@ async fn the_door_for_a_carry_reads_a_channel_that_was_left_and_stores_nothing()
     let nowhere = reads_left_at(&a, old, by_secret(), Some(Vec::new())).await;
     assert!(nowhere.is_empty(), "{nowhere:?}");
 
-    // A node that is held up reads nothing.
+    // A node that cannot go on reads nothing.
     a.state
         .held
         .hold(cordelia_api::state::Held::LaterDatabase("later".into()));
     let read = reads_left(&a, old, by_secret()).await;
-    assert!(matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("held up")));
+    assert!(matches!(&read[0].read, LeftRead::NotRead(why) if why.contains("cannot go on")));
     a.state.held.release();
 }
 
