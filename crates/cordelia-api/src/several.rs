@@ -2605,31 +2605,46 @@ mod tests {
     /// A look names the keys that the change removed and the statement
     /// before had not, each as `removed` shows it (decision 2026-11-11
     /// (plain words), slice 0): on the device that made the change and on
-    /// one that applies it; none at a renewal; the later removal's key
-    /// alone, not every key removed so far; and none where an earlier
-    /// version kept only that a key was removed.
+    /// one that applies it; none at a renewal; the later removal's two
+    /// keys, not every key removed so far; each with an empty label where
+    /// the device kept none of it; and none where an earlier version kept
+    /// only that a key was removed.
     #[test]
     fn a_look_names_the_keys_the_change_removed() {
         use crate::look::Shown;
-        let mut s = Several::of_one_person(3);
+        let mut s = Several::of_one_person(4);
         let seen = |s: &Several, n: usize| {
             look(&s[n].conn, &s[n].identity, &AtRelays::default(), 0).unwrap()
         };
         let shown = |s: &Several, n: usize| Shown::of(&s.key(n), &format!("device {n}")).unwrap();
         assert!(seen(&s, 0).newly_removed.is_empty());
-        let removal = s.change(0, &[0, 1], &[2]);
+        let removal = s.change(0, &[0, 1, 3], &[2]);
         assert_eq!(seen(&s, 0).newly_removed, [shown(&s, 2)]);
         let now = s.tick();
         take(&s[1].conn, &s[1].identity, &removal, now).unwrap();
         assert_eq!(seen(&s, 1).newly_removed, [shown(&s, 2)]);
         // A renewal removes nobody.
-        s.change(0, &[0, 1], &[]);
+        s.change(0, &[0, 1, 3], &[]);
         assert!(seen(&s, 0).newly_removed.is_empty());
-        // A later removal: its own key alone.
-        s.change(0, &[0], &[1]);
+        // A later removal of two at once: its own keys, not the one
+        // removed before.
+        s.change(0, &[0], &[1, 3]);
         let later = seen(&s, 0);
-        assert_eq!(later.removed.len(), 2);
-        assert_eq!(later.newly_removed, [shown(&s, 1)]);
+        assert_eq!(later.removed.len(), 3);
+        let mut newly = later.newly_removed;
+        newly.sort_by(|a, b| a.label.cmp(&b.label));
+        assert_eq!(newly, [shown(&s, 1), shown(&s, 3)]);
+        // Where the device kept no label of them, each is named by its
+        // key and words, with an empty label.
+        meta::remove(&s[0].conn, meta::PERSON_REMOVED_LABELS).unwrap();
+        let mut newly = seen(&s, 0).newly_removed;
+        newly.sort_by(|a, b| a.words.cmp(&b.words));
+        let mut bare = vec![
+            Shown::of(&s.key(1), "").unwrap(),
+            Shown::of(&s.key(3), "").unwrap(),
+        ];
+        bare.sort_by(|a, b| a.words.cmp(&b.words));
+        assert_eq!(newly, bare);
         // What an earlier version kept: that a key was removed, not which.
         meta::set(&s[0].conn, meta::PERSON_REMOVED_A_KEY, "1").unwrap();
         let earlier = seen(&s, 0);

@@ -189,8 +189,9 @@ fn since_of(group: &Value) -> i64 {
 /// Two removals (decision 2026-10-10 §9): the phone is removed, and later
 /// the tablet, while the channel stays not clean on the desktop. The entry
 /// names the device that each removal removed, and not every key removed
-/// so far, in `device` and alone in `devices` (decision 2026-11-11 (plain
-/// words), slice 0); and its seven days count from the later removal.
+/// so far, in `device` and alone in `devices`, with an empty label where
+/// the device kept none (decision 2026-11-11 (plain words), slice 0); and
+/// its seven days count from the later removal.
 #[test]
 fn a_later_removal_names_its_own_device_and_counts_from_itself() {
     let mut s = bob(4);
@@ -230,6 +231,16 @@ fn a_later_removal_names_its_own_device_and_counts_from_itself() {
         format!("\"device 2\" ({})", fingerprint::shown(&s.key(2)))
     );
     assert_eq!(second[0]["devices"], alone(&s, 2), "{shared}");
+    // Where the device kept no label of it, the label is empty.
+    cordelia_storage::meta::remove(&s[1].conn, cordelia_storage::meta::PERSON_REMOVED_LABELS)
+        .unwrap();
+    let shared = object(&s, 1, &SharedSaid::default(), now).unwrap();
+    let mut bare = alone(&s, 2);
+    bare[0]["label"] = json!("");
+    assert_eq!(
+        shared["removed_device_holds"][0]["devices"], bare,
+        "{shared}"
+    );
     assert!(
         since_of(&second[0]) > first_since + 8 * 86_400,
         "{shared}, first since {first_since}"

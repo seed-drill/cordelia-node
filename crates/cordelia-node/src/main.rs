@@ -719,13 +719,13 @@ enum SharedCommand {
         words: Option<String>,
     },
     /// Reset a shared channel: make a new channel, and choose who stays,
-    /// device by device. It is what `cordelia renew` does for your own
-    /// channels.
+    /// device by device
     ///
-    /// Run it in a terminal. It lists every device this device knows in
-    /// the channel, those refused for lack of room among them, and asks of
-    /// each whether it stays. Those who stay move with `cordelia shared
-    /// move` on one of their devices.
+    /// It is what `cordelia renew` does for your own channels. Run it in a
+    /// terminal. It lists every device this device knows in the channel,
+    /// those refused for lack of room among them, and asks of each whether
+    /// it stays. Those who stay move with `cordelia shared move` on one of
+    /// their devices.
     ///
     /// It prints the new channel line, which names the devices it left
     /// out. If the channel is a repository's, put that line in place of the
@@ -9351,12 +9351,19 @@ mod tests {
         let shared = cli
             .find_subcommand_mut("shared")
             .expect("shared is a command");
-        let help = shared.render_long_help().to_string();
+        let help = shared.render_help().to_string();
         let listed = |command: &str| {
             help.lines()
-                .any(|line| line.trim_start().starts_with(&format!("{command} ")))
+                .find(|line| line.trim_start().starts_with(&format!("{command} ")))
         };
-        assert!(listed("reset") && !listed("anew"), "{help}");
+        assert!(listed("anew").is_none(), "{help}");
+        // Its line there is one phrase.
+        let line = listed("reset").unwrap_or_else(|| panic!("{help}"));
+        assert!(
+            line.trim_end()
+                .ends_with("make a new channel, and choose who stays, device by device"),
+            "{help}"
+        );
         let reset = shared
             .find_subcommand_mut("reset")
             .expect("shared reset is a command")

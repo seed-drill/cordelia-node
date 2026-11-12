@@ -1123,14 +1123,22 @@ fn share_refuses_a_new_key_where_the_channel_shows_64() {
     let word = |key: &[u8; 32]| {
         let key = encode_public_key(key).unwrap();
         match share_plan(conn, identity, &relays(), "review", &key, None, now) {
-            Err(Failed::Refused(refusal)) => refusal.word,
-            Ok(_) => "ok",
+            Err(Failed::Refused(refusal)) => (refusal.word, refusal.line),
+            Ok(_) => ("ok", String::new()),
             Err(Failed::Error(e)) => panic!("{e}"),
         }
     };
-    assert_eq!(word(&member(500).public_key()), "channel_full");
+    assert_eq!(
+        word(&member(500).public_key()),
+        (
+            "channel_full",
+            "\"review\" shows 64 keys on this device, which is the most: make it anew without \
+             some (cordelia shared reset)."
+                .to_string()
+        )
+    );
     let among = shown.iter().find(|key| **key != s.key(0)).unwrap();
-    assert_eq!(word(among), "ok");
+    assert_eq!(word(among).0, "ok");
 }
 
 /// **A channel with no held row is not clean** (the read of #281 for the

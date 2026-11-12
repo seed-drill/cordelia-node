@@ -820,7 +820,7 @@ never held, comes in only under **a word that the phrase signed:**
 ### 3.19 Shared Channels
 
 > **v1 status.** The routes under `/api/v1/shared/` are those of decision
-> 2026-10-10 §5.6, which gives their bodies and answers. Two notes here.
+> 2026-10-10 §5.6, which lists them. Two notes here.
 
 - **`POST /api/v1/shared/anew`** is the route of `cordelia shared reset`,
   `shared anew` before: the command was renamed, and the route keeps its

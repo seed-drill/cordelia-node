@@ -2411,7 +2411,9 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     let old = id_filed(&laptop, "review").unwrap();
     let old_card = card_of_node(&laptop, &old);
     let unreached = "These shared channels are not reached from this device, so they are not \
-                     made anew in this change: \"review\"";
+                     made anew in this change: \"review\". Your devices send nothing in each \
+                     until you make it anew with cordelia shared reset <name> on a device of \
+                     yours that reaches its relays.";
 
     let mut at = removes_from_an_added(&desktop, &key_of(&tablet), &words);
     at.says("The change is made (change 2)");
