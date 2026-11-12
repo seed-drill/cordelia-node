@@ -840,20 +840,6 @@ pub async fn p2p_loop(
     heartbeat_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     heartbeat_interval.tick().await;
 
-    // The loop begins after a wait of up to REPUSH_INTERVAL_SECS, set by the
-    // node's key, as it did while it re-pushed the older kind (decision
-    // 2026-11-10 (older kind), rule 3), so nodes do not all begin at once.
-    // It only shifts the reads of the lists a device follows against its
-    // whole passes, and they need not be kept apart: a read that types a
-    // key again while a pass asks for it does not end that ask (#336).
-    let start_after = {
-        use std::hash::{Hash, Hasher};
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        our_node_id.0.hash(&mut h);
-        h.finish() % (cordelia_core::protocol::REPUSH_INTERVAL_SECS * 1000)
-    };
-    tokio::time::sleep(std::time::Duration::from_millis(start_after)).await;
-
     // The configured relays: each one that is not connected is dialled
     // again, at a slowing pace (see `relay_backoff`).
     let mut relay_interval = tokio::time::interval(std::time::Duration::from_secs(1));
