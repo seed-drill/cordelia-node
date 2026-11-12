@@ -39,7 +39,7 @@ use cordelia_crypto::identity::NodeIdentity;
 use cordelia_storage::follows::{self, LastRead};
 use cordelia_storage::shared as kept;
 
-use crate::git_list::{ClonedList, Git, Identity, ListFailed, RemoteRefused};
+use crate::git_list::{ClonedList, Git, Identity, ListFailed, RemoteRefused, short};
 use crate::lists::Do;
 use crate::members::{self, ChannelLine, Members, same_key};
 use crate::messages::cleaned;
@@ -293,10 +293,6 @@ pub fn plan(
     // share to its twin is in another share pair channel, which this
     // device never reads (rule 4.4).
     let label = members.line_of(&own).map(|device| device.label.clone());
-    let key_line = match &label {
-        Some(label) => format!("Your key is on the list, as {label}."),
-        None => "Your key is not on the list.".to_string(),
-    };
     let not_listed = || match members.lists(&own) {
         true => sharing::refused("twin_listed", twin_line(&repository, &own)?),
         false => sharing::refused(
@@ -307,16 +303,28 @@ pub fn plan(
             ),
         ),
     };
-    // The yes names this clone and its remote, so that it is a yes to no
-    // other clone or remote of the repository at this commit.
-    let mut asks = vec![format!(
-        "This reads the list of {repository} at commit {commit}, from your clone at {}, \
-         through its remote {}.",
+    // The yes asks in two lines (made terser on 11 November 2026, issue
+    // #338): what is made or followed, and who reads it. The first names
+    // this clone, its remote and the commit, by its first twelve
+    // characters as the status shows one, so that it is a yes to no other
+    // clone or remote of the repository; the route binds the whole commit
+    // too (`shared_routes::follow_read`), so it is a yes to no other
+    // commit. And rule 2.2's three facts: the repository and the commit,
+    // the channel the list names, and whether this device's key is on the
+    // list.
+    let followed = format!(
+        "{repository} from your clone at {} ({}, commit {})",
         cleaned(&clone),
-        cleaned(&read.remote)
-    )];
+        cleaned(&read.remote),
+        short(commit)
+    );
+    let whose = |names: &str| match &label {
+        Some(label) => format!("whose list names {names}, and your key as {label}"),
+        None => format!("whose list names {names}, but not your key"),
+    };
     // Following again starts never-back over (rule 2.5): the yes says where
     // this device read last, and whether this clone would go back from it.
+    let mut surprising = Vec::new();
     if let Some(row) = follows::follow_of(conn, &repository)? {
         let last = row.last.map(|last| last.commit);
         if last != read.after_last.as_ref().map(|after| after.last.clone()) {
@@ -324,10 +332,11 @@ pub fn plan(
             return sharing::refused("changed", crate::sharing_routes::CHANGED.into());
         }
         let from = cleaned(&row.clone);
-        asks.push(match &last {
-            Some(last) => {
-                format!("This device follows {repository} already, from {from} at {last}.")
-            }
+        surprising.push(match &last {
+            Some(last) => format!(
+                "This device follows {repository} already, from {from} at {}.",
+                short(last)
+            ),
             None => format!("This device follows {repository} already, from {from}."),
         });
         if read
@@ -335,9 +344,10 @@ pub fn plan(
             .as_ref()
             .is_some_and(|after| !after.comes_after)
         {
-            asks.push(format!(
-                "Your clone is at {commit}, which does not come after it: you would read an older \
-                 or another list."
+            surprising.push(format!(
+                "Your clone is at {}, which does not come after it: you would read an older or \
+                 another list.",
+                short(commit)
             ));
         }
     }
@@ -357,6 +367,7 @@ pub fn plan(
             },
         })
     };
+    let shown_agent = cleaned(&agent);
     if new {
         // Rule 2.4: only for a list that has no channel line.
         if members.channel.is_some() {
@@ -383,34 +394,31 @@ pub fn plan(
             );
         }
         let made = sharing::new_plan(conn, own_relays, &name, &[])?;
-        asks.push(no_channel_line(&repository));
-        asks.push(key_line);
-        asks.push(made.asks);
-        asks.push(format!(
-            "This follows {repository}, and subscribes {}, the agent of this folder, to the new \
-             channel. Then it prints the lines to add to the list.",
-            cleaned(&agent)
-        ));
+        // What `shared new` says of it, and what subscribing does.
+        let mut asks = vec![format!(
+            "This makes the shared channel \"{}\" at {}, which carries messages between your \
+             agents and other people's and never memory; subscribes {shown_agent}, {MAPPED}, to \
+             read and write in it; and follows {followed}, {}.",
+            cleaned(&name),
+            sharing::relays_said(own_relays, &made.what.relays),
+            whose("no channel yet")
+        )];
+        asks.extend(surprising);
+        asks.push(WHO_READS_NEW.into());
         return planned(asks, Then::Make(made.what));
     }
-    // The folder's agent of a device that takes the channel is subscribed
-    // to it as it takes it (rule 4.4), from the follow's clone.
-    let once_taken = format!(
-        "The agent of this folder, {}, is subscribed to it once this device takes it. Anyone in \
-         it can hand it on, and a device that only reads shows nowhere.",
-        cleaned(&agent)
-    );
     let Some(line) = &members.channel else {
         if label.is_none() {
             return not_listed();
         }
-        asks.push(no_channel_line(&repository));
-        asks.push(key_line);
-        asks.push(format!(
-            "This follows {repository}. A member's device hands you its channel once the list \
-             names one. cordelia status shows how it goes."
-        ));
-        asks.push(once_taken);
+        let mut asks = vec![format!(
+            "This follows {followed}, {}. A member's device hands you its channel once the list \
+             names one; then {}",
+            whose("no channel yet"),
+            subscribed(&shown_agent)
+        )];
+        asks.extend(surprising);
+        asks.push(WHO_READS.into());
         return planned(asks, Then::Nothing);
     };
     let words = channel_words(&line.channel);
@@ -437,22 +445,16 @@ pub fn plan(
     // A channel follows one repository, so that no two lists hand it over,
     // or delete its shares (rule 2.5): the yes says which follow stops.
     if let Some(other) = &replaces {
-        asks.push(stops_following_line(
+        surprising.push(stops_following_line(
             other,
             &channel_named(conn, &line.channel)?,
         ));
     }
     if let Some(filing) = filings.iter().find(|filing| filing.channel == line.channel) {
         let name = cleaned(&filing.name);
-        asks.push(format!(
-            "It names the shared channel \"{name}\" (channel {words}), which you hold."
-        ));
-        asks.push(key_line);
         // The gate holds back hand-overs and takes alone: a subscription is
         // neither, so the agent of a holder is subscribed now, whatever it
         // says. Where the agent subscribes already, it still follows.
-        asks.extend(gate_lines(&name));
-        asks.push(format!("This follows {repository}."));
         let subscribing = crate::shared_routes::subscribe_plan(
             conn,
             identity,
@@ -460,19 +462,30 @@ pub fn plan(
             &filing.name,
             Some(&words),
         )?;
-        let then = match subscribing {
-            Err(already) => {
-                asks.push(already);
-                Then::Nothing
-            }
-            Ok(subscribing) => {
-                asks.push(subscribing.asks);
+        let (first, then) = match subscribing {
+            Err(already) => (
+                format!(
+                    "This follows {followed}, {}. {already}",
+                    whose(&format!("\"{name}\", which you hold"))
+                ),
+                Then::Nothing,
+            ),
+            Ok(subscribing) => (
+                format!(
+                    "This subscribes {shown_agent}, {MAPPED}, to read and write in \"{name}\", \
+                     which you hold, and follows {followed}, {}.",
+                    whose("it")
+                ),
                 Then::Subscribe {
                     subscription: subscribing.what,
                     name: filing.name.clone(),
-                }
-            }
+                },
+            ),
         };
+        let mut asks = vec![first];
+        asks.extend(surprising);
+        asks.extend(gate_lines(&name));
+        asks.push(WHO_READS.into());
         return planned(asks, then);
     }
     // A channel dropped or moved from is not taken again, as `accept
@@ -489,38 +502,67 @@ pub fn plan(
         }
         None => {}
     }
+    let not_held = whose(&format!("channel {words}, which you do not hold"));
     // The person holds the channel the named one was made anew from: they
-    // move to it, and nobody hands it to them (rule 6).
+    // move to it, and nobody hands it to them (rule 6). `shared move` asks
+    // its own yes, which says who reads it.
     if let Some(from) = made_anew_from(conn, identity, &filings, &line.channel)? {
-        asks.push(format!("It names channel {words}, which you do not hold."));
-        asks.push(key_line);
+        let mut asks = vec![format!("This follows {followed}, {not_held}.")];
+        asks.extend(surprising);
         asks.push(format!(
             "Run cordelia shared move {}: the list names the channel it was made anew as.",
             crate::shared_routes::shell_word(&from.name)
         ));
-        asks.push(format!("This follows {repository}."));
         return planned(asks, Then::Nothing);
     }
     if label.is_none() {
         return not_listed();
     }
-    asks.push(format!("It names channel {words}, which you do not hold."));
-    asks.push(key_line);
-    match gated.is_empty() {
-        true => asks.push(format!(
-            "This follows {repository}. A member's device hands you its channel once it reads the \
-             list. cordelia status shows how it goes."
-        )),
-        false => {
-            asks.extend(gate_lines(&format!("channel {words}")));
-            asks.push(format!(
-                "This follows {repository}. cordelia status shows how it goes."
-            ));
-        }
-    }
-    asks.push(once_taken);
+    // The folder's agent of a device that takes the channel is subscribed
+    // to it as it takes it (rule 4.4), from the follow's clone. No yes is
+    // asked then, so this one says who reads it.
+    let mut asks = vec![match gated.is_empty() {
+        true => format!(
+            "This follows {followed}, {not_held}. A member's device hands it to you once it reads \
+             the list; then {}",
+            subscribed(&shown_agent)
+        ),
+        false => format!(
+            "This follows {followed}, {not_held}. Once this device takes it, {}",
+            subscribed(&shown_agent)
+        ),
+    }];
+    asks.extend(surprising);
+    asks.extend(gate_lines(&format!("channel {words}")));
+    asks.push(WHO_READS.into());
     planned(asks, Then::Nothing)
 }
+
+/// Where a subscription shows the channel to the agent, as `subscribe
+/// <name>` says it (decision 2026-10-10 §5.2).
+const MAPPED: &str = "on every device of yours where it is mapped";
+
+/// What the yes says of the agent that is subscribed once this device
+/// takes the channel (rule 4.4): what subscribing does.
+fn subscribed(agent: &str) -> String {
+    format!("{agent} is subscribed, {MAPPED}, to read and write in it.")
+}
+
+/// The last line of the yes of `subscribe` in a clone, where the list
+/// names a channel or will (rule 2.3; made terser on 11 November 2026,
+/// issue #338): who reads it. Every device of a person holds the person's
+/// shared channels (decision 2026-10-10, property 19). No yes is asked when a
+/// joiner takes the channel, so this is where the person is told.
+pub(crate) const WHO_READS: &str = "Who reads it: every device of each person on the list. Anyone \
+                                    in it can hand it on, and a device that only reads shows \
+                                    nowhere.";
+
+/// The last line of the yes of `subscribe --new` (rule 2.4): who reads the
+/// channel it makes, and, as `shared new` says, what takes anyone out.
+pub(crate) const WHO_READS_NEW: &str = "Who reads it: your devices now, and every device of each \
+                                        person on the list once your pull request is merged. \
+                                        Anyone in it can hand it on, and a device that only reads \
+                                        shows nowhere. Only making it anew takes anyone out.";
 
 /// What `subscribe` in a clone says where this device follows as many
 /// repositories as there can be.

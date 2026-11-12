@@ -363,7 +363,7 @@ fn subscribes_in(n: &Node, top: &Path, extra: &[&str], asks: &str) -> String {
 /// line it prints, and the lines of the person's own devices, each ending
 /// in a line feed.
 fn makes_the_channel(n: &Node, top: &Path) -> (String, String) {
-    let said = subscribes_in(n, top, &["--new"], "to the new channel");
+    let said = subscribes_in(n, top, &["--new"], "This makes the shared channel");
     assert!(
         said.contains("Add these lines to .cordelia/members in a pull request:"),
         "{said}"
@@ -731,7 +731,7 @@ fn two_people_join_by_a_merged_pull_request_alone() {
     share_at_the_relay(&all, &relay, &bob, &alice_key);
     assert!(channel_of(&alice, NAME).is_none());
     let made = channel_of(&bob, NAME).unwrap();
-    let said = subscribes_in(&alice, &alice_clone, &[], "once this device takes it");
+    let said = subscribes_in(&alice, &alice_clone, &[], "which you do not hold");
     assert!(
         said.contains(&format!(
             "Following {REPOSITORY}, from its list at commit {}",
@@ -1095,7 +1095,7 @@ fn only_the_named_channel_is_taken_and_only_keys_on_the_list_are_handed_it() {
     assert!(to(&carol).is_empty() && to(&erin).is_empty(), "{shares:?}");
 
     let alice_clone = host.clone_for(&alice);
-    subscribes_in(&alice, &alice_clone, &[], "once this device takes it");
+    subscribes_in(&alice, &alice_clone, &[], "which you do not hold");
     wait_for(
         "Alice's node asks for a share from Bob's key",
         &all,
@@ -1137,7 +1137,7 @@ fn nine_new_keys_with_eight_off_the_ninth_is_handed_the_channel_at_the_third_rea
     host.merges(&list);
     host.fetches(&bob, &bob_clone);
     let alice_clone = host.clone_for(&alice);
-    subscribes_in(&alice, &alice_clone, &[], "once this device takes it");
+    subscribes_in(&alice, &alice_clone, &[], "which you do not hold");
 
     // What Bob's node keeps of its shares as it hands Alice's key the
     // channel: that read writes it all at once.
@@ -1227,7 +1227,7 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
     let alice_clone = host.clone_for(&alice);
     let carol_clone = host.clone_for(&carol);
     for (n, clone) in [(&alice, &alice_clone), (&carol, &carol_clone)] {
-        subscribes_in(n, clone, &[], "once this device takes it");
+        subscribes_in(n, clone, &[], "which you do not hold");
     }
     // Each device holds the other two's keys: each wrote in the channel as
     // it took it.
@@ -1451,7 +1451,7 @@ fn a_removed_device_still_listed_is_never_handed_the_new_channel() {
     let desktop_clone = host.clone_for(&desktop);
     {
         let all = [&relay, &laptop, &desktop, &tablet, &bob];
-        subscribes_in(&bob, &bob_clone, &[], "once this device takes it");
+        subscribes_in(&bob, &bob_clone, &[], "which you do not hold");
         wait_for("Bob's node takes the channel", &all, 300, || {
             channel_of(&bob, NAME)
         });

@@ -66,6 +66,18 @@ fn with_a_yes(
     path: &str,
     body: Value,
 ) -> anyhow::Result<Option<Value>> {
+    with_a_yes_binding(config_path, at, path, body, &[])
+}
+
+/// [`with_a_yes`], whose yes sends back each field of `bound` that the
+/// look answered: what the yes binds beyond its text.
+fn with_a_yes_binding(
+    config_path: &str,
+    at: &Terminal,
+    path: &str,
+    body: Value,
+    bound: &[&str],
+) -> anyhow::Result<Option<Value>> {
     let mut look = body.clone();
     look["look"] = true.into();
     let would = asked(config_path, path, &look)?;
@@ -82,6 +94,9 @@ fn with_a_yes(
     }
     let mut body = body;
     body["said_yes_to"] = asks.into();
+    for field in bound {
+        body[*field] = would[*field].clone();
+    }
     Ok(Some(asked(config_path, path, &body)?))
 }
 
@@ -193,17 +208,18 @@ fn asking_line(words: &str, until: &str) -> String {
 }
 
 /// What `accept --channel` says of a share it took (§5.2): the name it is
-/// filed under, its words and its relays, where the node lists it.
+/// filed under, its words and its relays, where the node lists it, and the
+/// next act, which its yes no longer says (made terser on 11 November
+/// 2026, issue #338). That the words prove nothing is said once, at its
+/// yes, as at the yes of `share`.
 fn taken_line(name: Option<&str>, words: &str, relays: &[&str]) -> String {
     match name {
         Some(name) => format!(
-            "Taken: \"{name}\" is channel {words}, at {}. The channel's words are its name, and \
-             prove nothing.",
+            "Taken: \"{name}\" is channel {words}, at {}. No folder subscribes to it: in a \
+             folder, run cordelia subscribe {name}",
             relays.join(" and ")
         ),
-        None => {
-            format!("Taken: channel {words}. The channel's words are its name, and prove nothing.")
-        }
+        None => format!("Taken: channel {words}."),
     }
 }
 
@@ -255,7 +271,10 @@ pub fn follow(config_path: &str, new: bool, remote: Option<&str>) -> anyhow::Res
     refuse_another_version(config_path)?;
     let (folder, _) = crate::msg_cmd::folder_of(config_path)?;
     let body = json!({ "folder": folder, "remote": remote, "new": new });
-    if let Some(done) = with_a_yes(config_path, &at, "/api/v1/shared/follow", body)? {
+    // The yes binds the whole commit the look read: its text shows only
+    // the first twelve characters.
+    let path = "/api/v1/shared/follow";
+    if let Some(done) = with_a_yes_binding(config_path, &at, path, body, &["commit"])? {
         print_said(&done);
     }
     Ok(())
@@ -596,9 +615,7 @@ pub fn list_lines(listed: &Value) -> Vec<String> {
     let channels: Vec<&Value> = list(listed, "channels").collect();
     match channels.len() {
         0 => lines.push("No shared channel is held on your devices.".to_string()),
-        n => lines.push(format!(
-            "Shared channels: {n} of 16. Each lives at the relays named, known by their keys."
-        )),
+        n => lines.push(format!("Shared channels: {n} of 16.")),
     }
     for channel in channels {
         let relays: Vec<&str> = list(channel, "relays")
@@ -740,9 +757,17 @@ mod tests {
             taken_line(Some("review-with-alice"), four, &[relay]),
             says(
                 "Taken: \"review-with-alice\" is channel <four words>, at relay.example.org:9474 \
-                 (<four words>). The channel's words are its name, and prove nothing.",
+                 (<four words>). No folder subscribes to it: in a folder, run cordelia subscribe \
+                 review-with-alice",
                 &[four, "kind lamp mint nest"]
             )
+        );
+        // That the words prove nothing is said once, at the yes of `share`
+        // and of `accept --channel` (the person's choice of 11 November
+        // 2026, issue #338).
+        assert_eq!(
+            taken_line(None, four, &[]),
+            format!("Taken: channel {four}.")
         );
         assert_eq!(
             nothing_taken_line("14:00"),
@@ -979,10 +1004,9 @@ mod tests {
             "past_a_bound": [],
         });
         let lines = list_lines(&listed);
-        assert_eq!(
-            lines[0],
-            "Shared channels: 1 of 16. Each lives at the relays named, known by their keys."
-        );
+        // Its header is the count alone (made terser on 11 November 2026,
+        // issue #338).
+        assert_eq!(lines[0], "Shared channels: 1 of 16.");
         assert_eq!(
             lines[1],
             "  \"review\": channel a b c d, 1 key wrote there, 0 labelled by you; at \

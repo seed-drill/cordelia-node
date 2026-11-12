@@ -73,16 +73,40 @@ bob@laptop$ cordelia subscribe
    - With one such remote, it is the one.
    - With several that differ (a fork's `origin` and the repository's `upstream`), `--remote <name>` chooses. Without it, the command names them and does nothing.
    - The host must be reachable as HTTPS. An SSH alias such as `github.com-work` is refused, with a line that says why.
-2. **It reads the list** by rule 3, and shows:
-   - the identity and the commit;
+2. **It reads the list** by rule 3, and shows, in one line with what it does:
+   - the identity and the commit, with the clone and its remote;
    - the channel the list names;
    - whether this device's key is on the list.
+
+   **Its yes is two lines:** what it makes or follows, and who reads it. The commit shows by its first twelve characters, as in the status (rule 7). The yes binds its text, with the clone and the remote, and the whole commit: the look answers it, the command sends it back with the yes, and a yes to another commit is refused as changed. For a device that waits to be handed the channel:
+
+   ```
+   This follows <identity> from your clone at <clone> (<remote>, commit <commit>), whose list names channel <four words>, which you do not hold, and your key as <label>. A member's device hands it to you once it reads the list; then <agent> is subscribed, on every device of yours where it is mapped, to read and write in it.
+   Who reads it: every device of each person on the list. Anyone in it can hand it on, and a device that only reads shows nowhere.
+   ```
+
+   The first line of each other case:
+   - holding the channel: `This subscribes <agent>, on every device of yours where it is mapped, to read and write in "<name>", which you hold, and follows <identity> from your clone at <clone> (<remote>, commit <commit>), whose list names it, and your key as <label>.`; where the agent subscribes already, `This follows ... whose list names "<name>", which you hold, and your key as <label>. <agent> subscribes to "<name>" already.`;
+   - a list that names no channel yet: `This follows ... whose list names no channel yet, and your key as <label>. A member's device hands you its channel once the list names one; then <agent> is subscribed, on every device of yours where it is mapped, to read and write in it.`;
+   - a key that the gate of rule 1 holds back: `This follows ... which you do not hold, and your key as <label>. Once this device takes it, <agent> is subscribed, on every device of yours where it is mapped, to read and write in it.`;
+   - holding the channel the named one was made anew from (rule 6): `This follows ... which you do not hold, and your key as <label>.`, then `Run cordelia shared move <name>: the list names the channel it was made anew as.`, and no second line, as `shared move` asks its own yes.
+
+   A key that is not on the list is said `but not your key` in place of `and your key as <label>`. Between the two lines it says only what holds: `This device follows <identity> already, from <clone> at <commit>.`; `Your clone is at <commit>, which does not come after it: you would read an older or another list.` (rule 3); the follow it stops (rule 2.5); and each key the gate holds back, `<label> is on the list of <name> but was left out of it: nothing is handed over until its line goes, or it writes in the channel.`
+
+   **Made terser on 11 November 2026, on the person's ruling (issue #338).** The yes was five to ten lines: where it read the list, the channel, the key, what it would do, and for `--new` the whole yes of `shared new`. `cordelia status shows how it goes` is said after the yes, and not in it.
 3. **Then one of these:**
    - **The person holds the channel the list names:** it follows the repository and subscribes this folder's agent.
-   - **They do not, and the list names this device:** it follows the repository and waits to be handed the channel (rule 4). The yes says: `This follows <identity>. A member's device hands you its channel once it reads the list. cordelia status shows how it goes.` and `The agent of this folder, <agent>, is subscribed to it once this device takes it. Anyone in it can hand it on, and a device that only reads shows nowhere.` No yes is asked when it is taken, so this is where the person is told who else can read it (11 November 2026, issue #338).
+   - **They do not, and the list names this device:** it follows the repository and waits to be handed the channel (rule 4), with the yes of rule 2.2. No yes is asked when it is taken, so its second line is where the person is told who else can read it (11 November 2026, issue #338).
    - **The list does not name this device:** `Your key is not on the list of <identity> at <commit>. Add it with a pull request, then run this again.` Nothing is done.
    - **The person dropped that channel:** it says so and does nothing, as `accept --channel` refuses today (§3.4 there): `You dropped channel <words>, and a dropped channel is not taken again.` A drop keeps no name, so the channel is said by its four words.
-4. **`cordelia subscribe --new`** makes the channel for the team, once, at the person's relays, as `shared new` does. It is filed under the repository's `owner/name`. It prints the line to add, and the person's own keys and labels:
+4. **`cordelia subscribe --new`** makes the channel for the team, once, at the person's relays, as `shared new` does. It is filed under the repository's `owner/name`. Its yes is two lines (made terser on 11 November 2026, issue #338):
+
+   ```
+   This makes the shared channel "<owner/name>" at <relay>, which carries messages between your agents and other people's and never memory; subscribes <agent>, on every device of yours where it is mapped, to read and write in it; and follows <identity> from your clone at <clone> (<remote>, commit <commit>), whose list names no channel yet, and your key as <label>.
+   Who reads it: your devices now, and every device of each person on the list once your pull request is merged. Anyone in it can hand it on, and a device that only reads shows nowhere. Only making it anew takes anyone out.
+   ```
+
+   After the yes it prints the line to add, and the person's own keys and labels:
 
    ```
    Add these lines to .cordelia/members in a pull request:

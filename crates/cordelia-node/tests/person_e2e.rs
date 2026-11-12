@@ -450,12 +450,26 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     at.says("Type yes to go on").types("yes");
     let added = at.done();
     println!("{added}");
-    assert!(
-        added.contains(&format!("cordelia accept {laptop_key}")),
+    // After its yes, three lines and no more: what to run there, and the
+    // words it shows there (made terser on 11 November 2026, issue #338).
+    let lines: Vec<&str> = added
+        .lines()
+        .map(|line| line.trim_end_matches('\r'))
+        .collect();
+    let at = lines.len() - 4;
+    assert!(lines[at].contains("Type yes to go on"), "{added}");
+    assert_eq!(
+        lines[at + 1..],
+        [
+            "On the other device, within the hour, run:".to_string(),
+            format!("  cordelia accept {laptop_key}"),
+            format!(
+                "It shows these words for this device's key before it asks its yes: {}",
+                words_of(&laptop_key)
+            ),
+        ],
         "{added}"
     );
-    assert!(added.contains(&words_of(&laptop_key)), "{added}");
-    assert!(added.contains("within the hour"), "{added}");
 
     // `accept`, on a device that follows no phrase: what will happen,
     // with the words of the key that was typed, and its yes.
@@ -1654,7 +1668,7 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     at.says("Type yes to go on").types("yes");
     let said = at.done();
     assert!(
-        said.contains("The last change is handed to it again."),
+        said.contains(&format!("  cordelia accept {}", key_of(&laptop))),
         "{said}"
     );
     assert!(notices(&laptop).is_empty(), "no record was made");

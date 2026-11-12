@@ -106,6 +106,16 @@ pub fn relay_shown(relays: &[OwnRelay], key: &[u8; 32]) -> String {
     }
 }
 
+/// The relays of `relays`, each as [`relay_shown`] says it among `own`:
+/// `a`, or `a and b`.
+pub(crate) fn relays_said(own: &[OwnRelay], relays: &[OwnRelay]) -> String {
+    let shown: Vec<String> = relays
+        .iter()
+        .map(|relay| relay_shown(own, &relay.key))
+        .collect();
+    and(&shown)
+}
+
 /// `a`, or `a and b`.
 fn and(things: &[String]) -> String {
     match things {
@@ -734,16 +744,13 @@ pub fn new_plan(
     if filed(conn)?.len() >= SHARED_MAX_CHANNELS {
         return refused("too_many_channels", TOO_MANY_CHANNELS.into());
     }
-    let lives: Vec<String> = relays
-        .iter()
-        .map(|relay| format!("  {}", relay_shown(own, &relay.key)))
-        .collect();
+    // Two lines (made terser on 11 November 2026, issue #338): what is
+    // made, and who reads it.
     let asks = format!(
-        "This makes a channel shared between people, filed on your devices as \"{name}\".\nIt \
-         carries messages between your agents and other people's agents, and nothing else: never \
-         memory.\nIt lives at:\n{}\nWhoever you share it with holds it as fully as you do, and \
-         can share it on. Nobody is taken out of it except by making it anew.",
-        lives.join("\n")
+        "This makes \"{name}\" at {}: a shared channel that carries messages between your agents \
+         and other people's, and never memory.\nWho reads it: whoever you share it with, and \
+         whoever they share it with. Only making it anew takes anyone out.",
+        relays_said(own, &relays)
     );
     Ok(Plan {
         asks,
@@ -869,22 +876,33 @@ pub fn share_plan(
         );
     }
     let six = six_words(&key);
+    // Two lines (made terser on 11 November 2026, on the person's ruling,
+    // issue #338): what it hands, to whom, and who reads it then, with the
+    // channel's words said once, here, as a name that proves nothing
+    // (§3.2); and the check of the six words, which the person must make.
     let asks = format!(
-        "This hands the shared channel \"{name}\" (channel {}) to the device ({six}) {}.\nBefore \
-         you go on, have the person whose device it is read you the six words that cordelia id \
-         --words prints there, by another way than the one the key came by: a call, or in \
-         person. They must be these: {six}. If they are not, someone has put their own key in \
-         its place: stop here.\nWhoever holds that device reads every message written there \
-         from now on, and can write there and hand it on, until the channel is made anew \
-         without them.\nNothing of your own goes with it: no memory, no name of yours, and no \
-         other channel.",
+        "This hands \"{name}\" (channel {}, a name that proves nothing) to the device ({six}) \
+         {}: whoever holds it reads and writes there from now on, and can hand it on, until the \
+         channel is made anew without it.\n{}",
         channel_words(&filing.channel),
-        label_part(conn, &key)?
+        label_part(conn, &key)?,
+        check_line(&six)
     );
     Ok(Plan {
         asks,
         what: ShareTo { filing, key },
     })
+}
+
+/// The second line of the yes of `share` and of `accept --channel` (§3.2,
+/// §5.2): the check of the other key, by its six words, read back by its
+/// person by another way than the one the key came by.
+fn check_line(six: &str) -> String {
+    format!(
+        "Check first: have its person read you the six words that cordelia id --words prints \
+         there, by another way than the one the key came by, such as a call or in person. They \
+         must be: {six}. If not, someone put their own key in its place: stop here."
+    )
 }
 
 /// Whether this device may hand the channel of `filing` to `key`, as
@@ -1114,9 +1132,10 @@ pub fn make_share(
             "It lives at {}. The other device takes it only where {which}.",
             and(&at)
         ),
+        // The yes said, once, that the channel's words prove nothing
+        // (issue #338).
         format!(
-            "It prints these words for the channel once it has taken it: {}. They are its name, \
-             and prove nothing.",
+            "It prints these words for the channel once it has taken it: {}.",
             channel_words(&channel)
         ),
     ];
@@ -1208,22 +1227,19 @@ pub fn accept_plan(
         );
     }
     let six = six_words(&key);
-    let at: Vec<String> = own_relays
-        .iter()
-        .map(|relay| format!("  {}", relay_shown(own_relays, &relay.key)))
-        .collect();
+    // Two lines (made terser on 11 November 2026, issue #338): what it
+    // takes, from whom and where, and that the words it prints for the
+    // channel prove nothing (§3.2), said here, where the person decides;
+    // and the check of the six words. That no agent is shown it until a
+    // folder subscribes is said once it is taken.
     let asks = format!(
-        "This device will take, within the hour, one shared channel that the device ({six}) {} \
-         hands it, and file it as \"{name}\" on every device of yours.\nBefore you go on, have \
-         the person whose device it is read you the six words that cordelia id --words prints \
-         there, by another way than the one the key came by: a call, or in person. They must be \
-         these: {six}. If they are not, someone has put their own key in its place: stop \
-         here.\nIt is asked for at your relays that have a key, and taken only where it lives at \
-         them:\n{}\nIt carries messages from other people's agents, and never memory. No agent \
-         of yours is shown anything from it until you subscribe a folder: cordelia subscribe \
-         {name}",
+        "This device takes, within the hour, the shared channel that the device ({six}) {} hands \
+         it, and files it as \"{name}\" on every device of yours. It is asked for at your relays \
+         that have a key, {}, and taken only where it lives at them. The words it prints for the \
+         channel are a name that proves nothing.\n{}",
         label_part(conn, &key)?,
-        at.join("\n")
+        relays_said(own_relays, own_relays),
+        check_line(&six)
     );
     Ok(Plan {
         asks,

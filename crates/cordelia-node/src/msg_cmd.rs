@@ -1155,8 +1155,8 @@ pub fn summary_for(answer: &Value, folder: Option<&str>) -> Option<String> {
 /// `cordelia msg read <id> [-v]` (decision 2026-10-09 §4.1), for the
 /// folder `given` where `--folder` gave one (§3.1). `verbose` is `-v`: of
 /// a message of the person's own agents, the header says too the sending
-/// device's four words, the thread, and the pair's counts. A shared
-/// message's header says its thread and counts, with or without it.
+/// device's four words, the thread, and the pair's counts; of a shared
+/// message, its thread and its counts (decision 2026-10-10 §5.3).
 pub fn read(config_path: &str, id: &str, given: Option<&str>, verbose: bool) -> anyhow::Result<()> {
     // 2. What the command checks alone.
     if !is_an_id(id) {
@@ -1174,7 +1174,7 @@ pub fn read(config_path: &str, id: &str, given: Option<&str>, verbose: bool) -> 
     let posted = node.post("/api/v1/shared/read", &request, node.answer_wait());
     match of_the_route(posted) {
         Posted::Answered(200, answer) => {
-            written(&shared_readout_for(&answer, &marker(), given));
+            written(&shared_readout_for(&answer, &marker(), given, verbose));
             return Ok(());
         }
         Posted::Answered(_, answer) if answer["error"]["code"] == "no_such_message" => {}
@@ -1199,11 +1199,16 @@ pub fn read(config_path: &str, id: &str, given: Option<&str>, verbose: bool) -> 
     Ok(())
 }
 
-/// `cordelia msg read --next-shared` (decision 2026-10-10 §5.1, §5.3): the
-/// oldest message unread by this folder's agent in the shared channels it
-/// subscribes to, in the frame of another person's agent or of the
-/// person's own device.
-pub fn read_next_shared(config_path: &str, given: Option<&str>) -> anyhow::Result<()> {
+/// `cordelia msg read --next-shared [-v]` (decision 2026-10-10 §5.1,
+/// §5.3): the oldest message unread by this folder's agent in the shared
+/// channels it subscribes to, in the frame of another person's agent or of
+/// the person's own device. With `-v` (`verbose`), its header says its
+/// thread and counts too.
+pub fn read_next_shared(
+    config_path: &str,
+    given: Option<&str>,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let node = Node::of(config_path)?;
     let (folder, shown) =
         folder_here(given, node.git_wait()).unwrap_or_else(|| refuse(says::FOLDER_NOT_KNOWN));
@@ -1224,7 +1229,7 @@ pub fn read_next_shared(config_path: &str, given: Option<&str>) -> anyhow::Resul
             Posted::NotKnown => refuse(says::READ_NOT_ANSWERED),
         },
     };
-    written(&shared_readout_for(&answer, &marker(), given));
+    written(&shared_readout_for(&answer, &marker(), given, verbose));
     Ok(())
 }
 
@@ -1278,19 +1283,33 @@ fn shared_framed(message: &Value, marker: &str) -> String {
 
 /// What `read` prints of a shared message the node answered, with `marker`
 /// on its frame's two lines (decision 2026-10-10 §5.3). Where `read` was
-/// given `--folder`, the line that answers gives the same folder.
-pub fn shared_readout_for(answer: &Value, marker: &str, folder: Option<&str>) -> String {
+/// given `--folder`, the line that answers gives the same folder. With
+/// `-v` (`verbose`), its header says its thread and counts, as of a
+/// message of the person's own agents (the person's ruling of 11 November
+/// 2026, issue #338).
+pub fn shared_readout_for(
+    answer: &Value,
+    marker: &str,
+    folder: Option<&str>,
+    verbose: bool,
+) -> String {
     let text = |field: &str| cleaned(answer[field].as_str().unwrap_or_default());
     let id = text("id");
     let mut out = format!(
-        "Message {id} in the shared channel \"{}\", sent {}, in thread {}: {} message(s) in this \
-         thread here, {} of them not yet read by a person here.\n",
+        "Message {id} in the shared channel \"{}\", sent {}",
         text("channel"),
         indicator::ago(answer["ago_secs"].as_i64().unwrap_or(0)),
-        short(&text("thread")),
-        answer["thread_count"].as_u64().unwrap_or(0),
-        answer["thread_unread_by_a_person"].as_u64().unwrap_or(0),
     );
+    if verbose {
+        out.push_str(&format!(
+            ", in thread {}: {} message(s) in this thread here, {} of them not yet read by a \
+             person here",
+            short(&text("thread")),
+            answer["thread_count"].as_u64().unwrap_or(0),
+            answer["thread_unread_by_a_person"].as_u64().unwrap_or(0),
+        ));
+    }
+    out.push_str(".\n");
     if let Some(answers) = answer["answers"].as_str() {
         out.push_str(&format!("Answers {}.\n", short(&cleaned(answers))));
     }
@@ -3578,24 +3597,46 @@ mod tests {
         let m = "0a0b0c0d0e0f";
         let six = "able bake cold dune east fair";
         let theirs = format!("({six}) no label of yours");
-        let read = shared_readout_for(
-            &shared_answered("other", &theirs, Some("owner/repo#12")),
-            m,
-            None,
-        );
+        let answered = shared_answered("other", &theirs, Some("owner/repo#12"));
+        let read = shared_readout_for(&answered, m, None, false);
         let values = [
             ("<marker>", m),
             ("<sender>", theirs.as_str()),
             ("<name>", "design-review"),
             ("<owner/repo#n>", "owner/repo#12"),
+            ("<id, 32 hex>", "0123456789abcdef0123456789abcdef"),
+            ("<ago>", "2m ago"),
+            ("<thread, 8 hex>", "fedcba98"),
+            ("<T>", "1"),
+            ("<U>", "1"),
         ];
+        // Its thread and counts only with `-v` (the person's ruling of 11
+        // November 2026, issue #338).
+        let verbose = shared_readout_for(&answered, m, None, true);
+        assert_eq!(
+            verbose.lines().next().unwrap(),
+            as_written(
+                SHARED_RECORD,
+                "Message <id, 32 hex> in the shared channel \"<name>\", sent <ago>, in thread \
+                 <thread, 8 hex>: <T> message(s) in this thread here, <U> of them not yet read by \
+                 a person here.",
+                &values
+            )
+        );
+        assert_eq!(
+            verbose.lines().skip(1).collect::<Vec<&str>>(),
+            read.lines().skip(1).collect::<Vec<&str>>()
+        );
         let lines: Vec<&str> = read.lines().collect();
         assert_eq!(
             lines,
             [
-                "Message 0123456789abcdef0123456789abcdef in the shared channel \"design-review\", \
-                 sent 2m ago, in thread fedcba98: 1 message(s) in this thread here, 1 of them not \
-                 yet read by a person here.",
+                as_written(
+                    SHARED_RECORD,
+                    "Message <id, 32 hex> in the shared channel \"<name>\", sent <ago>.",
+                    &values
+                )
+                .as_str(),
                 as_written(
                     SHARED_RECORD,
                     "[<marker>] START. A request from ANOTHER PERSON's agent, from <sender>, in \
@@ -3627,7 +3668,7 @@ mod tests {
         assert!(lines[1].contains(&format!("from ({six}) no label of yours, in")));
         // A label of the person's, after the six words.
         let labelled = format!("({six}) \"bob\"");
-        let read = shared_readout_for(&shared_answered("other", &labelled, None), m, None);
+        let read = shared_readout_for(&shared_answered("other", &labelled, None), m, None, false);
         assert!(
             read.contains(&format!(
                 "[{m}] START. A request from ANOTHER PERSON's agent, from ({six}) \"bob\", in"
@@ -3639,7 +3680,7 @@ mod tests {
             format!("your own device ({six}) \"desktop\""),
             "this device".into(),
         ] {
-            let read = shared_readout_for(&shared_answered("own", &sender, None), m, None);
+            let read = shared_readout_for(&shared_answered("own", &sender, None), m, None, false);
             let values = [
                 ("<marker>", m),
                 ("<sender>", sender.as_str()),
@@ -3799,7 +3840,7 @@ mod tests {
             ("this", "this device"),
         ] {
             let shared = shared_answered(kind, sender, Some("owner/repo#12"));
-            keeps(&shared_readout_for(&shared, &marker(), None), true);
+            keeps(&shared_readout_for(&shared, &marker(), None, false), true);
         }
         // `log`, with either fence, of the person's own agents' messages
         // and of a shared channel's.

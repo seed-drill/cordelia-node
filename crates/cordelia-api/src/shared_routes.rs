@@ -42,7 +42,7 @@ use crate::person::{PersonError, in_one, who_counts};
 use crate::sender::{self, Address, At, NotSent, Refused, Reply, Request};
 use crate::shared_messages::{self as seen, Seen, id_of, thread_of};
 use crate::sharing::{self, Failed, OwnRelay, Plan, Refusal};
-use crate::sharing_routes::{answer_of, asked_then, db};
+use crate::sharing_routes::{answer_of, asked_then, asked_then_showing, db};
 use crate::state::AppState;
 
 // ── Lines ────────────────────────────────────────────────────────────
@@ -280,6 +280,10 @@ pub struct FollowRequest {
     pub look: bool,
     #[serde(default)]
     pub said_yes_to: Option<String>,
+    /// The whole commit the look read, which the command sends back with
+    /// its yes: the text shows it by its first twelve characters.
+    #[serde(default)]
+    pub commit: Option<String>,
 }
 
 /// `cordelia subscribe` in a clone, and `--new` (decision 2026-11-06
@@ -289,7 +293,8 @@ pub struct FollowRequest {
 ///
 /// The folder must be mapped before git is run. The clone is read at the
 /// look and again at the yes, so a yes to a list at another commit is
-/// refused as `changed`. All of git's work is given 20 seconds, so the
+/// refused as `changed`: the look answers the whole commit it read, and
+/// the yes must send it back. All of git's work is given 20 seconds, so the
 /// command, which waits 30, is always answered. On the yes, the node is
 /// asked to read the lists it follows now.
 pub async fn follow(
@@ -381,10 +386,17 @@ pub(crate) fn follow_read(
     read: &crate::following::ClonedRead,
 ) -> Result<HttpResponse, ApiError> {
     let identity = &state.identity;
-    asked_then(
+    let commit = &read.list.at.commit;
+    // The yes binds the whole commit, and not only the first twelve
+    // characters its text shows (rule 2.2).
+    if !body.look && body.commit.as_ref() != Some(commit) {
+        return crate::sharing_routes::changed();
+    }
+    asked_then_showing(
         state,
         body.look,
         body.said_yes_to.as_deref(),
+        json!({ "commit": commit }),
         |conn, own, _| crate::following::plan(conn, identity, own, read, body.new),
         |conn, _, following, now| {
             let said = crate::following::make(conn, identity, following, now)?;
