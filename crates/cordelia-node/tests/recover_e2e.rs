@@ -2528,8 +2528,8 @@ fn a_recovery_says_before_its_yes_where_what_was_carried_is_at_a_relay_it_did_no
     carried(&said, &format!("the relay with key {a_key}"));
     assert!(
         said.contains(&format!(
-            "To bring it in by this recovery, answer no. On this machine, set up the relay whose \
-             key is {a_key}: the configuration of that device (its `[[network.bootnodes]]`) names \
+            "To bring it in by this recovery, answer no. On this machine, set up the relay with \
+             key {a_key}: the configuration of that device (its `[[network.bootnodes]]`) names \
              it. Then run `cordelia recover` again. If you answer yes, it comes in later only by \
              `cordelia sync carry <name> --from <device>`, with the phrase, once this machine \
              reaches that relay."
