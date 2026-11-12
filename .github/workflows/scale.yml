@@ -49,9 +49,12 @@ jobs:
           cargo test --release -p cordelia-node --test scale a_small_run
           -- --ignored --nocapture
 
+      # An upload that fails or hangs does not fail the runs it carries.
       - name: What the runs left
         if: always()
         uses: actions/upload-artifact@v4
+        continue-on-error: true
+        timeout-minutes: 10
         with:
           name: scale-small-runs
           path: |

@@ -189,9 +189,14 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         continue-on-error: true
+        timeout-minutes: 10
 
+      # An upload that fails or hangs does not fail the job, whose tests
+      # passed: on 11 November this one hung until the runner was lost.
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
+        continue-on-error: true
+        timeout-minutes: 10
         with:
           name: coverage-report
           path: coverage.lcov
