@@ -797,7 +797,7 @@ fn two_people_join_by_a_merged_pull_request_alone() {
     );
     assert!(holds_of(&status_json(&bob)).contains(&"shared_repository".to_string()));
     let said = bob.at_terminal(&["shared", "seen", NAME]).done();
-    assert!(said.contains(&format!("Cleared: {joined}")), "{said}");
+    assert!(said.contains(&format!("Marked seen: {joined}")), "{said}");
     let status = status_json(&bob);
     assert!(
         !holds_of(&status)
@@ -1248,8 +1248,8 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
     assert_ne!(new, old);
     assert_eq!(id_filed(&bob, NAME), Some(new));
     let put = format!(
-        "{NAME} was made anew here: put its new channel line in .cordelia/members, in a pull \
-         request"
+        "{NAME} was reset on this device: put its new channel line in .cordelia/members, in a \
+         pull request"
     );
     let view = shows(&all, &bob, "put_the_line", &put, true);
     let shown: Vec<&Value> = view["lines"]
@@ -1264,8 +1264,8 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
     // offer, and Carol's has read it "without you", a merge adds Dave's
     // line, and nobody hands Dave anything, or anyone the new channel.
     let offer_read = format!(
-        "{NAME} was made anew by bob-desktop: nothing is handed over until the list names the \
-         new channel."
+        "{NAME} was reset by bob-desktop: this device shares it with no one new until the list \
+         names the new channel."
     );
     for n in [&alice, &carol] {
         shows(&all, n, "offer_read", &offer_read, false);
@@ -1295,8 +1295,8 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
     host.fetches(&bob, &bob_clone);
     host.fetches(&alice, &alice_clone);
     let no_longer = format!(
-        "carol-tablet is no longer on the list of {NAME}: make it anew with cordelia shared \
-         reset {NAME}"
+        "carol-tablet is no longer on the list of {NAME}, but can still read new messages there. \
+         To stop that: cordelia shared reset {NAME}"
     );
     for n in [&bob, &alice] {
         shows(&all, n, "no_longer_listed", &no_longer, true);
@@ -1342,8 +1342,8 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
         host.fetches(n, clone);
     }
     let gate = format!(
-        "carol-tablet is on the list of {NAME} but was left out of it: delete its line in a pull \
-         request, or wait for that device to write in the channel"
+        "carol-tablet is on the list of {NAME} but was left out of the channel: delete its line \
+         in a pull request, or wait for that device to write in the channel"
     );
     for n in [&bob, &alice] {
         shows(&all, n, "left_out", &gate, true);
@@ -1373,7 +1373,7 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
         host.fetches(n, clone);
     }
     let not_said = format!(
-        "carol-tablet was left out of {NAME}, and its channel line does not say so: add it after \
+        "carol-tablet was left out of {NAME}, but its channel line does not say so: add it after \
          without, or delete its line"
     );
     shows(&all, &bob, "not_said", &not_said, true);
@@ -1390,15 +1390,15 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
     let said = bob.at_terminal(&["shared", "seen", NAME]).done();
     assert!(
         said.contains(&format!(
-            "Still shown: {not_said}. If you brought it back on purpose, run cordelia shared \
-             seen {NAME} carol-tablet."
+            "Still shown: {not_said}. If you added it back on purpose, run cordelia shared seen \
+             {NAME} carol-tablet."
         )),
         "{said}"
     );
     let said = bob
         .at_terminal(&["shared", "seen", NAME, "carol-tablet"])
         .done();
-    assert!(said.contains(&format!("Cleared: {not_said}")), "{said}");
+    assert!(said.contains(&format!("Marked seen: {not_said}")), "{said}");
     assert!(
         !lines_of(&bob).iter().any(|line| line.0 == "not_said"),
         "{}",
@@ -1487,8 +1487,8 @@ fn a_removed_device_still_listed_is_never_handed_the_new_channel() {
     // The new channel line is merged, and the tablet's line is not deleted.
     let gated = host.merges(&format!("{new_line}\n{alices}{bobs}"));
     let gate = format!(
-        "alice-tablet is on the list of {NAME} but was left out of it: delete its line in a pull \
-         request, or wait for that device to write in the channel"
+        "alice-tablet is on the list of {NAME} but was left out of the channel: delete its line \
+         in a pull request, or wait for that device to write in the channel"
     );
     host.fetches(&desktop, &desktop_clone);
     shows(&on, &desktop, "left_out", &gate, true);

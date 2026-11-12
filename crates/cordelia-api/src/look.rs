@@ -780,9 +780,9 @@ fn of_its_person(
         }
         State::Applied => match &at_relays.cannot_go_on {
             Some(CannotGoOn::NotApplied { relay, why }) => Some(format!(
-                "this device was answered with a change by {relay} and could not apply it \
-                 ({why}): it sends nothing and takes nothing in a channel of its own, and tries \
-                 again at each pass"
+                "{relay} sent a change to your devices that this device cannot use ({why}): \
+                 until it can, this device sends and receives nothing in your own channels, and \
+                 it tries again at each pass"
             )),
             // A device that follows a clear change goes on with any head
             // set aside, and says each (rule 11).
@@ -797,8 +797,8 @@ fn of_its_person(
             }
         },
         State::Removed => Some(
-            "this device was removed. `cordelia init --new-key` gives it a new key; it is then \
-             added as a new device"
+            "this device was removed from your devices. To use it again, run `cordelia init \
+             --new-key`, then add it as a new device"
                 .into(),
         ),
         State::NotListed => Some(format!(
@@ -838,24 +838,25 @@ fn of_its_person(
 /// Why a device closed among heads set aside cannot go on (decision
 /// 2026-10-24 (removal), rule 10): said in red, with the lists of each
 /// head.
-pub const CLOSED_BY_HEADS_WHY: &str = "two changes were made apart, and none that lists this \
-     device is clear of a removed device: settle it with the phrase (`cordelia settle`)";
+pub const CLOSED_BY_HEADS_WHY: &str = "two changes to your devices were made separately, \
+     neither knowing of the other, and a device you removed has the secret of each one that \
+     includes this device. To go on, run `cordelia settle` here and type your recovery phrase";
 
 /// What a status says, in a few words, of a device that follows a clear
 /// change and sets a head aside (decision 2026-10-24 (removal), rule 11).
-pub const SET_ASIDE_SHORT: &str = "a change made apart is set aside";
+pub const SET_ASIDE_SHORT: &str = "a change to your devices was made separately, and put aside";
 
 /// Why a closed device cannot go on, in a few words (decision 2026-10-24
 /// (removal), rule 10): what `cordelia devices` says first, and what a
 /// command that a closed device refuses says.
-pub const CLOSED_SHORT: &str = "a removed device holds the secret this device follows";
+pub const CLOSED_SHORT: &str = "a device you removed still has the secret this device uses";
 
 /// Why a closed device that keeps no change made apart cannot go on, and
 /// the way on (decision 2026-10-24 (removal), rules 3, 4 and 10): a change
 /// made here with the phrase, which lists no removed device.
-pub const CLOSED_WHY: &str = "a removed device holds the secret of the change this device \
-     follows, so this device sends nothing and takes nothing, and keeps what is new in its \
-     folders. To go on, run `cordelia renew` here and type your recovery phrase";
+pub const CLOSED_WHY: &str = "a device you removed still has the secret this device uses, so \
+     this device sends and receives nothing, and keeps new edits in its folders. To go on, run \
+     `cordelia renew` here and type your recovery phrase";
 
 /// Why a device whose own key is among those it knows to be removed
 /// cannot go on, in a few words (decision 2026-10-24 (removal), rule 2).
@@ -865,20 +866,21 @@ pub const REMOVED_AS_KNOWN_SHORT: &str = "this device was removed";
 /// cannot go on, and the way on: a change of the phrase that it has seen
 /// removes it, on this branch or on one made apart, and no change that
 /// lists it is clear. Its way on is a new key.
-pub const REMOVED_AS_KNOWN_WHY: &str = "this device was removed: a change of the recovery \
-     phrase that it has seen removes it, and it seals nothing, sends nothing and takes nothing \
-     in a channel of its own. `cordelia init --new-key` gives it a new key; it is then added \
-     as a new device";
+pub const REMOVED_AS_KNOWN_WHY: &str = "this device was removed from your devices, so it \
+     writes, sends and receives nothing in your own channels. To use it again, run `cordelia \
+     init --new-key`, then add it as a new device";
 
 /// Why a device in `state` cannot go on, in a few words: what `cordelia
 /// devices` says first, and what a command that the state refuses says.
 pub fn short_why(state: State) -> &'static str {
     match state {
         State::Removed => "this device was removed",
-        State::NotListed => "this device is not in the last change",
-        State::NotOpened => "a change could not be opened here",
-        State::Fork => "two changes were made apart",
-        State::Applied => "a change could not be applied",
+        State::NotListed => "this device is not in the last change to your devices",
+        State::NotOpened => "a change to your devices could not be opened here",
+        State::Fork => {
+            "two changes to your devices were made separately, neither knowing of the other"
+        }
+        State::Applied => "a change to your devices could not be used here",
     }
 }
 
@@ -945,8 +947,9 @@ fn of_its_names(
     let days = |names: &[&NameNotListed]| names.iter().map(|name| name.days_left).min();
     if let Some(days) = days(&ours) {
         look.says.push(format!(
-            "{} that your devices synced before the last change {} listed by no device yet: \
-             {}. What the relays hold of {} can still be brought in for {days} day{}",
+            "{} that your devices synced before the last change to your devices {} synced by \
+             no device yet: {}. You can still bring {} back from the relays for {days} more \
+             day{}: cordelia sync carry <name>",
             counted(ours.len(), "name"),
             if ours.len() == 1 { "is" } else { "are" },
             named(&ours),
@@ -986,8 +989,8 @@ fn of_its_names(
             .map(|file| format!("{} in {}", name_shown(&file.file), file.name))
             .collect();
         look.says.push(format!(
-            "what this device held of {} could not be read at the last change, and was not \
-             carried: {}. Each meets its channel as a new file does",
+            "what this device knew of {} could not be read at the last change to your devices, \
+             so it was not copied over: {}. Each will sync as a new file",
             counted(each.len(), "file"),
             each.join(", ")
         ));
@@ -1089,10 +1092,10 @@ fn set_aside_line(noted: &SetAsideNoted) -> String {
         n => format!("{n} edits were"),
     };
     let what = format!(
-        "{edits_were} set aside at a change: a removed device wrote {them}, {} written over what \
-         one wrote, or {} taken in a removal's window where no chain can show otherwise (the \
-         index that another device wrote, a busy file with a full chain, and any later edit of \
-         that file, this device's own included)",
+        "{edits_were} put aside when you removed a device: a removed device wrote {them}, {} \
+         written over what one wrote, or {} received while you were removing it, when Cordelia \
+         cannot show who wrote what (another device's version of the index, a busy file with a \
+         long history, and any later edit of that file, this device's own too)",
         if one { "it was" } else { "they were" },
         if one { "it was" } else { "they were" },
     );
@@ -1106,10 +1109,10 @@ fn set_aside_line(noted: &SetAsideNoted) -> String {
         ),
     };
     format!(
-        "{what}. {history}. Another device's edit comes back from that device's own carry, and \
-         any edit by hand, copied from `cordelia history show <id>`; what a removed device wrote \
-         also comes back at a terminal, with the recovery phrase: `cordelia sync carry <name> \
-         --from <its label>`"
+        "{what}. {history}. An edit by another of your devices comes back when that device \
+         copies its memory over; you can copy any edit back by hand from `cordelia history show \
+         <id>`. To bring back what a removed device wrote, run `cordelia sync carry <name> --from \
+         <device>` at a terminal, with your recovery phrase"
     )
 }
 
@@ -1440,7 +1443,7 @@ pub fn statements_left(number: u64) -> Option<u64> {
 /// Why a record does not count, in words.
 fn not_counted(why: NotCounted) -> &'static str {
     match why {
-        NotCounted::Removed => "its key was removed, and a removed key is not added again",
+        NotCounted::Removed => "it was removed, and a removed device is not added again",
         NotCounted::CountsAlready => "it counts already",
         NotCounted::MayNotAdd => {
             "the device that added it was itself added, since the last change, by a device \
@@ -1481,9 +1484,9 @@ struct Told {
 /// §5.2).
 fn left_says(device: &Shown) -> String {
     format!(
-        "{} left, and started again under another phrase. It still holds the secret it had, \
-         and is still listed: removing it, with the phrase, is what cuts it off (`cordelia \
-         remove-device`)",
+        "{} left, and started again under another recovery phrase. It still has the secret it \
+         had, and is still on your list of devices: to cut it off, remove it with `cordelia \
+         remove-device` and your recovery phrase",
         device.named()
     )
 }
@@ -1610,7 +1613,8 @@ fn told(
             // A row that the recovery could not show: its key is said,
             // since a person was shown it nowhere else (§9, step 3).
             true => format!(
-                "{} is not in the last change, and the recovery could not show it or ask                  about it: its key is {}",
+                "{} is not in the last change to your devices, and the recovery could not show \
+                 it or ask you about it. Its device ID is {}",
                 of_it.named(),
                 of_it.key
             ),
@@ -1739,15 +1743,14 @@ fn set_aside(
                 .map_or(device.label.as_str(), |(_, label)| label.as_str());
             lists_removed.push(Shown::of(&device.key, label)?);
         }
-        let made = format!(
-            "a change made apart on {} (change {})",
-            lists.made_on.named(),
-            lists.number
-        );
+        // Its number is in `cordelia devices`, above the line (decision
+        // 2026-11-11 (plain words), rule 4).
+        let made = format!("a change made separately on {}", lists.made_on.named());
         let says = match (clear, lists_removed.first()) {
-            (true, _) => {
-                format!("{made} is set aside: settle it with the phrase (`cordelia settle`)")
-            }
+            (true, _) => format!(
+                "{made} was put aside. To settle it, run `cordelia settle` and type your recovery \
+                 phrase"
+            ),
             (false, Some(first)) => {
                 let key = Shown::key_of(first)?;
                 let by = kept
@@ -1757,19 +1760,17 @@ fn set_aside(
                     .transpose()?;
                 match by {
                     Some(by) => format!(
-                        "{made} lists {}, which a change made on {by} removed: it is set aside",
+                        "{made} was put aside: it includes {}, which a change made on {by} \
+                         removed",
                         first.named()
                     ),
                     None => format!(
-                        "{made} lists {}, which a change this device has seen removed: it is \
-                         set aside",
+                        "{made} was put aside: it includes {}, which another change removed",
                         first.named()
                     ),
                 }
             }
-            (false, None) => {
-                format!("{made} hands its secret to a device that was removed: it is set aside")
-            }
+            (false, None) => format!("{made} was put aside: a device you removed has its secret"),
         };
         out.push(SetAsideLook {
             lists,
@@ -1910,7 +1911,7 @@ pub fn relay_named(key: &str, relays: &[(&str, Option<&str>)]) -> String {
         .position(|default| *default == key)
     {
         Some(at) => FALLBACK_PEERS[at].to_string(),
-        None => format!("the relay whose key is {key}"),
+        None => format!("the relay with key {key}"),
     }
 }
 
@@ -1967,7 +1968,7 @@ pub fn since(reach: &ReachLook, now: i64) -> String {
         (_, ReferenceBy::Reached) => {
             return format!("has not been reached since {}", when(reach.reference, now));
         }
-        (_, ReferenceBy::Change) => "this device applied the change",
+        (_, ReferenceBy::Change) => "this device took in the latest change",
         (_, ReferenceBy::Start) => "this device started",
         (_, ReferenceBy::Sleep) => "this device woke from sleep",
     };
@@ -2038,15 +2039,15 @@ impl AtRelayLook {
         let out = self.out_of_reach(latest);
         if out && self.reach.holds == Holds::Lacks {
             says.push(format!(
-                "{} cannot be reached from here, and is not known to hold the latest change: \
-                 it {}",
+                "{} cannot be reached from here, and may not have the latest change to your \
+                 devices: it {}",
                 self.relay,
                 since()
             ));
         } else if out && self.reach.holds == Holds::Holds {
             says.push(format!(
-                "{} cannot be reached from here: it {}. It holds the latest change, and this \
-                 device sends through the others",
+                "{} cannot be reached from here: it {}. It has the latest change to your \
+                 devices, and this device sends through your other relays",
                 self.relay,
                 since()
             ));
@@ -2060,15 +2061,15 @@ impl AtRelayLook {
             ));
         } else if self.holds_latest == Some(false) {
             says.push(format!(
-                "{} does not hold the latest change yet",
+                "{} does not have the latest change to your devices yet",
                 self.relay
             ));
         }
         says.extend(self.no_room.clone());
         if let Some(why) = &self.refuses {
             says.push(format!(
-                "{} holds a change that this device does not take ({why}): this device \
-                 neither sends there nor takes from there while it does",
+                "{} has a change to your devices that this device cannot use ({why}), so this \
+                 device neither sends to it nor receives from it while it has that change",
                 self.relay
             ));
         }
@@ -2128,13 +2129,13 @@ impl Accepting {
         };
         match self.asking {
             true => format!(
-                "asking for what the device ({}) hands over, until {}.{so_far}",
+                "waiting for the device ({}) to send what this device needs, until {}.{so_far}",
                 self.words,
                 time_of_day(self.until)
             ),
             false => format!(
-                "the hour in which the device ({}) could hand this one what it needs has gone, \
-                 and nothing was taken: run `cordelia accept` again.{so_far}",
+                "the hour for the device ({}) to send what this device needs has gone, and \
+                 nothing was received: run `cordelia accept` again.{so_far}",
                 self.words
             ),
         }
@@ -2193,14 +2194,14 @@ mod tests {
             .collect();
         assert_eq!(removed.len(), 1, "{:?}", look.says);
         assert!(removed[0].contains("`cordelia history` lists them"));
-        assert!(removed[0].contains("--from <its label>"));
+        assert!(removed[0].contains("--from <device>` at a terminal, with your recovery phrase"));
         // An honest device's version of the index, and this device's own
         // edits after it, are named, with the ways back that work for
         // them (the review of the removal build into main, M3 and M4).
-        assert!(removed[0].contains("the index that another device wrote"));
-        assert!(removed[0].contains("this device's own included"));
-        assert!(removed[0].contains("from that device's own carry"));
-        assert!(removed[0].contains("by hand, copied from `cordelia history show <id>`"));
+        assert!(removed[0].contains("another device's version of the index"));
+        assert!(removed[0].contains("this device's own too"));
+        assert!(removed[0].contains("comes back when that device copies its memory over"));
+        assert!(removed[0].contains("by hand from `cordelia history show <id>`"));
         assert!(
             look.says
                 .iter()
@@ -2642,9 +2643,10 @@ mod tests {
             assert_eq!(
                 look.notices[0].says,
                 format!(
-                    "({}) \"device 2\" left, and started again under another phrase. It still \
-                     holds the secret it had, and is still listed: removing it, with the \
-                     phrase, is what cuts it off (`cordelia remove-device`)",
+                    "({}) \"device 2\" left, and started again under another recovery phrase. \
+                     It still has the secret it had, and is still on your list of devices: to \
+                     cut it off, remove it with `cordelia remove-device` and your recovery \
+                     phrase",
                     fingerprint::shown(&s.key(2))
                 )
             );
@@ -2780,8 +2782,8 @@ mod tests {
         assert_eq!(
             removed.cannot_go_on.as_deref(),
             Some(
-                "this device was removed. `cordelia init --new-key` gives it a new key; it is \
-                 then added as a new device"
+                "this device was removed from your devices. To use it again, run `cordelia init \
+                 --new-key`, then add it as a new device"
             )
         );
         assert_eq!(removed.says[0], removed.cannot_go_on.clone().unwrap());
@@ -2796,11 +2798,15 @@ mod tests {
         assert_eq!(fork.short.as_deref(), Some(SET_ASIDE_SHORT));
         let says = &fork.set_aside[0].says;
         assert!(
-            says.contains("(change 3) lists ")
+            says.starts_with("a change made separately on ")
+                && says.contains("\"device 1\" was put aside: it includes ")
                 && says.contains("\"device 2\", which a change made on ")
-                && says.contains("\"device 0\" removed: it is set aside"),
+                && says.ends_with("\"device 0\" removed"),
             "{says}"
         );
+        // Its number is in `cordelia devices` alone (decision 2026-11-11
+        // (plain words), rule 4).
+        assert!(!says.contains("change 3"), "{says}");
         // Both lists: its own, and the other's.
         assert_eq!(fork.change, Some(3));
         assert_eq!(fork.devices.len(), 2);
@@ -3121,7 +3127,7 @@ mod tests {
                     when(woke, s.now)
                 )
                 .as_str(),
-                "three.example:1 does not hold the latest change yet",
+                "three.example:1 does not have the latest change to your devices yet",
                 "three.example:1 had no room for a new channel at 08:00 UTC on 2027-01-15 \
                  (this address is over its allowance of new channels there)",
             ]
@@ -3157,9 +3163,9 @@ mod tests {
         let look = seen_at(&s, &at);
         assert!(
             look.says.contains(
-                &"one.example:1 holds a change that this device does not take (the statement \
-              undoes a removal): this device neither sends there nor takes from there while \
-              it does"
+                &"one.example:1 has a change to your devices that this device cannot use (the \
+                  statement undoes a removal), so this device neither sends to it nor receives \
+                  from it while it has that change"
                     .to_string()
             )
         );
@@ -3173,12 +3179,15 @@ mod tests {
         assert_eq!(
             look.cannot_go_on.as_deref(),
             Some(
-                "this device was answered with a change by one.example:1 and could not apply \
-                 it (the disk is full): it sends nothing and takes nothing in a channel of its \
-                 own, and tries again at each pass"
+                "one.example:1 sent a change to your devices that this device cannot use (the \
+                 disk is full): until it can, this device sends and receives nothing in your \
+                 own channels, and it tries again at each pass"
             )
         );
-        assert_eq!(look.short.as_deref(), Some("a change could not be applied"));
+        assert_eq!(
+            look.short.as_deref(),
+            Some("a change to your devices could not be used here")
+        );
     }
 
     /// A key that a person typed is shown with what became of it: the
@@ -3200,13 +3209,17 @@ mod tests {
         assert_eq!(asking[0].taken_at, None);
         assert_eq!(asking[0].until, s.now + 3600);
         assert!(asking[0].says().starts_with(&format!(
-            "asking for what the device ({}) hands over, until ",
+            "waiting for the device ({}) to send what this device needs, until ",
             fingerprint::shown(&key)
         )));
         // The hour has gone.
         let gone = seen_at(s.now + 3600);
         assert!(!gone[0].asking && !gone[0].taken);
-        assert!(gone[0].says().contains("has gone, and nothing was taken"));
+        assert!(
+            gone[0]
+                .says()
+                .contains("has gone, and nothing was received")
+        );
         // Taken within it.
         acts::spend_typed_key(conn, &key, s.now, s.now + 20, "this device has joined").unwrap();
         let taken = seen_at(s.now + 30);
@@ -3278,7 +3291,7 @@ mod tests {
             asking
                 .says
                 .iter()
-                .any(|line| line.starts_with("asking for what the device (")),
+                .any(|line| line.starts_with("waiting for the device (")),
             "{:?}",
             asking.says
         );
@@ -3323,7 +3336,7 @@ mod tests {
         let line = look
             .says
             .iter()
-            .find(|line| line.contains("was not carried"))
+            .find(|line| line.contains("was not copied over"))
             .expect("the look says what was not carried");
         assert!(line.contains(&format!("{just}... in lab")), "{line}");
         assert!(!line.contains("x.md"), "{line}");
@@ -3496,7 +3509,7 @@ mod tests {
         );
         assert_eq!(
             relay_named(&unknown, &relays),
-            format!("the relay whose key is {unknown}")
+            format!("the relay with key {unknown}")
         );
         // A default relay set up under a name of this device's own goes by
         // that name.
@@ -3513,12 +3526,12 @@ mod tests {
         };
         assert_eq!(
             held_named(&word, &relays),
-            format!("relay-a.example:9474 and the relay whose key is {unknown}")
+            format!("relay-a.example:9474 and the relay with key {unknown}")
         );
         let more = CarriedWordLook { more: 3, ..word };
         assert_eq!(
             held_named(&more, &relays),
-            format!("relay-a.example:9474, the relay whose key is {unknown} and 3 more")
+            format!("relay-a.example:9474, the relay with key {unknown} and 3 more")
         );
         assert_eq!(joined(&["a".into(), "b".into(), "c".into()]), "a, b and c");
         assert_eq!(joined(&["a".into()]), "a");
@@ -3596,9 +3609,9 @@ mod tests {
             assert_eq!(
                 t2.says(Some(now - 600), latest, now),
                 [
-                    "b.example:9474 cannot be reached from here, and is not known to hold the \
-                     latest change: it has not answered since this device applied the change at \
-                     11:45 UTC"
+                    "b.example:9474 cannot be reached from here, and may not have the latest \
+                     change to your devices: it has not answered since this device took in the \
+                     latest change at 11:45 UTC"
                 ]
             );
             let t3 = relay(
@@ -3610,8 +3623,8 @@ mod tests {
                 t3.says(Some(now - 600), latest, now),
                 [
                     "b.example:9474 cannot be reached from here: it has not been reached since \
-                     11:55 UTC. It holds the latest change, and this device sends through the \
-                     others"
+                     11:55 UTC. It has the latest change to your devices, and this device sends \
+                     through your other relays"
                 ]
             );
         }
@@ -3621,12 +3634,12 @@ mod tests {
         before.reach.about = Some("0202".into());
         assert_eq!(
             before.says(Some(now - 600), latest, now),
-            ["b.example:9474 does not hold the latest change yet"]
+            ["b.example:9474 does not have the latest change to your devices yet"]
         );
         let reached = relay(true, Some(false), reach(Holds::Lacks, None, Some(now - 10)));
         assert_eq!(
             reached.says(Some(now - 600), latest, now),
-            ["b.example:9474 does not hold the latest change yet"]
+            ["b.example:9474 does not have the latest change to your devices yet"]
         );
     }
 
@@ -3661,7 +3674,7 @@ mod tests {
         let cases = [
             (
                 ReferenceBy::Change,
-                "has not answered since this device applied the change at 10:53 UTC",
+                "has not answered since this device took in the latest change at 10:53 UTC",
             ),
             (
                 ReferenceBy::Start,
@@ -3684,8 +3697,8 @@ mod tests {
         }
         assert_eq!(
             since(&reach(ReferenceBy::Change, Some(at_10_48)), now),
-            "has not answered since this device applied the change at 10:53 UTC (it was last \
-             reached at 10:48 UTC)"
+            "has not answered since this device took in the latest change at 10:53 UTC (it was \
+             last reached at 10:48 UTC)"
         );
         assert_eq!(
             since(&reach(ReferenceBy::Sleep, Some(at_10_48)), now),
@@ -3694,8 +3707,8 @@ mod tests {
         );
         assert_eq!(
             since(&reach(ReferenceBy::Change, Some(at_10_48 - 86_400)), now),
-            "has not answered since this device applied the change at 10:53 UTC (it was last \
-             reached at 10:48 UTC on 2026-10-20)"
+            "has not answered since this device took in the latest change at 10:53 UTC (it was \
+             last reached at 10:48 UTC on 2026-10-20)"
         );
     }
 

@@ -1942,7 +1942,7 @@ pub(crate) mod tests {
         let mut reach = a.reach.clone().unwrap();
         assert_eq!(
             since(&reach, now),
-            "has not answered since this device applied the change at 11:50 UTC"
+            "has not answered since this device took in the latest change at 11:50 UTC"
         );
         reach.last_reached = Some(now - 300);
         reach.reference = now - 300;
@@ -1954,16 +1954,16 @@ pub(crate) mod tests {
         reach.reference_by = cordelia_api::state::ReferenceBy::Change;
         assert_eq!(
             since(&reach, now),
-            "has not answered since this device applied the change at 11:58 UTC (it was last \
-             reached at 11:55 UTC)"
+            "has not answered since this device took in the latest change at 11:58 UTC (it was \
+             last reached at 11:55 UTC)"
         );
 
         // S2 and S3.
         assert_eq!(
             out_of_reach_line(&a, now),
-            "keep this machine on: a.example:9474 cannot be reached from here, and is not known \
-             to hold the change yet: it has not answered since this device applied the change at \
-             11:50 UTC"
+            "keep this machine on: a.example:9474 cannot be reached from here, and is not known to \
+             hold the change yet: it has not answered since this device took in the latest change \
+             at 11:50 UTC"
         );
         let b = relay_at(
             "b.example:9474",
@@ -1974,7 +1974,7 @@ pub(crate) mod tests {
         assert_eq!(
             out_of_reach_line(&b, now),
             "b.example:9474 holds the change, and cannot be reached from here: it has not \
-             answered since this device applied the change at 11:50 UTC"
+             answered since this device took in the latest change at 11:50 UTC"
         );
 
         // End 2: S6 in both forms, S6b, and S7.
@@ -1996,9 +1996,9 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  b.example:9474 holds the change and all that this device carried, and cannot \
-                 be reached from here: it has not answered since this device applied the change \
-                 at 11:50 UTC.",
+                "  b.example:9474 holds the change and all that this device carried, and cannot be \
+                 reached from here: it has not answered since this device took in the latest \
+                 change at 11:50 UTC.",
                 "Every relay holds the change. You may close this machine. All that this device \
                  carried is at a.example:9474 and b.example:9474. What this device writes from \
                  now on waits for b.example:9474. `cordelia devices` shows which devices have \
@@ -2015,8 +2015,8 @@ pub(crate) mod tests {
             lines,
             [
                 "  b.example:9474 holds the change, and cannot be reached from here: it has not \
-                 answered since this device applied the change at 11:50 UTC. Some of what this \
-                 device carried is not there yet.",
+                 answered since this device took in the latest change at 11:50 UTC. Some of what \
+                 this device carried is not there yet.",
                 "  c.example:9474 holds the change. It has refused for room what this device \
                  still has to send there since 11:53 UTC.",
                 "Every relay holds the change. You may close this machine. All that this device \
@@ -2114,9 +2114,10 @@ pub(crate) mod tests {
             lines,
             [
                 "  a.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not answered since this device applied the change at 11:50 UTC.",
+                 change: it has not answered since this device took in the latest change at 11:50 \
+                 UTC.",
                 "  b.example:9474 holds the change, and cannot be reached from here: it has not \
-                 answered since this device applied the change at 11:50 UTC.",
+                 answered since this device took in the latest change at 11:50 UTC.",
                 "  c.example:9474 holds the change. It has refused for room what this device \
                  still has to send there since 11:53 UTC.",
                 "  d.example:9474 is reached, and has not taken the change: it had no room for \
@@ -2127,11 +2128,14 @@ pub(crate) mod tests {
                  (another key than the phrase's wrote it). It does not take this one in its \
                  place.",
                 "  g.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not answered since this device applied the change at 11:50 UTC.",
+                 change: it has not answered since this device took in the latest change at 11:50 \
+                 UTC.",
                 "  h.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not answered since this device applied the change at 11:50 UTC.",
+                 change: it has not answered since this device took in the latest change at 11:50 \
+                 UTC.",
                 "  i.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not answered since this device applied the change at 11:50 UTC.",
+                 change: it has not answered since this device took in the latest change at 11:50 \
+                 UTC.",
                 "A device of yours that reaches only a.example:9474, d.example:9474, \
                  e.example:9474, f.example:9474, g.example:9474, h.example:9474 and \
                  i.example:9474 may not have heard of the change. Until it does, it goes on in \
@@ -2292,7 +2296,7 @@ pub(crate) mod tests {
             lines,
             [
                 "  b.example:9474 holds the change, and cannot be reached from here: it has not \
-                 answered since this device applied the change at 11:50 UTC.",
+                 answered since this device took in the latest change at 11:50 UTC.",
                 "No relay can be reached from here. This command ends here, with status 3. It \
                  does not say that you may close this machine. Keep it on, on a network from \
                  which a relay can be reached. `cordelia devices` says what is missing.",

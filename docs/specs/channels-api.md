@@ -747,7 +747,9 @@ never held, comes in only under **a word that the phrase signed:**
       for seven days.
     - `set_aside`: a change made apart is set aside, for seven days.
     - `shared_removed_device_holds`: a removed device still holds shared
-      channels not made anew, for seven days (decision 2026-10-10 §9).
+      channels not made anew, for seven days (decision 2026-10-10 §9): one
+      for each channel, which its words name (decision 2026-11-11 (plain
+      words), rule 2).
     - `added`: a device was added and is not yet cleared with `cordelia
       devices --clear`.
     - `left`: a device has left.

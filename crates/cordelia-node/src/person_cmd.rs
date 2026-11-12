@@ -400,8 +400,9 @@ pub(crate) fn entry_of(hex_bytes: &str) -> anyhow::Result<CheckedEntry> {
 }
 
 /// What the lines that `cordelia status` adds say of this device and its
-/// person: a few words, and then a sentence each.
-pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
+/// person: a few words, and then a sentence each. The change's number
+/// shows with `verbose` alone (decision 2026-11-11 (plain words), rule 4).
+pub fn status_lines(seen: &Value, verbose: bool) -> (String, Vec<String>) {
     let short = match seen["short"].as_str() {
         Some(short) => short.to_string(),
         None => {
@@ -409,10 +410,13 @@ pub fn status_lines(seen: &Value) -> (String, Vec<String>) {
                 + list(seen, "added")
                     .filter(|added| added["counted"] == true)
                     .count();
-            let change = seen["change"].as_u64().unwrap_or(0);
+            let change = match verbose {
+                true => format!(" (change {})", seen["change"].as_u64().unwrap_or(0)),
+                false => String::new(),
+            };
             match devices {
-                1 => format!("this device alone, under a recovery phrase (change {change})"),
-                devices => format!("{devices} devices under a recovery phrase (change {change})"),
+                1 => format!("this device alone, under a recovery phrase{change}"),
+                devices => format!("{devices} devices under a recovery phrase{change}"),
             }
         }
     };
@@ -1404,11 +1408,11 @@ fn relay_says(relay: &Value, woke_at: Option<i64>, latest: Option<&str>, now: i6
     match out {
         Some(reach) if reach.holds == Holds::Lacks => {
             return format!(
-                "cannot be reached from here, and is not known to hold the latest change: it {}. \
-                 A device of yours that reaches only it may not have heard of that change. If \
-                 you know that {name} is gone for good, take it out of the configuration of \
-                 every device. Do not do so only because this machine cannot reach it: it may \
-                 still serve a device that does.",
+                "cannot be reached from here, and may not have the latest change to your devices: \
+                 it {}. A device of yours that reaches only this relay may not know of that \
+                 change. If you know that {name} is gone for good, take it out of the \
+                 configuration of every device. Do not do so only because this machine cannot \
+                 reach it: it may still serve a device that does.",
                 since(reach, now)
             );
         }
@@ -1418,7 +1422,8 @@ fn relay_says(relay: &Value, woke_at: Option<i64>, latest: Option<&str>, now: i6
                 .map(|at| format!(" (as it said at {})", when(at, now)))
                 .unwrap_or_default();
             return format!(
-                "cannot be reached from here, and holds the latest change{said}: it {}",
+                "cannot be reached from here, and has the latest change to your devices{said}: \
+                 it {}",
                 since(reach, now)
             );
         }
@@ -1444,9 +1449,9 @@ fn relay_says(relay: &Value, woke_at: Option<i64>, latest: Option<&str>, now: i6
             "has not answered since this device started or woke{woke}. A change made while \
              this device was off may be there, and not have reached it."
         ),
-        (true, Some(true)) => "holds the latest change".into(),
-        (true, Some(false)) => "does not hold the latest change yet".into(),
-        (true, None) => "has not said whether it holds the latest change".into(),
+        (true, Some(true)) => "has the latest change to your devices".into(),
+        (true, Some(false)) => "does not have the latest change to your devices yet".into(),
+        (true, None) => "has not said whether it has the latest change to your devices".into(),
     }
 }
 
@@ -4655,30 +4660,45 @@ mod tests {
     /// What `cordelia status` says of a device and its person in a few
     /// words: the words that the node gives where it has any, and
     /// otherwise how many devices there are, counting those added since
-    /// that count.
+    /// that count. The change's number shows with `-v` alone (decision
+    /// 2026-11-11 (plain words), rule 4).
     #[test]
     fn status_says_in_a_few_words_where_a_device_stands() {
-        let (short, says) = status_lines(&json!({
-            "short": "no recovery phrase yet",
-            "says": ["no recovery phrase yet: memory stays on this machine."],
-        }));
-        assert_eq!(short, "no recovery phrase yet");
+        for verbose in [false, true] {
+            let (short, says) = status_lines(
+                &json!({
+                    "short": "no recovery phrase yet",
+                    "says": ["no recovery phrase yet: memory stays on this machine."],
+                }),
+                verbose,
+            );
+            assert_eq!(short, "no recovery phrase yet");
+            assert_eq!(
+                says,
+                ["no recovery phrase yet: memory stays on this machine."]
+            );
+        }
+        let alone = json!({ "change": 1, "devices": [{}], "says": [] });
+        let (short, says) = status_lines(&alone, false);
+        assert_eq!(short, "this device alone, under a recovery phrase");
+        assert!(says.is_empty());
         assert_eq!(
-            says,
-            ["no recovery phrase yet: memory stays on this machine."]
-        );
-        let (short, says) = status_lines(&json!({ "change": 1, "devices": [{}], "says": [] }));
-        assert_eq!(
-            short,
+            status_lines(&alone, true).0,
             "this device alone, under a recovery phrase (change 1)"
         );
-        assert!(says.is_empty());
-        let (short, _) = status_lines(&json!({
+        let three = json!({
             "change": 4,
             "devices": [{}, {}],
             "added": [{ "counted": true }, { "counted": false }],
-        }));
-        assert_eq!(short, "3 devices under a recovery phrase (change 4)");
+        });
+        assert_eq!(
+            status_lines(&three, false).0,
+            "3 devices under a recovery phrase"
+        );
+        assert_eq!(
+            status_lines(&three, true).0,
+            "3 devices under a recovery phrase (change 4)"
+        );
     }
 
     /// What a removal shows of names and of the device that goes
@@ -5572,13 +5592,16 @@ mod tests {
         assert!(!lines.contains('\u{202e}'), "{lines}");
         assert_eq!(file_shown("plain.md"), "plain.md");
         // So is a line of the status that names one.
-        let (_, says) = status_lines(&json!({
-            "short": "x",
-            "says": ["what this device held of 1 file: gh\u{1b}[2Kost.md in lab"],
-        }));
+        let (_, says) = status_lines(
+            &json!({
+                "short": "x",
+                "says": ["what this device knew of 1 file: gh\u{1b}[2Kost.md in lab"],
+            }),
+            false,
+        );
         assert_eq!(
             says,
-            ["what this device held of 1 file: gh\\u{1b}[2Kost.md in lab"]
+            ["what this device knew of 1 file: gh\\u{1b}[2Kost.md in lab"]
         );
 
         // With nothing to say of names, nothing is said of them.
@@ -5827,12 +5850,12 @@ mod tests {
             // reached from here (decision 2026-10-24, rule 7).
             (
                 relay(false, Value::Null, reach("lacks", Some(now - 60), None)),
-                "cannot be reached from here, and is not known to hold the latest change: it has \
-                 not answered since this device applied the change at 11:45 UTC. A device of \
-                 yours that reaches only it may not have heard of that change. If you know that \
-                 b.example:9474 is gone for good, take it out of the configuration of every \
-                 device. Do not do so only because this machine cannot reach it: it may still \
-                 serve a device that does.",
+                "cannot be reached from here, and may not have the latest change to your devices: \
+                 it has not answered since this device took in the latest change at 11:45 UTC. A \
+                 device of yours that reaches only this relay may not know of that change. If you \
+                 know that b.example:9474 is gone for good, take it out of the configuration of \
+                 every device. Do not do so only because this machine cannot reach it: it may \
+                 still serve a device that does.",
             ),
             (
                 relay(
@@ -5840,11 +5863,11 @@ mod tests {
                     Value::Null,
                     reach("lacks", Some(now - 60), Some(now - 1200)),
                 ),
-                "cannot be reached from here, and is not known to hold the latest change: it has \
-                 not answered since this device applied the change at 11:45 UTC (it was last \
-                 reached at 11:40 UTC). A device of yours that reaches only it may not have \
-                 heard of that change. If you know that b.example:9474 is gone for good, take it \
-                 out of the configuration of every device. Do not do so only because this \
+                "cannot be reached from here, and may not have the latest change to your devices: \
+                 it has not answered since this device took in the latest change at 11:45 UTC (it \
+                 was last reached at 11:40 UTC). A device of yours that reaches only this relay \
+                 may not know of that change. If you know that b.example:9474 is gone for good, \
+                 take it out of the configuration of every device. Do not do so only because this \
                  machine cannot reach it: it may still serve a device that does.",
             ),
             // D5: out of reach, and holds it, by what is kept across a
@@ -5855,8 +5878,8 @@ mod tests {
                     Value::Null,
                     reach("holds", Some(now - 60), Some(now - 600)),
                 ),
-                "cannot be reached from here, and holds the latest change (as it said at 12:00 UTC \
-                 on 2026-10-20): it has not been reached since 11:50 UTC",
+                "cannot be reached from here, and has the latest change to your devices (as it \
+                 said at 12:00 UTC on 2026-10-20): it has not been reached since 11:50 UTC",
             ),
             (
                 relay(
@@ -5864,32 +5887,32 @@ mod tests {
                     json!(true),
                     reach("holds", Some(now - 60), Some(now - 300)),
                 ),
-                "cannot be reached from here, and holds the latest change (as it said at 12:00 UTC \
-                 on 2026-10-20): it has not been reached since 11:55 UTC",
+                "cannot be reached from here, and has the latest change to your devices (as it \
+                 said at 12:00 UTC on 2026-10-20): it has not been reached since 11:55 UTC",
             ),
             // The lines of before.
             (
                 relay(true, json!(true), reach("holds", None, None)),
-                "holds the latest change",
+                "has the latest change to your devices",
             ),
             (
                 relay(true, json!(false), reach("lacks", None, None)),
-                "does not hold the latest change yet",
+                "does not have the latest change to your devices yet",
             ),
             (
                 relay(true, Value::Null, reach("neither", None, None)),
-                "has not said whether it holds the latest change",
+                "has not said whether it has the latest change to your devices",
             ),
             // Its reach of the kept entry, not its last answer: a relay
             // given no key whose connection closed lacks the change though
             // it answered that it holds it (decision 2026-10-19 §1).
             (
                 relay(true, json!(true), reach("lacks", None, None)),
-                "does not hold the latest change yet",
+                "does not have the latest change to your devices yet",
             ),
             (
                 relay(true, json!(false), reach("holds", None, None)),
-                "holds the latest change",
+                "has the latest change to your devices",
             ),
         ];
         for (relay, said) in cases {
@@ -5901,7 +5924,7 @@ mod tests {
         before["reach"]["about"] = json!("0202");
         assert_eq!(
             relay_says(&before, woke, LATEST, now),
-            "holds the latest change"
+            "has the latest change to your devices"
         );
         // With no wake said, no time is said of it.
         let d2 = relay(false, Value::Null, reach("lacks", None, None));
@@ -5933,8 +5956,8 @@ mod tests {
         );
         assert!(
             lines[from + 1].starts_with(
-                "  b.example:9474: cannot be reached from here, and is not known to hold the \
-                 latest change"
+                "  b.example:9474: cannot be reached from here, and may not have the latest \
+                 change to your devices"
             ),
             "{lines:?}"
         );
@@ -5945,8 +5968,8 @@ mod tests {
     }
 
     /// `cordelia devices` lists each relay once, by its name, with both
-    /// things said on its line: whether it holds the latest change, and
-    /// what waits to be sent there (decision 2026-10-04 §8). What waits
+    /// things said on its line: whether it has the latest change to your
+    /// devices, and what waits to be sent there (decision 2026-10-04 §8). What waits
     /// at an address that is no relay's name is listed after the relays,
     /// and never by its address (decision 2026-10-24, rule 2).
     #[test]
@@ -5978,13 +6001,13 @@ mod tests {
             lines[from..],
             [
                 "Relays:",
-                "  one.example:9474: holds the latest change; 1 of this device's channels still \
-                 to send there",
-                "  two.example:9474: does not hold the latest change yet; 3 of this device's \
+                "  one.example:9474: has the latest change to your devices; 1 of this device's \
                  channels still to send there",
-                "  three.example:9474: holds the latest change",
-                "  192.0.2.4:9474: holds the latest change; 2 of this device's channels still to \
-                 send there",
+                "  two.example:9474: does not have the latest change to your devices yet; 3 of \
+                 this device's channels still to send there",
+                "  three.example:9474: has the latest change to your devices",
+                "  192.0.2.4:9474: has the latest change to your devices; 2 of this device's \
+                 channels still to send there",
                 "  a relay that this device is connected to and that no line above names: 5 of \
                  this device's channels still to send there",
             ]
@@ -6030,8 +6053,8 @@ mod tests {
             lines[from..],
             [
                 "Relays:",
-                "  localhost:9474: holds the latest change; 4 of this device's channels still to \
-                 send there",
+                "  localhost:9474: has the latest change to your devices; 4 of this device's \
+                 channels still to send there",
                 "  a relay that this device is connected to and that no line above names: 5 of \
                  this device's channels still to send there",
             ]
@@ -6056,9 +6079,9 @@ mod tests {
             lines[from..],
             [
                 "Relays:",
-                "  localhost:9474: holds the latest change",
-                "  other.example:9474: holds the latest change; 3 of this device's channels \
-                 still to send there",
+                "  localhost:9474: has the latest change to your devices",
+                "  other.example:9474: has the latest change to your devices; 3 of this device's \
+                 channels still to send there",
                 "  a relay that this device is connected to and that no line above names: 5 of \
                  this device's channels still to send there",
             ]
@@ -6102,8 +6125,8 @@ mod tests {
         assert_eq!(
             relays_of(&Lookup { wait, by: found }),
             [
-                "  203.0.113.7:9474: holds the latest change; 2 of this device's channels still \
-              to send there"
+                "  203.0.113.7:9474: has the latest change to your devices; 2 of this device's \
+                 channels still to send there"
             ]
         );
         let began = std::time::Instant::now();
@@ -6114,7 +6137,7 @@ mod tests {
                 by: never
             }),
             [
-                "  203.0.113.7:9474: holds the latest change",
+                "  203.0.113.7:9474: has the latest change to your devices",
                 "  a relay that this device is connected to and that no line above names: 2 of \
                  this device's channels still to send there",
             ]
@@ -6526,14 +6549,14 @@ mod tests {
             row_of_2(&seen),
             format!(
                 "  (w2) \"desktop\": has applied change 3, and has sent what it held to \
-                 a.example:9474 and the relay whose key is {unknown}; not yet to 1 other relay \
+                 a.example:9474 and the relay with key {unknown}; not yet to 1 other relay \
                  that it is set up with (if it is lost now, what it held is at a.example:9474 \
-                 and the relay whose key is {unknown} alone)"
+                 and the relay with key {unknown} alone)"
             )
         );
         assert!(waited(&seen).contains(&format!(
             "(w2) \"desktop\" has applied the change, and has sent what it held to \
-             a.example:9474 and the relay whose key is {unknown}; not yet to 1 other relay"
+             a.example:9474 and the relay with key {unknown}; not yet to 1 other relay"
         )));
         // At every relay it is set up with: no `<not yet>`. Two not yet,
         // and more counted.
@@ -6569,7 +6592,7 @@ mod tests {
             "{row}"
         );
         assert!(
-            row.contains("has sent what it held to a.example:9474, the relay whose key is"),
+            row.contains("has sent what it held to a.example:9474, the relay with key"),
             "{row}"
         );
 

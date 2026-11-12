@@ -926,7 +926,7 @@ impl DeviceEntries {
                     // The key of the connection that it is read on.
                     let key = Some(link.relay().0);
                     if held_up {
-                        let read_as = LeftRead::NotRead("the node is held up".into());
+                        let read_as = LeftRead::NotRead("the node cannot go on".into());
                         read.push(LeftAt {
                             relay: name,
                             read: read_as,

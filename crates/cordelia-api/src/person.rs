@@ -10376,10 +10376,10 @@ mod tests {
         );
         assert_eq!(head.lists_removed.len(), 1);
         assert!(
-            head.says.starts_with("a change made apart on ")
-                && head.says.contains("(change 3) lists ")
+            head.says.starts_with("a change made separately on ")
+                && head.says.contains(" was put aside: it includes ")
                 && head.says.contains(", which a change made on ")
-                && head.says.ends_with(" removed: it is set aside"),
+                && head.says.ends_with(" removed"),
             "{}",
             head.says
         );
@@ -10395,10 +10395,14 @@ mod tests {
         );
         assert_eq!(
             crate::look::CLOSED_BY_HEADS_WHY,
-            "two changes were made apart, and none that lists this device is clear of a \
-             removed device: settle it with the phrase (`cordelia settle`)"
+            "two changes to your devices were made separately, neither knowing of the other, \
+             and a device you removed has the secret of each one that includes this device. To \
+             go on, run `cordelia settle` here and type your recovery phrase"
         );
-        assert_eq!(look.short.as_deref(), Some("two changes were made apart"));
+        assert_eq!(
+            look.short.as_deref(),
+            Some("two changes to your devices were made separately, neither knowing of the other")
+        );
     }
 
     /// Rule 12: at its first start on this version a device in a fork

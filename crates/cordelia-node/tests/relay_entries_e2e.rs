@@ -992,10 +992,7 @@ async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
     );
     let plain = relay.cli(&["stats"]);
     assert!(
-        plain.contains(
-            "Storage:          3.8 KB in use of 3.8 KB allowed, by channels from their secrets \
-             (3 held, 3 entries)"
-        ),
+        plain.contains("Storage:          3.8 KB used of 3.8 KB allowed (3 channels, 3 entries)"),
         "{plain}"
     );
 

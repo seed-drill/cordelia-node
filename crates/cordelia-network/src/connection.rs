@@ -67,7 +67,10 @@ pub enum ConnectionError {
     #[error("peer already connected: {0}")]
     AlreadyConnected(NodeId),
 
-    #[error("{0} answered at, or connected from, a configured relay's address, with another key")]
+    #[error(
+        "{0} answered at, or connected from, the address of a relay you set up, but with a key \
+         other than the one your configuration gives that relay"
+    )]
     NotTheRelay(NodeId),
 }
 

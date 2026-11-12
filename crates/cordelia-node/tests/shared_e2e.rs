@@ -2531,14 +2531,23 @@ fn removed_device_holds_review(n: &Node, removed: &str, named: Named) {
         holds_of(&status).contains(&"shared_removed_device_holds".to_string()),
         "{status}"
     );
+    // One line for the channel, which names the removed device, or where
+    // the node names none, says that this device writes nothing there
+    // (decision 2026-11-11 (plain words), rules 2 and 3).
     let plain = n.cli(&["status"]);
-    assert!(
-        plain.contains(
-            "  Shared:    1 shared channel not made anew since a removal: make \
-             each anew once with cordelia shared reset <name>"
+    let line = match holds_it[0]["devices"]
+        .as_array()
+        .is_some_and(|d| !d.is_empty())
+    {
+        true => format!(
+            "  Shared:    review: \"{removed}\" can still read new messages there. To stop that: \
+             cordelia shared reset review"
         ),
-        "{plain}"
-    );
+        false => "  Shared:    review: this device sends nothing there until you reset it: \
+                  cordelia shared reset review"
+            .to_string(),
+    };
+    assert!(plain.contains(&line), "{plain}");
 }
 
 /// A removal lists what the removed key did, with the command that undoes

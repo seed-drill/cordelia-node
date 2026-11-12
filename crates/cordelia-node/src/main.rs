@@ -1711,18 +1711,20 @@ fn messages_line(says: &str) -> String {
 
 /// What the plain status says under `Memory:`, worked out from `facts`
 /// without the holds of shared channels and without the hold of agents
-/// held for their person, and the hold of a removed device that holds a
-/// shared channel, where it holds (decision 2026-10-10 §9). The ambers of
+/// held for their person, and the holds of a removed device that holds a
+/// shared channel, one for each channel, where they hold (decision
+/// 2026-10-10 §9; decision 2026-11-11 (plain words), rule 2). The ambers of
 /// the repositories this device follows are said under each repository
 /// (decision 2026-11-06 (joining), rule 7), and the hold of agents by
 /// [`messages_held`].
-fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Option<indicator::Holds>) {
+fn memory_and_shared(facts: &indicator::Facts) -> (indicator::Shown, Vec<indicator::Holds>) {
     let shared = indicator::shown(facts)
         .holds
         .into_iter()
-        .find(indicator::is_shared);
+        .filter(indicator::is_shared)
+        .collect();
     let mut without = facts.clone();
-    without.devices.removed_holds_shared = 0;
+    without.devices.removed_holds_shared.clear();
     without.devices.repository_ambers.clear();
     without.held_pairs = 0;
     (indicator::shown(&without), shared)
@@ -1766,7 +1768,7 @@ fn cmd_status(
             details.push(format!("Not asked: {why}"));
         }
         if let Some(why) = status.held() {
-            details.push(format!("Held up: {why}"));
+            details.push(format!("Cannot go on: {why}"));
         }
         if status.facts.running {
             // Every relay the device is connected to, as the node lists
@@ -1988,7 +1990,7 @@ fn cmd_status(
         println!();
         println!("Identity:");
         println!("  Entity ID:  {}", config.identity.entity_id);
-        println!("  Public key: {pk_bech32}");
+        println!("  Device ID:  {pk_bech32}");
         println!("  Data dir:   {}", data_dir.display());
     }
 
@@ -2129,7 +2131,7 @@ fn node_lines(
     }
     // A node that is held up says why (decision 2026-10-04 §10.1).
     if let Some(why) = status.held() {
-        lines.push(format!("  Held up:   {why}"));
+        lines.push(format!("  Problem:   the node cannot go on: {why}"));
     }
     if role != "personal" {
         return lines;
@@ -2148,7 +2150,7 @@ fn node_lines(
     {
         lines.push(format!("    also:     {more}"));
     }
-    if let Some(shared) = shared {
+    for shared in shared {
         lines.push(shared_line(&shared.says));
     }
     for c in &status.facts.conflicts {
@@ -2160,7 +2162,7 @@ fn node_lines(
     // What this device says of itself and its person's devices (decision
     // 2026-10-04 §5.1, §5.2, §8).
     if let Some(person) = person {
-        let (short, says) = person_cmd::status_lines(person);
+        let (short, says) = person_cmd::status_lines(person, verbose);
         lines.push(format!("  Devices:   {short}"));
         for line in says {
             lines.push(format!("    {line}"));
@@ -2420,6 +2422,13 @@ fn channel_facts(
 /// ([`indicator::Devices`]).
 fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
     let list = |key: &str| person[key].as_array().into_iter().flatten();
+    // A device as a line names it: the name you gave it, or its words.
+    let named = |device: &serde_json::Value| {
+        indicator::device_named(
+            device["label"].as_str().unwrap_or_default(),
+            device["words"].as_str().unwrap_or_default(),
+        )
+    };
     let ago = |at: &serde_json::Value| at.as_i64().map(|at| now.saturating_sub(at).max(0) as u64);
     let change = person["change"].as_u64();
     let applied_secs = ago(&person["applied_at"]);
@@ -2434,6 +2443,9 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
     indicator::Devices {
         not_applied: person["state"] == "applied" && person["cannot_go_on"].is_string(),
         removal_not_applied_secs: applied_secs.filter(|_| removal && not_by_all),
+        // Each device it removed, by name (decision 2026-11-11 (plain
+        // words), rule 2).
+        removed_named: list("newly_removed").map(named).collect(),
         // A head set aside on a device that goes on (decision 2026-10-24
         // (removal), rule 11): from the newest.
         set_aside_secs: match person["state"] == "applied" {
@@ -2445,6 +2457,16 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         added_not_cleared: list("notices")
             .filter(|notice| notice["kind"] == "added")
             .count(),
+        // This device, where a notice is of its own addition.
+        added_named: list("notices")
+            .filter(|notice| notice["kind"] == "added" && notice["device"].is_object())
+            .map(
+                |notice| match notice["device"]["key"] == person["this_device"] {
+                    true => "this device".to_string(),
+                    false => named(&notice["device"]),
+                },
+            )
+            .collect(),
         said_left: said_left.filter(|device| device["left"] == true).count(),
         // What is known of each relay's reach, as the node put it
         // (decision 2026-10-19 §1, rule 11): nothing of it is worked out
@@ -2482,10 +2504,17 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
             .as_array()
             .map_or(0, Vec::len),
         carried_to_go_secs: ago(&person["names"]["carried_to_go_since"]),
+        carried_named: person["names"]["carried_to_go"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|name| name.as_str())
+            .map(cordelia_api::messages::cleaned)
+            .collect(),
         // From the status's `shared` object, not from the look
         // ([`indicator::shared`]).
         removed_holds_shared_secs: None,
-        removed_holds_shared: 0,
+        removed_holds_shared: Vec::new(),
         repository_ambers: Vec::new(),
     }
 }
@@ -3513,7 +3542,7 @@ fn cmd_channels(config_path: &str) -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "Channels:  {} held",
+        "Channels:  {} stored",
         cordelia_storage::relay::count_held(&conn)?
     );
     Ok(())
@@ -3527,8 +3556,8 @@ fn names_held(conn: &rusqlite::Connection) -> anyhow::Result<Vec<String>> {
     let names = cordelia_storage::person::names(conn)?;
     if names.is_empty() {
         return Ok(vec![
-            "No names. A device holds a name once it follows a recovery phrase and a folder \
-             is mapped to it (`cordelia sync map <folder> <name>`)."
+            "No names yet. A device has a name once it is under a recovery phrase and you map \
+             a folder to the name (`cordelia sync map <folder> <name>`)."
                 .to_string(),
         ]);
     }
@@ -3629,8 +3658,8 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
         format_bytes(usage.bytes_stored)
     );
     match personal {
-        true => println!("Names:            {channels} held"),
-        false => println!("Channels:         {channels} held"),
+        true => println!("Names:            {channels}"),
+        false => println!("Channels:         {channels} stored"),
     }
     println!(
         "Peers seen:       {} in the last day, {} in the last week (plus {} and {} relays)",
@@ -3661,11 +3690,15 @@ struct EntriesHeld {
 /// its cap (decision 2026-10-04 §2.5).
 fn storage_line(cap: u64, held: &EntriesHeld) -> String {
     format!(
-        "Storage:          {} in use of {} allowed, by channels from their secrets ({} held, {} \
-         {})",
+        "Storage:          {} used of {} allowed ({} {}, {} {})",
         format_bytes(held.used),
         format_bytes(cap),
         held.channels,
+        if held.channels == 1 {
+            "channel"
+        } else {
+            "channels"
+        },
         held.entries,
         if held.entries == 1 {
             "entry"
@@ -6230,7 +6263,7 @@ mod tests {
         let conn = cordelia_storage::db::open_in_memory().unwrap();
         let none = names_held(&conn).unwrap();
         assert_eq!(none.len(), 1, "{none:?}");
-        assert!(none[0].starts_with("No names."), "{none:?}");
+        assert!(none[0].starts_with("No names yet."), "{none:?}");
         assert!(none[0].contains("cordelia sync map"), "{none:?}");
 
         let identity = NodeIdentity::generate().unwrap();
@@ -6899,7 +6932,7 @@ mod tests {
             assert_eq!(lacks.level, Some(indicator::Level::Amber));
             assert_eq!(
                 lacks.summary,
-                "memory: a relay not known to hold the latest change"
+                "memory: a relay may not have the latest change to your devices"
             );
         }
     }
@@ -6961,7 +6994,7 @@ mod tests {
         );
         // The status names the device that filled it.
         assert!(
-            channel.warning().starts_with("memory: desk"),
+            channel.warning().starts_with("memory: \"desk"),
             "{}",
             channel.warning()
         );
@@ -7007,12 +7040,19 @@ mod tests {
                 { "this_device": false, "applied": 3, "left": true },
             ],
             "added": [{ "applied": 3, "left": true }, { "applied": 3, "left": false }],
-            "removed": [{ "key": "k" }],
+            "removed": [{ "key": "k" }, { "key": "j", "label": "", "words": "e f g h" }],
+            // The devices the change removed, by name (decision 2026-11-11
+            // (plain words), rule 2).
+            "newly_removed": [{ "key": "j", "label": "", "words": "e f g h" }],
+            "this_device": "t",
             "notices": [
-                { "id": "1", "kind": "added" },
-                { "id": "2", "kind": "left" },
+                { "id": "1", "kind": "added",
+                  "device": { "key": "p", "label": "phone", "words": "a b c d" } },
+                { "id": "2", "kind": "left", "device": null },
                 { "id": "3", "kind": "added" },
-                { "id": "4", "kind": "left_out" },
+                { "id": "4", "kind": "left_out", "device": null },
+                { "id": "5", "kind": "added",
+                  "device": { "key": "t", "label": "laptop", "words": "i j k l" } },
             ],
             "relays": [
                 { "relay": "a", "holds_latest": false, "connected_secs": 400, "no_room_at": null,
@@ -7047,8 +7087,12 @@ mod tests {
             indicator::Devices {
                 not_applied: false,
                 removal_not_applied_secs: Some(3_600),
+                removed_named: vec!["the device (e f g h)".into()],
                 set_aside_secs: None,
-                added_not_cleared: 2,
+                added_not_cleared: 3,
+                // Only a notice that names its device: one of an earlier
+                // version names none. This device's own is "this device".
+                added_named: vec!["\"phone\"".into(), "this device".into()],
                 said_left: 2,
                 // Each relay that lacks the change, connected or not, as
                 // the node counts it; one in the third state is not
@@ -7080,8 +7124,9 @@ mod tests {
                 // Of those, the names that a carry holds with no folder.
                 carried_to_go: 2,
                 carried_to_go_secs: Some(20),
+                carried_named: vec!["old".into(), "team".into()],
                 removed_holds_shared_secs: None,
-                removed_holds_shared: 0,
+                removed_holds_shared: Vec::new(),
                 repository_ambers: Vec::new(),
             }
         );
@@ -7318,11 +7363,15 @@ mod tests {
         };
         assert_eq!(
             storage_line(16 * 1_048_576, &held),
-            "Storage:          3.0 MB in use of 16.0 MB allowed, by channels from their secrets \
-             (2 held, 1 entry)",
+            "Storage:          3.0 MB used of 16.0 MB allowed (2 channels, 1 entry)",
         );
         let more = EntriesHeld { entries: 5, ..held };
-        assert!(storage_line(1024, &more).ends_with("(2 held, 5 entries)"));
+        assert!(storage_line(1024, &more).ends_with("(2 channels, 5 entries)"));
+        let one = EntriesHeld {
+            channels: 1,
+            ..held
+        };
+        assert!(storage_line(1024, &one).ends_with("(1 channel, 1 entry)"));
     }
 
     /// Each system's service is restarted by its own command, as the
@@ -8923,7 +8972,7 @@ mod tests {
         .collect();
         summaries.extend(
             [
-                "memory: a relay not known to hold the latest change",
+                "memory: a relay may not have the latest change to your devices",
                 "memory not syncing: two changes made apart",
                 "memory sync error",
                 "memory: node stopped",
@@ -8948,8 +8997,8 @@ mod tests {
             assert!(shown.contains(summary.as_str()), "{shown}");
         }
         assert_eq!(
-            memory_line("memory: a relay not known to hold the latest change"),
-            "  Memory:    a relay not known to hold the latest change"
+            memory_line("memory: a relay may not have the latest change to your devices"),
+            "  Memory:    a relay may not have the latest change to your devices"
         );
         assert_eq!(
             memory_line("memory not syncing: two changes made apart"),
@@ -8966,7 +9015,9 @@ mod tests {
     /// own** (decision 2026-10-10 §9, section 19 item 22): `Shared:`, with
     /// its words after its label, and `Memory:` says what it would say
     /// without it, its other holds among the "also" lines and that hold not
-    /// among them. The line itself (`--line`) says it as it is.
+    /// among them. The line itself (`--line`) says it as it is. Each
+    /// channel is a line of its own (decision 2026-11-11 (plain words),
+    /// rule 2).
     #[test]
     fn the_plain_status_says_a_removed_device_that_holds_a_shared_channel_apart() {
         let mut f = indicator::Facts {
@@ -8981,21 +9032,43 @@ mod tests {
             mapped: 1,
             ..Default::default()
         };
-        f.devices.removed_holds_shared = 1;
+        let held = |channel: &str| indicator::HeldShared {
+            channel: channel.into(),
+            devices: vec!["\"old laptop\"".into()],
+        };
+        f.devices.removed_holds_shared = vec![held("design-review")];
         f.devices.removed_holds_shared_secs = Some(3_600);
         let line = indicator::shown(&f).summary;
         assert_eq!(
             line,
-            "shared: 1 shared channel not made anew since a removal: make \
-             each anew once with cordelia shared reset <name>"
+            "shared: design-review: \"old laptop\" can still read new messages there. To stop \
+             that: cordelia shared reset design-review"
         );
         let (memory, shared) = memory_and_shared(&f);
         assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
         assert!(memory.holds.is_empty(), "{:?}", memory.holds);
+        let lines: Vec<String> = shared
+            .iter()
+            .map(|holds| shared_line(&holds.says))
+            .collect();
         assert_eq!(
-            shared_line(&shared.unwrap().says),
-            "  Shared:    1 shared channel not made anew since a removal: make \
-             each anew once with cordelia shared reset <name>"
+            lines,
+            [
+                "  Shared:    design-review: \"old laptop\" can still read new messages there. To \
+                 stop that: cordelia shared reset design-review"
+            ]
+        );
+        // Two channels: two lines.
+        f.devices.removed_holds_shared.push(held("ops"));
+        let (_, shared) = memory_and_shared(&f);
+        let lines: Vec<String> = shared
+            .iter()
+            .map(|holds| shared_line(&holds.says))
+            .collect();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].starts_with("  Shared:    ops: \"old laptop\""),
+            "{lines:?}"
         );
         // Beside another amber hold: that one is under `Memory:`.
         f.devices.said_left = 1;
@@ -9004,7 +9077,7 @@ mod tests {
             memory_line(&memory.summary),
             "  Memory:    a device has left"
         );
-        assert!(shared.is_some());
+        assert!(!shared.is_empty());
         assert!(
             memory
                 .holds
@@ -9012,8 +9085,603 @@ mod tests {
                 .all(|holds| !indicator::is_shared(holds))
         );
         // With none, there is no `Shared:` line.
-        f.devices.removed_holds_shared = 0;
-        assert!(memory_and_shared(&f).1.is_none());
+        f.devices.removed_holds_shared.clear();
+        assert!(memory_and_shared(&f).1.is_empty());
+    }
+
+    // ── Plain words (decision 2026-11-11 (plain words), §8) ──────────
+
+    /// The words that no line a person reads uses (decision 2026-11-11
+    /// (plain words), §8): each as a whole word, in any case. "key" is a
+    /// device's key; a relay's is kept by [`KEPT`].
+    const OLD_WORDS: &[&str] = &[
+        "anew",
+        "labelled",
+        "applied change",
+        "holds",
+        "held",
+        "sealed",
+        "a removal",
+        "made apart",
+        "set aside",
+        "follows",
+        "handed",
+        "the look",
+        "statement",
+        "generation",
+        "key",
+        "keys",
+    ];
+
+    /// What keeps a word for a reason (record §2 and §8): each is taken out
+    /// of a line before the line is read.
+    const KEPT: &[(&str, &str)] = &[
+        ("the relay with key", "a relay's key is its setting's name"),
+        ("--new-key", "the flag keeps its name"),
+        (
+            "with a key other than the one your configuration gives that relay",
+            "a relay's key is its setting's name",
+        ),
+    ];
+
+    /// The sources of slice 1's lines (decision 2026-11-11 (plain words),
+    /// §6), and in each the items that hold them. Later slices add theirs.
+    const PLAIN_SOURCES: &[(&str, &str, &[&str])] = &[
+        (
+            "cordelia-api/src/look.rs",
+            include_str!("../../cordelia-api/src/look.rs"),
+            &[
+                "fn of_its_person(",
+                "pub const CLOSED_BY_HEADS_WHY",
+                "pub const SET_ASIDE_SHORT",
+                "pub const CLOSED_SHORT",
+                "pub const CLOSED_WHY",
+                "pub const REMOVED_AS_KNOWN_SHORT",
+                "pub const REMOVED_AS_KNOWN_WHY",
+                "pub fn short_why(",
+                "fn of_its_names(",
+                "fn set_aside_line(",
+                "fn not_counted(",
+                "fn left_says(",
+                "fn told(",
+                "fn set_aside(",
+                "pub fn relay_named(",
+                "pub fn since(",
+                "fn no_room_says(",
+                "impl AtRelayLook {",
+                "impl Accepting {",
+            ],
+        ),
+        (
+            "cordelia-api/src/repository_status.rs",
+            include_str!("../../cordelia-api/src/repository_status.rs"),
+            &[
+                "fn not_handing_line(",
+                "pub fn gate_line(",
+                "pub fn handing_line(",
+                "pub fn dropped_line(",
+                "pub fn put_the_line(",
+                "pub fn not_said_line(",
+                "pub fn still_shown_line(",
+                "pub const DROPPED_STAYS",
+                "pub fn seen(",
+            ],
+        ),
+        (
+            "cordelia-network/src/connection.rs",
+            include_str!("../../cordelia-network/src/connection.rs"),
+            &["pub enum ConnectionError"],
+        ),
+        (
+            "cordelia-node/src/device_entries.rs",
+            include_str!("device_entries.rs"),
+            &["let read_as = LeftRead::NotRead("],
+        ),
+        (
+            "cordelia-node/src/indicator.rs",
+            include_str!("indicator.rs"),
+            &[
+                "pub fn warning(&self)",
+                "pub fn device_named(",
+                "pub fn removed_holds_shared_says(",
+                "fn stopped_says(",
+                "fn held_says(",
+                "const NO_PHRASE_SAYS",
+                "const NOT_APPLIED_SAYS",
+                "pub fn holds(f: &Facts)",
+                "const LATEST",
+                "pub const MESSAGES_HELD_SAYS",
+                "fn folders_after(",
+                "pub fn derive(",
+                "fn of_its_folders(",
+            ],
+        ),
+        (
+            "cordelia-node/src/main.rs",
+            include_str!("main.rs"),
+            &[
+                "fn cmd_status(",
+                "fn node_lines(",
+                "fn not_running_line(",
+                "fn cmd_channels(",
+                "fn names_held(",
+                "fn cmd_stats(",
+                "fn storage_line(",
+            ],
+        ),
+        (
+            "cordelia-node/src/person_cmd.rs",
+            include_str!("person_cmd.rs"),
+            &["pub fn status_lines(", "fn relay_says("],
+        ),
+    ];
+
+    /// Where the code at `at` goes on, past a comment, a string, a raw
+    /// string or a char literal that starts there (or `at` itself), with
+    /// the text of the string, its `\` line ends taken out.
+    fn past(src: &str, at: usize) -> (usize, Option<String>) {
+        let b = src.as_bytes();
+        let rest = &src[at..];
+        if rest.starts_with("//") {
+            return (rest.find('\n').map_or(src.len(), |n| at + n), None);
+        }
+        if rest.starts_with("/*") {
+            return (rest.find("*/").map_or(src.len(), |n| at + n + 2), None);
+        }
+        let word_before = at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
+        if !word_before && rest.starts_with('r') {
+            let hashes = rest[1..].bytes().take_while(|c| *c == b'#').count();
+            if rest[1 + hashes..].starts_with('"') {
+                let open = at + 2 + hashes;
+                let close = format!("\"{}", "#".repeat(hashes));
+                let end = src[open..].find(&close).map_or(src.len(), |n| open + n);
+                return (end + close.len(), Some(src[open..end].to_string()));
+            }
+        }
+        if rest.starts_with('"') {
+            let mut i = at + 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            // A `\` at a line's end takes the line end and the next
+            // line's leading space out.
+            let mut text = String::new();
+            let mut chars = src[at + 1..i].chars().peekable();
+            while let Some(c) = chars.next() {
+                match (c, chars.peek()) {
+                    ('\\', Some('\n')) => {
+                        while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                            chars.next();
+                        }
+                    }
+                    ('\\', Some(_)) => {
+                        text.push(c);
+                        text.extend(chars.next());
+                    }
+                    _ => text.push(c),
+                }
+            }
+            return (i + 1, Some(text));
+        }
+        // An escaped char: '\n', '\'', '\u{1b}'.
+        if let Some(escaped) = rest.strip_prefix("'\\") {
+            let end = escaped[1..]
+                .find('\'')
+                .map_or(src.len(), |n| at + 3 + n + 1);
+            return (end, None);
+        }
+        if let Some(c) = rest[1..].chars().next()
+            && rest.starts_with('\'')
+            && rest[1 + c.len_utf8()..].starts_with('\'')
+        {
+            return (at + 2 + c.len_utf8(), None);
+        }
+        (at, None)
+    }
+
+    /// The item of `src` that starts at `start`: to its closing brace, or
+    /// to its `;` where it has no body.
+    fn item<'a>(src: &'a str, start: &str) -> &'a str {
+        let at = src
+            .find(start)
+            .unwrap_or_else(|| panic!("no {start} in the source"));
+        let (mut i, mut depth) = (at, 0usize);
+        while i < src.len() {
+            let (next, _) = past(src, i);
+            if next != i {
+                i = next;
+                continue;
+            }
+            match src.as_bytes()[i] {
+                b'{' => depth += 1,
+                b'}' if depth == 1 => return &src[at..=i],
+                b'}' => depth = depth.saturating_sub(1),
+                b';' if depth == 0 => return &src[at..=i],
+                _ => {}
+            }
+            i += 1;
+        }
+        panic!("{start} does not end");
+    }
+
+    /// The literals of `code` that a person reads: none of the node's log,
+    /// a panic, an assertion or an internal fault, and none with no space
+    /// (a field's name, a route), as the inventory's parser read them.
+    fn read_by_a_person(code: &str) -> Vec<String> {
+        let (mut i, mut statement) = (0, 0);
+        let mut out = Vec::new();
+        while i < code.len() {
+            let (next, text) = past(code, i);
+            if let Some(text) = text {
+                let before = &code[statement..i];
+                let not_read = ["tracing::", "PersonError", "panic!", ".expect(", "assert"]
+                    .iter()
+                    .any(|not| before.contains(not));
+                if !not_read && text.contains(' ') {
+                    out.push(text);
+                }
+            }
+            if next != i {
+                i = next;
+                continue;
+            }
+            if matches!(code.as_bytes()[i], b';' | b'{' | b'}') {
+                statement = i + 1;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The old words that `line` uses, but those it keeps for a reason.
+    fn old_words_in(line: &str) -> Vec<&'static str> {
+        let mut line = line.to_lowercase();
+        for (kept, _) in KEPT {
+            line = line.replace(kept, " ");
+        }
+        // A placeholder names a value, not a word.
+        while let Some(open) = line.find('{') {
+            let close = line[open..].find('}').map_or(line.len(), |n| open + n + 1);
+            line.replace_range(open..close, " ");
+        }
+        let whole = |word: &str| {
+            line.match_indices(word).any(|(at, _)| {
+                let next = line[at + word.len()..].chars().next();
+                let before = line[..at].chars().next_back();
+                !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                    && !next.is_some_and(|c| c.is_alphanumeric() || c == '_')
+            })
+        };
+        OLD_WORDS
+            .iter()
+            .copied()
+            .filter(|word| whole(word))
+            .collect()
+    }
+
+    /// The plain status of a device that stands as `person` says, with
+    /// `facts` and its repository `lines`: every line it prints without
+    /// `-v`, with the status line and what its tooltip lists.
+    fn plain_status(
+        facts: &indicator::Facts,
+        person: &serde_json::Value,
+        lines: &[serde_json::Value],
+    ) -> Vec<String> {
+        use serde_json::json;
+        let repository = json!({
+            "identity": "example.org/team/project", "name": "team/project", "held": true,
+            "read": { "says": "List of example.org/team/project read from your clone." },
+            "members": [{ "label": "alice-laptop", "words": "a b c d e f", "in": true }],
+            "unread_by_a_person": 0, "unread_by_an_agent": 0,
+            "lines": lines, "in_step": lines.is_empty(),
+        });
+        // The repository's ambers, as the node's `shared` gives them; what
+        // `facts` says of shared channels stays.
+        let mut facts = facts.clone();
+        let mut of_shared = indicator::Devices::default();
+        indicator::shared(
+            &mut of_shared,
+            &json!({ "repositories": [repository.clone()] }),
+            0,
+        );
+        facts.devices.repository_ambers = of_shared.repository_ambers;
+        let held = facts
+            .held
+            .as_ref()
+            .map(|by| json!({ "by": by, "why": "the database is newer" }));
+        let live = json!({
+            "uptime_secs": 7380, "version": env!("CARGO_PKG_VERSION"), "peers_hot": 2,
+            "peers_warm": 0, "sync_errors": 0, "held": held,
+            "shared": { "repositories": [repository] },
+        });
+        let status = GatheredStatus {
+            facts: facts.clone(),
+            device: None,
+            live: Some(live.clone()),
+            sync: None,
+            not_asked: None,
+            person: Some(person.clone()),
+        };
+        let shown = indicator::shown(&facts);
+        let mut said = node_lines(&status, &live, "personal", Some(person), false, 0);
+        said.push(indicator::line(
+            shown.state,
+            shown.level,
+            &shown.summary,
+            false,
+        ));
+        said.extend(shown.holds.iter().map(indicator::Holds::detail));
+        said
+    }
+
+    /// **No line of the status uses an old word** (decision 2026-11-11
+    /// (plain words), §8): each literal of slice 1's lines that a person
+    /// reads, and the plain status rendered as a person sees it, all well
+    /// and in each state that it warns of, with its status line and
+    /// tooltip. A line that keeps a word says why ([`KEPT`]).
+    #[test]
+    fn the_plain_lines_use_no_old_words() {
+        use cordelia_api::look::{self, AtRelayLook, ReachLook};
+        use cordelia_storage::person::State;
+        use serde_json::json;
+        let mut found: Vec<String> = Vec::new();
+        let mut read = 0;
+        for (file, src, items) in PLAIN_SOURCES {
+            for start in *items {
+                for literal in read_by_a_person(item(src, start)) {
+                    read += 1;
+                    let old = old_words_in(&literal);
+                    if !old.is_empty() {
+                        found.push(format!("{file}, {start} {literal:?}: {old:?}"));
+                    }
+                }
+            }
+        }
+        // The scan reads what it should: every item, and the lines in them.
+        assert!(read > 150, "{read} literals read");
+
+        // The status as a person sees it.
+        let well = indicator::Facts {
+            initialised: true,
+            running: true,
+            role: "personal".into(),
+            stands: "applied".into(),
+            peers_hot: 2,
+            sync_enabled: true,
+            report_age_secs: Some(3),
+            folders: 1,
+            mapped: 1,
+            ..Default::default()
+        };
+        let lacking = |out: &[bool]| -> Vec<indicator::NotKnown> {
+            out.iter()
+                .map(|out| indicator::NotKnown {
+                    lacking_secs: 400,
+                    said_secs: None,
+                    out_of_reach: *out,
+                })
+                .collect()
+        };
+        let signer = |this: bool, label: &str, not_words: u64| indicator::Signer {
+            key: format!("cordelia_pk1{label}"),
+            this_device: this,
+            label: label.into(),
+            words_of_key: "able bake cold dune".into(),
+            words: 0,
+            not_words,
+        };
+        let mib = 1024 * 1024;
+        let filled = move |words: u64, this: u64, other: u64, label: &str| indicator::Channel {
+            total: words + this + other,
+            words,
+            by: vec![signer(true, "desktop", this), signer(false, label, other)],
+        };
+        let shared = |devices: &[&str]| indicator::HeldShared {
+            channel: "design review".into(),
+            devices: devices.iter().map(|d| d.to_string()).collect(),
+        };
+        type Edit = Box<dyn Fn(&mut indicator::Facts)>;
+        let mut states: Vec<Edit> = vec![Box::new(|_| {})];
+        for stands in [
+            "fork",
+            "removed",
+            "not_listed",
+            "not_opened",
+            "closed",
+            "no_phrase",
+        ] {
+            states.push(Box::new(move |f| f.stands = stands.into()));
+        }
+        for by in ["later_database", "earlier_database", "step_failed", "other"] {
+            states.push(Box::new(move |f| f.held = Some(by.into())));
+        }
+        states.extend::<Vec<Edit>>(vec![
+            Box::new(|f| f.devices.not_applied = true),
+            Box::new(|f| f.errors = vec!["notes.md: no room".into()]),
+            Box::new(|f| f.no_report_secs = Some(600)),
+            Box::new(|f| f.conflicts = vec!["notes.md".into()]),
+            Box::new(|f| f.too_large = vec!["big.md".into()]),
+            Box::new(move |f| f.channel = Some(filled(mib, mib, 12 * mib, "laptop"))),
+            Box::new(move |f| f.channel = Some(filled(mib, mib, 12 * mib, ""))),
+            Box::new(move |f| f.channel = Some(filled(mib, 12 * mib, mib, "laptop"))),
+            Box::new(move |f| f.channel = Some(filled(13 * mib, mib, mib, "laptop"))),
+            Box::new(move |f| f.channel = Some(filled(6 * mib, 4 * mib, 4 * mib, "laptop"))),
+            Box::new(|f| f.no_relay_secs = Some(400)),
+            Box::new(|f| f.other_version = true),
+            Box::new(|f| f.devices.removal_not_applied_secs = Some(60)),
+            Box::new(|f| {
+                f.devices.removal_not_applied_secs = Some(60);
+                f.devices.removed_named =
+                    vec!["\"old laptop\"".into(), "the device (a b c d)".into()];
+            }),
+            Box::new(|f| f.devices.set_aside_secs = Some(60)),
+            Box::new(move |f| {
+                f.devices.removed_holds_shared_secs = Some(60);
+                f.devices.removed_holds_shared = vec![
+                    shared(&["\"old laptop\""]),
+                    shared(&["the device (a b c d)"]),
+                    shared(&[]),
+                ];
+            }),
+            Box::new(|f| f.devices.added_not_cleared = 2),
+            Box::new(|f| {
+                f.devices.added_not_cleared = 5;
+                f.devices.added_named = vec![
+                    "\"phone\"".into(),
+                    "this device".into(),
+                    "the device (a b c d)".into(),
+                    "\"tablet\"".into(),
+                ];
+            }),
+            Box::new(|f| f.devices.said_left = 2),
+            Box::new(|f| {
+                f.devices.carried_to_go = 2;
+                f.devices.carried_to_go_secs = Some(400);
+                f.devices.carried_named = vec!["lab".into(), "team".into()];
+            }),
+            Box::new(|f| f.devices.no_room_secs = vec![30]),
+            Box::new(|f| {
+                f.devices.names_not_listed = 2;
+                f.devices.applied_secs = Some(400);
+            }),
+            Box::new(|f| {
+                f.devices.names_to_go = 2;
+                f.devices.to_go_secs = Some(400);
+            }),
+            Box::new(|f| {
+                f.devices.out_of_reach_secs = vec![120];
+                f.devices.one_reached = true;
+            }),
+            Box::new(|f| {
+                f.devices.out_of_reach_secs = vec![120, 300];
+                f.devices.one_reached = true;
+            }),
+            Box::new(|f| f.held_pairs = 1),
+        ]);
+        for out in [
+            &[false][..],
+            &[false, false],
+            &[true],
+            &[true, true],
+            &[true, false],
+            &[true, true, false],
+        ] {
+            let out = out.to_vec();
+            states.push(Box::new(move |f| {
+                f.devices.not_known_to_hold = lacking(&out)
+            }));
+        }
+
+        // What the node says of this device, of its relays and of a key
+        // typed at `cordelia accept`.
+        let now = 1_794_398_400;
+        let reach = |holds: &str, by: &str, out: bool| -> ReachLook {
+            serde_json::from_value(json!({
+                "about": "0101", "holds": holds, "reached": !out,
+                "out_of_reach_since": out.then_some(now - 60), "reference": now - 600,
+                "reference_by": by, "last_reached": now - 900,
+            }))
+            .unwrap()
+        };
+        let relay = |heard: bool, holds_latest: Option<bool>, reach: ReachLook| AtRelayLook {
+            relay: "relay-a.example:9474".into(),
+            holds_latest,
+            heard_since_woke: heard,
+            no_room: None,
+            no_room_at: None,
+            connected_secs: None,
+            another_form: 2,
+            refuses: Some("it removes no device".into()),
+            key: None,
+            has_what_was_carried: None,
+            reach,
+        };
+        let mut says: Vec<String> = Vec::new();
+        for by in ["start", "sleep", "change", "reached"] {
+            for (heard, holds, latest, out) in [
+                (false, "neither", None, false),
+                (true, "lacks", Some(false), true),
+                (true, "holds", Some(true), true),
+                (true, "lacks", Some(false), false),
+            ] {
+                let reach = reach(holds, by, out);
+                let said =
+                    relay(heard, latest, reach.clone()).says(Some(now - 60), Some("0101"), now);
+                says.extend(said);
+                says.push(look::since(&reach, now));
+            }
+        }
+        says.push(look::relay_named("cordelia_pk1unknown", &[]));
+        for (asking, taken) in [(true, false), (false, false), (false, true)] {
+            let accepting = look::Accepting {
+                key: "cordelia_pk1typed".into(),
+                words: "a b c d e f".into(),
+                typed_at: now - 60,
+                until: now + 3_540,
+                taken,
+                taken_at: taken.then_some(now - 30),
+                asking,
+                said: Some("this device has joined".into()),
+            };
+            says.push(accepting.says());
+        }
+        let mut people = vec![
+            json!({ "devices": [{ "key": "a" }], "change": 1, "says": says }),
+            json!({ "devices": [{ "key": "a" }, { "key": "b" }], "change": 4 }),
+            json!({ "short": look::CLOSED_SHORT, "says": [look::CLOSED_WHY] }),
+            json!({
+                "short": look::REMOVED_AS_KNOWN_SHORT,
+                "says": [look::REMOVED_AS_KNOWN_WHY],
+            }),
+            json!({ "short": look::SET_ASIDE_SHORT, "says": [] }),
+            json!({
+                "short": look::short_why(State::Fork),
+                "says": [look::CLOSED_BY_HEADS_WHY],
+            }),
+        ];
+        for state in [
+            State::Removed,
+            State::NotListed,
+            State::NotOpened,
+            State::Applied,
+        ] {
+            people.push(json!({ "short": look::short_why(state), "says": [] }));
+        }
+
+        // The lines of a repository followed, each amber.
+        use cordelia_api::repository_status as repository;
+        let amber = |says: String| json!({ "word": "w", "says": says, "amber": true });
+        let lines = [
+            amber(repository::gate_line("carol-laptop", "team/project")),
+            amber(repository::handing_line("team/project", "carol-laptop")),
+            amber(repository::dropped_line("carol-laptop", "team/project")),
+            amber(repository::put_the_line("team/project", true)),
+            amber(repository::put_the_line("team/project", false)),
+            amber(repository::not_said_line("carol-laptop", "team/project")),
+            amber(repository::still_shown_line("carol-laptop", "team/project")),
+            amber(repository::DROPPED_STAYS.to_string()),
+        ];
+
+        let mut rendered = 0;
+        for edit in &states {
+            let mut facts = well.clone();
+            edit(&mut facts);
+            for person in &people {
+                for lines in [&[][..], &lines[..]] {
+                    for line in plain_status(&facts, person, lines) {
+                        rendered += 1;
+                        let old = old_words_in(&line);
+                        if !old.is_empty() {
+                            found.push(format!("the status says {line:?}: {old:?}"));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(rendered > 1_000, "{rendered} lines rendered");
+        found.sort();
+        found.dedup();
+        assert!(found.is_empty(), "old words:\n{}", found.join("\n"));
     }
 
     /// **The plain status says one line for each area when all is well**
@@ -9079,7 +9747,7 @@ mod tests {
             [
                 "  Running:   yes, up 2h 03m",
                 "  Memory:    synced",
-                "  Devices:   2 devices under a recovery phrase (change 4)",
+                "  Devices:   2 devices under a recovery phrase",
                 "  Following: example.org/team/project, for team/project: 2 members, all in",
             ]
         );
@@ -9153,11 +9821,11 @@ mod tests {
             ),
             [
                 "  Running:   yes, up 2h 03m",
-                "  Held up:   the database is newer",
+                "  Problem:   the node cannot go on: the database is newer",
                 "  Memory:    1 conflict",
                 "    also:     To know: a device has left",
                 "    conflict: notes.md",
-                "  Devices:   2 devices under a recovery phrase (change 4)",
+                "  Devices:   2 devices under a recovery phrase",
                 "    new device: desktop",
                 "  Following: example.org/team/project, for team/project: 2 members, all in",
             ]
@@ -9211,7 +9879,7 @@ mod tests {
         let (memory, shared) = memory_and_shared(&f);
         assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
         assert!(memory.holds.is_empty(), "{:?}", memory.holds);
-        assert!(shared.is_none());
+        assert!(shared.is_empty());
         assert_eq!(
             messages_line(&messages_held(&f).unwrap().says),
             format!("  Messages:  {says}")
