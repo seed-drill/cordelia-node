@@ -66,6 +66,18 @@ fn with_a_yes(
     path: &str,
     body: Value,
 ) -> anyhow::Result<Option<Value>> {
+    with_a_yes_binding(config_path, at, path, body, &[])
+}
+
+/// [`with_a_yes`], whose yes sends back each field of `bound` that the
+/// look answered: what the yes binds beyond its text.
+fn with_a_yes_binding(
+    config_path: &str,
+    at: &Terminal,
+    path: &str,
+    body: Value,
+    bound: &[&str],
+) -> anyhow::Result<Option<Value>> {
     let mut look = body.clone();
     look["look"] = true.into();
     let would = asked(config_path, path, &look)?;
@@ -82,6 +94,9 @@ fn with_a_yes(
     }
     let mut body = body;
     body["said_yes_to"] = asks.into();
+    for field in bound {
+        body[*field] = would[*field].clone();
+    }
     Ok(Some(asked(config_path, path, &body)?))
 }
 
@@ -195,8 +210,8 @@ fn asking_line(words: &str, until: &str) -> String {
 /// What `accept --channel` says of a share it took (§5.2): the name it is
 /// filed under, its words and its relays, where the node lists it, and the
 /// next act, which its yes no longer says (made terser on 11 November
-/// 2026, issue #338). That the words prove nothing is said once, at the
-/// yes of `share`.
+/// 2026, issue #338). That the words prove nothing is said once, at its
+/// yes, as at the yes of `share`.
 fn taken_line(name: Option<&str>, words: &str, relays: &[&str]) -> String {
     match name {
         Some(name) => format!(
@@ -256,7 +271,10 @@ pub fn follow(config_path: &str, new: bool, remote: Option<&str>) -> anyhow::Res
     refuse_another_version(config_path)?;
     let (folder, _) = crate::msg_cmd::folder_of(config_path)?;
     let body = json!({ "folder": folder, "remote": remote, "new": new });
-    if let Some(done) = with_a_yes(config_path, &at, "/api/v1/shared/follow", body)? {
+    // The yes binds the whole commit the look read: its text shows only
+    // the first twelve characters.
+    let path = "/api/v1/shared/follow";
+    if let Some(done) = with_a_yes_binding(config_path, &at, path, body, &["commit"])? {
         print_said(&done);
     }
     Ok(())
@@ -745,7 +763,8 @@ mod tests {
             )
         );
         // That the words prove nothing is said once, at the yes of `share`
-        // (the person's choice of 11 November 2026, issue #338).
+        // and of `accept --channel` (the person's choice of 11 November
+        // 2026, issue #338).
         assert_eq!(
             taken_line(None, four, &[]),
             format!("Taken: channel {four}.")

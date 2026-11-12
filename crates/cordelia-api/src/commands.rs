@@ -669,9 +669,9 @@ pub async fn add_look(
     let (would, shared) = {
         let conn = db(&state);
         let would = adding::would_add(&conn, &state.identity, &device, label).map_err(refused)?;
-        // The shared channels the new device is handed, with the keys of
-        // each (decision 2026-10-10 §5.2): adding a device trusts it with
-        // everything of the person's.
+        // The shared channels the new device is handed, each with its
+        // keys (decision 2026-10-10 §5.2): adding a device trusts it with
+        // everything of the person's, and its yes says how many.
         let shared =
             crate::sharing::held_with_keys(&conn, &state.identity.public_key()).map_err(refused)?;
         (would, shared)

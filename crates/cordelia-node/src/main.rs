@@ -572,9 +572,9 @@ enum MsgCommand {
         /// give the folder you gave `msg summary --folder`
         #[arg(long, value_name = "DIR")]
         folder: Option<String>,
-        /// Also show the message's thread and how many messages it has
-        /// here, and for a message from your own agents, the four words
-        /// of the device that sent it
+        /// Also show the thread, and how many messages are here: in that
+        /// thread, for a shared channel; between the two agents, with the
+        /// four words of the device that sent it, for your own agents
         #[arg(short = 'v', long)]
         verbose: bool,
     },
@@ -631,9 +631,8 @@ enum MsgCommand {
         /// shared channel's are all shown
         #[arg(long)]
         since: Option<String>,
-        /// Also show the four words of the device that sent each
-        /// message, and at a terminal too, the lines an agent sees around
-        /// each message
+        /// At a terminal too, show the lines an agent sees around each
+        /// message
         #[arg(short = 'v', long)]
         verbose: bool,
     },

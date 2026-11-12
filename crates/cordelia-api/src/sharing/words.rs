@@ -177,7 +177,7 @@ fn the_shared_commands_say_what_this_record_says() {
              words>) <\"label\", or no label of yours> hands it, and files it as \
              \"review-with-alice\" on every device of yours. It is asked for at your relays \
              that have a key, relay.example.org:9474 (<four words>), and taken only where it \
-             lives at them.\n\
+             lives at them. The words it prints for the channel are a name that proves nothing.\n\
              Check first: have its person read you the six words that cordelia id --words prints \
              there, by another way than the one the key came by, such as a call or in person. \
              They must be: <six words>. If not, someone put their own key in its place: stop \

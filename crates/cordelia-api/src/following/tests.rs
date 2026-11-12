@@ -33,9 +33,14 @@ const RECORD: &str =
     include_str!("../../../../docs/decisions/2026-11-06-joining-by-pull-request.md");
 
 /// The yes's last line, as rules 2.2 and 2.3 give it: who reads the
-/// channel.
-const WHO_READS: &str = "Who reads it: each device on the list. Anyone in it can hand it on, \
-                         and a device that only reads shows nowhere.";
+/// channel, every device of each person on the list (decision 2026-10-10,
+/// property 19).
+const WHO_READS: &str = "Who reads it: every device of each person on the list. Anyone in it \
+                         can hand it on, and a device that only reads shows nowhere.";
+
+/// What the yes says subscribing does, as `subscribe <name>` says it.
+const READ_AND_WRITE: &str = "project is subscribed, on every device of yours where it is \
+                              mapped, to read and write in it.";
 
 fn own_relays() -> Vec<OwnRelay> {
     vec![OwnRelay {
@@ -156,8 +161,8 @@ fn waits_for(commit: &str, words: &str) -> String {
     says(
         "This follows <identity> from your clone at <clone> (<remote>, commit <commit>), whose \
          list names channel <four words>, which you do not hold, and your key as <label>. A \
-         member's device hands it to you once it reads the list, and <agent> is subscribed to \
-         it then.",
+         member's device hands it to you once it reads the list; then <agent> is subscribed, on \
+         every device of yours where it is mapped, to read and write in it.",
         &[
             REPOSITORY,
             FOLDER,
@@ -212,8 +217,8 @@ fn a_list_that_names_this_device_and_no_channel_is_followed_and_waits() {
         [
             &format!(
                 "This follows {}, whose list names no channel yet, and your key as bob-laptop. A \
-                 member's device hands you its channel once the list names one, and project is \
-                 subscribed to it then.",
+                 member's device hands you its channel once the list names one; then \
+                 {READ_AND_WRITE}",
                 follows_from(FIRST)
             ),
             WHO_READS,
@@ -354,9 +359,10 @@ fn a_holder_follows_and_its_agent_is_subscribed() {
         first.asks,
         [
             says(
-                "This subscribes <agent> to \"<name>\", which you hold, and follows <identity> \
-                 from your clone at <clone> (<remote>, commit <commit>), whose list names it, and \
-                 your key as <label>.",
+                "This subscribes <agent>, on every device of yours where it is mapped, to read and \
+                 write in \"<name>\", which you hold, and follows <identity> from your clone at \
+                 <clone> (<remote>, commit <commit>), whose list names it, and your key as \
+                 <label>.",
                 &[
                     "project",
                     "review",
@@ -574,8 +580,9 @@ fn a_key_left_out_and_still_listed_holds_the_list_back() {
         held_back.asks,
         [
             format!(
-                "This subscribes project to \"review\", which you hold, and follows {}, whose \
-                 list names it, and your key as bob-laptop.",
+                "This subscribes project, on every device of yours where it is mapped, to read and \
+                 write in \"review\", which you hold, and follows {}, whose list names it, and \
+                 your key as bob-laptop.",
                 follows_from(FIRST)
             ),
             gate_line("alice-laptop", "review"),
@@ -631,7 +638,7 @@ fn the_cases_of_rule_2_3_are_taken_on_the_line_whatever_the_gate_says() {
         [
             format!(
                 "This follows {}, whose list names channel {words}, which you do not hold, and \
-                 your key as bob-laptop. project is subscribed to it once this device takes it.",
+                 your key as bob-laptop. Once this device takes it, {READ_AND_WRITE}",
                 follows_from(FIRST)
             ),
             gate_line("alice-laptop", &format!("channel {words}")),
@@ -888,9 +895,11 @@ fn new_makes_the_channel_follows_and_says_the_lines_to_add() {
         planned.asks,
         [
             says(
-                "This makes the shared channel \"<owner/name>\" at <relay>, subscribes <agent> to \
-                 it, and follows <identity> from your clone at <clone> (<remote>, commit \
-                 <commit>), whose list names no channel yet, and your key as <label>.",
+                "This makes the shared channel \"<owner/name>\" at <relay>, which carries messages \
+                 between your agents and other people's and never memory; subscribes <agent>, on \
+                 every device of yours where it is mapped, to read and write in it; and follows \
+                 <identity> from your clone at <clone> (<remote>, commit <commit>), whose list \
+                 names no channel yet, and your key as <label>.",
                 &[
                     "team/project",
                     &relay_shown,
@@ -904,9 +913,9 @@ fn new_makes_the_channel_follows_and_says_the_lines_to_add() {
             )
             .replace(", and your key as <label>.", ", but not your key."),
             says(
-                "Who reads it: your devices now, and each device on the list once your pull \
-                 request is merged. Anyone in it can hand it on, and a device that only reads \
-                 shows nowhere.",
+                "Who reads it: your devices now, and every device of each person on the list once \
+                 your pull request is merged. Anyone in it can hand it on, and a device that only \
+                 reads shows nowhere. Only making it anew takes anyone out.",
                 &[]
             ),
         ]
@@ -1351,7 +1360,21 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
     );
     assert!(row(&state).is_none(), "a look does nothing");
     assert!(!read_asked(&state).await);
-    let (status, done) = asked(&state, json!({ "folder": top, "said_yes_to": asks })).await;
+    // The yes binds the whole commit the look read, which the look
+    // answers: the text shows only its first twelve characters. A yes
+    // that sends none, or another, is refused as changed.
+    assert_eq!(looked["commit"], first.as_str());
+    let mut another = first.clone();
+    another.replace_range(39.., if first.ends_with('0') { "1" } else { "0" });
+    for commit in [None, Some(another.as_str())] {
+        let yes = json!({ "folder": top, "said_yes_to": asks, "commit": commit });
+        let (status, refused) = asked(&state, yes).await;
+        assert_eq!(status, 409, "{commit:?}");
+        assert_eq!(refused["error"]["code"], "changed", "{refused}");
+        assert!(row(&state).is_none(), "{commit:?}");
+    }
+    let yes = json!({ "folder": top, "said_yes_to": asks, "commit": first });
+    let (status, done) = asked(&state, yes).await;
     assert_eq!(status, 200, "{done}");
     let followed = row(&state).unwrap();
     assert_eq!(followed.clone, top);
@@ -1364,7 +1387,8 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
 
     // A new commit: the yes to the old one is refused, and nothing done.
     let second = clone.fetched(&format!("# the team\n{me}"));
-    let (status, refused) = asked(&state, json!({ "folder": top, "said_yes_to": asks })).await;
+    let yes = json!({ "folder": top, "said_yes_to": asks, "commit": first });
+    let (status, refused) = asked(&state, yes).await;
     assert_eq!(status, 409);
     assert_eq!(refused["error"]["code"], "changed", "{refused}");
     assert_eq!(row(&state).unwrap().last.unwrap().commit, first);
@@ -1392,7 +1416,8 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
         "{back}"
     );
     clone.at(&second);
-    let (status, _) = asked(&state, json!({ "folder": top, "said_yes_to": again })).await;
+    let yes = json!({ "folder": top, "said_yes_to": again, "commit": second });
+    let (status, _) = asked(&state, yes).await;
     assert_eq!(status, 200);
     let again = row(&state).unwrap();
     // Never-back starts over at the commit the yes named; the list
@@ -1414,11 +1439,9 @@ async fn a_clone_on_the_disk_is_followed_through_the_route() {
     let asks = looked["asks"].as_str().unwrap().to_string();
     // The agent the yes names is the one mapped at the top, which a take
     // subscribes, and not that of the folder given (rule 4.4).
-    assert!(
-        asks.contains(", and project is subscribed to it then."),
-        "{asks}"
-    );
-    let (status, done) = asked(&state, json!({ "folder": docs, "said_yes_to": asks })).await;
+    assert!(asks.contains(&format!("; then {READ_AND_WRITE}")), "{asks}");
+    let yes = json!({ "folder": docs, "said_yes_to": asks, "commit": looked["commit"] });
+    let (status, done) = asked(&state, yes).await;
     assert_eq!(status, 200, "{done}");
     assert_eq!(row(&state).unwrap().clone, top);
     // And the command sends the top, from any folder of the clone.

@@ -1228,12 +1228,15 @@ pub fn accept_plan(
     }
     let six = six_words(&key);
     // Two lines (made terser on 11 November 2026, issue #338): what it
-    // takes, from whom and where; and the check of the six words. That no
-    // agent is shown it until a folder subscribes is said once it is taken.
+    // takes, from whom and where, and that the words it prints for the
+    // channel prove nothing (§3.2), said here, where the person decides;
+    // and the check of the six words. That no agent is shown it until a
+    // folder subscribes is said once it is taken.
     let asks = format!(
         "This device takes, within the hour, the shared channel that the device ({six}) {} hands \
          it, and files it as \"{name}\" on every device of yours. It is asked for at your relays \
-         that have a key, {}, and taken only where it lives at them.\n{}",
+         that have a key, {}, and taken only where it lives at them. The words it prints for the \
+         channel are a name that proves nothing.\n{}",
         label_part(conn, &key)?,
         relays_said(own_relays, own_relays),
         check_line(&six)

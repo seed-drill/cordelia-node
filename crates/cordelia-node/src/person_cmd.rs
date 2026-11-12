@@ -780,12 +780,7 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
             if would["counts_already"] == true {
                 println!("This key counts as one of your devices already, by an earlier addition.");
             }
-            at.yes(&format!(
-                "This gives {} every name's memory, {}and the means to read what your devices \
-                 write from now on.",
-                named(label, &device),
-                shared_handed(&would)
-            ))?
+            at.yes(&add_device_yes(&named(label, &device), &would))?
         }
     };
     if !agreed {
@@ -806,6 +801,17 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
         fingerprint::shown(&own)
     );
     Ok(())
+}
+
+/// The yes `add-device` asks for a new key, `device` as [`named`] says it
+/// (decision 2026-10-04 §6; decision 2026-10-10 §5.2), given what its
+/// look answered, `would`.
+fn add_device_yes(device: &str, would: &Value) -> String {
+    format!(
+        "This gives {device} every name's memory, {}and the means to read what your devices \
+         write from now on.",
+        shared_handed(would)
+    )
 }
 
 /// What `add-device`'s yes adds where the person holds a shared channel
@@ -3529,13 +3535,7 @@ mod tests {
     fn add_device_counts_the_shared_channels_in_its_one_line() {
         const RECORD: &str =
             include_str!("../../../docs/decisions/2026-10-10-a-shared-channel-for-messages.md");
-        let yes = |would: &Value| {
-            format!(
-                "This gives <device> every name's memory, {}and the means to read what your \
-                 devices write from now on.",
-                shared_handed(would)
-            )
-        };
+        let yes = |would: &Value| add_device_yes("<device>", would);
         let none = yes(&json!({ "shared": [] }));
         assert_eq!(none, yes(&json!({})));
         let one = yes(&json!({ "shared": [{ "name": "design", "keys": 1 }] }));

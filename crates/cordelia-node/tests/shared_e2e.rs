@@ -1123,21 +1123,30 @@ fn a_shared_message_is_read_inside_the_frame_of_another_person() {
             &id[..8]
         )
     );
-    // `read <id>` reads it in the same frame; with `-v`, its header says
-    // its thread and counts.
-    let by_id = msg_in(&two.alice, &two.alice_dir, &["read", &id, "-v"], b"");
+    // `read <id>` reads it in the same frame, under the same header,
+    // without its thread and counts; with `-v`, with them.
+    let counts = ": 1 message(s) in this thread here, 1 of them not yet read by a person here.";
+    let by_id = msg_in(&two.alice, &two.alice_dir, &["read", &id], b"");
     assert!(by_id.status.success(), "{}", err_of(&by_id));
+    let by_id = out_of(&by_id);
     assert!(
-        out_of(&by_id).contains("] START. A request from ANOTHER PERSON's agent, from ("),
-        "{}",
-        out_of(&by_id)
+        by_id.contains("] START. A request from ANOTHER PERSON's agent, from ("),
+        "{by_id}"
     );
+    let header = by_id.lines().next().unwrap();
     assert!(
-        out_of(&by_id).lines().next().unwrap().ends_with(
-            ": 1 message(s) in this thread here, 1 of them not yet read by a person here."
-        ),
-        "{}",
-        out_of(&by_id)
+        header.starts_with(&format!("Message {id}"))
+            && header.ends_with('.')
+            && !header.contains("thread"),
+        "{by_id}"
+    );
+    let verbose = msg_in(&two.alice, &two.alice_dir, &["read", &id, "-v"], b"");
+    assert!(verbose.status.success(), "{}", err_of(&verbose));
+    let verbose = out_of(&verbose);
+    let header = verbose.lines().next().unwrap();
+    assert!(
+        header.starts_with(&format!("Message {id}")) && header.ends_with(counts),
+        "{verbose}"
     );
     // Read, it waits no more for this agent.
     let next = msg_in(&two.alice, &two.alice_dir, &["read", "--next-shared"], b"");
@@ -1145,6 +1154,33 @@ fn a_shared_message_is_read_inside_the_frame_of_another_person() {
         out_of(&next).starts_with("Nothing waits"),
         "{}",
         out_of(&next)
+    );
+    // `read --next-shared -v`: the next one, with its thread and counts.
+    let another = sends_into(
+        &all,
+        &two.bob,
+        &two.bob_dir,
+        "review-with-alice",
+        &[],
+        "One more.",
+    );
+    let verbose = wait_for("another shared message waits", &all, 180, || {
+        let said = msg_in(
+            &two.alice,
+            &two.alice_dir,
+            &["read", "--next-shared", "-v"],
+            b"",
+        );
+        assert!(said.status.success(), "{}", err_of(&said));
+        let said = out_of(&said);
+        (!said.starts_with("Nothing waits")).then_some(said)
+    });
+    let header = verbose.lines().next().unwrap();
+    assert!(
+        header.starts_with(&format!("Message {another}"))
+            && header.contains("in the shared channel \"design-review\", sent ")
+            && header.ends_with(counts),
+        "{verbose}"
     );
 }
 

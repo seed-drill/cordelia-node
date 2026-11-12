@@ -307,9 +307,11 @@ pub fn plan(
     // #338): what is made or followed, and who reads it. The first names
     // this clone, its remote and the commit, by its first twelve
     // characters as the status shows one, so that it is a yes to no other
-    // clone or remote of the repository, nor to another commit; and rule
-    // 2.2's three facts: the repository and the commit, the channel the
-    // list names, and whether this device's key is on the list.
+    // clone or remote of the repository; the route binds the whole commit
+    // too (`shared_routes::follow_read`), so it is a yes to no other
+    // commit. And rule 2.2's three facts: the repository and the commit,
+    // the channel the list names, and whether this device's key is on the
+    // list.
     let followed = format!(
         "{repository} from your clone at {} ({}, commit {})",
         cleaned(&clone),
@@ -392,9 +394,11 @@ pub fn plan(
             );
         }
         let made = sharing::new_plan(conn, own_relays, &name, &[])?;
+        // What `shared new` says of it, and what subscribing does.
         let mut asks = vec![format!(
-            "This makes the shared channel \"{}\" at {}, subscribes {shown_agent} to it, and \
-             follows {followed}, {}.",
+            "This makes the shared channel \"{}\" at {}, which carries messages between your \
+             agents and other people's and never memory; subscribes {shown_agent}, {MAPPED}, to \
+             read and write in it; and follows {followed}, {}.",
             cleaned(&name),
             sharing::relays_said(own_relays, &made.what.relays),
             whose("no channel yet")
@@ -409,8 +413,9 @@ pub fn plan(
         }
         let mut asks = vec![format!(
             "This follows {followed}, {}. A member's device hands you its channel once the list \
-             names one, and {shown_agent} is subscribed to it then.",
-            whose("no channel yet")
+             names one; then {}",
+            whose("no channel yet"),
+            subscribed(&shown_agent)
         )];
         asks.extend(surprising);
         asks.push(WHO_READS.into());
@@ -467,8 +472,8 @@ pub fn plan(
             ),
             Ok(subscribing) => (
                 format!(
-                    "This subscribes {shown_agent} to \"{name}\", which you hold, and follows \
-                     {followed}, {}.",
+                    "This subscribes {shown_agent}, {MAPPED}, to read and write in \"{name}\", \
+                     which you hold, and follows {followed}, {}.",
                     whose("it")
                 ),
                 Then::Subscribe {
@@ -519,11 +524,12 @@ pub fn plan(
     let mut asks = vec![match gated.is_empty() {
         true => format!(
             "This follows {followed}, {not_held}. A member's device hands it to you once it reads \
-             the list, and {shown_agent} is subscribed to it then."
+             the list; then {}",
+            subscribed(&shown_agent)
         ),
         false => format!(
-            "This follows {followed}, {not_held}. {shown_agent} is subscribed to it once this \
-             device takes it."
+            "This follows {followed}, {not_held}. Once this device takes it, {}",
+            subscribed(&shown_agent)
         ),
     }];
     asks.extend(surprising);
@@ -532,18 +538,31 @@ pub fn plan(
     planned(asks, Then::Nothing)
 }
 
+/// Where a subscription shows the channel to the agent, as `subscribe
+/// <name>` says it (decision 2026-10-10 §5.2).
+const MAPPED: &str = "on every device of yours where it is mapped";
+
+/// What the yes says of the agent that is subscribed once this device
+/// takes the channel (rule 4.4): what subscribing does.
+fn subscribed(agent: &str) -> String {
+    format!("{agent} is subscribed, {MAPPED}, to read and write in it.")
+}
+
 /// The last line of the yes of `subscribe` in a clone, where the list
 /// names a channel or will (rule 2.3; made terser on 11 November 2026,
-/// issue #338): who reads it. No yes is asked when a joiner takes the
-/// channel, so this is where the person is told.
-pub(crate) const WHO_READS: &str = "Who reads it: each device on the list. Anyone in it can hand \
-                                    it on, and a device that only reads shows nowhere.";
+/// issue #338): who reads it. Every device of a person holds the person's
+/// shared channels (decision 2026-10-10, property 19). No yes is asked when a
+/// joiner takes the channel, so this is where the person is told.
+pub(crate) const WHO_READS: &str = "Who reads it: every device of each person on the list. Anyone \
+                                    in it can hand it on, and a device that only reads shows \
+                                    nowhere.";
 
 /// The last line of the yes of `subscribe --new` (rule 2.4): who reads the
-/// channel it makes.
-pub(crate) const WHO_READS_NEW: &str = "Who reads it: your devices now, and each device on the \
-                                        list once your pull request is merged. Anyone in it can \
-                                        hand it on, and a device that only reads shows nowhere.";
+/// channel it makes, and, as `shared new` says, what takes anyone out.
+pub(crate) const WHO_READS_NEW: &str = "Who reads it: your devices now, and every device of each \
+                                        person on the list once your pull request is merged. \
+                                        Anyone in it can hand it on, and a device that only reads \
+                                        shows nowhere. Only making it anew takes anyone out.";
 
 /// What `subscribe` in a clone says where this device follows as many
 /// repositories as there can be.

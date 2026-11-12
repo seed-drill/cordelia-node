@@ -214,7 +214,7 @@ It refuses a key that is one of the person's own devices, and a key that the per
 **What each command prints for the people to compare** (exact text in 5.2):
 
 - **The words of each other's key.** Before either command, each person copies their device's key to the other (`cordelia id`). `share` shows, before its yes, the six words of the taker's key's fingerprint (`fingerprint::words(key, 6)`, `cordelia-crypto/src/fingerprint.rs`), and asks the sharer to have the other person read them the six words of their own key, from `cordelia id --words`, by another way than the one the key came by. `accept --channel` does the same the other way. **This is what guards against somebody in the middle of the exchange,** who swaps a key for one of their own: the words read back are of the key the reader really has, and the words shown are of the key that was typed. It is what `add-device` and `accept` do for a person's own devices (`person_cmd::named`), with six words in place of four, since the other key can come from anyone. Six words are 66 bits: a search over keys made to match them costs far more than one to match four, and is not impossible (5.3).
-- **The channel's words**, the first four words of the fingerprint of its ID (`fingerprint::shown`), printed by `share` and by `accept` once it has taken the channel. They are a name to say, and prove nothing (2.1). The yes of `share` says so, once, beside them (5.2); the lines after a yes do not say it again (the person's ruling of 11 November 2026, issue #338).
+- **The channel's words**, the first four words of the fingerprint of its ID (`fingerprint::shown`), printed by `share` and by `accept` once it has taken the channel. They are a name to say, and prove nothing (2.1). The yes of `share` and the yes of `accept --channel` say so, each once (5.2); the lines after a yes do not say it again (the person's ruling of 11 November 2026, issue #338).
 
 ### 3.3 Either order, and what a relay can do
 
@@ -448,12 +448,12 @@ It prints these words for the channel once it has taken it: <four words>.
 <the lines of 5.4>
 ```
 
-**Made terser on 11 November 2026, on the person's ruling (issue #338).** The yes was four lines: what it hands, the check, who reads it, and `Nothing of your own goes with it: no memory, no name of yours, and no other channel.`, which is gone (the person's first choice). It is two: what it hands and who reads it, then the check, which the person must make. That the channel's words prove nothing (3.2) is said once, at this yes, where the person decides, and not after it by `share` or `accept --channel` (the second).
+**Made terser on 11 November 2026, on the person's ruling (issue #338).** The yes was four lines: what it hands, the check, who reads it, and `Nothing of your own goes with it: no memory, no name of yours, and no other channel.`, which is gone (the person's first choice). It is two: what it hands and who reads it, then the check, which the person must make. That the channel's words prove nothing (3.2) is said once, at the yes where each person decides, this one and that of `accept --channel`, and not after either (the second).
 
 **`cordelia accept <key> --channel review-with-alice`**, before its yes:
 
 ```
-This device takes, within the hour, the shared channel that the device (<six words>) <"label", or no label of yours> hands it, and files it as "review-with-alice" on every device of yours. It is asked for at your relays that have a key, relay.example.org:9474 (<four words>), and taken only where it lives at them.
+This device takes, within the hour, the shared channel that the device (<six words>) <"label", or no label of yours> hands it, and files it as "review-with-alice" on every device of yours. It is asked for at your relays that have a key, relay.example.org:9474 (<four words>), and taken only where it lives at them. The words it prints for the channel are a name that proves nothing.
 Check first: have its person read you the six words that cordelia id --words prints there, by another way than the one the key came by, such as a call or in person. They must be: <six words>. If not, someone put their own key in its place: stop here.
 ```
 
@@ -997,6 +997,7 @@ Each property of section 1 has tests, and each test fails on an assertion where 
     - `the_refusals_go_where_the_table_says` (real processes): `accept --channel` that takes nothing within its wait prints on standard output and exits 0; `accept --channel` with the device's own key, with a removed key, and for a channel already held; `share` to a removed key and of a channel not reached; `shared new` with no keyed relay; `label` with a bad label; and `unsubscribe` where not subscribed, each print their line of 5.5 on its stream with its exit; `shared move`'s yes names each subscription that moves.
 19. **Every device of the person.**
     - `a_device_added_later_holds_the_shared_channels` (real processes, T23).
+    - `add_device_counts_the_keys_of_each_channel` (unit, `sharing/tests.rs`): `add-device`'s look gives each channel, with its keys.
     - `add_device_counts_the_shared_channels_in_its_one_line` (unit, `person_cmd.rs`): `add-device`'s yes counts the shared channels the device is handed, as 5.2 writes it.
 20. **A statement, a removal and a recovery.**
     - `a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing_new` (real processes, T23; the removal record's test 9): Alice's laptop, desktop and tablet, Bob's laptop, and a shared channel all hold. The desktop removes the tablet; `remove-device` prints each channel before its yes and among the lines of its end. The channel is made anew in the same act, without the tablet; Alice's laptop moves with no yes; no entry signed by Alice's devices reaches the old channel after each knew of the removal; Bob's laptop sends nothing in the old channel after it read the offer (`paused`), until Bob runs `cordelia shared move`, or `cordelia shared stay` in a second run; and the tablet's database holds no seed of the new channel. Taken out: rule 24 (no offer: the first fails); rule 23 (Alice's laptop writes in the old channel: the third fails); rule 26 (Bob's message reaches the old channel: the fourth fails).

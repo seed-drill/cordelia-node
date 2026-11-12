@@ -616,8 +616,9 @@ fn a_channel_is_renamed_dropped_and_told_apart_by_its_words() {
     );
 }
 
-/// `add-device`'s yes names each shared channel the person holds with the
-/// keys that wrote there (decision 2026-10-10 §5.2): what its look gives.
+/// `add-device`'s look gives each shared channel the person holds, with
+/// the keys that wrote there (decision 2026-10-10 §5.2); its yes says how
+/// many channels.
 #[test]
 fn add_device_counts_the_keys_of_each_channel() {
     let s = bob(1);

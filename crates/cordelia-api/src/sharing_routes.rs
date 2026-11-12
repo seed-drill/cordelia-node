@@ -58,6 +58,20 @@ pub(crate) fn asked_then<T>(
     plan: impl FnOnce(&rusqlite::Connection, &[OwnRelay], i64) -> Out<Plan<T>>,
     then: impl FnOnce(&rusqlite::Connection, &[OwnRelay], &T, i64) -> Out<serde_json::Value>,
 ) -> Result<HttpResponse, ApiError> {
+    asked_then_showing(state, look, said_yes_to, json!({}), plan, then)
+}
+
+/// [`asked_then`], whose look answers too each field of `shown`: what the
+/// command sends back with its yes, where the yes binds more than its
+/// text shows.
+pub(crate) fn asked_then_showing<T>(
+    state: &AppState,
+    look: bool,
+    said_yes_to: Option<&str>,
+    shown: serde_json::Value,
+    plan: impl FnOnce(&rusqlite::Connection, &[OwnRelay], i64) -> Out<Plan<T>>,
+    then: impl FnOnce(&rusqlite::Connection, &[OwnRelay], &T, i64) -> Out<serde_json::Value>,
+) -> Result<HttpResponse, ApiError> {
     let own = sharing::own_relays(state);
     let now = state.sync_control.now();
     let done = {
@@ -67,15 +81,17 @@ pub(crate) fn asked_then<T>(
             Err(failed) => return answer_of(failed),
         };
         if look {
-            return Ok(HttpResponse::Ok().json(json!({
+            let mut looked = json!({
                 "asks": plan.asks,
                 "this_device": this_device(state)?,
-            })));
+            });
+            for (field, value) in shown.as_object().into_iter().flatten() {
+                looked[field] = value.clone();
+            }
+            return Ok(HttpResponse::Ok().json(looked));
         }
         if said_yes_to != Some(plan.asks.as_str()) {
-            return Ok(HttpResponse::Conflict().json(json!({
-                "error": { "code": "changed", "message": CHANGED },
-            })));
+            return changed();
         }
         then(&conn, &own, &plan.what, now)
     };
@@ -86,6 +102,13 @@ pub(crate) fn asked_then<T>(
         }
         Err(failed) => answer_of(failed),
     }
+}
+
+/// The answer to a yes to what is now another thing: nothing was done.
+pub(crate) fn changed() -> Result<HttpResponse, ApiError> {
+    Ok(HttpResponse::Conflict().json(json!({
+        "error": { "code": "changed", "message": CHANGED },
+    })))
 }
 
 fn this_device(state: &AppState) -> Result<String, ApiError> {
