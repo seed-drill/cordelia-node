@@ -404,7 +404,7 @@ Slice 4 measured, over in-process QUIC, a relay's own fetch from a relay configu
 
 | # | Severity | Finding | How it is settled |
 |---|---|---|---|
-| 3 | Low | Test 8 passed on a host that hands a socket no batches, having checked nothing | Where `CI` is set, it fails on its notice, as `msg_e2e.rs` fails there without the binary of the version before; off CI it passes with the notice. **Changed on 12 November (#251):** a CI runner that could not fill its batches failed a run that changed nothing of it, so on CI too it passes with the notice, as a warning on the run and a line of the step's summary; the socket's option is still read on every host (`a_nodes_socket_takes_no_batches_of_datagrams`) |
+| 3 | Low | Test 8 passed on a host that hands a socket no batches, having checked nothing | Where `CI` is set, it fails on its notice, as `msg_e2e.rs` fails there without the binary of the version before; off CI it passes with the notice. **Changed on 12 November (#251):** a CI runner that could not fill its batches failed a run that changed nothing of it, so on CI too it passes with the notice, as a warning on the run and a line of the step's summary; on Linux with `UDP_GRO`, as on CI, the socket's option is still read (`a_nodes_socket_takes_no_batches_of_datagrams`) |
 
 Slice 4's run of the NAT case, in the measurement of section 2.3 (the dialled end, A, on every peer's windows; B on the listed ones), each the median of three:
 

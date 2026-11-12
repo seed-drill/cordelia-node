@@ -370,15 +370,15 @@ const CONTROL_TRIES: usize = 3;
 /// times, until one reading is over the threshold.
 ///
 /// Where every reading of the control stays under the threshold, the test
-/// checks nothing, and says so loudly on its output. It is not failed,
-/// since that is a property of the host (a kernel without GRO, a loopback
-/// that does not coalesce, or a machine too loaded for the peer to fill
-/// its batches) and not of the node, and a node on such a host takes no
-/// batches either. On CI too (#251): a runner there held 817 to 934 KiB in
-/// all three tries on 11 November. There it says so as a warning on the
-/// run and a line of the step's summary ([`on_ci_says`]), so that a run
-/// that checked nothing is not taken for one that did. Rule 10 is still
-/// checked on every host by the socket's option
+/// checks nothing, and says so loudly ([`says_it_checked_nothing`]). It is
+/// not failed, since that is a property of the host (a kernel without
+/// GRO, a loopback that does not coalesce, or a machine too loaded for the
+/// peer to fill its batches) and not of the node, and a node on such a
+/// host takes no batches either. On CI too (#251): a runner there held 817
+/// to 934 KiB in all three tries on 11 November. There it says so as a
+/// warning on the run and a line of the step's summary too, so that a run
+/// that checked nothing is not taken for one that did. On Linux with
+/// `UDP_GRO`, as on CI, rule 10 is still checked by the socket's option
 /// (`a_nodes_socket_takes_no_batches_of_datagrams`, `transport.rs`).
 #[test]
 fn a_peer_cannot_make_a_node_hold_its_batches_of_datagrams() {
@@ -399,11 +399,7 @@ fn a_peer_cannot_make_a_node_hold_its_batches_of_datagrams() {
              loaded to fill them), and rule 10 was not tested here by memory",
             THRESHOLD_BYTES / 1024
         );
-        // On both streams, so that it is seen whether or not the output
-        // is captured.
-        println!("\n*** TEST 8 CHECKED NOTHING. {said} ***\n");
-        eprintln!("\n*** TEST 8 CHECKED NOTHING. {said} ***\n");
-        on_ci_says(&said);
+        says_it_checked_nothing(&said);
         return;
     }
     for pace in [2u64, 8] {
@@ -417,11 +413,16 @@ fn a_peer_cannot_make_a_node_hold_its_batches_of_datagrams() {
     }
 }
 
-/// Where GitHub Actions runs the test, `said` as a warning on the run and as
-/// a line of the step's summary (#251). The warning goes to the process's
-/// own output, which the test harness does not capture.
-fn on_ci_says(said: &str) {
+/// Says that test 8 checked nothing, and why (`said`), on the process's own
+/// error stream, which the test harness does not capture, as it captures
+/// what a test prints where it passes. Where GitHub Actions runs it, also as
+/// a warning on the run and a line of the step's summary (#251).
+fn says_it_checked_nothing(said: &str) {
     use std::io::Write;
+    let _ = writeln!(
+        std::io::stderr(),
+        "\n*** TEST 8 CHECKED NOTHING. {said} ***\n"
+    );
     if std::env::var_os("GITHUB_ACTIONS").is_none() {
         return;
     }
