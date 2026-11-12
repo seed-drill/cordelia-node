@@ -2368,8 +2368,9 @@ mod tests {
         assert!(
             says.contains(
                 "1 name that your devices synced before the last change to your devices is \
-                 synced by no device yet: team. You can still bring it back from the relays for \
-                 89 more days: cordelia sync carry <name>"
+                 synced by no device yet: team. It comes back once a device that synced it is up \
+                 to date. If none will be, bring it back from the relays within 89 more days: \
+                 cordelia sync carry <name>"
             ),
             "{says}"
         );

@@ -1546,7 +1546,8 @@ fn the_record_says_each_line() {
     }
     // The table's line of a member who cannot, in its parts.
     for part in [
-        "has not been reset since you removed a device",
+        "has not been reset since you removed",
+        "To reset it: cordelia shared reset <name>",
         "not reached at its relays",
         "full",
         "this device shares it with no one new until then.",

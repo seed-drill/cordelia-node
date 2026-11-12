@@ -621,9 +621,13 @@ fn nothing_is_handed_over_in_a_channel_not_clean() {
     s.change(0, &[0], &[1]);
     let list = list_with(Some((&channel.id, &[])), &listed(1..=2));
     follows_at(&s, &list, &commit('a'), now);
+    // It names the device removed (decision 2026-11-11 (plain words),
+    // rule 2).
+    let removed =
+        crate::look::named_device("device 1", &cordelia_crypto::fingerprint::shown(&s.key(1)));
     assert_eq!(
         not_handing(reads(&s, &list, &commit('a'), s.now + 1)),
-        NotHanding::NotClean
+        NotHanding::NotClean(vec![removed])
     );
     assert!(node_keys(&s).is_empty());
 }

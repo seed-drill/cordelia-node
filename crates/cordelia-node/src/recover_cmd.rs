@@ -2340,7 +2340,7 @@ fn look_not_waited_for(failed: &dyn std::fmt::Display) -> (String, i32) {
         format!(
             "This command could not go on to say what the look found ({failed}). The node goes \
              on by itself: it looks at what the relays hold of each name, once, and sends what \
-             it carried. `cordelia devices` shows whether each relay holds the change, and what \
+             it carried. `cordelia devices` shows whether each relay has the change, and what \
              this machine has still to send. Keep this machine on until nothing is left to send."
         ),
         NOT_AT_EVERY_RELAY_STATUS,
@@ -4573,7 +4573,7 @@ mod tests {
         assert_eq!(all.matches("cordelia add-device <that key>").count(), 1);
         // Whether each relay holds the change is the wait's to say, and
         // no line here says it (decision 2026-10-19 §4, rule 9).
-        assert!(!all.contains("holds the change"), "{all}");
+        assert!(!all.contains("has the change"), "{all}");
         assert!(!all.contains("does not hold the change"), "{all}");
         assert!(!all.contains("is not connected"), "{all}");
         assert!(
@@ -4721,7 +4721,7 @@ mod tests {
         one_of_two["waiting"] = json!([{ "relay": "one", "waits": 0 }]);
         let all = after_lines(&one_of_two, 0);
         assert_eq!(all, [shows]);
-        // A relay that is connected does not hold the change yet, and
+        // A relay that is connected does not have the change yet, and
         // nothing waits in the store: the machine is to be kept on, and
         // nothing is said to be waiting nowhere beside that.
         let mut not_held_yet = seen(json!([]), 0);
@@ -5760,15 +5760,15 @@ mod tests {
         let (a, b) = keys_ab();
         assert_eq!(
             wait::recovery_first_line(),
-            "This command stays until every relay holds the change. It ends sooner, with status \
-             3, once each relay that is not known to hold it cannot be reached, or refuses it, \
+            "This command stays until every relay has the change. It ends sooner, with status \
+             3, once each relay that may not have it cannot be reached, or refuses it, \
              for five minutes. Stopping it stops nothing: the node goes on, and the recovery \
              stays made. Until the wait ends, each line below starts with the time it was said, \
              in UTC."
         );
         assert_eq!(
             wait::recovery_end_lines(RecoveryEnd::Recovered, &[], 0),
-            ["Every relay holds the change."]
+            ["Every relay has the change."]
         );
 
         let laptop = "(w1 w2 w3 w4) \"laptop\"";
@@ -6042,13 +6042,13 @@ mod tests {
         assert!(all.contains(&wait::recovery_first_line()), "{all}");
         assert!(
             all.contains(
-                "  relay-1.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not"
+                "  relay-1.example:9474 cannot be reached from here, and may not have the change: \
+                 it has not"
             ),
             "{all}"
         );
         assert!(
-            all.contains("A device of yours that reaches only relay-1.example:9474 may not have"),
+            all.contains("A device of yours that reaches only relay-1.example:9474 may not know"),
             "{all}"
         );
         assert!(
@@ -6063,12 +6063,12 @@ mod tests {
         assert!(!all.contains("may be closed"), "{all}");
         assert!(!all.contains("You may close"), "{all}");
 
-        // Every relay holds the change, one out of reach: R1, status 0,
+        // Every relay has the change, one out of reach: R1, status 0,
         // and no R0.
         let node = Stands::of(finished(true), vec![looked(&[Reached, OutHolding])]);
         let (ended, said) = after(&node);
         assert_eq!(ended.unwrap(), Recovered::Ended(RecoveryEnd::Recovered));
-        assert_eq!(said.last().unwrap(), "Every relay holds the change.");
+        assert_eq!(said.last().unwrap(), "Every relay has the change.");
         assert!(!said.contains(&format!("\n{}", wait::recovery_first_line())));
     }
 
@@ -6105,25 +6105,20 @@ mod tests {
             let at = words.iter().position(|line| line.starts_with(says));
             at.unwrap_or_else(|| panic!("{says}: {said:?}"))
         };
-        let r0 = at("\nThis command stays until every relay holds");
-        let s3 =
-            at("  relay-0.example:9474 holds the change, and cannot be reached from here: it ");
+        let r0 = at("\nThis command stays until every relay has");
+        let s3 = at("  relay-0.example:9474 has the change, but cannot be reached from here: it ");
         let s2 = at(
-            "  keep this machine on: relay-1.example:9474 cannot be reached from here, and is not \
-             known to hold the change yet: it ",
+            "  keep this machine on: relay-1.example:9474 cannot be reached from here, and may not \
+             have the change yet: it ",
         );
         assert!(r0 < s3 && s3 < s2, "{said:?}");
         let once = |says: &str| words.iter().filter(|line| line.starts_with(says)).count();
-        assert_eq!(
-            once("  relay-0.example:9474 holds the change"),
-            1,
-            "{said:?}"
-        );
+        assert_eq!(once("  relay-0.example:9474 has the change"), 1, "{said:?}");
         assert_eq!(once("  keep this machine on: relay-1"), 1, "{said:?}");
         assert_eq!(
             once(
-                "  relay-1.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it"
+                "  relay-1.example:9474 cannot be reached from here, and may not have the change: \
+                 it"
             ),
             1
         );
@@ -6140,14 +6135,14 @@ mod tests {
         assert_eq!(ended.unwrap(), Recovered::Ended(RecoveryEnd::NotDone));
         let all = said.join("\n");
         assert!(
-            all.contains("relay-1.example:9474 is reached, and has not taken the change"),
+            all.contains("relay-1.example:9474 is reached, but has not stored the change"),
             "{all}"
         );
         assert!(
-            !all.contains("relay-0.example:9474 holds the change. It has refused"),
+            !all.contains("relay-0.example:9474 has the change, but has had no room"),
             "{all}"
         );
-        // Every relay holds the change, whatever waits: R1.
+        // Every relay has the change, whatever waits: R1.
         for holding in [[Reached, Stuck], [Moving, OutHolding]] {
             let node = Stands::of(finished(false), vec![looked(&holding)]);
             let (ended, said) = after(&node);
@@ -6173,13 +6168,13 @@ mod tests {
                 .any(|line| line.contains("This command stays until")),
             "{said:?}"
         );
-        assert_eq!(said.last().unwrap(), "Every relay holds the change.");
+        assert_eq!(said.last().unwrap(), "Every relay has the change.");
         // No relay reached, none holding: S11, with its second part.
         let node = Stands::of(finished(false), vec![looked(&[OutLacking])]);
         let (_, said) = after(&node);
         assert!(
             said.last().unwrap().starts_with(
-                "No relay can be reached from here. None is known to hold the change."
+                "No relay can be reached from here. None is known to have the change."
             ),
             "{said:?}"
         );
@@ -6223,8 +6218,8 @@ mod tests {
         }
         // R0 at 10:53:01, after the look's first pause; the next look a
         // second later.
-        let s3 = "  10:53:02  relay-0.example:9474 holds the change, and cannot be reached from \
-                  here: it ";
+        let s3 =
+            "  10:53:02  relay-0.example:9474 has the change, but cannot be reached from here: it ";
         assert_eq!(
             said.iter().filter(|line| line.starts_with(s3)).count(),
             1,
@@ -6298,7 +6293,7 @@ mod tests {
         }
         let node = Stands::of(finished(false), vec![looked(&[Reached, OutHolding])]);
         let (_, said) = after(&node);
-        assert_eq!(said.last().unwrap(), "Every relay holds the change.");
+        assert_eq!(said.last().unwrap(), "Every relay has the change.");
         assert!(
             !said.iter().any(|line| line.contains("The wait has ended.")),
             "{said:?}"
@@ -6308,7 +6303,7 @@ mod tests {
         // lines have their times in UTC, is not said.
         assert!(
             said.iter().any(|line| line.starts_with(
-                "  relay-1.example:9474 holds the change, and cannot be reached from here"
+                "  relay-1.example:9474 has the change, but cannot be reached from here"
             )),
             "{said:?}"
         );
@@ -6436,7 +6431,7 @@ mod tests {
         assert_eq!(ended.unwrap(), Recovered::NoLongerStands);
         assert!(
             said.last().unwrap().starts_with(
-                "This device no longer stands in its phrase (this device was removed)"
+                "This device is no longer under its recovery phrase (this device was removed)"
             ),
             "{said:?}"
         );
@@ -6499,7 +6494,7 @@ mod tests {
         assert!(
             !said
                 .iter()
-                .any(|line| line == "Every relay holds the change."),
+                .any(|line| line == "Every relay has the change."),
             "{said:?}"
         );
         let node = Stands::of(
@@ -6513,7 +6508,7 @@ mod tests {
                 .any(|line| line.contains("This command stays until")),
             "{said:?}"
         );
-        assert_eq!(said.last().unwrap(), "Every relay holds the change.");
+        assert_eq!(said.last().unwrap(), "Every relay has the change.");
         // S2 and S3 are not said of a reach about the entry before: there
         // the relay held the entry kept before, and is out of reach.
         let mut one = looked(&[Reached, OutHolding]);
@@ -6524,10 +6519,10 @@ mod tests {
         );
         let (_, said) = after(&node);
         let said: Vec<String> = said.iter().map(|line| without_its_time(line)).collect();
-        let s3 = "  relay-1.example:9474 holds the change, and ";
+        let s3 = "  relay-1.example:9474 has the change, but ";
         assert!(!said.iter().any(|line| line.starts_with(s3)), "{said:?}");
-        let s2 = "  keep this machine on: relay-1.example:9474 cannot be reached from here, and is \
-                  not known to hold";
+        let s2 = "  keep this machine on: relay-1.example:9474 cannot be reached from here, and \
+                  may not have";
         assert_eq!(
             said.iter().filter(|line| line.starts_with(s2)).count(),
             1,

@@ -267,11 +267,11 @@ Section 2 found item 6 to be the words. **Today:**
 - **D5:** "  `<relay>`: cannot be reached from here, and has the latest change to your devices (as it said at `<when>`): it `<since>`"
 - **T2:** "`<relay>` cannot be reached from here, and may not have the latest change to your devices: it `<since>`"
 - **T3:** "`<relay>` cannot be reached from here: it `<since>`. It has the latest change to your devices, and this device sends through your other relays"
-- **S2:** "keep this machine on: `<relay>` cannot be reached from here, and is not known to hold the change yet: it `<since>`"
-- **S3:** "`<relay>` holds the change, and cannot be reached from here: it `<since>`"
-- **S6,** in `<held>`: "  `<relay>` holds the change and all that this device carried, and cannot be reached from here: it `<since>`." Not in `<held>`: "  `<relay>` holds the change, and cannot be reached from here: it `<since>`. Some of what this device carried is not there yet."
-- **S8, OUT and lacking:** "  `<relay>` cannot be reached from here, and is not known to hold the change: it `<since>`."
-- **S8, OUT and holding:** "  `<relay>` holds the change, and cannot be reached from here: it `<since>`."
+- **S2:** "keep this machine on: `<relay>` cannot be reached from here, and may not have the change yet: it `<since>`"
+- **S3:** "`<relay>` has the change, but cannot be reached from here: it `<since>`"
+- **S6,** in `<held>`: "  `<relay>` has the change and all that this device copied over, but cannot be reached from here: it `<since>`." Not in `<held>`: "  `<relay>` has the change, but cannot be reached from here: it `<since>`. Some of what this device copied over is not there yet."
+- **S8, OUT and lacking:** "  `<relay>` cannot be reached from here, and may not have the change: it `<since>`."
+- **S8, OUT and holding:** "  `<relay>` has the change, but cannot be reached from here: it `<since>`."
 - **The status line,** where every relay it counts is out of reach: "memory: a relay is out of reach and may not have the latest change to your devices", or "memory: some relays are out of reach and may not have the latest change to your devices". Where some are out of reach and some not: "memory: some relays may not have the latest change to your devices, and one of them is out of reach" (or "some of them"). Otherwise as today.
 
 **Rule 7.**

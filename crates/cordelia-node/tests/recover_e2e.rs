@@ -696,15 +696,15 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
     // (decision 2026-10-19 §4, rule 9); where not yet, it still holds it.
     // It comes back, is shown the change again, and the wait ends.
     let waits = at.says_one_of(&[
-        "Every relay holds the change.",
-        "This command stays until every relay holds the change.",
+        "Every relay has the change.",
+        "This command stays until every relay has the change.",
     ]);
     second.start();
     wait_for("the second relay is up again", &[&second], 30, || {
         healthy(&second)
     });
     if waits == 1 {
-        at.says("Every relay holds the change.");
+        at.says("Every relay has the change.");
     }
     let said = at.done();
     println!("{said}");
@@ -1251,7 +1251,10 @@ fn a_device_that_the_64_kept_out_and_was_not_asked_about_is_removed_by_its_key()
         .types(&two.words);
     at.says("The change is made (change 4).");
     let said = at.done();
-    assert!(said.contains("this machine may be closed."), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     assert_eq!(person_of(&new)["change"], 4);
     assert_eq!(removed(&new).len(), 65);
     assert!(
@@ -1784,12 +1787,12 @@ fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
         .says("The look is made");
     // The second relay is not reached: the command waits for the change
     // there (decision 2026-10-19 §4, rule 9), until it comes back.
-    at.says("This command stays until every relay holds the change.");
+    at.says("This command stays until every relay has the change.");
     second.start();
     wait_for("the second relay is up again", &[&second], 30, || {
         healthy(&second)
     });
-    at.says("Every relay holds the change.");
+    at.says("Every relay has the change.");
     let said = at.done();
     println!("{said}");
     assert!(said.contains("Recovering from change 2."), "{said}");
@@ -2317,8 +2320,8 @@ fn a_recovery_ends_not_done_where_a_relay_lacks_the_change() {
         .says("The look is made");
     let made = Instant::now();
     at.says(
-        "This command stays until every relay holds the change. It ends sooner, with status 3, \
-         once each relay that is not known to hold it cannot be reached, or refuses it, for five \
+        "This command stays until every relay has the change. It ends sooner, with status 3, \
+         once each relay that may not have it cannot be reached, or refuses it, for five \
          minutes. Stopping it stops nothing: the node goes on, and the recovery stays made. Until \
          the wait ends, each line below starts with the time it was said, in UTC.",
     );
@@ -2332,16 +2335,14 @@ fn a_recovery_ends_not_done_where_a_relay_lacks_the_change() {
     assert_eq!(status, Some(3), "{said}");
     for line in [
         format!(
-            "keep this machine on: {NO_SUCH_NAME} cannot be reached from here, and is not known \
-             to hold the change yet: it has not answered since"
+            "keep this machine on: {NO_SUCH_NAME} cannot be reached from here, and may not have \
+             the change yet: it has not answered since"
         ),
         format!(
-            "  {NO_SUCH_NAME} cannot be reached from here, and is not known to hold the change: \
-             it has not answered since"
+            "  {NO_SUCH_NAME} cannot be reached from here, and may not have the change: it has not \
+             answered since"
         ),
-        format!(
-            "A device of yours that reaches only {NO_SUCH_NAME} may not have heard of the change."
-        ),
+        format!("A device of yours that reaches only {NO_SUCH_NAME} may not know of the change."),
         "It looks its name up every 30 seconds.".to_string(),
         format!(
             "The change is not known to be at {NO_SUCH_NAME}. This command ends here, with status \
@@ -2352,7 +2353,7 @@ fn a_recovery_ends_not_done_where_a_relay_lacks_the_change() {
     }
     // The relay that holds the change has no line of S8.
     assert!(
-        !said.contains(&format!("  {reached} holds the change")),
+        !said.contains(&format!("  {reached} has the change")),
         "{said}"
     );
     says_not_that_it_may_be_closed(&said);
@@ -2367,9 +2368,9 @@ fn a_recovery_ends_not_done_where_a_relay_lacks_the_change() {
     let (status, said) = at.ends_with_status_within(Duration::from_secs(180));
     println!("{said}");
     assert_eq!(status, Some(0), "{said}");
-    assert!(said.contains("Every relay holds the change."), "{said}");
+    assert!(said.contains("Every relay has the change."), "{said}");
     assert!(
-        !said.contains("This command stays until every relay holds the change."),
+        !said.contains("This command stays until every relay has the change."),
         "{said}"
     );
     says_not_that_it_may_be_closed(&said);
@@ -2649,7 +2650,7 @@ fn a_recovery_ends_with_3_where_its_look_cannot_be_waited_for_or_on_an_error() {
             "{said}"
         );
         assert!(said.contains(why), "{said}");
-        assert!(!said.contains("Every relay holds the change."), "{said}");
+        assert!(!said.contains("Every relay has the change."), "{said}");
     }
     // The node cannot be asked.
     new.stop();
@@ -2662,7 +2663,7 @@ fn a_recovery_ends_with_3_where_its_look_cannot_be_waited_for_or_on_an_error() {
     );
     assert!(
         error.contains(
-            "Do not make the change again. `cordelia devices` shows whether each relay holds it."
+            "Do not make the change again. `cordelia devices` shows whether each relay has it."
         ),
         "{error}"
     );
