@@ -1715,7 +1715,7 @@ fn a_share_older_than_the_hour_of_the_latest_read_is_not_taken() {
 
 /// A read that types the keys again while a pass asks for them does not
 /// end those asks (#336): the share the pass finds is taken, and a key that
-/// handed nothing is asked for again only after the next read.
+/// handed nothing is kept as asked for that read too.
 #[test]
 fn a_read_while_a_pass_asks_for_a_key_does_not_end_the_ask() {
     let s = bob(1);
@@ -1741,6 +1741,33 @@ fn a_read_while_a_pass_asks_for_a_key_does_not_end_the_ask() {
         Became::Taken(channel.id)
     );
     assert!(asked_for(&s, at + 2).is_empty());
+}
+
+/// A share made within the hour of the read whose typing a pass asks for,
+/// but not within the hour of a read that types the key again while it
+/// asks, is not taken (rule 4.4, #336): it is judged against the latest
+/// read, at the judge and again at the take, as a read can come between
+/// the two.
+#[test]
+fn a_share_older_than_the_hour_of_a_read_made_while_it_was_asked_for_is_not_taken() {
+    let s = bob(1);
+    let now = s.now + 10;
+    let (_, list) = joins(&s, 7, now);
+    let alice = member(1);
+    let first = now + READ;
+    reads(&s, &list, &commit('a'), first);
+    let old = share_of(&s, &alice, 7, first - HOUR + 30);
+    let typing = typing_of(&s, &alice, first + READ - 1);
+    let (conn, identity) = (&s[0].conn, &s[0].identity);
+    let judged = judge(conn, identity, &typing, &old, first + READ - 1).unwrap();
+    assert!(matches!(judged, Some(Judged::Share(_))), "{judged:?}");
+
+    let latest = first + READ;
+    reads(&s, &list, &commit('a'), latest);
+    let judged = judge(conn, identity, &typing, &old, latest + 1).unwrap();
+    assert_eq!(judged, Some(Judged::Not(NotAShare::NotMadeWithinTheHour)));
+    let took = take(conn, identity, &typing, &[old], &own_relays(), latest + 1);
+    assert_eq!(took.unwrap(), Became::Nothing);
 }
 
 /// Nothing is taken where the list names no channel, its channel line
