@@ -318,7 +318,7 @@ pub fn without_memory(says: &str) -> &str {
 pub fn removed_holds_shared_says(n: usize) -> String {
     format!(
         "shared: {n} shared {} not made anew since a removal: make each anew once with cordelia \
-         shared anew <name>",
+         shared reset <name>",
         plural(n as u64, "channel")
     )
 }
@@ -3535,13 +3535,13 @@ mod tests {
         assert_eq!(
             six.summary,
             "shared: 2 shared channels not made anew since a removal: make \
-             each anew once with cordelia shared anew <name>"
+             each anew once with cordelia shared reset <name>"
         );
         let one = with_shared(&holding(6, &["review"]), &|_| {});
         assert_eq!(
             one.summary,
             "shared: 1 shared channel not made anew since a removal: make \
-             each anew once with cordelia shared anew <name>"
+             each anew once with cordelia shared reset <name>"
         );
         // A channel named by two removals counts once.
         let twice = with_shared(
@@ -3605,7 +3605,7 @@ mod tests {
         assert_eq!(
             without_shared(&six.summary),
             "2 shared channels not made anew since a removal: make each anew once with cordelia \
-             shared anew <name>"
+             shared reset <name>"
         );
         assert!(is_shared(&six.holds[0]));
     }

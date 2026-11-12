@@ -361,7 +361,7 @@ pub fn joined_line(name: &str, commit: &str, labels: &[&str], shown: usize) -> S
 /// list names the channel made anew without it, or is listed again.
 pub fn dropped_line(label: &str, name: &str) -> String {
     format!(
-        "{label} is no longer on the list of {name}: make it anew with cordelia shared anew {}",
+        "{label} is no longer on the list of {name}: make it anew with cordelia shared reset {}",
         shell_word(name)
     )
 }

@@ -617,11 +617,11 @@ fn six_words_of(key: &str) -> String {
     cordelia_crypto::fingerprint::words(&decode_public_key(key).unwrap(), 6)
 }
 
-/// `cordelia shared anew <name>` on `n`, at a terminal: each key it asks
+/// `cordelia shared reset <name>` on `n`, at a terminal: each key it asks
 /// about is answered as `answers` says of the key the question names;
 /// then its yes. The new channel line it prints.
 fn makes_anew(n: &Node, name: &str, answers: &[(&str, &str)]) -> String {
-    let mut at = n.at_terminal(&["shared", "anew", name]);
+    let mut at = n.at_terminal(&["shared", "reset", name]);
     let questions: Vec<String> = answers
         .iter()
         .map(|(key, _)| format!("Does ({}) ", six_words_of(key)))
@@ -1296,7 +1296,7 @@ fn leaving_by_hand_and_coming_back_by_a_pull_request() {
     host.fetches(&alice, &alice_clone);
     let no_longer = format!(
         "carol-tablet is no longer on the list of {NAME}: make it anew with cordelia shared \
-         anew {NAME}"
+         reset {NAME}"
     );
     for n in [&bob, &alice] {
         shows(&all, n, "no_longer_listed", &no_longer, true);

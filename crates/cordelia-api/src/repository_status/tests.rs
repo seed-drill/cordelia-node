@@ -838,7 +838,7 @@ fn the_notices_are_amber_and_seen_clears_the_new_keys_and_the_changed_line_alone
                 short_of('b')
             ),
             "carol-laptop is no longer on the list of review: make it anew with cordelia shared \
-             anew review"
+             reset review"
                 .to_string(),
         ]
     );

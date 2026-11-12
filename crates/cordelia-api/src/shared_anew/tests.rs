@@ -1534,7 +1534,7 @@ fn a_removal_leaves_a_channel_it_does_not_reach_not_clean() {
         seen.notices
     );
     assert!(unreached_line("review").ends_with(
-        "make it anew with cordelia shared anew review on a device of yours that reaches its \
+        "make it anew with cordelia shared reset review on a device of yours that reaches its \
          relays"
     ));
 }
@@ -2513,6 +2513,7 @@ fn the_status_names_no_device_for_a_channel_first_held_after_a_removal() {
     assert_eq!(groups.len(), 1, "{groups:?}");
     assert_eq!(groups[0]["channels"], serde_json::json!(["later"]));
     assert!(groups[0].get("device").is_none(), "{groups:?}");
+    assert_eq!(groups[0]["devices"], serde_json::json!([]), "{groups:?}");
 }
 
 const HOUR_SECS: i64 = 3600;

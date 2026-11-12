@@ -743,7 +743,7 @@ pub fn unreached_line(name: &str) -> String {
     let word = crate::shared_routes::shell_word(name);
     format!(
         "\"{}\" was held by a device that was removed, and is not reached from this device: make \
-         it anew with cordelia shared anew {word} on a device of yours that reaches its relays",
+         it anew with cordelia shared reset {word} on a device of yours that reaches its relays",
         crate::messages::cleaned(name)
     )
 }
@@ -2856,7 +2856,7 @@ pub fn not_clean_line(name: &str) -> String {
     let word = crate::shared_routes::shell_word(name);
     format!(
         "\"{}\" is not clean: after a removal, each shared channel is made anew once on this \
-         device before it sends there. Run cordelia shared anew {word}",
+         device before it sends there. Run cordelia shared reset {word}",
         crate::messages::cleaned(name)
     )
 }

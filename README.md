@@ -231,7 +231,7 @@ you to type yes, then asks for the phrase.
 - What the removed device wrote after the removal is set aside, into local
   history. To bring it back, if you trust it, run `cordelia sync carry
   <name> --from <its label>` (it asks for the phrase).
-- After a removal, run `cordelia shared anew <name>` once on each of your
+- After a removal, run `cordelia shared reset <name>` once on each of your
   other devices, for each shared channel. `cordelia status` says how many
   are left.
 - A removal makes each shared channel anew with your own devices, and the
@@ -385,7 +385,7 @@ subscribe` there follows again.
 
 **To leave, or to take someone out:**
 
-1. A member runs `cordelia shared anew <name>`. It makes the channel anew
+1. A member runs `cordelia shared reset <name>`. It makes the channel anew
    without them, and prints its new `channel` line. The line names each
    device it left out whose line is still in the list, so run it before
    their lines are deleted. If a line is gone already, the new line does

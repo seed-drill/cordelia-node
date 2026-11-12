@@ -2974,7 +2974,7 @@ fn come_to(
         None => Vec::new(),
     };
     let removes_a_key = !removed_now.is_empty();
-    crate::look::note_removed_a_key(conn, removes_a_key)?;
+    crate::look::note_removed_a_key(conn, &removed_now)?;
     // A removal makes every shared channel this device holds not yet clean
     // (decision 2026-10-24, rule 23; decision 2026-10-10 §3.5).
     if removes_a_key {

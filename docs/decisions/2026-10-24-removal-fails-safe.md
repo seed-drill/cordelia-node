@@ -1,7 +1,7 @@
 # Decision: a removal fails safe
 
 **Date**: 2026-10-24
-**Status**: Accepted, and built in `v0.2.0-alpha.18`, shared channels (rules 23 to 26) with the shared record. Rule 27 was taken out on 31 October, and rule 28 withdrawn with it (section 12, item 8; section 15). It amends the records and documents named in section 5.
+**Status**: Accepted, and built in `v0.2.0-alpha.18`, shared channels (rules 23 to 26) with the shared record. Its quoted lines amended by decision 2026-11-11 (plain words). Rule 27 was taken out on 31 October, and rule 28 withdrawn with it (section 12, item 8; section 15). It amends the records and documents named in section 5.
 **Cited as**: "decision 2026-10-24 rule 7", "decision 2026-10-24 §8". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -281,7 +281,7 @@ Each is a promise to a person, and each has tests (section 7). Where a property 
 - The removal's prompt names each shared channel, and says that it will be made anew without the device removed, who stays, and that the other people in it move with a yes of their own; and it names each repository this device follows, as above. The one yes of the removal covers it.
 - A recovery does the same.
 
-**Rule 25. A device that applies a removal and finds a shared channel that the person has not made anew** (the device that made the removal was lost first, or the filing has not come) sends nothing there, and says so: "\"<name>\" is not clean: after a removal, each shared channel is made anew once on this device before it sends there. Run `cordelia shared anew <name>`" (the words of 2 November, true too of a channel first held after the removal). It does not make the channel anew by itself: two devices would make two channels.
+**Rule 25. A device that applies a removal and finds a shared channel that the person has not made anew** (the device that made the removal was lost first, or the filing has not come) sends nothing there, and says so: "\"<name>\" is not clean: after a removal, each shared channel is made anew once on this device before it sends there. Run `cordelia shared reset <name>`" (the words of 2 November, true too of a channel first held after the removal). It does not make the channel anew by itself: two devices would make two channels.
 
 **Rule 26. Another person's device that reads an offer which seals to its person and leaves out a key sends nothing more in the old channel.** What its agents send there waits, and the send says why. It goes on when its person moves (`cordelia shared move`, with a yes, as the shared record has it), or says at a terminal, with a yes, to go on in the old channel, where the keys left out read: `cordelia shared stay <name>`. An offer that leaves this person out ("without you") changes nothing here.
 

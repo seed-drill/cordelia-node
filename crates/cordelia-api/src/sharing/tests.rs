@@ -810,6 +810,65 @@ async fn the_routes_ask_their_yes_and_refuse_a_field_they_do_not_know() {
     assert_eq!(status.as_u16(), 404);
 }
 
+/// `accept --channel`'s answer gives, beside the key typed and its six
+/// words, the name the person gave that key alone, and an empty one where
+/// they gave none (decision 2026-11-11 (plain words), slice 0).
+#[actix_web::test]
+async fn the_accept_route_answers_the_label_given_the_key() {
+    use actix_web::{App, test};
+    let s = bob(1);
+    let carol = encode_public_key(&member(2).public_key()).unwrap();
+    let dave = encode_public_key(&member(3).public_key()).unwrap();
+    {
+        let (conn, identity) = (&s[0].conn, &s[0].identity);
+        let plan = label_plan(conn, identity, &carol, Some("carol"), s.now)
+            .unwrap()
+            .unwrap();
+        make_label(conn, identity, &plan.what, s.now).unwrap();
+    }
+    let state = actix_web::web::Data::new(crate::several::state_of(
+        s.machines.into_iter().next().unwrap(),
+    ));
+    *state.relays.write().unwrap() = vec![crate::state::RelaySnapshot {
+        host: "relay.example.org:9474".into(),
+        key: Some(encode_public_key(&AT).unwrap()),
+        state: "connected".into(),
+        unreachable_secs: None,
+        last_tried_secs: None,
+        error: None,
+        tried: Default::default(),
+        connection: None,
+    }];
+    let personal = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::configure_device_routes),
+    )
+    .await;
+    let call = |body: serde_json::Value| {
+        test::TestRequest::post()
+            .uri("/api/v1/shared/accept")
+            .insert_header(("Authorization", "Bearer t"))
+            .set_json(body)
+            .to_request()
+    };
+    for (key, name, label) in [(&carol, "design", "carol"), (&dave, "plans", "")] {
+        let looked: serde_json::Value = test::call_and_read_body_json(
+            &personal,
+            call(json!({ "key": key, "name": name, "look": true })),
+        )
+        .await;
+        let asks = looked["asks"].as_str().unwrap();
+        let typed: serde_json::Value = test::call_and_read_body_json(
+            &personal,
+            call(json!({ "key": key, "name": name, "said_yes_to": asks })),
+        )
+        .await;
+        assert_eq!(typed["key"], json!(key), "{typed}");
+        assert_eq!(typed["label"], label, "{typed}");
+    }
+}
+
 /// A key the person's statement lists as removed is handed nothing, taken
 /// from in nothing and labelled nothing (decision 2026-10-10 §5.5,
 /// `removed_key`), and nor is its twin, its top bit flipped, which opens
@@ -1064,14 +1123,22 @@ fn share_refuses_a_new_key_where_the_channel_shows_64() {
     let word = |key: &[u8; 32]| {
         let key = encode_public_key(key).unwrap();
         match share_plan(conn, identity, &relays(), "review", &key, None, now) {
-            Err(Failed::Refused(refusal)) => refusal.word,
-            Ok(_) => "ok",
+            Err(Failed::Refused(refusal)) => (refusal.word, refusal.line),
+            Ok(_) => ("ok", String::new()),
             Err(Failed::Error(e)) => panic!("{e}"),
         }
     };
-    assert_eq!(word(&member(500).public_key()), "channel_full");
+    assert_eq!(
+        word(&member(500).public_key()),
+        (
+            "channel_full",
+            "\"review\" shows 64 keys on this device, which is the most: make it anew without \
+             some (cordelia shared reset)."
+                .to_string()
+        )
+    );
     let among = shown.iter().find(|key| **key != s.key(0)).unwrap();
-    assert_eq!(word(among), "ok");
+    assert_eq!(word(among).0, "ok");
 }
 
 /// **A channel with no held row is not clean** (the read of #281 for the

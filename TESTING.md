@@ -155,7 +155,7 @@ cargo test -p cordelia-node --test threat_model
 - `a_clone_behind_the_last_commit_read_gives_no_new_list_across_a_restart`: a read of the clone never goes back, across a restart too.
 - `only_the_named_channel_is_taken_and_only_keys_on_the_list_are_handed_it`: a share of another channel is not taken, and a key on a local branch or in the working tree is handed nothing.
 - `nine_new_keys_with_eight_off_the_ninth_is_handed_the_channel_at_the_third_read`: the turns of rule 4.2.
-- `leaving_by_hand_and_coming_back_by_a_pull_request`: a dropped key's amber, `shared anew`'s line, nothing handed before it is merged (by a device left out either), rule 1's gate, and a key brought back, which renames its old channel first.
+- `leaving_by_hand_and_coming_back_by_a_pull_request`: a dropped key's amber, `shared reset`'s line, nothing handed before it is merged (by a device left out either), rule 1's gate, and a key brought back, which renames its old channel first.
 - `a_removed_device_still_listed_is_never_handed_the_new_channel`: after a removal, by any follower, two of them off at the removal.
 
 `crates/cordelia-node/tests/common/mod.rs` is the harness they share: it

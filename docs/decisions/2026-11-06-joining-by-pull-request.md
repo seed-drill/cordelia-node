@@ -1,7 +1,7 @@
 # Decision: joining a repository's shared channel by pull request
 
 **Date**: 2026-11-06
-**Status**: Accepted on 6 November, and built for `v0.2.0-alpha.19`. Amended by the person's rulings of 7, 8, 10 and 11 November (section 14); the last two (rule 4.5, and the one line of rule 7) come after alpha.19. It replaces the members record's command, and overturns property 16 of the shared channels record (section 7).
+**Status**: Accepted on 6 November, and built for `v0.2.0-alpha.19`. Its quoted lines amended by decision 2026-11-11 (plain words). Amended by the person's rulings of 7, 8, 10 and 11 November (section 14); the last two (rule 4.5, and the one line of rule 7) come after alpha.19. It replaces the members record's command, and overturns property 16 of the shared channels record (section 7).
 **Cited as**: "decision 2026-11-06 (joining), rule 4". The numbers do not change.
 
 Words used throughout:
@@ -165,7 +165,7 @@ At each read, each device that follows the repository does the following, with n
    - **A read that counts for nothing shows nothing.** Following again (rule 2.5) keeps the list kept, so it shows nothing new at its yes.
    - **Each line stays until a person clears it** on that device with `cordelia shared seen <name>`, which says each line it clears. The plain status names the first six labels (`MEMBERS_LABELS_SHOWN`) and how many more; `shared list` names every label; `--json` gives the whole commit and each key, as `members` gives it.
    - **The upgrade:** a device that upgrades from `v0.2.0-alpha.19` keeps the lists it read, so a key that alpha.19 never showed is not shown now. That was the person's choice on 10 November: no catch-up amber at the upgrade. Keys listed before the upgrade still show in the status's list of members.
-6. **Says a key was dropped.** A key in the channel that an earlier read named and the latest does not shows amber: `<label> is no longer on the list of <name>: make it anew with cordelia shared anew <name>`.
+6. **Says a key was dropped.** A key in the channel that an earlier read named and the latest does not shows amber: `<label> is no longer on the list of <name>: make it anew with cordelia shared reset <name>`.
 7. **Says a listed key was left out.** A key the list names, that its `channel` line names after `without`, and that is not in the channel, shows once, on each follower that holds the channel and so sees who is in it: `<label> is on the list of <name> but was left out of it: delete its line in a pull request, or wait for that device to write in the channel`. A follower that does not hold the channel cannot tell, and shows nothing. Until it goes, the list names no channel (rule 1). A key that is in the channel, as a device of a person who stays is (§7 there), is not shown.
 
 ## 5. Making a repository channel anew

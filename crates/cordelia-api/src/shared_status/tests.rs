@@ -169,6 +169,16 @@ fn a_channel_not_yet_clean_is_said_as_held_by_a_removed_device() {
     assert_eq!(shared["channels"], json!([]));
 }
 
+/// The one device of a group's `devices`: device `n`, by its key, the
+/// label it was added under alone, and its four words.
+fn alone(s: &crate::several::Several, n: usize) -> Value {
+    json!([{
+        "key": encode_public_key(&s.key(n)).unwrap(),
+        "label": format!("device {n}"),
+        "words": fingerprint::shown(&s.key(n)),
+    }])
+}
+
 /// The `since` of a group, by the node's clock.
 fn since_of(group: &Value) -> i64 {
     chrono::DateTime::parse_from_rfc3339(group["since"].as_str().unwrap())
@@ -179,7 +189,9 @@ fn since_of(group: &Value) -> i64 {
 /// Two removals (decision 2026-10-10 §9): the phone is removed, and later
 /// the tablet, while the channel stays not clean on the desktop. The entry
 /// names the device that each removal removed, and not every key removed
-/// so far; and its seven days count from the later removal.
+/// so far, in `device` and alone in `devices`, with an empty label where
+/// the device kept none (decision 2026-11-11 (plain words), slice 0); and
+/// its seven days count from the later removal.
 #[test]
 fn a_later_removal_names_its_own_device_and_counts_from_itself() {
     let mut s = bob(4);
@@ -202,6 +214,7 @@ fn a_later_removal_names_its_own_device_and_counts_from_itself() {
         device,
         format!("\"device 3\" ({})", fingerprint::shown(&s.key(3)))
     );
+    assert_eq!(first[0]["devices"], alone(&s, 3), "{shared}");
     let first_since = since_of(&first[0]);
     // Later, the laptop removes the tablet.
     s.now += 9 * 86_400;
@@ -216,6 +229,17 @@ fn a_later_removal_names_its_own_device_and_counts_from_itself() {
     assert_eq!(
         device,
         format!("\"device 2\" ({})", fingerprint::shown(&s.key(2)))
+    );
+    assert_eq!(second[0]["devices"], alone(&s, 2), "{shared}");
+    // Where the device kept no label of it, the label is empty.
+    cordelia_storage::meta::remove(&s[1].conn, cordelia_storage::meta::PERSON_REMOVED_LABELS)
+        .unwrap();
+    let shared = object(&s, 1, &SharedSaid::default(), now).unwrap();
+    let mut bare = alone(&s, 2);
+    bare[0]["label"] = json!("");
+    assert_eq!(
+        shared["removed_device_holds"][0]["devices"], bare,
+        "{shared}"
     );
     assert!(
         since_of(&second[0]) > first_since + 8 * 86_400,

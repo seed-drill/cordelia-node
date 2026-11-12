@@ -142,12 +142,29 @@ pub fn status_of(
         // `device`: none of them was held by a removed device (issue #279).
         // One first held in the same second as the removal names the
         // removal's keys: the mark keeps no more than its time.
+        // `devices` gives each of those keys alone, with the name the
+        // person gave it apart from its words, for a line that names it
+        // (decision 2026-11-11 (plain words), rule 2): empty where `device`
+        // is absent.
+        let alone = |key: &[u8; 32]| -> Result<Value, PersonError> {
+            let label = removed_labels
+                .iter()
+                .find(|(of, _)| of == key)
+                .map_or(String::new(), |(_, label)| crate::messages::cleaned(label));
+            Ok(json!({
+                "key": encode_public_key(key)?,
+                "label": label,
+                "words": fingerprint::shown(key),
+            }))
+        };
         let mut removed_device_holds: Vec<Value> = Vec::new();
         for (since, channels) in by_since {
             let removed = shared_anew::removed_at(conn, since)?.unwrap_or_default();
+            let devices: Vec<Value> = removed.iter().map(&alone).collect::<Result<_, _>>()?;
             let mut group = json!({
                 "channels": channels,
                 "since": rfc3339(since),
+                "devices": devices,
             });
             if !removed.is_empty() {
                 let device: Vec<String> = removed.iter().map(named).collect();
