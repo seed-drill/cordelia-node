@@ -2131,7 +2131,10 @@ fn node_lines(
     }
     // A node that is held up says why (decision 2026-10-04 §10.1).
     if let Some(why) = status.held() {
-        lines.push(format!("  Problem:   the node cannot go on: {why}"));
+        lines.push(format!(
+            "  Problem:   the node cannot go on: {}",
+            mid_line(why)
+        ));
     }
     if role != "personal" {
         return lines;
@@ -2150,7 +2153,13 @@ fn node_lines(
     {
         lines.push(format!("    also:     {more}"));
     }
-    for shared in shared {
+    // Each is the node's notice of its channel, word for word, which is
+    // then said here once (decision 2026-11-11 (plain words)).
+    let said_shared: Vec<String> = shared
+        .iter()
+        .map(|holds| history_cmd::printable(indicator::without_shared(&holds.says)))
+        .collect();
+    for shared in &shared {
         lines.push(shared_line(&shared.says));
     }
     for c in &status.facts.conflicts {
@@ -2164,7 +2173,7 @@ fn node_lines(
     if let Some(person) = person {
         let (short, says) = person_cmd::status_lines(person, verbose);
         lines.push(format!("  Devices:   {short}"));
-        for line in says {
+        for line in says.iter().filter(|line| !said_shared.contains(line)) {
             lines.push(format!("    {line}"));
         }
     }
@@ -2189,6 +2198,19 @@ fn node_lines(
         }
     }
     lines
+}
+
+/// `why` put after a colon in a line: a sentence that starts with a
+/// capital, as "This database ...", starts small there.
+fn mid_line(why: &str) -> String {
+    let mut chars = why.chars();
+    match (chars.next(), chars.next()) {
+        (Some(first), Some(second)) if first.is_uppercase() && second.is_lowercase() => first
+            .to_lowercase()
+            .chain(why[first.len_utf8()..].chars())
+            .collect(),
+        _ => why.to_string(),
+    }
 }
 
 /// The line of `cordelia status` where the node is not running, on the
@@ -2457,16 +2479,17 @@ fn devices_facts(person: &serde_json::Value, now: i64) -> indicator::Devices {
         added_not_cleared: list("notices")
             .filter(|notice| notice["kind"] == "added")
             .count(),
-        // This device, where a notice is of its own addition.
+        // But this device, where a notice is of its own addition: the line
+        // says that from this device's view.
         added_named: list("notices")
             .filter(|notice| notice["kind"] == "added" && notice["device"].is_object())
-            .map(
-                |notice| match notice["device"]["key"] == person["this_device"] {
-                    true => "this device".to_string(),
-                    false => named(&notice["device"]),
-                },
-            )
+            .filter(|notice| notice["device"]["key"] != person["this_device"])
+            .map(|notice| named(&notice["device"]))
             .collect(),
+        added_this_device: list("notices").any(|notice| {
+            notice["kind"] == "added" && notice["device"]["key"] == person["this_device"]
+        }),
+        short: person["short"].as_str().unwrap_or_default().to_string(),
         said_left: said_left.filter(|device| device["left"] == true).count(),
         // What is known of each relay's reach, as the node put it
         // (decision 2026-10-19 §1, rule 11): nothing of it is worked out
@@ -6994,7 +7017,7 @@ mod tests {
         );
         // The status names the device that filled it.
         assert!(
-            channel.warning().starts_with("memory: \"desk"),
+            channel.warning().starts_with("memory: (") && channel.warning().contains(") \"desk"),
             "{}",
             channel.warning()
         );
@@ -7091,8 +7114,10 @@ mod tests {
                 set_aside_secs: None,
                 added_not_cleared: 3,
                 // Only a notice that names its device: one of an earlier
-                // version names none. This device's own is "this device".
-                added_named: vec!["\"phone\"".into(), "this device".into()],
+                // version names none. This device's own is said apart.
+                added_named: vec!["(a b c d) \"phone\"".into()],
+                added_this_device: true,
+                short: String::new(),
                 said_left: 2,
                 // Each relay that lacks the change, connected or not, as
                 // the node counts it; one in the third state is not
@@ -9034,15 +9059,16 @@ mod tests {
         };
         let held = |channel: &str| indicator::HeldShared {
             channel: channel.into(),
-            devices: vec!["\"old laptop\"".into()],
+            devices: vec![indicator::device_named("old laptop", "a b c d")],
         };
         f.devices.removed_holds_shared = vec![held("design-review")];
         f.devices.removed_holds_shared_secs = Some(3_600);
         let line = indicator::shown(&f).summary;
         assert_eq!(
             line,
-            "shared: design-review: \"old laptop\" can still read new messages there. To stop \
-             that: cordelia shared reset design-review"
+            "shared: \"design-review\": (a b c d) \"old laptop\", which you removed, can still \
+             read new messages there, and this device sends nothing there until you reset it. To \
+             stop that: cordelia shared reset design-review"
         );
         let (memory, shared) = memory_and_shared(&f);
         assert_eq!(memory_line(&memory.summary), "  Memory:    synced");
@@ -9053,10 +9079,10 @@ mod tests {
             .collect();
         assert_eq!(
             lines,
-            [
-                "  Shared:    design-review: \"old laptop\" can still read new messages there. To \
-                 stop that: cordelia shared reset design-review"
-            ]
+            [format!(
+                "  Shared:    {}",
+                line.strip_prefix("shared: ").unwrap()
+            )]
         );
         // Two channels: two lines.
         f.devices.removed_holds_shared.push(held("ops"));
@@ -9067,7 +9093,7 @@ mod tests {
             .collect();
         assert_eq!(lines.len(), 2, "{lines:?}");
         assert!(
-            lines[1].starts_with("  Shared:    ops: \"old laptop\""),
+            lines[1].starts_with("  Shared:    \"ops\": (a b c d) \"old laptop\""),
             "{lines:?}"
         );
         // Beside another amber hold: that one is under `Memory:`.
@@ -9122,6 +9148,11 @@ mod tests {
             "with a key other than the one your configuration gives that relay",
             "a relay's key is its setting's name",
         ),
+        (
+            "given no key, at the address of a relay given one",
+            "a relay's key is its setting's name",
+        ),
+        ("that relay's key", "a relay's key is its setting's name"),
     ];
 
     /// The sources of slice 1's lines (decision 2026-11-11 (plain words),
@@ -9150,6 +9181,20 @@ mod tests {
                 "fn no_room_says(",
                 "impl AtRelayLook {",
                 "impl Accepting {",
+                "pub fn named_device(",
+                "pub fn named_few(",
+            ],
+        ),
+        (
+            "cordelia-api/src/shared_anew.rs",
+            include_str!("../../cordelia-api/src/shared_anew.rs"),
+            &[
+                "pub fn unreached_named_line(",
+                "pub fn unreached_past_a_bound_line(",
+                "pub fn not_made_anew_past_a_bound_line(",
+                "pub fn not_clean_named_line(",
+                "pub fn removed_act_line(",
+                "pub(crate) fn notices(",
             ],
         ),
         (
@@ -9182,7 +9227,6 @@ mod tests {
             include_str!("indicator.rs"),
             &[
                 "pub fn warning(&self)",
-                "pub fn device_named(",
                 "pub fn removed_holds_shared_says(",
                 "fn stopped_says(",
                 "fn held_says(",
@@ -9213,6 +9257,27 @@ mod tests {
             "cordelia-node/src/person_cmd.rs",
             include_str!("person_cmd.rs"),
             &["pub fn status_lines(", "fn relay_says("],
+        ),
+        // The wait after a change says what each relay has (record §6:
+        // every relay line is slice 1's).
+        (
+            "cordelia-node/src/person_cmd/wait.rs",
+            include_str!("person_cmd/wait.rs"),
+            &[
+                "pub(crate) fn no_longer_stands(",
+                "pub(crate) fn recovery_first_line(",
+                "pub(crate) fn recovery_end_lines(",
+                "pub(crate) fn first_line(",
+                "pub(crate) fn out_of_reach_line(",
+                "pub(crate) fn count_line(",
+                "fn stuck_line(",
+                "pub(crate) fn end_lines(",
+                "fn warned_lines(",
+                "fn refusing_line(",
+                "fn not_done_lines(",
+                "fn why_not_done(",
+                "pub(crate) fn could_not_go_on(",
+            ],
         ),
     ];
 
@@ -9492,6 +9557,19 @@ mod tests {
         ] {
             states.push(Box::new(move |f| f.stands = stands.into()));
         }
+        // A device stopped, with the look's few words that say its way on.
+        for (stands, short) in [
+            ("closed", look::CLOSED_SHORT.to_string()),
+            ("closed", look::REMOVED_AS_KNOWN_SHORT.to_string()),
+            ("fork", look::CLOSED_SHORT.to_string()),
+            ("fork", look::REMOVED_AS_KNOWN_SHORT.to_string()),
+            ("fork", look::short_why(State::Fork).to_string()),
+        ] {
+            states.push(Box::new(move |f| {
+                f.stands = stands.into();
+                f.devices.short = short.clone();
+            }));
+        }
         for by in ["later_database", "earlier_database", "step_failed", "other"] {
             states.push(Box::new(move |f| f.held = Some(by.into())));
         }
@@ -9511,27 +9589,33 @@ mod tests {
             Box::new(|f| f.devices.removal_not_applied_secs = Some(60)),
             Box::new(|f| {
                 f.devices.removal_not_applied_secs = Some(60);
-                f.devices.removed_named =
-                    vec!["\"old laptop\"".into(), "the device (a b c d)".into()];
+                f.devices.removed_named = vec![
+                    indicator::device_named("old laptop", "a b c d"),
+                    indicator::device_named("", "e f g h"),
+                ];
             }),
             Box::new(|f| f.devices.set_aside_secs = Some(60)),
             Box::new(move |f| {
                 f.devices.removed_holds_shared_secs = Some(60);
                 f.devices.removed_holds_shared = vec![
-                    shared(&["\"old laptop\""]),
-                    shared(&["the device (a b c d)"]),
+                    shared(&[&indicator::device_named("old laptop", "a b c d")]),
+                    shared(&[&indicator::device_named("", "e f g h")]),
                     shared(&[]),
                 ];
             }),
             Box::new(|f| f.devices.added_not_cleared = 2),
             Box::new(|f| {
+                f.devices.added_not_cleared = 1;
+                f.devices.added_this_device = true;
+            }),
+            Box::new(|f| {
                 f.devices.added_not_cleared = 5;
                 f.devices.added_named = vec![
-                    "\"phone\"".into(),
-                    "this device".into(),
-                    "the device (a b c d)".into(),
-                    "\"tablet\"".into(),
+                    indicator::device_named("phone", "a b c d"),
+                    indicator::device_named("", "e f g h"),
+                    indicator::device_named("tablet", "i j k l"),
                 ];
+                f.devices.added_this_device = true;
             }),
             Box::new(|f| f.devices.said_left = 2),
             Box::new(|f| {
@@ -9625,8 +9709,29 @@ mod tests {
             };
             says.push(accepting.says());
         }
+        // The notices of shared channels not yet clean, and of an act of a
+        // removed device, as the node words them.
+        use cordelia_api::shared_anew as anew;
+        let old_laptop = indicator::device_named("old laptop", "a b c d");
+        let act = anew::Named {
+            maker: [7; 32],
+            act: "label",
+            item: "a name for a device".into(),
+            undo: "cordelia label".into(),
+            id: [8; 32],
+        };
+        let notices = [
+            anew::not_clean_named_line("design review", std::slice::from_ref(&old_laptop)),
+            anew::not_clean_line("later"),
+            anew::unreached_named_line("ops", std::slice::from_ref(&old_laptop)),
+            anew::unreached_line("ops"),
+            anew::unreached_past_a_bound_line("big"),
+            anew::not_made_anew_past_a_bound_line("big"),
+            anew::removed_act_line(&old_laptop, &act),
+        ];
         let mut people = vec![
             json!({ "devices": [{ "key": "a" }], "change": 1, "says": says }),
+            json!({ "devices": [{ "key": "a" }], "change": 1, "says": notices }),
             json!({ "devices": [{ "key": "a" }, { "key": "b" }], "change": 4 }),
             json!({ "short": look::CLOSED_SHORT, "says": [look::CLOSED_WHY] }),
             json!({
@@ -9679,6 +9784,34 @@ mod tests {
             }
         }
         assert!(rendered > 1_000, "{rendered} lines rendered");
+
+        // A channel not yet clean is said once, by its `Shared:` line,
+        // which names the removed device, and says that this device sends
+        // nothing there; and once more after its seven days, as a notice.
+        let mut held = well.clone();
+        held.devices.removed_holds_shared_secs = Some(60);
+        held.devices.removed_holds_shared = vec![shared(&[&old_laptop])];
+        let said = plain_status(&held, &people[1], &[]);
+        let not_clean = &notices[0];
+        assert_eq!(
+            said.iter()
+                .filter(|line| line.contains(not_clean.as_str()))
+                .count(),
+            // The `Shared:` line, the status line and the tooltip.
+            3,
+            "{said:#?}"
+        );
+        assert!(
+            said.contains(&format!("  Shared:    {not_clean}")),
+            "{said:#?}"
+        );
+        assert!(
+            not_clean.contains("(a b c d) \"old laptop\", which you removed, can still read")
+                && not_clean.contains("this device sends nothing there until you reset it"),
+            "{not_clean}"
+        );
+        let after = plain_status(&well, &people[1], &[]);
+        assert!(after.contains(&format!("    {not_clean}")), "{after:#?}");
         found.sort();
         found.dedup();
         assert!(found.is_empty(), "old words:\n{}", found.join("\n"));

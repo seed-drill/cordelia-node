@@ -1526,6 +1526,29 @@ pub fn key_of(node: &Node) -> String {
     node.cli(&["id"]).trim().to_string()
 }
 
+/// `node` as a line of the status names a device: the words of its key's
+/// fingerprint, then the name `label`, quoted (decision 2026-11-11 (plain
+/// words), rule 4).
+pub fn named_in_a_line(node: &Node, label: &str) -> String {
+    let key = cordelia_crypto::bech32::decode_public_key(&key_of(node)).unwrap();
+    format!("({}) {label:?}", cordelia_crypto::fingerprint::shown(&key))
+}
+
+/// What the status says of a device added and not yet cleared, `added`
+/// as a line names it, on another device; and on the device added, from
+/// its own view (decision 2026-11-11 (plain words), rule 2).
+pub fn added_says(added: Option<&str>) -> String {
+    match added {
+        Some(added) => format!(
+            "memory: {added} was added. If you did not add it, remove it; if you did, run \
+             cordelia devices --clear"
+        ),
+        None => "memory: this device was added to your devices. To mark that seen: cordelia \
+                 devices --clear"
+            .to_string(),
+    }
+}
+
 // ── Commands, as a person runs them ──────────────────────────────────
 
 /// The line above the twelve numbers where a command asks for a recovery

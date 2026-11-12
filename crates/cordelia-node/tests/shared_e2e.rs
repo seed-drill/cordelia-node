@@ -2423,11 +2423,13 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
         "{}",
         at.said
     );
-    at.says("The wait has ended.").says(
-        "\"review\" was held by a device that was removed, and is not reached from this \
-         device: make it anew with cordelia shared reset review on a device of yours that \
-         reaches its relays",
-    );
+    // Its notice names the tablet, removed, by its words and name.
+    at.says("The wait has ended.").says(&format!(
+        "\"review\": {}, which you removed, can still read new messages there, and this device \
+         cannot reach its relays. To stop that, run cordelia shared reset review on a device of \
+         yours that reaches them",
+        named_in_a_line(&tablet, "tablet")
+    ));
     drop(at);
     assert_eq!(id_filed(&desktop, "review"), Some(old));
     // The desktop holds a channel not clean that the tablet held: its
@@ -2466,8 +2468,8 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     assert_eq!(ended, Some(false));
     assert!(
         err.contains(
-            "\"review\" is not clean: after a removal, each shared channel is made anew once \
-             on this device before it sends there. Run cordelia shared reset review"
+            "\"review\" has not been reset on this device since you removed a device, so this \
+             device sends nothing there until you reset it: cordelia shared reset review"
         ),
         "{err}"
     );
@@ -2531,23 +2533,27 @@ fn removed_device_holds_review(n: &Node, removed: &str, named: Named) {
         holds_of(&status).contains(&"shared_removed_device_holds".to_string()),
         "{status}"
     );
-    // One line for the channel, which names the removed device, or where
-    // the node names none, says that this device writes nothing there
-    // (decision 2026-11-11 (plain words), rules 2 and 3).
+    // One line for the channel, which names the removed device by its
+    // words and name, and says that this device sends nothing there; where
+    // the node names none, that it was not reset (decision 2026-11-11
+    // (plain words), rules 2 to 4). Its notice, the same words, is not
+    // said again.
     let plain = n.cli(&["status"]);
-    let line = match holds_it[0]["devices"]
-        .as_array()
-        .is_some_and(|d| !d.is_empty())
-    {
-        true => format!(
-            "  Shared:    review: \"{removed}\" can still read new messages there. To stop that: \
-             cordelia shared reset review"
+    let line = match holds_it[0]["devices"].as_array().and_then(|d| d.first()) {
+        Some(device) => format!(
+            "  Shared:    \"review\": ({}) \"{removed}\", which you removed, can still read new \
+             messages there, and this device sends nothing there until you reset it. To stop \
+             that: cordelia shared reset review",
+            device["words"].as_str().unwrap()
         ),
-        false => "  Shared:    review: this device sends nothing there until you reset it: \
-                  cordelia shared reset review"
+        None => "  Shared:    \"review\" has not been reset on this device since you removed a \
+                 device, so this device sends nothing there until you reset it: cordelia shared \
+                 reset review"
             .to_string(),
     };
     assert!(plain.contains(&line), "{plain}");
+    let words = line.trim_start().trim_start_matches("Shared:").trim_start();
+    assert_eq!(plain.matches(words).count(), 1, "{plain}");
 }
 
 /// A removal lists what the removed key did, with the command that undoes
@@ -3012,8 +3018,8 @@ fn after_a_removal_each_device_makes_a_shared_channel_anew_once() {
         has_applied(device, 2, &after);
         files_as(&after, device, "review", first);
     }
-    let not_clean = "\"review\" is not clean: after a removal, each shared channel is made \
-                     anew once on this device before it sends there";
+    let not_clean = "\"review\" has not been reset on this device since you removed a device, \
+                     so this device sends nothing there until you reset it";
     // The desktop made it anew: it sends there. The laptop and the phone
     // send nothing until each makes it anew once.
     assert_eq!(
@@ -3073,14 +3079,14 @@ fn after_a_removal_each_device_makes_a_shared_channel_anew_once() {
     let (ended, _, err) = laptop.at_terminal_into_a_pipe(&["share", "bobs", &key_of(&bob)]);
     assert_eq!(ended, Some(false));
     assert!(
-        err.contains("\"bobs\" is not clean: after a removal"),
+        err.contains("\"bobs\" has not been reset on this device since you removed a device"),
         "{err}"
     );
     subscribes(&laptop, &dirs[0], "bobs");
     let refused = send_comes_to(&after, &laptop, &dirs[0], "bobs", "taken after")
         .expect("the laptop sent in a channel taken after a removal");
     assert!(
-        refused.contains("\"bobs\" is not clean: after a removal"),
+        refused.contains("\"bobs\" has not been reset on this device since you removed a device"),
         "{refused}"
     );
 }

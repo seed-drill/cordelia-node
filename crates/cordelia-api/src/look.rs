@@ -106,10 +106,37 @@ impl Shown {
     /// may hold brackets and words of the list: after the words, and in
     /// quotes, it cannot pass for the words of a fingerprint.
     pub fn named(&self) -> String {
-        match self.label.is_empty() {
-            true => format!("the device ({})", self.words),
-            false => format!("({}) {:?}", self.words, self.label),
-        }
+        named_device(&self.label, &self.words)
+    }
+}
+
+/// A device in a sentence, by the name you gave it, `label`, and the words
+/// of its key's fingerprint, `words`, as [`Shown::named`] says it: a line
+/// of the status names a device so wherever it names one (decision
+/// 2026-11-11 (plain words), rule 4), whose name may be another's.
+pub fn named_device(label: &str, words: &str) -> String {
+    match label.is_empty() {
+        true => format!("the device ({words})"),
+        false => format!("({words}) {label:?}"),
+    }
+}
+
+/// How many things a line names before it says how many more (decision
+/// 2026-11-11 (plain words), rule 2).
+pub const NAMED_IN_A_LINE: usize = 3;
+
+/// Things that a line names, of `total`: the first few by name, then how
+/// many more: "a", "a and b", "a, b and c", "a, b, c and 2 more". Where
+/// it names none of them, `none` (one) or `several` (more).
+pub fn named_few(names: &[String], total: usize, none: &str, several: &str) -> String {
+    let total = total.max(names.len());
+    let shown = &names[..names.len().min(NAMED_IN_A_LINE)];
+    let more = total - shown.len();
+    match (shown, more) {
+        ([], 1) => none.to_string(),
+        ([], _) => format!("{total} {several}"),
+        (shown, 0) => joined(shown),
+        (shown, more) => format!("{} and {more} more", shown.join(", ")),
     }
 }
 
@@ -780,9 +807,9 @@ fn of_its_person(
         }
         State::Applied => match &at_relays.cannot_go_on {
             Some(CannotGoOn::NotApplied { relay, why }) => Some(format!(
-                "{relay} sent a change to your devices that this device cannot use ({why}): \
-                 until it can, this device sends and receives nothing in your own channels, and \
-                 it tries again at each pass"
+                "this device cannot use a change to your devices that {relay} sent ({why}): \
+                 until it can, it sends and receives nothing in your own channels, and it tries \
+                 again at each pass"
             )),
             // A device that follows a clear change goes on with any head
             // set aside, and says each (rule 11).
@@ -948,11 +975,18 @@ fn of_its_names(
     if let Some(days) = days(&ours) {
         look.says.push(format!(
             "{} that your devices synced before the last change to your devices {} synced by \
-             no device yet: {}. You can still bring {} back from the relays for {days} more \
-             day{}: cordelia sync carry <name>",
+             no device yet: {}. {} back once a device that synced {} is up to date. If none \
+             will be, bring {} back from the relays within {days} more day{}: cordelia sync \
+             carry <name>",
             counted(ours.len(), "name"),
             if ours.len() == 1 { "is" } else { "are" },
             named(&ours),
+            if ours.len() == 1 {
+                "It comes"
+            } else {
+                "They come"
+            },
+            if ours.len() == 1 { "it" } else { "them" },
             if ours.len() == 1 { "it" } else { "them" },
             if days == 1 { "" } else { "s" },
         ));
@@ -1093,9 +1127,9 @@ fn set_aside_line(noted: &SetAsideNoted) -> String {
     };
     let what = format!(
         "{edits_were} put aside when you removed a device: a removed device wrote {them}, {} \
-         written over what one wrote, or {} received while you were removing it, when Cordelia \
-         cannot show who wrote what (another device's version of the index, a busy file with a \
-         long history, and any later edit of that file, this device's own too)",
+         written over what one wrote, or {} received after you removed it, before this device \
+         knew, when Cordelia cannot show who wrote what (another device's version of the index, a \
+         busy file with a long history, and any later edit of that file, this device's own too)",
         if one { "it was" } else { "they were" },
         if one { "it was" } else { "they were" },
     );
@@ -3179,9 +3213,9 @@ mod tests {
         assert_eq!(
             look.cannot_go_on.as_deref(),
             Some(
-                "one.example:1 sent a change to your devices that this device cannot use (the \
-                 disk is full): until it can, this device sends and receives nothing in your \
-                 own channels, and it tries again at each pass"
+                "this device cannot use a change to your devices that one.example:1 sent (the \
+                 disk is full): until it can, it sends and receives nothing in your own \
+                 channels, and it tries again at each pass"
             )
         );
         assert_eq!(

@@ -389,15 +389,15 @@ fn a_relay_whose_name_does_not_resolve_is_waited_for_and_named() {
         "{}",
         at.said
     );
-    at.says(&format!("{reached} holds the change"));
+    at.says(&format!("{reached} has the change"));
     let said = at.hears_for(Duration::from_secs(5)).to_string();
     assert!(
         said.contains(&format!(
-            "keep this machine on: {NO_SUCH_NAME} does not hold the change yet"
+            "keep this machine on: {NO_SUCH_NAME} does not have the change yet"
         )),
         "{said}"
     );
-    assert!(!said.contains("Every relay holds the change"), "{said}");
+    assert!(!said.contains("Every relay has the change"), "{said}");
 }
 
 // ── cordelia add-device, cordelia accept, cordelia devices ───────────
@@ -1134,8 +1134,8 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
          changes made apart have to be settled with the phrase.",
     );
     at.says(
-        "You may close this machine once every relay holds the change, and what this device \
-         carried is at a relay that it reaches.",
+        "You may close this machine once every relay has the change, and what this device copied \
+         over is at a relay that it reaches.",
     );
     at.says("Until the wait ends, each line below starts with the time it was said, in UTC.");
     let said = at.done();
@@ -1161,8 +1161,11 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         )),
         "{said:?}"
     );
-    assert!(said.contains("holds the change"), "{said}");
-    assert!(said.contains("this machine may be closed."), "{said}");
+    assert!(said.contains("has the change"), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     let own_words: Vec<&str> = words.split(' ').collect();
     assert_eq!(
         two_words_in_a_row(said.as_bytes(), &own_words),
@@ -1345,7 +1348,10 @@ fn a_key_that_no_device_knows_is_removed_by_key_and_refused_for_good() {
         !said.contains(&format!("({}), known here as", words_of(&old_key))),
         "{said}"
     );
-    assert!(said.contains("this machine may be closed."), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
 
     // The statement that the laptop has applied lists the key as removed,
     // and the desktop applies it.
@@ -1999,7 +2005,10 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
         // It stays, and does not say that the machine may be closed:
         // no relay holds the change.
         let said = at.hears_for(std::time::Duration::from_secs(3));
-        assert!(!said.contains("this machine may be closed."), "{said}");
+        assert!(
+            !said.contains("has sent all it has: you may close this machine"),
+            "{said}"
+        );
         drop(at);
         assert_eq!(look(device)["change"], 3);
     }
@@ -4134,9 +4143,12 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
             assert!(unguarded, "the image that waits");
         }
     }
-    at.says("You may close this machine once every relay holds the change");
+    at.says("You may close this machine once every relay has the change");
     let said = at.done();
-    assert!(said.contains("this machine may be closed."), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
 }
 
 // ── What answers at the node's address ───────────────────────────────
@@ -5420,7 +5432,10 @@ fn amber_with(node: &Node, says: &str) -> Option<()> {
 /// What no line of a wait that ends without success says: that the
 /// machine may be closed, at end 1 or at end 2.
 fn says_not_that_it_may_be_closed(said: &str) {
-    assert!(!said.contains("this machine may be closed"), "{said}");
+    assert!(
+        !said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     assert!(!said.contains("You may close this machine."), "{said}");
 }
 
@@ -5428,7 +5443,7 @@ fn says_not_that_it_may_be_closed(said: &str) {
 /// (decision 2026-10-19 §4, rule 8, end 3). The laptop is set up with a
 /// relay that answers and with one whose name does not resolve, and
 /// renews. Within the five minutes the command goes on, and says that
-/// the second does not hold the change yet. After them it says S2, S8, S9
+/// the second does not have the change yet. After them it says S2, S8, S9
 /// and S10, and ends with status 3. It never says that the machine may be
 /// closed.
 #[test]
@@ -5444,7 +5459,7 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     let mut at = renews(&laptop, &[], &words);
     at.says("The change is made (change 2).");
     let made = Instant::now();
-    at.says(&format!("{reached} holds the change"));
+    at.says(&format!("{reached} has the change"));
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     // Said as the wait goes on, before or after that line: the first look
     // after the change may still be of the entry before it, and then
@@ -5452,7 +5467,7 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     // all that was said, once the command has ended.
     assert!(
         said.contains(&format!(
-            "keep this machine on: {NO_SUCH_NAME} does not hold the change yet"
+            "keep this machine on: {NO_SUCH_NAME} does not have the change yet"
         )),
         "{said}"
     );
@@ -5467,17 +5482,14 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     // since this device applied the change.
     for line in [
         format!(
-            "keep this machine on: {NO_SUCH_NAME} cannot be reached from here, and is not known to \
-             hold the change yet: it has not answered since this device took in the latest change \
-             at "
+            "keep this machine on: {NO_SUCH_NAME} cannot be reached from here, and may not have \
+             the change yet: it has not answered since this device took in the latest change at "
         ),
         format!(
-            "  {NO_SUCH_NAME} cannot be reached from here, and is not known to hold the change: \
-             it has not answered since this device took in the latest change at "
+            "  {NO_SUCH_NAME} cannot be reached from here, and may not have the change: it has not \
+             answered since this device took in the latest change at "
         ),
-        format!(
-            "A device of yours that reaches only {NO_SUCH_NAME} may not have heard of the change."
-        ),
+        format!("A device of yours that reaches only {NO_SUCH_NAME} may not know of the change."),
         "It looks its name up every 30 seconds.".to_string(),
         format!(
             "The change is not known to be at {NO_SUCH_NAME}. This command ends here, with \
@@ -5604,14 +5616,15 @@ fn a_change_ends_not_done_where_the_relay_it_reaches_refuses_it() {
     );
     assert_eq!(status, Some(3), "{said}");
     for line in [
-        format!("  {reached} is reached, and has not taken the change: it had no room for it at"),
+        format!("  {reached} is reached, but has not stored the change: it had no room for it at"),
         "(it is full).".to_string(),
         format!(
-            "  {NO_SUCH_NAME} cannot be reached from here, and is not known to hold the change: \
-             it has not answered since"
+            "  {NO_SUCH_NAME} cannot be reached from here, and may not have the change: it has not \
+             answered since"
         ),
         format!(
-            "{reached} refuses the change. A device that reaches it hears of it only once it takes it, or from another relay."
+            "{reached} refuses the change. A device that reaches it hears of it only once it \
+             stores it, or from another relay."
         ),
         format!(
             "The change is not known to be at {reached} and {NO_SUCH_NAME}. This command ends \
@@ -5650,7 +5663,7 @@ fn a_change_ends_not_done_where_the_other_relay_has_the_wrong_key_at_the_same_ad
     assert_eq!(status, Some(3), "{said}");
     for line in [
         format!(
-            "  {wrong} cannot be reached from here, and is not known to hold the change: it has \
+            "  {wrong} cannot be reached from here, and may not have the change: it has \
              not answered since"
         ),
         format!("It cannot dial {wrong} while another relay answers at its address."),
@@ -5694,7 +5707,10 @@ fn a_relay_that_comes_back_within_five_minutes_does_not_end_the_wait() {
     b.start();
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     assert_eq!(status, Some(0), "{said}");
-    assert!(said.contains("this machine may be closed."), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     assert!(!said.contains("This command ends here"), "{said}");
 }
 
@@ -5726,7 +5742,10 @@ fn a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two() {
         ],
     );
     let said = renews(&laptop, &[], &words).done();
-    assert!(said.contains("this machine may be closed."), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     b.stop();
     wait_for("the laptop sees that B is gone", &[&a, &laptop], 90, || {
         (look(&laptop)["relays"][1]["reach"]["reached"] == false).then_some(())
@@ -5736,11 +5755,11 @@ fn a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two() {
     assert_eq!(status, Some(0), "{said}");
     for line in [
         format!(
-            "  {name_b} holds the change and all that this device carried, and cannot be reached \
+            "  {name_b} has the change and all that this device copied over, but cannot be reached \
              from here: it has not been reached since"
         ),
-        "Every relay holds the change. You may close this machine.".to_string(),
-        format!("All that this device carried is at {name_a} and {name_b}."),
+        "Every relay has the change. You may close this machine.".to_string(),
+        format!("All that this device copied over is at {name_a} and {name_b}."),
         format!("What this device writes from now on waits for {name_b}."),
     ] {
         assert!(said.contains(&line), "{line}\n{said}");
@@ -5877,8 +5896,7 @@ fn the_wait_that_cannot_start_ends_with_3() {
     );
     assert!(
         said.contains(
-            "Keep this machine on until every relay holds the change and nothing is left to \
-             send."
+            "Keep this machine on until every relay has the change and nothing is left to send."
         ),
         "{said}"
     );
@@ -5914,7 +5932,9 @@ fn the_wait_ends_with_3_where_the_device_no_longer_stands_in_its_phrase() {
     let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
     assert_eq!(status, Some(3), "{said}");
     assert!(
-        said.contains("This device no longer stands in its phrase (this device was removed"),
+        said.contains(
+            "This device is no longer under its recovery phrase (this device was removed"
+        ),
         "{said}"
     );
     says_not_that_it_may_be_closed(&said);
@@ -5975,7 +5995,7 @@ fn the_wait_ends_with_3_on_an_error_and_where_another_change_was_applied() {
     );
     assert!(
         error.contains(
-            "Do not make the change again. `cordelia devices` shows whether each relay holds it."
+            "Do not make the change again. `cordelia devices` shows whether each relay has it."
         ),
         "{error}"
     );

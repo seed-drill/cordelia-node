@@ -267,18 +267,13 @@ fn a_phrase_is_made_its_folders_are_published_and_a_second_devices_folders_meet_
     // still tells of the device that was added, which nobody has
     // cleared: that is amber, and says so (decision 2026-10-04 §10.1).
     std::fs::remove_file(a_mem.join(&copies[0])).unwrap();
-    for (n, added) in [(&a, "\"laptop\""), (&b, "this device")] {
+    let b_named = named_in_a_line(&b, "laptop");
+    for (n, added) in [(&a, Some(b_named.as_str())), (&b, None)] {
         wait_for("the device is synced", &all, 90, || {
             let s = state(n);
             (s["state"] == "synced" && s["level"] == "amber").then_some(())
         });
-        assert_eq!(
-            state(n)["summary"],
-            format!(
-                "memory: {added} was added. If you did not add it, remove it; if you did, run \
-                 cordelia devices --clear"
-            )
-        );
+        assert_eq!(state(n)["summary"], added_says(added));
         clears_what_it_tells(n);
         let s = state(n);
         assert!(s["level"].is_null(), "{s}");
@@ -373,7 +368,10 @@ fn a_removed_devices_later_edit_reaches_nobody_and_the_others_go_on_syncing() {
     // device has sent what it carried, and says so by name.
     let said = at.done();
     assert!(said.contains("1 name sent"), "{said}");
-    assert!(said.contains("this machine may be closed"), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     wait_for(
         "the laptop is said to have sent what it held",
         &all,
@@ -513,7 +511,10 @@ fn an_edit_made_before_a_device_heard_of_a_change_arrives_as_an_edit_of_the_carr
     let mut at = renews(&a, &["stays"], &words);
     at.says("The change is made (change 2)");
     let said = at.done();
-    assert!(said.contains("this machine may be closed"), "{said}");
+    assert!(
+        said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     // The desktop has carried the version: it is the same, at its
     // revision.
     assert_eq!(rev_of(&a), Some((1, Some("as both had it\n".to_string()))));
@@ -1047,7 +1048,10 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
             .then_some(())
     });
     let said = at.hears_for(std::time::Duration::from_secs(8)).to_string();
-    assert!(!said.contains("this machine may be closed"), "{said}");
+    assert!(
+        !said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     // Nor that a name is sent: with the relay gone, that is not known.
     assert!(!said.contains("1 name sent"), "{said}");
     assert!(
@@ -1068,21 +1072,24 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
     assert_eq!(status, Some(3), "{said}");
     assert!(
         said.contains(&format!(
-            "  {name} cannot be reached from here, and is not known to hold the change: it has \
+            "  {name} cannot be reached from here, and may not have the change: it has \
              not been reached since"
         )),
         "{said}"
     );
     assert!(
         said.contains(
-            "No relay can be reached from here. None is known to hold the change. No other \
+            "No relay can be reached from here. None is known to have the change. No other \
              device of yours can hear of it until one does. This command ends here, with status \
              3. It does not say that you may close this machine. Keep it on, on a network from \
              which a relay can be reached. `cordelia devices` says what is missing."
         ),
         "{said}"
     );
-    assert!(!said.contains("this machine may be closed"), "{said}");
+    assert!(
+        !said.contains("has sent all it has: you may close this machine"),
+        "{said}"
+    );
     assert!(!said.contains("You may close this machine."), "{said}");
 }
 

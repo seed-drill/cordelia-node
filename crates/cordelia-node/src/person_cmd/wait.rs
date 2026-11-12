@@ -371,8 +371,8 @@ pub(crate) fn no_longer_stands(seen: &Value) -> Option<String> {
     }
     let why = seen["cannot_go_on"].as_str().unwrap_or(state);
     Some(format!(
-        "This device no longer stands in its phrase ({why}): it shows the change to no relay, \
-         and what each relay holds is not known from here. This command ends here, with status \
+        "This device is no longer under its recovery phrase ({why}): it shows the change to no \
+         relay, and cannot tell what each relay has. This command ends here, with status \
          {NOT_AT_EVERY_RELAY_STATUS}. It does not say that you may close this machine. `cordelia \
          devices` says what is so."
     ))
@@ -396,9 +396,9 @@ pub(crate) fn moved_from(seen: &Value, made: &str) -> Option<String> {
 /// it has its time (decision 2026-10-24, rule 3).
 pub(crate) fn recovery_first_line() -> String {
     format!(
-        "This command stays until every relay holds the change. It ends sooner, with status \
-         {NOT_AT_EVERY_RELAY_STATUS}, once each relay that is not known to hold it cannot be \
-         reached, or refuses it, for five minutes. Stopping it stops nothing: the node goes on, \
+        "This command stays until every relay has the change. It ends sooner, with status \
+         {NOT_AT_EVERY_RELAY_STATUS}, once each relay that may not have it cannot be reached, or \
+         refuses it, for five minutes. Stopping it stops nothing: the node goes on, \
          and the recovery stays made. {TIMES_SAID}"
     )
 }
@@ -409,7 +409,7 @@ pub(crate) fn recovery_first_line() -> String {
 /// never says that the machine may be closed.
 pub(crate) fn recovery_end_lines(end: RecoveryEnd, relays: &[RelayAt], now: i64) -> Vec<String> {
     match end {
-        RecoveryEnd::Recovered => vec!["Every relay holds the change.".into()],
+        RecoveryEnd::Recovered => vec!["Every relay has the change.".into()],
         RecoveryEnd::NotDone => {
             let lacking: Vec<&RelayAt> = relays.iter().filter(|relay| !relay.holds()).collect();
             not_done_lines(relays, &lacking, now)
@@ -452,11 +452,11 @@ fn names(relays: &[&RelayAt]) -> String {
 /// line after it has its time (decision 2026-10-24, rule 3).
 pub(crate) fn first_line() -> String {
     format!(
-        "You may close this machine once every relay holds the change, and what this device \
-         carried is at a relay that it reaches. This command stays until then, and says what \
-         is missing. It ends sooner, with status {NOT_AT_EVERY_RELAY_STATUS}, where for five \
-         minutes a relay that is not known to hold the change cannot be reached or refuses it, \
-         or where no relay that this machine reaches has what this device carried. It then \
+        "You may close this machine once every relay has the change, and what this device \
+         copied over is at a relay that it reaches. This command stays until then, and says \
+         what is missing. It ends sooner, with status {NOT_AT_EVERY_RELAY_STATUS}, where for \
+         five minutes a relay that may not have the change cannot be reached or refuses it, or \
+         where no relay that this machine reaches has what this device copied over. It then \
          does not say that you may close this machine. Stopping it stops nothing: the node \
          goes on. {TIMES_SAID}"
     )
@@ -474,12 +474,12 @@ pub(crate) fn out_of_reach_line(relay: &RelayAt, now: i64) -> String {
     let since = since_of(relay, now);
     match relay.holds() {
         true => format!(
-            "{} holds the change, and cannot be reached from here: it {since}",
+            "{} has the change, but cannot be reached from here: it {since}",
             relay.name
         ),
         false => format!(
-            "keep this machine on: {} cannot be reached from here, and is not known to hold the \
-             change yet: it {since}",
+            "keep this machine on: {} cannot be reached from here, and may not have the change \
+             yet: it {since}",
             relay.name
         ),
     }
@@ -637,7 +637,7 @@ fn stuck_line(relay: &RelayAt, now: i64) -> String {
         .map(|at| format!(" since {}", when(at, now)))
         .unwrap_or_default();
     format!(
-        "  {} holds the change. It has refused for room what this device still has to send \
+        "  {} has the change, but has had no room for what this device still has to send \
          there{since}.",
         relay.name
     )
@@ -649,8 +649,8 @@ fn stuck_line(relay: &RelayAt, now: i64) -> String {
 pub(crate) fn end_lines(end: End, relays: &[RelayAt], word: OwnWord, now: i64) -> Vec<String> {
     match end {
         End::Done => vec![
-            "Every relay holds the change, and this device has sent what it holds: this machine \
-             may be closed. `cordelia devices` shows which devices have applied the change."
+            "Every relay has the change, and this device has sent all it has: you may close \
+             this machine. `cordelia devices` shows which devices are up to date."
                 .into(),
         ],
         End::Warned => warned_lines(relays, word, now),
@@ -675,13 +675,13 @@ fn warned_lines(relays: &[RelayAt], word: OwnWord, now: i64) -> Vec<String> {
                 let since = since_of(relay, now);
                 lines.push(match held.iter().any(|at| at.name == relay.name) {
                     true => format!(
-                        "  {} holds the change and all that this device carried, and cannot be \
+                        "  {} has the change and all that this device copied over, but cannot be \
                          reached from here: it {since}.",
                         relay.name
                     ),
                     false => format!(
-                        "  {} holds the change, and cannot be reached from here: it {since}. \
-                         Some of what this device carried is not there yet.",
+                        "  {} has the change, but cannot be reached from here: it {since}. Some \
+                         of what this device copied over is not there yet.",
                         relay.name
                     ),
                 });
@@ -690,10 +690,10 @@ fn warned_lines(relays: &[RelayAt], word: OwnWord, now: i64) -> Vec<String> {
             _ => {}
         }
     }
-    let mut last = vec!["Every relay holds the change. You may close this machine.".to_string()];
+    let mut last = vec!["Every relay has the change. You may close this machine.".to_string()];
     if !held.is_empty() {
         last.push(format!(
-            "All that this device carried is at {}.",
+            "All that this device copied over is at {}.",
             names(&held)
         ));
     }
@@ -715,7 +715,7 @@ fn warned_lines(relays: &[RelayAt], word: OwnWord, now: i64) -> Vec<String> {
             names(&waits_for)
         ));
     }
-    last.push("`cordelia devices` shows which devices have applied the change.".into());
+    last.push("`cordelia devices` shows which devices are up to date.".into());
     lines.push(last.join(" "));
     lines
 }
@@ -733,7 +733,7 @@ fn refusing_line(relay: &RelayAt, now: i64) -> String {
         .and_then(|reach| reach.lacks_for.clone());
     match lacks_for {
         Some(LacksFor::Room(refused)) => format!(
-            "  {} is reached, and has not taken the change: it had no room for it at {} ({}).",
+            "  {} is reached, but has not stored the change: it had no room for it at {} ({}).",
             relay.name,
             when(refused.at, now),
             match refused.over_allowance {
@@ -742,13 +742,16 @@ fn refusing_line(relay: &RelayAt, now: i64) -> String {
             }
         ),
         Some(LacksFor::Another { why }) => format!(
-            "  {} is reached, and holds a change that this device does not take ({}). It does \
-             not take this one in its place.",
+            "  {} is reached, but has a change to your devices that this device cannot use \
+             ({}), and does not store this one in its place.",
             relay.name,
             why.as_deref()
                 .unwrap_or("it is another change than the one this device keeps")
         ),
-        None => format!("  {} is reached, and has not taken the change.", relay.name),
+        None => format!(
+            "  {} is reached, but has not stored the change.",
+            relay.name
+        ),
     }
 }
 
@@ -762,13 +765,13 @@ fn not_done_lines(relays: &[RelayAt], said_of: &[&RelayAt], now: i64) -> Vec<Str
     for relay in said_of {
         match relay.class() {
             Some(Class::OutLacking) => lines.push(format!(
-                "  {} cannot be reached from here, and is not known to hold the change: it {}.",
+                "  {} cannot be reached from here, and may not have the change: it {}.",
                 relay.name,
                 since_of(relay, now)
             )),
             Some(Class::Refusing) => lines.push(refusing_line(relay, now)),
             Some(Class::OutHolding) => lines.push(format!(
-                "  {} holds the change, and cannot be reached from here: it {}.",
+                "  {} has the change, but cannot be reached from here: it {}.",
                 relay.name,
                 since_of(relay, now)
             )),
@@ -789,10 +792,10 @@ fn not_done_lines(relays: &[RelayAt], said_of: &[&RelayAt], now: i64) -> Vec<Str
     lines.push(match (reached, lacking.is_empty()) {
         (true, false) => format!(
             "The change is not known to be at {}. {ends} `cordelia devices`, here or on a device \
-             of yours that reaches {}, says when {} the latest change.",
+             of yours that reaches {}, says when {} the change.",
             names(&lacking),
             it_them(lacking.len()),
-            verb(lacking.len(), "it holds", "they hold")
+            verb(lacking.len(), "it has", "they have")
         ),
         (true, true) => {
             let stuck: Vec<&RelayAt> = relays
@@ -800,18 +803,18 @@ fn not_done_lines(relays: &[RelayAt], said_of: &[&RelayAt], now: i64) -> Vec<Str
                 .filter(|relay| relay.class() == Some(Class::Stuck))
                 .collect();
             format!(
-                "Every relay holds the change. What this device carried is at no relay that \
-                 this machine reaches: {} {} it for room. {ends} Keep it on. `cordelia devices` \
-                 says when what it carried is sent.",
+                "Every relay has the change. What this device copied over is at no relay that \
+                 this machine reaches: {} {} no room for it. {ends} Keep it on. `cordelia \
+                 devices` says when it is sent.",
                 names(&stuck),
-                verb(stuck.len(), "refuses", "refuse")
+                verb(stuck.len(), "has", "have")
             )
         }
         (false, _) => {
             let mut said = vec!["No relay can be reached from here.".to_string()];
             if !relays.iter().any(RelayAt::holds) {
                 said.push(
-                    "None is known to hold the change. No other device of yours can hear of it \
+                    "None is known to have the change. No other device of yours can hear of it \
                      until one does."
                         .into(),
                 );
@@ -848,22 +851,22 @@ fn why_not_done(relays: &[RelayAt]) -> String {
     let mut said: Vec<String> = Vec::new();
     if !lacking.is_empty() {
         said.push(format!(
-            "A device of yours that reaches only {} may not have heard of the change.",
+            "A device of yours that reaches only {} may not know of the change.",
             names(&lacking)
         ));
         said.push(
             "Until it does, it goes on in the channels from before the change, where every \
-             device that held their secret can still read what it writes."
+             device that had their secret can still read what it writes."
                 .into(),
         );
     }
     if !out.is_empty() {
         let them = it_them(out.len());
         said.push(format!(
-            "{} {} the change from a device that has applied it and reaches {them}, this one \
+            "{} {} the change from a device that is up to date and reaches {them}, this one \
              included, and from a relay that works with {them}.",
             names(&out),
-            verb(out.len(), "takes", "take")
+            verb(out.len(), "gets", "get")
         ));
     }
     let dialled = dialled_so(Dial::Dialled);
@@ -917,7 +920,7 @@ fn why_not_done(relays: &[RelayAt]) -> String {
             names(&refusing),
             verb(n, "refuses", "refuse"),
             it_them(n),
-            verb(n, "it takes", "they take")
+            verb(n, "it stores", "they store")
         ));
     }
     said.join(" ")
@@ -928,7 +931,7 @@ fn why_not_done(relays: &[RelayAt]) -> String {
 pub(crate) fn could_not_go_on(number: u64, error: &anyhow::Error) -> String {
     format!(
         "The change is made (change {number}). This command could not go on: {error:#}. Do not \
-         make the change again. `cordelia devices` shows whether each relay holds it."
+         make the change again. `cordelia devices` shows whether each relay has it."
     )
 }
 
@@ -1921,13 +1924,13 @@ pub(crate) mod tests {
         let now = noon();
         assert_eq!(
             first_line(),
-            "You may close this machine once every relay holds the change, and what this device \
-             carried is at a relay that it reaches. This command stays until then, and says \
-             what is missing. It ends sooner, with status 3, where for five minutes a relay \
-             that is not known to hold the change cannot be reached or refuses it, or where no \
-             relay that this machine reaches has what this device carried. It then does not say \
-             that you may close this machine. Stopping it stops nothing: the node goes on. Until \
-             the wait ends, each line below starts with the time it was said, in UTC."
+            "You may close this machine once every relay has the change, and what this device \
+             copied over is at a relay that it reaches. This command stays until then, and says \
+             what is missing. It ends sooner, with status 3, where for five minutes a relay that \
+             may not have the change cannot be reached or refuses it, or where no relay that this \
+             machine reaches has what this device copied over. It then does not say that you may \
+             close this machine. Stopping it stops nothing: the node goes on. Until the wait ends, \
+             each line below starts with the time it was said, in UTC."
         );
 
         // `<when>`, today and not; `<since>`, both forms.
@@ -1961,9 +1964,9 @@ pub(crate) mod tests {
         // S2 and S3.
         assert_eq!(
             out_of_reach_line(&a, now),
-            "keep this machine on: a.example:9474 cannot be reached from here, and is not known to \
-             hold the change yet: it has not answered since this device took in the latest change \
-             at 11:50 UTC"
+            "keep this machine on: a.example:9474 cannot be reached from here, and may not have \
+             the change yet: it has not answered since this device took in the latest change at \
+             11:50 UTC"
         );
         let b = relay_at(
             "b.example:9474",
@@ -1973,7 +1976,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             out_of_reach_line(&b, now),
-            "b.example:9474 holds the change, and cannot be reached from here: it has not \
+            "b.example:9474 has the change, but cannot be reached from here: it has not \
              answered since this device took in the latest change at 11:50 UTC"
         );
 
@@ -1996,13 +1999,13 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  b.example:9474 holds the change and all that this device carried, and cannot be \
-                 reached from here: it has not answered since this device took in the latest \
+                "  b.example:9474 has the change and all that this device copied over, but cannot \
+                 be reached from here: it has not answered since this device took in the latest \
                  change at 11:50 UTC.",
-                "Every relay holds the change. You may close this machine. All that this device \
-                 carried is at a.example:9474 and b.example:9474. What this device writes from \
-                 now on waits for b.example:9474. `cordelia devices` shows which devices have \
-                 applied the change.",
+                "Every relay has the change. You may close this machine. All that this device \
+                 copied over is at a.example:9474 and b.example:9474. What this device writes from \
+                 now on waits for b.example:9474. `cordelia devices` shows which devices are up to \
+                 date.",
             ]
         );
         let lines = end_lines(
@@ -2014,16 +2017,16 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  b.example:9474 holds the change, and cannot be reached from here: it has not \
+                "  b.example:9474 has the change, but cannot be reached from here: it has not \
                  answered since this device took in the latest change at 11:50 UTC. Some of what \
-                 this device carried is not there yet.",
-                "  c.example:9474 holds the change. It has refused for room what this device \
-                 still has to send there since 11:53 UTC.",
-                "Every relay holds the change. You may close this machine. All that this device \
-                 carried is at a.example:9474. b.example:9474 and c.example:9474 get the rest \
+                 this device copied over is not there yet.",
+                "  c.example:9474 has the change, but has had no room for what this device still \
+                 has to send there since 11:53 UTC.",
+                "Every relay has the change. You may close this machine. All that this device \
+                 copied over is at a.example:9474. b.example:9474 and c.example:9474 get the rest \
                  when this machine next reaches them. What this device writes from now on waits \
-                 for b.example:9474 and c.example:9474. `cordelia devices` shows which devices \
-                 have applied the change.",
+                 for b.example:9474 and c.example:9474. `cordelia devices` shows which devices are \
+                 up to date.",
             ]
         );
         let lines = end_lines(End::Warned, &[ok.clone(), b.clone()], OwnWord::Carried, now);
@@ -2034,21 +2037,21 @@ pub(crate) mod tests {
         // On the `sent` path, every relay has all that this device carried.
         let lines = end_lines(End::Warned, &[ok.clone(), b.clone()], OwnWord::Sent, now);
         assert!(
-            lines[0].contains("holds the change and all that this device carried"),
+            lines[0].contains("has the change and all that this device copied over"),
             "{lines:?}"
         );
         assert!(
-            lines[1]
-                .contains("All that this device carried is at a.example:9474 and b.example:9474."),
+            lines[1].contains(
+                "All that this device copied over is at a.example:9474 and b.example:9474."
+            ),
             "{lines:?}"
         );
         // End 1.
         assert_eq!(
             end_lines(End::Done, std::slice::from_ref(&ok), OwnWord::Sent, now),
             [
-                "Every relay holds the change, and this device has sent what it holds: this \
-              machine may be closed. `cordelia devices` shows which devices have applied the \
-              change."
+                "Every relay has the change, and this device has sent all it has: you may close \
+                 this machine. `cordelia devices` shows which devices are up to date."
             ]
         );
 
@@ -2113,46 +2116,42 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  a.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not answered since this device took in the latest change at 11:50 \
-                 UTC.",
-                "  b.example:9474 holds the change, and cannot be reached from here: it has not \
+                "  a.example:9474 cannot be reached from here, and may not have the change: it has \
+                 not answered since this device took in the latest change at 11:50 UTC.",
+                "  b.example:9474 has the change, but cannot be reached from here: it has not \
                  answered since this device took in the latest change at 11:50 UTC.",
-                "  c.example:9474 holds the change. It has refused for room what this device \
-                 still has to send there since 11:53 UTC.",
-                "  d.example:9474 is reached, and has not taken the change: it had no room for \
-                 it at 11:45 UTC (it is full).",
-                "  e.example:9474 is reached, and has not taken the change: it had no room for \
-                 it at 11:45 UTC (this address is over its allowance of new channels there).",
-                "  f.example:9474 is reached, and holds a change that this device does not take \
-                 (another key than the phrase's wrote it). It does not take this one in its \
-                 place.",
-                "  g.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not answered since this device took in the latest change at 11:50 \
-                 UTC.",
-                "  h.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not answered since this device took in the latest change at 11:50 \
-                 UTC.",
-                "  i.example:9474 cannot be reached from here, and is not known to hold the \
-                 change: it has not answered since this device took in the latest change at 11:50 \
-                 UTC.",
+                "  c.example:9474 has the change, but has had no room for what this device still \
+                 has to send there since 11:53 UTC.",
+                "  d.example:9474 is reached, but has not stored the change: it had no room for it \
+                 at 11:45 UTC (it is full).",
+                "  e.example:9474 is reached, but has not stored the change: it had no room for it \
+                 at 11:45 UTC (this address is over its allowance of new channels there).",
+                "  f.example:9474 is reached, but has a change to your devices that this device \
+                 cannot use (another key than the phrase's wrote it), and does not store this one \
+                 in its place.",
+                "  g.example:9474 cannot be reached from here, and may not have the change: it has \
+                 not answered since this device took in the latest change at 11:50 UTC.",
+                "  h.example:9474 cannot be reached from here, and may not have the change: it has \
+                 not answered since this device took in the latest change at 11:50 UTC.",
+                "  i.example:9474 cannot be reached from here, and may not have the change: it has \
+                 not answered since this device took in the latest change at 11:50 UTC.",
                 "A device of yours that reaches only a.example:9474, d.example:9474, \
-                 e.example:9474, f.example:9474, g.example:9474, h.example:9474 and \
-                 i.example:9474 may not have heard of the change. Until it does, it goes on in \
-                 the channels from before the change, where every device that held their secret \
-                 can still read what it writes. a.example:9474, g.example:9474, h.example:9474 \
-                 and i.example:9474 take the change from a device that has applied it and \
-                 reaches them, this one included, and from a relay that works with them. While \
-                 this machine is on it dials it every 30 seconds. It looks its name up every 30 \
-                 seconds. It shows it the change again at most every ten minutes. It cannot dial \
-                 i.example:9474 while another relay answers at its address. d.example:9474, \
-                 e.example:9474 and f.example:9474 refuse the change. A device that reaches \
-                 them hears of it only once they take it, or from another relay.",
+                 e.example:9474, f.example:9474, g.example:9474, h.example:9474 and i.example:9474 \
+                 may not know of the change. Until it does, it goes on in the channels from before \
+                 the change, where every device that had their secret can still read what it \
+                 writes. a.example:9474, g.example:9474, h.example:9474 and i.example:9474 get the \
+                 change from a device that is up to date and reaches them, this one included, and \
+                 from a relay that works with them. While this machine is on it dials it every 30 \
+                 seconds. It looks its name up every 30 seconds. It shows it the change again at \
+                 most every ten minutes. It cannot dial i.example:9474 while another relay answers \
+                 at its address. d.example:9474, e.example:9474 and f.example:9474 refuse the \
+                 change. A device that reaches them hears of it only once they store it, or from \
+                 another relay.",
                 "The change is not known to be at a.example:9474, d.example:9474, \
                  e.example:9474, f.example:9474, g.example:9474, h.example:9474 and \
                  i.example:9474. This command ends here, with status 3. It does not say that \
                  you may close this machine. `cordelia devices`, here or on a device of yours \
-                 that reaches them, says when they hold the latest change.",
+                 that reaches them, says when they have the change.",
             ]
         );
         // A relay that holds another change, with no reason known, and one
@@ -2174,10 +2173,10 @@ pub(crate) mod tests {
         assert_eq!(
             lines[..2],
             [
-                "  m.example:9474 is reached, and holds a change that this device does not take \
-                 (it is another change than the one this device keeps). It does not take this \
-                 one in its place.",
-                "  n.example:9474 is reached, and has not taken the change.",
+                "  m.example:9474 is reached, but has a change to your devices that this device \
+                 cannot use (it is another change than the one this device keeps), and does not \
+                 store this one in its place.",
+                "  n.example:9474 is reached, but has not stored the change.",
             ]
         );
         // One relay of each kind: the singular.
@@ -2234,22 +2233,21 @@ pub(crate) mod tests {
         );
         assert_eq!(
             lines[1],
-            "A device of yours that reaches only k.example:9474 may not have heard of the \
-             change. Until it does, it goes on in the channels from before the change, where \
-             every device that held their secret can still read what it writes. k.example:9474 \
-             refuses the change. A device that reaches it hears of it only once it takes it, \
-             or from another relay."
+            "A device of yours that reaches only k.example:9474 may not know of the change. Until \
+             it does, it goes on in the channels from before the change, where every device that \
+             had their secret can still read what it writes. k.example:9474 refuses the change. A \
+             device that reaches it hears of it only once it stores it, or from another relay."
         );
         assert_eq!(
             lines[2],
             "The change is not known to be at k.example:9474. This command ends here, with \
              status 3. It does not say that you may close this machine. `cordelia devices`, \
-             here or on a device of yours that reaches it, says when it holds the latest change."
+             here or on a device of yours that reaches it, says when it has the change."
         );
         let lines = end_lines(End::NotDone, &[ok.clone(), a.clone()], OwnWord::None, now);
         assert!(
             lines[1].contains(
-                "a.example:9474 takes the change from a device that has applied it and reaches it, \
+                "a.example:9474 gets the change from a device that is up to date and reaches it, \
              this one included, and from a relay that works with it."
             ),
             "{lines:?}"
@@ -2264,10 +2262,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             lines.last().unwrap(),
-            "Every relay holds the change. What this device carried is at no relay that this \
-             machine reaches: c.example:9474 refuses it for room. This command ends here, with \
+            "Every relay has the change. What this device copied over is at no relay that this \
+             machine reaches: c.example:9474 has no room for it. This command ends here, with \
              status 3. It does not say that you may close this machine. Keep it on. `cordelia \
-             devices` says when what it carried is sent."
+             devices` says when it is sent."
         );
         // S9 says nothing of a relay that lacks nothing.
         assert_eq!(lines.len(), 3, "{lines:?}");
@@ -2281,7 +2279,7 @@ pub(crate) mod tests {
         );
         assert_eq!(
             lines.last().unwrap(),
-            "No relay can be reached from here. None is known to hold the change. No other \
+            "No relay can be reached from here. None is known to have the change. No other \
              device of yours can hear of it until one does. This command ends here, with status \
              3. It does not say that you may close this machine. Keep it on, on a network from \
              which a relay can be reached. `cordelia devices` says what is missing."
@@ -2295,7 +2293,7 @@ pub(crate) mod tests {
         assert_eq!(
             lines,
             [
-                "  b.example:9474 holds the change, and cannot be reached from here: it has not \
+                "  b.example:9474 has the change, but cannot be reached from here: it has not \
                  answered since this device took in the latest change at 11:50 UTC.",
                 "No relay can be reached from here. This command ends here, with status 3. It \
                  does not say that you may close this machine. Keep it on, on a network from \
@@ -2306,9 +2304,8 @@ pub(crate) mod tests {
         // An error in the wait.
         assert_eq!(
             could_not_go_on(4, &anyhow::anyhow!("the node did not answer")),
-            "The change is made (change 4). This command could not go on: the node did not \
-             answer. Do not make the change again. `cordelia devices` shows whether each relay \
-             holds it."
+            "The change is made (change 4). This command could not go on: the node did not answer. \
+             Do not make the change again. `cordelia devices` shows whether each relay has it."
         );
 
         // H1, in the help of each command that makes a change, and H2.
@@ -2352,10 +2349,10 @@ pub(crate) mod tests {
             assert_eq!(
                 no_longer_stands(&look(state)).as_deref(),
                 Some(
-                    "This device no longer stands in its phrase (why it cannot): it shows the \
-                     change to no relay, and what each relay holds is not known from here. This \
-                     command ends here, with status 3. It does not say that you may close this \
-                     machine. `cordelia devices` says what is so."
+                    "This device is no longer under its recovery phrase (why it cannot): it shows \
+                     the change to no relay, and cannot tell what each relay has. This command \
+                     ends here, with status 3. It does not say that you may close this machine. \
+                     `cordelia devices` says what is so."
                 ),
                 "{state}"
             );

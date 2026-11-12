@@ -315,9 +315,12 @@ fn not_handing_line(why: &NotHanding, name: &str, list: &Members, identity: &str
         NotHanding::LeftOut(_) => String::new(),
         NotHanding::NotHeld => format!("{name} is not on this device: {until}"),
         NotHanding::MovedFrom => MOVED_FROM.into(),
-        NotHanding::NotClean => {
-            format!("{name} has not been reset since you removed a device: {until}")
-        }
+        NotHanding::NotClean(devices) => format!(
+            "{name} has not been reset since you removed {}: {until} To reset it: cordelia \
+             shared reset {}",
+            crate::look::named_few(devices, devices.len().max(1), "a device", "devices"),
+            shell_word(name)
+        ),
         NotHanding::MadeAnew { maker } => format!(
             "{name} was reset by {}: this device shares it with no one new until the list names \
              the new channel.",

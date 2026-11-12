@@ -2212,7 +2212,8 @@ fn claude_memory_syncs_between_two_machines() {
     // devices holds all the same (decision 2026-10-04 §10.1): the device
     // that was added, and that nobody has cleared, is amber on each of
     // the two, and the line says it.
-    for (n, added) in [(&a, "\"b\""), (&b, "this device")] {
+    let b_named = named_in_a_line(&b, "b");
+    for (n, added) in [(&a, Some(b_named.as_str())), (&b, None)] {
         let s = state(n);
         assert_eq!(s["state"], "off", "{s}");
         assert_eq!(s["level"], "amber", "{s}");
@@ -2397,7 +2398,8 @@ fn claude_memory_syncs_between_two_machines() {
     // the last change, and nobody has cleared it: that is amber on each
     // device, with a mark of its own in the line and a class of its own
     // in the bar, and the state is as it was.
-    for (n, added) in [(&a, "\"b\""), (&b, "this device")] {
+    let b_named = named_in_a_line(&b, "b");
+    for (n, added) in [(&a, Some(b_named.as_str())), (&b, None)] {
         let s = state(n);
         assert_eq!(
             (&s["state"], &s["level"]),
@@ -2408,7 +2410,10 @@ fn claude_memory_syncs_between_two_machines() {
         assert_eq!(s["holds"].as_array().unwrap().len(), 1, "{s}");
     }
     let line = a.cli(&["status", "--line"]);
-    assert!(line.contains("◆ memory: \"b\" was added"), "{line}");
+    assert!(
+        line.contains(&format!("◆ memory: {b_named} was added")),
+        "{line}"
+    );
     let bar: serde_json::Value = serde_json::from_str(&a.cli(&["status", "--waybar"])).unwrap();
     assert_eq!(
         bar["class"],
@@ -4069,15 +4074,6 @@ async fn a_relay_given_no_key_at_another_relays_address_is_counted_as_its_own() 
 }
 
 // ── A relay out of reach (decision 2026-10-19) ───────────────────────
-
-/// What the status says of a device added and not yet cleared, named as
-/// it names it (decision 2026-11-11 (plain words), rule 2).
-fn added_says(device: &str) -> String {
-    format!(
-        "memory: {device} was added. If you did not add it, remove it; if you did, run cordelia \
-         devices --clear"
-    )
-}
 
 /// Whether `cordelia status` at `node` says, among what holds, that a
 /// relay is not known to hold the latest change: before it is out of

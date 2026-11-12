@@ -202,7 +202,7 @@ Every wait says what it waits for, in `cordelia status` and `cordelia shared lis
 | The channel's relays not among the person's own | `<name> is at <relay>, which is not one of your relays: add it to your configuration.` |
 | No room for one more channel, or its name taken | `You hold 16 shared channels, the most there can be`, or `You file another channel as <name>: rename it with cordelia shared rename.` |
 | A member handing over | `Sharing <name> with <label>: waiting for that device to receive it.` |
-| A member who cannot | `<name> is paused`, `has not been reset since you removed a device`, `is not on this device`, `is not reached at its relays`, or `is full`: `this device shares it with no one new until then.` |
+| A member who cannot | `<name> is paused`, `has not been reset since you removed <removed devices, or a device>`, `is not on this device`, `is not reached at its relays`, or `is full`: `this device shares it with no one new until then.`, and where it is not reset, `To reset it: cordelia shared reset <name>` |
 | A member who moved | `The list names the channel you moved from. The device that made it anew shows its new channel line: put that line in .cordelia/members.` |
 | An offer read in the named channel | `<name> was reset by <label>: this device shares it with no one new until the list names the new channel.` |
 | The gate of rule 1 | amber, rule 4.7's line, once, on a device that holds the channel: `<label> is on the list of <name> but was left out of the channel: delete its line in a pull request, or wait for that device to write in the channel`. Nothing is handed over until then. |

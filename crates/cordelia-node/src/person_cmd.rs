@@ -2896,9 +2896,9 @@ fn wait_not_started(failed: &dyn std::fmt::Display) -> (String, i32) {
     (
         format!(
             "This command could not go on to say what is still missing ({failed}). The node \
-             goes on by itself: `cordelia devices` shows whether each relay holds the change, \
-             and what this device has still to send. Keep this machine on until every relay \
-             holds the change and nothing is left to send."
+             goes on by itself: `cordelia devices` shows whether each relay has the change, and \
+             what this device has still to send. Keep this machine on until every relay has the \
+             change and nothing is left to send."
         ),
         NOT_AT_EVERY_RELAY_STATUS,
     )
@@ -2987,8 +2987,8 @@ fn after_a_change(seen: &Value, number: u64, own: &[u8; 32], now_at: i64) -> Vec
         let name = &relay.name;
         now.push(match (relay.out_of_reach(), relay.holds()) {
             (true, _) => wait::out_of_reach_line(relay, now_at),
-            (false, true) => format!("{name} holds the change"),
-            (false, false) => format!("keep this machine on: {name} does not hold the change yet"),
+            (false, true) => format!("{name} has the change"),
+            (false, false) => format!("keep this machine on: {name} does not have the change yet"),
         });
         // The count while it is waited out (decision 2026-10-24, rule 4).
         now.extend(wait::count_line(relay, now_at));
@@ -4838,7 +4838,7 @@ mod tests {
         let all = lines(&look(json!([]), reached.clone(), json!([]), sent.clone()));
         assert!(all.contains(&"1 name sent".to_string()), "{all:?}");
         assert!(
-            all.contains(&"relay.example:9474 holds the change".to_string()),
+            all.contains(&"relay.example:9474 has the change".to_string()),
             "{all:?}"
         );
         assert_eq!(
@@ -4915,7 +4915,7 @@ mod tests {
         behind["relays"][0]["reach"]["holds"] = json!("lacks");
         assert_eq!(missing(&behind), 1);
         assert!(lines(&behind).contains(
-            &"keep this machine on: relay.example:9474 does not hold the change yet".to_string()
+            &"keep this machine on: relay.example:9474 does not have the change yet".to_string()
         ));
 
         // Out of reach and lacking the change: S2, in place of the line
@@ -4930,9 +4930,8 @@ mod tests {
         out["relays"][0]["reach"] = reach("lacks", Some(0));
         let said = lines(&out);
         assert!(said.contains(
-            &"keep this machine on: relay.example:9474 cannot be reached from here, and is not \
-              known to hold the change yet: it has not answered since this device started at \
-              00:00 UTC"
+            &"keep this machine on: relay.example:9474 cannot be reached from here, and may not \
+              have the change yet: it has not answered since this device started at 00:00 UTC"
                 .to_string()
         ), "{said:?}");
         assert!(!said.join("\n").contains("is not connected"), "{said:?}");
@@ -4942,7 +4941,7 @@ mod tests {
         let said = lines(&out);
         assert!(
             said.contains(
-                &"relay.example:9474 holds the change, and cannot be reached from here: it has \
+                &"relay.example:9474 has the change, but cannot be reached from here: it has \
                   not answered since this device started at 00:00 UTC"
                     .to_string()
             ),
@@ -4955,7 +4954,7 @@ mod tests {
         let said = lines(&out);
         assert!(
             said.contains(
-                &"keep this machine on: relay.example:9474 does not hold the change yet"
+                &"keep this machine on: relay.example:9474 does not have the change yet"
                     .to_string()
             ),
             "{said:?}"
@@ -5070,12 +5069,12 @@ mod tests {
             assert!(has_its_time(line), "{line}: {said:?}");
         }
         let holds = |relay: &str| -> Vec<&String> {
-            let line = format!("{relay} holds the change");
+            let line = format!("{relay} has the change");
             said.iter().filter(|said| said.ends_with(&line)).collect()
         };
         assert_eq!(
             holds("relay-0.example:9474"),
-            ["  10:53:02  relay-0.example:9474 holds the change"]
+            ["  10:53:02  relay-0.example:9474 has the change"]
         );
         assert_eq!(holds("relay-1.example:9474").len(), 1, "{said:?}");
         assert_eq!(said[ended], "  10:53:40  The wait has ended.");
@@ -5367,9 +5366,9 @@ mod tests {
         assert_eq!(
             said,
             "This command could not go on to say what is still missing (no such file). The node \
-             goes on by itself: `cordelia devices` shows whether each relay holds the change, and \
-             what this device has still to send. Keep this machine on until every relay holds \
-             the change and nothing is left to send."
+             goes on by itself: `cordelia devices` shows whether each relay has the change, and \
+             what this device has still to send. Keep this machine on until every relay has the \
+             change and nothing is left to send."
         );
     }
 
@@ -6740,7 +6739,7 @@ mod tests {
             let relays = wait::relays_of(&seen).unwrap();
             let lines = wait::end_lines(wait::End::Warned, &relays, word, 0).join("\n");
             let all_at = lines
-                .split("All that this device carried is at ")
+                .split("All that this device copied over is at ")
                 .nth(1)
                 .and_then(|rest| rest.split(". ").next())
                 .unwrap_or_default()
@@ -6758,7 +6757,8 @@ mod tests {
                 assert_eq!(all_at.contains(name), whole, "{name}: {lines}");
                 assert_eq!(rest.contains(name), !whole, "{name}: {lines}");
                 if n > 0 {
-                    let all = format!("  {name} holds the change and all that this device carried");
+                    let all =
+                        format!("  {name} has the change and all that this device copied over");
                     assert_eq!(lines.contains(&all), whole, "{name}: {lines}");
                 }
             }
