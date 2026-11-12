@@ -51,7 +51,7 @@ use cordelia_api::person::{PersonError, first_entry};
 use cordelia_core::config::{self, Config};
 use cordelia_core::protocol::{
     CHANGE_FETCH_MAX_SECS, LEAVING_SEND_WAIT_SECS, MAX_ENTRY_CHANNEL_BYTES_AT_RELAY,
-    PERSONAL_CHANNEL_WARN_BYTES, PHRASE_WORDS, STATUS_AMBER_WAIT_SECS,
+    PERSONAL_CHANNEL_WARN_BYTES, PHRASE_WORDS, SHARED_MAX_CHANNELS, STATUS_AMBER_WAIT_SECS,
 };
 use cordelia_crypto::addition::SignedAddition;
 use cordelia_crypto::bech32::{decode_public_key, encode_public_key};
@@ -239,7 +239,7 @@ pub(crate) fn own_key(config_path: &str) -> anyhow::Result<[u8; 32]> {
     config.apply_env_overrides();
     let key_path = config.data_dir().join(cordelia_api::commands::KEY_FILE);
     if !key_path.exists() {
-        anyhow::bail!("this device has no key yet: `cordelia init` gives it one.");
+        anyhow::bail!("this device is not set up yet: run `cordelia init` first.");
     }
     Ok(NodeIdentity::from_file(&key_path)?.public_key())
 }
@@ -261,9 +261,9 @@ pub(crate) fn names_this_device(answer: &Value, own: &[u8; 32]) -> anyhow::Resul
 /// runs under the key the device had before answers so.
 fn not_this_devices_key_says(own: &[u8; 32], os: &str) -> String {
     format!(
-        "what answered at the node's address does not name this device's key, which is the \
-         one in its key file ({}). Nothing was done. A node goes on under the key it was \
-         started with. If this device was given a new key, restart the node:\n{}",
+        "what answered at the node's address is not this device ({}), as its key file says. \
+         Nothing was done. A node goes on as the device it was started as. If you started this \
+         device over as a new device, restart the node:\n{}",
         fingerprint::shown(own),
         cordelia_api::commands::restart_says(os)
     )
@@ -345,7 +345,10 @@ fn own_carried_line(seen: &Value) -> Option<String> {
     if held.is_empty() {
         return None;
     }
-    let mut line = format!("this device has sent what it carried to {}", joined(&held));
+    let mut line = format!(
+        "this device has sent what it copied over to {}",
+        joined(&held)
+    );
     if !not_yet.is_empty() {
         line.push_str(&format!("; not yet to {}", joined(&not_yet)));
     }
@@ -429,6 +432,30 @@ pub fn status_lines(seen: &Value, verbose: bool) -> (String, Vec<String>) {
     (short, says)
 }
 
+/// The other devices that a device which is one of several leaves (decision
+/// 2026-10-04 §5.2), as its yes names them (decision 2026-11-11 (plain
+/// words), rule 2): those of the look `seen` but `own`, each by its words
+/// and then its name, as [`named`] says it, a few and then how many more.
+/// The node's count, `others`, says how many there are.
+fn others_named(seen: &Value, own: &[u8; 32]) -> String {
+    let mut keys: Vec<&str> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for device in list(seen, "devices").chain(list(seen, "added")) {
+        let key = text(device, "key");
+        if is_own(device, own) || keys.contains(&key) {
+            continue;
+        }
+        keys.push(key);
+        names.push(shown(device));
+    }
+    let others = seen["others"].as_u64().map_or(names.len(), |n| n as usize);
+    let named = cordelia_api::look::named_few(&names, others, "another device", "other devices");
+    match others {
+        1 => format!("{named}, the other device it is with"),
+        _ => format!("{named}, the other devices it is with"),
+    }
+}
+
 /// What a command that has this device begin again says before its yes
 /// (decision 2026-10-04 §16), where the device holds versions that it
 /// has sent to no relay: how many, of how many names, as the node counts
@@ -442,8 +469,8 @@ fn waits_says(seen: &Value) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{} of {} that this device holds {} been sent to no relay yet: {} let go with \
-         everything else that it holds.",
+        "{} of {} on this device {} not reached any relay yet: {} removed from this device, \
+         with everything else it has of your devices. The files in its memory folders stay.",
         counted(versions, "version"),
         counted(names, "name"),
         match versions {
@@ -479,8 +506,8 @@ fn waits_before_a_new_phrase(seen: &Value) -> Option<String> {
 /// command that has a device begin again.
 fn alone_says(seen: &Value, from: &str) -> String {
     let leaves = format!(
-        "The recovery phrase that this device follows stops working here: this device leaves \
-         it, and joins the devices of {from}."
+        "The recovery phrase this device is under stops working here: this device leaves it, \
+         and joins the devices of {from}."
     );
     match waits_says(seen) {
         Some(waits) => format!("{waits}\n{leaves}"),
@@ -537,22 +564,22 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             .answer(SEE_THE_WORDS)?
             .is_some_and(|typed| typed.is_empty()),
         "alone" => at.yes(
-            "This replaces the recovery phrase that this device follows: the old one stops \
-             working here, and what the relays hold under it is left behind.",
+            "This replaces the recovery phrase this device is under: the old one stops working \
+             here, and what the relays keep under it is left behind.",
         )?,
         "several" => {
             let others = seen["others"].as_u64().unwrap_or(0);
             at.yes(&format!(
-                "This device leaves the {others} device{} it is with and starts again alone, \
-                 under a new phrase. It says so to {} first. It still holds what it held, and \
-                 is still listed there: removing it, with the old phrase, is what cuts it off.",
-                if others == 1 { "" } else { "s" },
+                "This device leaves {}, and starts again alone, under a new phrase. It tells {} \
+                 first. It keeps everything it has, and stays on their list: only removing it \
+                 there, with the old phrase, cuts it off.",
+                others_named(&seen, &this_device),
                 if others == 1 { "it" } else { "them" },
             ))?
         }
         _ => anyhow::bail!(
-            "{}. A device that has stopped makes no phrase of its own: `cordelia init \
-             --new-key` starts it afresh.",
+            "{}. A stopped device cannot make a recovery phrase: run `cordelia init --new-key` \
+             to start it over as a new device.",
             seen["cannot_go_on"]
                 .as_str()
                 .unwrap_or("this device has stopped")
@@ -618,8 +645,8 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
         Ok(Told::Yes(_)) => {}
         // The node refused: it said so, and made nothing.
         Ok(Told::No { message, .. }) => anyhow::bail!(
-            "{message}\nNothing was made, and the words that were shown are no phrase of \
-             anything: do not keep them."
+            "{message}\nNothing was made, and the words you were shown are not a recovery \
+             phrase: do not keep them."
         ),
         // The answer was lost, and the node may have made the phrase all
         // the same: it is asked again before anything is said of it.
@@ -627,24 +654,25 @@ pub fn phrase(config_path: &str, name: Option<String>) -> anyhow::Result<()> {
             println!("\n{lost}\nThe node's answer was lost. Asking it again...");
             if !made_all_the_same(config_path, &made.entry.id()) {
                 anyhow::bail!(
-                    "it is not known whether the node made the new phrase: it does not say \
-                     that it follows it so far, and it may still. KEEP the twelve words until \
-                     `cordelia devices` shows which recovery phrase this device follows: the \
-                     new one is shown there as ({}). If it shows another, or none, the words \
-                     are no phrase of anything.",
+                    "it is not known whether the node made the new phrase: it does not say yet \
+                     that this device is under it, and it may still. KEEP the twelve words \
+                     until `cordelia devices` shows the recovery phrase fingerprint: the new \
+                     one is ({}). If it shows another, or none, the words are not a recovery \
+                     phrase.",
                     fingerprint::shown(&made.entry.author)
                 );
             }
         }
     }
     println!(
-        "\nThis device follows the new recovery phrase, alone. It is listed as {} (change 1).",
+        "\nThis device is now under the new recovery phrase, and is your only device. It is \
+         listed as {}.",
         named(&label, &this_device)
     );
     println!(
-        "Each relay is shown the change first, before anything else is sent there: `cordelia \
-         devices` says which hold it.\nAdd another device with `cordelia add-device <its \
-         key>`."
+        "Each relay gets the change first, before anything else is sent there: `cordelia \
+         devices` says which have it.\nTo add another device, run `cordelia id` on it, then \
+         `cordelia add-device <its ID>` here."
     );
     Ok(())
 }
@@ -748,12 +776,19 @@ fn numbered(words: &str, in_a_row: usize) -> Zeroizing<String> {
 
 /// `cordelia add-device <key>`: hand a device what it needs to be one of
 /// the person's (decision 2026-10-04 §6). The phrase is not typed to
-/// add: a device that is in vouches for the new one.
-pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow::Result<()> {
+/// add: a device that is in vouches for the new one. With `verbose`, its
+/// yes says how many devices are in each shared channel it hands over
+/// (decision 2026-11-11 (plain words), rule 4).
+pub fn add_device(
+    config_path: &str,
+    key: &str,
+    name: Option<String>,
+    verbose: bool,
+) -> anyhow::Result<()> {
     let at = Terminal::at()?;
     refuse_another_version(config_path)?;
     let device = decode_public_key(key).map_err(|e| {
-        anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
+        anyhow::anyhow!("that is not a device ID, as `cordelia id` prints one: {e}")
     })?;
     // The key that the other device is told to type is the one in this
     // device's key file.
@@ -769,22 +804,23 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
     };
     let agreed = match yes_is_for {
         "hand_again" => at.yes(&format!(
-            "{} is one of your devices already: this hands it the last change again, and \
-             adds nothing.",
+            "{} is one of your devices already: this sends it the last change to your devices \
+             again, and adds nothing.",
             named(text(&would, "label"), &device)
         ))?,
         _ => {
             let label = name.as_deref().unwrap_or("the new device");
             if let Some(was) = would["left_out_as"].as_str() {
                 println!(
-                    "This key was not in the last change. This device knew it as {was:?}, and \
-                     it holds what your devices held before that change."
+                    "That device was left out of the last change to your devices. This device \
+                     knew it as {was:?}, and it still has what your devices had before that \
+                     change."
                 );
             }
             if would["counts_already"] == true {
-                println!("This key counts as one of your devices already, by an earlier addition.");
+                println!("That device is one of yours already: a device of yours added it before.");
             }
-            at.yes(&add_device_yes(&named(label, &device), &would))?
+            at.yes(&add_device_yes(&named(label, &device), &would, verbose))?
         }
     };
     if !agreed {
@@ -801,7 +837,7 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
     println!("On the other device, within the hour, run:");
     println!("  cordelia accept {}", encode_public_key(&own)?);
     println!(
-        "It shows these words for this device's key before it asks its yes: {}",
+        "Before you type yes there, check that it shows these words for this device: {}",
         fingerprint::shown(&own)
     );
     Ok(())
@@ -810,23 +846,40 @@ pub fn add_device(config_path: &str, key: &str, name: Option<String>) -> anyhow:
 /// The yes `add-device` asks for a new key, `device` as [`named`] says it
 /// (decision 2026-10-04 §6; decision 2026-10-10 §5.2), given what its
 /// look answered, `would`.
-fn add_device_yes(device: &str, would: &Value) -> String {
+fn add_device_yes(device: &str, would: &Value, verbose: bool) -> String {
     format!(
         "This gives {device} every name's memory, {}and the means to read what your devices \
          write from now on.",
-        shared_handed(would)
+        shared_handed(would, verbose)
     )
 }
 
 /// What `add-device`'s yes adds where the person holds a shared channel
-/// (decision 2026-10-10 §5.2): the shared channels the new device holds,
-/// by their count, in its list of what it gives. Nothing where it holds
-/// none. `shared list` names each, with its keys.
-fn shared_handed(would: &Value) -> String {
-    match list(would, "shared").count() {
+/// (decision 2026-10-10 §5.2): the shared channels the new device gets,
+/// in its list of what it gives, each by its name, a few and then how
+/// many more (decision 2026-11-11 (plain words), rule 2). With `verbose`,
+/// every one, each with how many devices are in it (rule 4). Nothing
+/// where the person holds none.
+fn shared_handed(would: &Value, verbose: bool) -> String {
+    let channels: Vec<&Value> = list(would, "shared").collect();
+    let names: Vec<String> = channels
+        .iter()
+        .map(|channel| {
+            let name = format!("{:?}", text(channel, "name"));
+            match (verbose, channel["keys"].as_u64()) {
+                (true, Some(n)) => format!("{name} ({})", counted(n as usize, "device")),
+                _ => name,
+            }
+        })
+        .collect();
+    let named = match verbose {
+        true => joined(&names),
+        false => cordelia_api::look::named_few(&names, names.len(), "", ""),
+    };
+    match channels.len() {
         0 => String::new(),
-        1 => "the shared channel you are in, ".into(),
-        n => format!("the {n} shared channels you are in, "),
+        1 => format!("the shared channel {named} you are in, "),
+        _ => format!("the shared channels {named} you are in, "),
     }
 }
 
@@ -834,12 +887,14 @@ fn shared_handed(would: &Value) -> String {
 
 /// `cordelia accept <key>`: take what the device of that key hands over
 /// (decision 2026-10-04 §5.1). What it does goes by the state this
-/// device is in, and its yes says which.
-pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
+/// device is in, and its yes says which. With `verbose`, what became of
+/// the key ends with the change this device is on (decision 2026-11-11
+/// (plain words), rule 4).
+pub fn accept(config_path: &str, key: &str, verbose: bool) -> anyhow::Result<()> {
     let at = Terminal::at()?;
     refuse_another_version(config_path)?;
     let typed = decode_public_key(key).map_err(|e| {
-        anyhow::anyhow!("that is no device's key, as `cordelia id` prints one: {e}")
+        anyhow::anyhow!("that is not a device ID, as `cordelia id` prints one: {e}")
     })?;
     let own = own_key(config_path)?;
     let seen = look_with_what_waits(config_path)?;
@@ -858,26 +913,26 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
             ("no_phrase", says)
         }
         ("removed", _) => anyhow::bail!(
-            "this device was removed: `cordelia init --new-key` first. It is then added as a \
-             new device."
+            "this device was removed: run `cordelia init --new-key` to start it over, then add \
+             it as a new device."
         ),
         // A closed device is added again by a hand-over of a clear change
         // that lists it (decision 2026-10-24 (removal), rule 10).
         ("fork", _) => (
             "several",
             format!(
-                "This device is closed: a device that was removed holds the secret of the \
-                 change it follows. It takes, within the hour, only what {from} hands over \
-                 under the recovery phrase that it already follows, where that brings a change \
-                 that lists it and that no removed device holds. Anything else moves nothing."
+                "This device is stopped: a device you removed still has the secret of the change \
+                 this device is on. Within the hour, it takes only what {from} sends under the \
+                 recovery phrase it is already under, and only a change that includes this \
+                 device and that no removed device can read. Anything else changes nothing."
             ),
         ),
         ("not_listed" | "not_opened", _) => (
             "not_listed",
             format!(
-                "This device takes, within the hour, only what {from} hands over under the \
-                 recovery phrase that it already follows, with the change that stopped it or \
-                 one made after that. It keeps its folders, and carries what it holds."
+                "Within the hour, this device takes only what {from} sends under the recovery \
+                 phrase it is already under: the change that stopped it, or a later one. It \
+                 keeps its folders, and copies over what it has."
             ),
         ),
         (_, "alone") => {
@@ -893,9 +948,9 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
         _ => (
             "several",
             format!(
-                "This device is one of several. It takes, within the hour, only what {from} \
-                 hands over under the recovery phrase that it already follows, where that \
-                 brings a change it can apply. Anything else moves nothing."
+                "This device is one of several. Within the hour, it takes only what {from} sends \
+                 under the recovery phrase it is already under, and only a change it can use. \
+                 Anything else changes nothing."
             ),
         ),
     };
@@ -906,7 +961,7 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
     let typed_in = json!({ "key": key, "row": row });
     let kept = api_post(config_path, "/api/v1/devices/accept", typed_in)?;
     let until = kept["until"].as_u64().map(time_of).unwrap_or_default();
-    println!("\nAsking the relays for what {from} hands over, until {until}.");
+    println!("\nAsking the relays for what {from} sends, until {until}.");
 
     // It stays for a while, and says what became of the key. The node
     // goes on asking after that, until the hour is gone.
@@ -917,11 +972,15 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
         let seen = look(config_path)?;
         let of_the_key = list(&seen, "accepting").find(|typed| text(typed, "key") == key);
         let Some(of_the_key) = of_the_key else {
-            anyhow::bail!("the node keeps that key no longer: type it again (`cordelia accept`)");
+            anyhow::bail!("the node no longer has that device ID: run `cordelia accept` again");
         };
         let now_said = text(of_the_key, "said");
         if of_the_key["taken"] == true {
-            println!("{}.", capitalised(now_said));
+            let change = match (verbose, seen["change"].as_u64()) {
+                (true, Some(change)) => format!(" (change {change})"),
+                _ => String::new(),
+            };
+            println!("{}{change}.", capitalised(now_said));
             return Ok(());
         }
         if !now_said.is_empty() && now_said != said {
@@ -930,8 +989,8 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
         }
         if Instant::now() >= ends {
             println!(
-                "Nothing was taken yet. This device goes on asking until {until}: `cordelia \
-                 status` says what became of it."
+                "Nothing has arrived yet. This device keeps asking until {until}: `cordelia \
+                 status` says how it went."
             );
             return Ok(());
         }
@@ -942,8 +1001,10 @@ pub fn accept(config_path: &str, key: &str) -> anyhow::Result<()> {
 
 /// `cordelia devices`: one place to look (decision 2026-10-04 §8). With
 /// `clear`, each notice is asked about at the terminal, and what a person
-/// says yes to is shown on this device no more.
-pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
+/// says yes to is shown on this device no more. With `verbose`, the
+/// change numbers and every device's fingerprint words (decision
+/// 2026-11-11 (plain words), rule 4).
+pub fn devices(config_path: &str, clear: bool, verbose: bool) -> anyhow::Result<()> {
     let own = own_key(config_path)?;
     if clear {
         let at = Terminal::at()?;
@@ -958,7 +1019,7 @@ pub fn devices(config_path: &str, clear: bool) -> anyhow::Result<()> {
     note_another_version(config_path);
     let seen = look(config_path)?;
     names_this_device(&seen, &own)?;
-    for line in devices_lines(&seen, &own) {
+    for line in devices_lines(&seen, &own, verbose) {
         println!("{line}");
     }
     Ok(())
@@ -1029,8 +1090,72 @@ fn signed_by(filled: &Value, device: &Value) -> u64 {
 
 /// What `cordelia devices` prints, a line each. `own` is this device's
 /// key, from its key file: which row is this device's goes by it.
-fn devices_lines(seen: &Value, own: &[u8; 32]) -> Vec<String> {
-    devices_lines_at(seen, own, chrono::Utc::now().timestamp(), &LOOKED_UP)
+pub(crate) fn devices_lines(seen: &Value, own: &[u8; 32], verbose: bool) -> Vec<String> {
+    devices_lines_at(
+        seen,
+        own,
+        chrono::Utc::now().timestamp(),
+        &LOOKED_UP,
+        verbose,
+    )
+}
+
+/// How the list of `cordelia devices` names a device (decision
+/// 2026-11-11 (plain words), rule 4): by the name you gave it alone,
+/// quoted. **Its fingerprint words come first, as [`named`] says it,**
+/// where it has no name from you, where another device in the list has
+/// its name, and with `verbose`. It is the one list that shows a name
+/// alone: a name can be forged, and every line where you decide about a
+/// device shows the words.
+struct InTheList {
+    verbose: bool,
+    /// The names that two devices or more in the list have.
+    twice: Vec<String>,
+}
+
+impl InTheList {
+    /// How the list of the look `seen` names its devices.
+    fn of(seen: &Value, verbose: bool) -> Self {
+        let mut keys_of: Vec<(String, String)> = Vec::new();
+        let heads = list(seen, "set_aside").chain(seen.get("apart").filter(|a| a.is_object()));
+        let in_heads: Vec<&Value> = heads
+            .flat_map(|head| {
+                std::iter::once(&head["made_on"])
+                    .chain(list(head, "devices"))
+                    .chain(list(head, "removed"))
+            })
+            .collect();
+        let not_listed = list(seen, "names_not_listed")
+            .flat_map(|name| list(name, "by").chain(list(name, "by_gone")));
+        for device in list(seen, "devices")
+            .chain(list(seen, "added"))
+            .chain(list(seen, "added").map(|added| &added["by"]))
+            .chain(list(seen, "removed"))
+            .chain(list(seen, "left_out"))
+            .chain(in_heads)
+            .chain(not_listed)
+        {
+            let (label, key) = (text(device, "label"), text(device, "words"));
+            if !label.is_empty() && !keys_of.iter().any(|(l, k)| l == label && k == key) {
+                keys_of.push((label.to_string(), key.to_string()));
+            }
+        }
+        let twice = keys_of
+            .iter()
+            .filter(|(label, _)| keys_of.iter().filter(|(l, _)| l == label).count() > 1)
+            .map(|(label, _)| label.clone())
+            .collect();
+        Self { verbose, twice }
+    }
+
+    /// `device`, as the list names it.
+    fn named(&self, device: &Value) -> String {
+        let label = text(device, "label");
+        match self.verbose || label.is_empty() || self.twice.iter().any(|l| l == label) {
+            true => shown(device),
+            false => format!("{label:?}"),
+        }
+    }
 }
 
 /// How `cordelia devices` looks up the relays' names
@@ -1077,8 +1202,15 @@ fn too_soon_to_say(seen: &Value, device: &Value, own: &[u8; 32], now: i64) -> bo
 
 /// [`devices_lines`], at `now`, in seconds: what is said of a device
 /// that has not been heard from goes by how long ago this device joined,
-/// or that one was added ([`too_soon_to_say`]).
-fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> Vec<String> {
+/// or that one was added ([`too_soon_to_say`]). With `verbose`, the
+/// change numbers and every device's fingerprint words ([`InTheList`]).
+fn devices_lines_at(
+    seen: &Value,
+    own: &[u8; 32],
+    now: i64,
+    lookup: &Lookup,
+    verbose: bool,
+) -> Vec<String> {
     let mut out = Vec::new();
     let change = seen["change"].as_u64();
     out.push(format!(
@@ -1089,9 +1221,17 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
         out.extend(list(seen, "says").filter_map(|line| Some(line.as_str()?.to_string())));
         return out;
     };
-    out.push(format!("The last change it has applied: change {change}."));
+    let in_the_list = InTheList::of(seen, verbose);
+    let shown = |device: &Value| in_the_list.named(device);
     if let Some(words) = seen["phrase_words"].as_str() {
-        out.push(format!("The recovery phrase it follows: ({words})."));
+        out.push(format!(
+            "It is under the recovery phrase with the fingerprint ({words})."
+        ));
+    }
+    // The number that a change whose answer was lost tells a person to
+    // check here (decision 2026-11-11 (plain words), rule 4).
+    if verbose {
+        out.push(format!("It is on change {change} to your devices."));
     }
     if let Some(why) = seen["cannot_go_on"].as_str() {
         out.push(format!("This device cannot go on: {why}."));
@@ -1102,23 +1242,27 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
             if left == 1 { "" } else { "s" }
         ));
     }
+    // Up to date: on the last change; with `verbose`, which.
+    let up_to_date = match verbose {
+        true => format!("up to date (change {change})"),
+        false => "up to date".to_string(),
+    };
     let applied = |device: &Value| match device["applied"].as_u64() {
         _ if is_own(device, own) => "this device".to_string(),
-        // Whether it has sent what it held when it applied the change
+        // Whether it has sent what it had when it took in the change
         // (§8): it says so itself, once it has.
         Some(number) if number == change => match device["sent"] == true {
-            true => format!("has applied change {change}, and has sent what it held"),
+            true => up_to_date.clone(),
             // Its carried word (decision 2026-10-19, rule 6, D1): what it
-            // held is at the relays it names, and only there if it is lost
+            // had is at the relays it names, and only there if it is lost
             // now.
             false if let Some(word) = carried_word_of(device) => {
                 let (held, not_yet) = held_by_another(&word, seen);
-                let mut said =
-                    format!("has applied change {change}, and has sent what it held to {held}");
+                let mut said = format!("{up_to_date}, and has sent what it has to {held}");
                 if not_yet > 0 {
                     said.push_str(&format!(
-                        "; not yet to {} that it is set up with (if it is lost now, what it held \
-                         is at {held} alone)",
+                        "; not yet to {} that it is set up with (if you lose it now, what it has \
+                         is only at {held})",
                         other_relays(not_yet)
                     ));
                 }
@@ -1128,19 +1272,22 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
             // not sent: what it had sent before comes in by command
             // (§7.3, §8).
             false => format!(
-                "has applied change {change}, and is still sending what it held (if it is \
-                 lost now, what it had not sent is lost with it; `cordelia sync carry` brings \
-                 in what it had sent before)"
+                "{up_to_date}, and still sending what it has (if you lose it now, what it has \
+                 not sent is lost; `cordelia sync carry` copies in what it sent before)"
             ),
         },
-        // Not heard to have applied it. Just after this device took a
+        // Not heard to have taken it in. Just after this device took a
         // typed key, or added that one, that is all that is known: its
         // word may not have arrived yet, and nothing is advised.
         _ if too_soon_to_say(seen, device, own, now) => "not heard from yet".to_string(),
         _ => format!(
-            "has not applied change {change} yet, as far as this device has heard: adding it \
-             again from a device that has (`cordelia add-device`) hands it the change, and \
-             `cordelia sync carry` brings in what it had sent to the relays"
+            "{}, as far as this device knows: to send it the last change, add it again from a \
+             device that is up to date (`cordelia add-device`); `cordelia sync carry` copies in \
+             what it had sent to the relays",
+            match verbose {
+                true => format!("not yet on change {change}"),
+                false => "not up to date yet".to_string(),
+            }
         ),
     };
     let left = |device: &Value| match device["left"] == true {
@@ -1156,7 +1303,7 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
     };
     if let Some(filled) = past {
         out.push(format!(
-            "Your devices keep {} MiB of the {} MiB a relay holds for them (names: {} MiB)",
+            "Your devices use {} MiB of the {} MiB a relay keeps for them (names: {} MiB)",
             mib(filled["total"].as_u64().unwrap_or(0)),
             MAX_ENTRY_CHANNEL_BYTES_AT_RELAY / MIB,
             mib(filled["words"].as_u64().unwrap_or(0)),
@@ -1164,10 +1311,10 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
     }
 
     out.push(String::new());
-    out.push("Devices of the last change:".into());
+    out.push("Your devices:".into());
     for device in list(seen, "devices") {
         let made = match device["maker"] == true {
-            true => "; the change was made on it",
+            true => "; it made the last change",
             false => "",
         };
         out.push(format!(
@@ -1182,7 +1329,7 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
     let added: Vec<&Value> = list(seen, "added").collect();
     if !added.is_empty() {
         out.push(String::new());
-        out.push("Added since:".into());
+        out.push("Added since the last change:".into());
     }
     for device in added {
         let by = shown(&device["by"]);
@@ -1197,7 +1344,7 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
             ),
         };
         out.push(format!(
-            "  {}, added from {by} at {at}: {says}",
+            "  {}, added by {by} at {at}: {says}",
             shown(device)
         ));
         out.push(format!("      {}", text(device, "key")));
@@ -1205,7 +1352,7 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
     let removed: Vec<&Value> = list(seen, "removed").collect();
     if !removed.is_empty() {
         out.push(String::new());
-        out.push("Removed keys:".into());
+        out.push("Removed devices:".into());
     }
     // A statement lists a removed key bare: it is shown by the label
     // that this device knew it by, where it knew it by one. That label,
@@ -1217,20 +1364,22 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
     let left_out: Vec<&Value> = list(seen, "left_out").collect();
     if !left_out.is_empty() {
         out.push(String::new());
-        out.push("Not in the last change (each holds what your devices held before it):".into());
+        out.push(
+            "Left out of the last change (each still has what your devices had before it):".into(),
+        );
     }
     for device in left_out {
         out.push(match device["key"].as_str() {
             None => format!(
-                "  {}: add it again, or it was meant to go. Its key is the one it prints \
-                 (`cordelia id`).",
+                "  {}: add it again, unless you meant it to go. Its ID is what `cordelia id` \
+                 prints on it.",
                 shown(device)
             ),
             // A row that the recovery could not show, and asked nothing
             // of: it is shown with its key (decision 2026-10-04 §9).
             Some(key) => format!(
-                "  {}  {key}: the recovery could not show it, and asked nothing of it. Nothing \
-                 that it wrote was brought back.",
+                "  {}  {key}: the recovery could not show this device, so it asked you nothing \
+                 about it. Nothing it wrote was brought back.",
                 shown(device)
             ),
         });
@@ -1249,9 +1398,12 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
     };
     for head in apart {
         out.push(String::new());
+        let number = match verbose {
+            true => format!(" (change {})", head["number"].as_u64().unwrap_or(0)),
+            false => String::new(),
+        };
         out.push(format!(
-            "The change made apart (change {}, made on {}):",
-            head["number"].as_u64().unwrap_or(0),
+            "A change made separately, on {}{number}:",
             shown(&head["made_on"])
         ));
         if let Some(says) = head["says"].as_str() {
@@ -1261,7 +1413,7 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
             out.push(format!("  {}", shown(device)));
         }
         for device in head["removed"].as_array().into_iter().flatten() {
-            out.push(format!("  removed: ({})", text(device, "words")));
+            out.push(format!("  removed: {}", shown(device)));
         }
     }
     out.push(String::new());
@@ -1346,17 +1498,17 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
             ));
         }
     }
-    out.extend(names_lines(seen));
+    out.extend(names_lines(seen, &shown));
     let accepting: Vec<&Value> = list(seen, "accepting").collect();
     if !accepting.is_empty() {
         out.push(String::new());
-        out.push("Keys typed at `cordelia accept`:".into());
+        out.push("Device IDs you typed at `cordelia accept`:".into());
     }
     for typed in accepting {
         let became = match (typed["taken"] == true, typed["asking"] == true) {
-            (true, _) => "taken",
+            (true, _) => "received",
             (false, true) => "asking",
-            (false, false) => "its hour has gone, and nothing was taken",
+            (false, false) => "its hour has passed, and nothing arrived",
         };
         let said = match typed["said"].as_str() {
             Some(said) if !said.is_empty() => format!(": {said}"),
@@ -1367,7 +1519,7 @@ fn devices_lines_at(seen: &Value, own: &[u8; 32], now: i64, lookup: &Lookup) -> 
     let notices: Vec<&Value> = list(seen, "notices").collect();
     if !notices.is_empty() {
         out.push(String::new());
-        out.push("To be told, until a person clears it here (`cordelia devices --clear`):".into());
+        out.push("To tell you, until you mark it seen here (`cordelia devices --clear`):".into());
     }
     for notice in notices {
         out.push(format!("  - {}", text(notice, "says")));
@@ -1459,8 +1611,9 @@ fn relay_says(relay: &Value, woke_at: Option<i64>, latest: Option<&str>, now: i6
 /// what this device has still to send, by name; each name that a device
 /// had listed before the last change and that no device lists yet, with
 /// those that only a key which no longer counts had listed shown apart;
-/// and the files whose record the last change could not carry.
-fn names_lines(seen: &Value) -> Vec<String> {
+/// and the files whose record the last change could not carry. Each
+/// device is named by `shown`, as the list names it ([`InTheList`]).
+fn names_lines(seen: &Value, shown: &dyn Fn(&Value) -> String) -> Vec<String> {
     let mut out = Vec::new();
     let to_go: Vec<&str> = list(&seen["names"], "to_go")
         .filter_map(|name| name.as_str())
@@ -1487,15 +1640,15 @@ fn names_lines(seen: &Value) -> Vec<String> {
     if !ours.is_empty() {
         out.push(String::new());
         out.push(
-            "Names that no device lists yet since the last change (`cordelia sync carry \
-             <name>` brings one in, and `cordelia sync map` does for a folder that comes to \
-             sync it):"
+            "Names no device syncs yet since the last change to your devices (`cordelia sync \
+             carry <name>` copies one in, as `cordelia sync map` does for a folder you map to \
+             it):"
                 .into(),
         );
     }
     for name in ours {
         out.push(format!(
-            "  {}: synced before by {}; what the relays hold of it can be brought in for {}",
+            "  {}: synced before by {}; you can copy in what the relays have of it for {}",
             text(name, "name"),
             by(name, "by").join(", "),
             days(name)
@@ -1504,15 +1657,15 @@ fn names_lines(seen: &Value) -> Vec<String> {
     if !gone.is_empty() {
         out.push(String::new());
         out.push(
-            "Names that only a device which no longer counts had synced (they stay behind: \
-             `cordelia sync carry <name> --from <device>` brings one in, with the recovery \
+            "Names only a device no longer on your list had synced (they stay behind: \
+             `cordelia sync carry <name> --from <device>` copies one in, with the recovery \
              phrase):"
                 .into(),
         );
     }
     for name in gone {
         out.push(format!(
-            "  {}: synced before by {}; it can be brought in for {}",
+            "  {}: synced before by {}; you can copy it in for {}",
             text(name, "name"),
             by(name, "by_gone").join(", "),
             days(name)
@@ -1528,8 +1681,8 @@ fn names_lines(seen: &Value) -> Vec<String> {
     if !not_carried.is_empty() {
         out.push(String::new());
         out.push(
-            "Not carried at the last change (what this device held of each could not be read; \
-             each meets its channel as a new file does):"
+            "Not copied over at the last change (this device could not read what it had of \
+             each; each will sync as a new file):"
                 .into(),
         );
     }
@@ -1566,7 +1719,7 @@ pub(crate) fn counted(n: usize, noun: &str) -> String {
 fn clear_notices(config_path: &str, at: &Terminal, seen: &Value) -> anyhow::Result<()> {
     let notices: Vec<&Value> = list(seen, "notices").collect();
     if notices.is_empty() {
-        println!("There is nothing to clear on this device.");
+        println!("There is nothing to mark seen on this device.");
         return Ok(());
     }
     for (asked, notice) in notices.into_iter().enumerate() {
@@ -1575,8 +1728,15 @@ fn clear_notices(config_path: &str, at: &Terminal, seen: &Value) -> anyhow::Resu
         if asked > 0 {
             println!();
         }
+        // A notice of a device added names that device, by its words and
+        // then its name (decision 2026-11-11 (plain words), rules 4 and 5):
+        // it is a question about a device added since.
+        let of = match notice["device"].is_object() {
+            true => format!("this notice of {}", shown(&notice["device"])),
+            false => "this notice".to_string(),
+        };
         let clears = at.yes(&format!(
-            "{}.\nClearing it changes what this device shows, and nothing else.",
+            "{}.\nYes marks {of} seen here, which changes only what this device shows.",
             capitalised(text(notice, "says"))
         ))?;
         if !clears {
@@ -1588,7 +1748,7 @@ fn clear_notices(config_path: &str, at: &Terminal, seen: &Value) -> anyhow::Resu
             "/api/v1/devices/clear",
             json!({ "notice": text(notice, "id") }),
         )?;
-        println!("Cleared on this device.");
+        println!("Marked seen on this device.");
     }
     Ok(())
 }
@@ -1610,11 +1770,12 @@ enum Which {
 /// `cordelia remove-device <key>` (decision 2026-10-04 §7.1). Given a
 /// key that is in no list and was not added since, it removes the key
 /// all the same, after saying what that means and a typed answer
-/// ([`refuses_a_key_it_does_not_know`], §10).
-pub fn remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
-    made_at_a_terminal(config_path, || {
+/// ([`refuses_a_key_it_does_not_know`], §10). With `verbose`, the change
+/// numbers and counts (decision 2026-11-11 (plain words), rule 4).
+pub fn remove_device(config_path: &str, key: &str, verbose: bool) -> anyhow::Result<()> {
+    made_at_a_terminal(config_path, verbose, || {
         let device = decode_public_key(key).map_err(|e| {
-            anyhow::anyhow!("that is no device's key, as `cordelia devices` lists one: {e}")
+            anyhow::anyhow!("that is not a device ID, as `cordelia devices` lists one: {e}")
         })?;
         Ok(Which::Remove(device))
     })
@@ -1626,24 +1787,25 @@ pub fn remove_device(config_path: &str, key: &str) -> anyhow::Result<()> {
 /// (decision 2026-10-04 §16).
 fn made_at_a_terminal(
     config_path: &str,
+    verbose: bool,
     which: impl FnOnce() -> anyhow::Result<Which>,
 ) -> anyhow::Result<()> {
     let at = Terminal::for_a_phrase()?;
     refuse_before_a_phrase(config_path)?;
-    change(config_path, &at, &which()?)
+    change(config_path, &at, &which()?, verbose)
 }
 
 /// `cordelia renew`: a new secret for the devices that stay, with no
 /// device removed but those added since that a person says go (decision
 /// 2026-10-04 §6, §7.1).
-pub fn renew(config_path: &str) -> anyhow::Result<()> {
-    made_at_a_terminal(config_path, || Ok(Which::Renew))
+pub fn renew(config_path: &str, verbose: bool) -> anyhow::Result<()> {
+    made_at_a_terminal(config_path, verbose, || Ok(Which::Renew))
 }
 
 /// `cordelia settle`: join the changes made apart that this device keeps
 /// (decision 2026-10-04 §4.5; decision 2026-10-24 (removal), rule 21).
-pub fn settle(config_path: &str) -> anyhow::Result<()> {
-    made_at_a_terminal(config_path, || Ok(Which::Settle))
+pub fn settle(config_path: &str, verbose: bool) -> anyhow::Result<()> {
+    made_at_a_terminal(config_path, verbose, || Ok(Which::Settle))
 }
 
 /// What the node hands a command that makes a change: read from the
@@ -1698,6 +1860,10 @@ struct Handed {
     /// The repositories this device follows (decision 2026-10-24, rule
     /// 24): a removal says to take the removed device's access away in each.
     repositories: Vec<String>,
+    /// Whether the command was given `-v`: the change numbers and counts
+    /// show (decision 2026-11-11 (plain words), rule 4). Never the node's
+    /// word: [`Self::of`] leaves it off, and the command sets it.
+    verbose: bool,
 }
 
 impl Handed {
@@ -1719,8 +1885,8 @@ impl Handed {
             statement.verify()?;
             if statement.statement.phrase_key != applied.statement.phrase_key {
                 anyhow::bail!(
-                    "the node handed a change set aside under another phrase than the one this \
-                     device follows. Nothing was done."
+                    "the node sent a change put aside under another recovery phrase than the one \
+                     this device is under. Nothing was done."
                 );
             }
             let entry = entry_of(text(head, "entry"))?;
@@ -1731,13 +1897,13 @@ impl Handed {
         let mut removed: Vec<[u8; 32]> = Vec::new();
         for key in list(handed, "removed") {
             let key = decode_public_key(key.as_str().unwrap_or_default()).map_err(|e| {
-                anyhow::anyhow!("the node handed a removed key that is no key: {e}")
+                anyhow::anyhow!("the node sent a removed device whose ID is not valid: {e}")
             })?;
             if key == *own {
                 anyhow::bail!(
-                    "this device was removed: a change of the recovery phrase that it has seen \
-                     removes it. `cordelia init --new-key` gives it a new key; it is then added \
-                     as a new device."
+                    "this device was removed: it has seen a change to your devices that removes \
+                     it. Run `cordelia init --new-key` to start it over, then add it as a new \
+                     device."
                 );
             }
             removed.push(key);
@@ -1753,8 +1919,8 @@ impl Handed {
             record.verify()?;
             if record.addition.under != under {
                 anyhow::bail!(
-                    "the node handed a record of an addition that is made under another change \
-                     than the one this device has applied. Nothing was done."
+                    "the node sent the record of an added device made under another change than \
+                     the one this device is on. Nothing was done."
                 );
             }
             Ok(record)
@@ -1777,8 +1943,8 @@ impl Handed {
             let adder = record.addition.adder;
             if !applied.statement.lists(&adder) && !added_by_a_listed.contains(&adder) {
                 anyhow::bail!(
-                    "the node handed a record of an addition whose adder is no device of the \
-                     last change, and was added by none. Nothing was done."
+                    "the node sent the record of an added device whose adder is not in the last \
+                     change, and was not added since. Nothing was done."
                 );
             }
             let key = record.addition.device.key;
@@ -1852,6 +2018,7 @@ impl Handed {
             shared_past_bound,
             shared_acts,
             repositories,
+            verbose: false,
             this_device: *own,
             applied,
             held,
@@ -1967,9 +2134,9 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
             .map(|name| format!("\"{name}\""))
             .collect();
         lines.push(format!(
-            "\nThese shared channels are made anew without the device removed, in this change: \
-             {}. The other people in each move with a yes of their own, and their devices send \
-             nothing more in the old channel meanwhile.",
+            "\nThis change resets these shared channels without the removed device: {}. The \
+             other people in each move to the new channel with a yes of their own; until then, \
+             their devices send nothing more in the old one.",
             names.join(", ")
         ));
         lines.push(STAYS_AT_A_REMOVAL.into());
@@ -1981,9 +2148,9 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
             .map(|name| format!("\"{name}\""))
             .collect();
         lines.push(format!(
-            "\nThese shared channels are not reached from this device, so they are not made anew \
-             in this change: {}. Your devices send nothing in each until you make it anew with \
-             cordelia shared reset <name> on a device of yours that reaches its relays.",
+            "\nThis device cannot reach these shared channels, so this change does not reset \
+             them: {}. Your devices send nothing in each until you reset it: run cordelia shared \
+             reset <name> on a device of yours that reaches its relays.",
             names.join(", ")
         ));
     }
@@ -1994,10 +2161,11 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
             .map(|name| format!("\"{name}\""))
             .collect();
         lines.push(format!(
-            "\nThese shared channels were past a bound, so your devices do not hold them: {}. \
-             Each is made anew without the device removed, in this change, where this device \
-             reaches its relays. Your devices do not hold the new one either: ask someone in it \
-             to share the new channel with you, and with anyone who wrote there since.",
+            "\nThese shared channels were pushed off your list of {SHARED_MAX_CHANNELS} shared \
+             channels, so your devices do not have them: {}. This change resets each without the \
+             removed device, where this device reaches its relays. Your devices will not have the \
+             new channel either: ask someone in it to share it with you, and with anyone who \
+             wrote there since.",
             names.join(", ")
         ));
     }
@@ -2009,16 +2177,16 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
         .collect();
     if !acts.is_empty() {
         lines.push(
-            "\nWhat the device removed did in your shared channels, still in force, each with \
-             what undoes it:"
+            "\nWhat the removed device did in your shared channels that still stands, each with \
+             the command that undoes it:"
                 .into(),
         );
         lines.extend(acts.into_iter().map(|line| format!("  {line}")));
     }
     for repository in &handed.repositories {
         lines.push(format!(
-            "\nThis device follows {repository}: take the removed device's access to it away \
-             there, and delete its line from .cordelia/members in a pull request."
+            "\nYou follow {repository} on this device: take the removed device's access to it \
+             away there, and delete its line from .cordelia/members in a pull request."
         ));
     }
     // Follows are a device's own: another device of the person's, or the
@@ -2029,16 +2197,17 @@ fn shared_at_a_removal(handed: &Handed, signs: &Statement) -> Vec<String> {
 
 /// What a removal says of the repositories this device does not follow
 /// (decision 2026-10-24, rule 24).
-const ACCESS_ELSEWHERE: &str = "\nAlso take its access away in any other repository a device of \
-                                yours follows, or that the removed device could push to.";
+const ACCESS_ELSEWHERE: &str = "\nAlso take its access away in any other repository you follow \
+                                on a device of yours, or that the removed device could push to.";
 
 /// Who stays in a shared channel that a removal makes anew (decision
 /// 2026-10-24, rule 24), said before its yes.
-const STAYS_AT_A_REMOVAL: &str = "In each, your own devices stay. A channel that follows a \
-                                  repository this device follows keeps the keys its list names. \
-                                  Any other keeps a key only where this device saw it in the \
-                                  channel and a device of yours that still counts labelled it. \
-                                  Anyone else is left out: share the new channel with them again.";
+const STAYS_AT_A_REMOVAL: &str = "In each, your own devices stay. The channel of a repository \
+                                  you follow on this device keeps the devices on the \
+                                  repository's list. Any other channel keeps a device only where \
+                                  this device saw it there, and a device of yours that stays gave \
+                                  it a name. Everyone else is left out: share the new channel \
+                                  with them again.";
 
 /// What a removal says of the things that a device being removed lists
 /// as names and that are no names as this version would map one: how
@@ -2086,7 +2255,7 @@ impl Answers for Terminal {
 /// is made of an answer that nobody typed.
 fn asks_of(at: &impl Answers, says: &str, neither: bool) -> anyhow::Result<Answer> {
     let third = match neither {
-        true => ", or `neither` (it is in no list, and is added again by hand)",
+        true => ", or `neither` (it goes on no list, and you add it again yourself)",
         false => "",
     };
     loop {
@@ -2110,8 +2279,8 @@ struct Question {
 }
 
 /// What is said of a device that has said that it left.
-const SAID_IT_LEFT: &str = "It has said that it left, and started again under another phrase: \
-                            it still holds what it held";
+const SAID_IT_LEFT: &str = "It has said that it left, and started again under another recovery \
+                            phrase: it still has what it had";
 
 /// The devices that a person is asked about at a removal or a renewal,
 /// in the order they are asked (decision 2026-10-04 §6, §7.1): each
@@ -2151,7 +2320,7 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
         asked.push(Question {
             device: device.clone(),
             says: format!(
-                "\n{}, a device of the last change. {SAID_IT_LEFT}:",
+                "\n{}, in the last change to your devices. {SAID_IT_LEFT}:",
                 named(&device.label, &key)
             ),
         });
@@ -2163,7 +2332,7 @@ fn questions(handed: &Handed, goes: Option<[u8; 32]>) -> Vec<Question> {
             continue;
         }
         let says = format!(
-            "\n{}, added since the last change, from {} at {}{}:",
+            "\n{}, added since the last change to your devices, by {} at {}{}:",
             named(&added.device.label, &key),
             named(&handed.label(&added.adder), &added.adder),
             time_of(added.at),
@@ -2221,9 +2390,9 @@ fn removed_with_it(with_it: &[&SignedAddition]) -> String {
         .map(|record| named(&record.addition.device.label, &record.addition.device.key))
         .collect();
     format!(
-        "\nRemoved with it, as the device being removed added them since the last change: {}. \
-         One of them that is yours comes back under a new key: run cordelia init --new-key on \
-         it, then add it from a device of yours.\n{REPLACING}",
+        "\nRemoved with it, since the device you remove added them after the last change: {}. \
+         To keep one of them that is yours, start it over: run cordelia init --new-key on it, \
+         then add it from a device of yours.\n{REPLACING}",
         names.join(", ")
     )
 }
@@ -2231,8 +2400,9 @@ fn removed_with_it(with_it: &[&SignedAddition]) -> String {
 /// What a removal says of a device replaced, beside the keys it removes
 /// with the device (decision 2026-10-24 (removal), rule 6): every removal
 /// removes them, not only one of a stolen device.
-const REPLACING: &str = "This is so at every removal, not only of a stolen device: to replace a \
-                         device, make the removal on the new one, which it then keeps.";
+const REPLACING: &str = "This is so whenever you remove a device, not only a stolen one. To \
+                         replace a device, remove the old one on the new one: the device that \
+                         makes a change always stays.";
 
 /// The devices of the last change that stay with nothing asked: each but
 /// the one that goes, but those that a person is asked about, and but
@@ -2254,13 +2424,15 @@ fn stays_unasked(handed: &Handed, goes: Option<[u8; 32]>, asked: &[Question]) ->
 /// Make a change (see the module's documentation): what the node
 /// prepared is shown, a person answers, the lists are shown from the
 /// bytes that will be signed, and then the yes and the phrase. Where a
-/// statement arrived meanwhile, nothing is made and it asks again.
-fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()> {
+/// statement arrived meanwhile, nothing is made and it asks again. With
+/// `verbose`, the change numbers and counts show (decision 2026-11-11
+/// (plain words), rule 4).
+fn change(config_path: &str, at: &Terminal, which: &Which, verbose: bool) -> anyhow::Result<()> {
     let settles = matches!(which, Which::Settle);
     loop {
         println!(
-            "Showing each relay the last change, and fetching what the relays hold (two \
-             minutes at most)..."
+            "Sending each relay the last change to your devices, and fetching what the relays \
+             have (two minutes at most)..."
         );
         let handed = api_post_told(
             config_path,
@@ -2275,14 +2447,15 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
         for line in list(&handed, "could_not_fetch") {
             println!("  Could not fetch: {}.", line.as_str().unwrap_or_default());
         }
-        let handed = Handed::of(&handed, &own_key(config_path)?)?;
+        let mut handed = Handed::of(&handed, &own_key(config_path)?)?;
+        handed.verbose = verbose;
         let prepared = asked(at, &handed, which)?;
 
         // The lists, from the bytes that the phrase will sign.
         let signs = Statement::from_bytes(prepared.bytes())?;
         println!(
-            "\nThe change that the recovery phrase will sign (change {}):",
-            signs.number
+            "\nThe change your recovery phrase will sign{}:",
+            number_shown(&handed, signs.number)
         );
         for line in lists_shown(&signs, &handed)? {
             println!("{line}");
@@ -2292,8 +2465,8 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
         if !stay_behind.is_empty() {
             println!(
                 "\nThese names stay behind, with what was written in them: {}.\nMap one on \
-                 another device first if you want it; after the removal it is brought in only \
-                 with the phrase.",
+                 another device first if you want it; once the device is removed, you can copy \
+                 it in only with the recovery phrase.",
                 stay_behind.join(", ")
             );
         }
@@ -2333,11 +2506,11 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
                 match made_all_the_same(config_path, &entry.id()) {
                     true => Told::Yes(json!({ "change": signs.number })),
                     false => anyhow::bail!(
-                        "it is not known whether the node made the change: it does not say \
-                         that it has applied change {} so far, and it may still. Do not make \
-                         it again, here or on another device, until `cordelia devices` shows \
-                         the last change that this device has applied: two changes made apart \
-                         have to be settled with the phrase.",
+                        "it is not known whether the node made the change: it does not say yet \
+                         that this device is on change {}, and it may still. Do not make it \
+                         again, here or on another device, until `cordelia devices -v` shows \
+                         the change this device is on: two changes made separately must be \
+                         settled with the recovery phrase.",
                         signs.number
                     ),
                 }
@@ -2348,18 +2521,19 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
                 let number = made["change"].as_u64().unwrap_or(signs.number);
                 for file in list(&made, "not_carried") {
                     println!(
-                        "  What this device held of {} in {} could not be read, and was not \
-                         carried: it meets its channel as a new file does.",
+                        "  This device could not read what it had of {} in {}, so it was not \
+                         copied over: it will sync as a new file.",
                         file_shown(text(file, "file")),
                         file_shown(text(file, "name"))
                     );
                 }
                 println!(
-                    "\nThe change is made (change {number}). It must not be made again on \
-                     another device, even if this command is stopped now: two changes made \
-                     apart have to be settled with the phrase."
+                    "\nThe change is made{}. Do not make it again on another device, even if you \
+                     stop this command now: two changes made separately must be settled with \
+                     the recovery phrase.",
+                    number_shown(&handed, number)
                 );
-                return stays_in_a_new_process(config_path, number, &entry.id());
+                return stays_in_a_new_process(config_path, number, &entry.id(), verbose);
             }
             // A statement arrived between the prompt and the phrase:
             // nothing was made, and it asks again.
@@ -2369,7 +2543,7 @@ fn change(config_path: &str, at: &Terminal, which: &Which) -> anyhow::Result<()>
             } => {
                 println!(
                     "\n{message}\nA change reached this device while you were answering. \
-                          This asks again, with what it holds now.\n"
+                     This asks again, with what it has now.\n"
                 );
             }
             Told::No { message, .. } => anyhow::bail!("{message}\nNothing was made."),
@@ -2406,12 +2580,12 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
     if let Some(goes) = goes {
         if goes == own {
             anyhow::bail!(
-                "that is this device's own key. The device that makes a change is always among \
-                 its devices: remove this device from another that stays."
+                "that is this device's own ID. The device that makes a change always stays: \
+                 remove this device on another device that stays."
             );
         }
         if applied.removes(&goes) || handed.knows_removed(&goes) {
-            anyhow::bail!("that key was removed already, by an earlier change.");
+            anyhow::bail!("that device was removed already, by an earlier change.");
         }
         let known = applied.lists(&goes)
             || handed
@@ -2421,7 +2595,7 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
             || handed.added.iter().any(|r| r.addition.device.key == goes);
         match known {
             true => {
-                println!("\nTo be removed: {}.", named(&handed.label(&goes), &goes));
+                println!("{}", to_be_removed(handed, &goes));
                 println!("  {}", handed.received_from(&goes));
             }
             // A key that this device knows nothing of is removed by key
@@ -2446,10 +2620,13 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
         .collect();
     if !elsewhere.is_empty() {
         println!(
-            "\nThis device knows {} to be removed by a change made apart from the one it \
-             follows. The change lists {} as removed too, and no device that was removed is \
-             in it:",
-            counted(elsewhere.len(), "key"),
+            "\nA change made separately from the one this device is on removed {}. This change \
+             removes {} too, and keeps no removed device:",
+            if elsewhere.len() == 1 {
+                "the device below"
+            } else {
+                "the devices below"
+            },
             if elsewhere.len() == 1 { "it" } else { "each" }
         );
         for key in &elsewhere {
@@ -2460,7 +2637,9 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
 
     if handed.heads.is_empty() {
         if let Which::Settle = which {
-            anyhow::bail!("this device has seen no two changes made apart: nothing to settle.");
+            anyhow::bail!(
+                "this device has seen no two changes made separately: there is nothing to settle."
+            );
         }
         // A removal, or a renewal.
         let asked = questions(handed, goes);
@@ -2491,26 +2670,29 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
         .chain(handed.heads.iter().map(|(head, _, _)| &head.statement))
         .collect();
     println!(
-        "\n{} changes were made apart. Each is shown from its signed bytes.",
-        heads.len()
+        "\nThese changes to your devices were made separately, {}. Each is shown as it was \
+         signed.",
+        match heads.len() {
+            2 => "neither knowing of the other",
+            _ => "none knowing of the others",
+        }
     );
     for (n, statement) in heads.iter().enumerate() {
         let says = match n {
-            0 => "this device follows",
-            _ => "set aside",
+            0 => "The change this device is on",
+            _ => "A change put aside",
         };
-        println!("\nChange {} ({says}):", statement.number);
+        println!("\n{says}{}:", number_shown(handed, statement.number));
         for line in lists_shown(statement, handed)? {
             println!("{line}");
         }
     }
     println!(
-        "\nThis change joins them: it is numbered above each, and undoes no removal: every key \
-         that any removed stays removed. Of each other device of any, say whether it stays, is \
-         removed, or is neither: one that is neither is in no list, and is added again by hand. \
-         Each device added since under the change this device follows is asked about too. A \
-         device added under a change set aside since it was made is not known here, and is in no \
-         list."
+        "\nThis change joins them. It comes after each, and undoes no removal: every device that \
+         any of them removed stays removed. For each other device in any of them, say whether it \
+         stays, is removed, or neither: one that is neither goes on no list, and you add it \
+         again yourself. Each device added since the change this device is on is asked about \
+         too. A device added since a change put aside is not known here, and goes on no list."
     );
     let gone = |key: &[u8; 32]| {
         Some(*key) == goes
@@ -2534,11 +2716,11 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
             .filter(|statement| statement.lists(&device.key));
         let of = match (listing.count(), applied.lists(&device.key)) {
             (n, _) if n == heads.len() => "every change shown",
-            (_, true) => "the change this device follows",
-            (_, false) => "a change set aside",
+            (_, true) => "the change this device is on",
+            (_, false) => "a change put aside",
         };
         let says = format!(
-            "\n{}, a device of {of}{}:",
+            "\n{}, in {of}{}:",
             named(&device.label, &device.key),
             match handed.left.contains(&device.key) {
                 true => format!(". {SAID_IT_LEFT}"),
@@ -2583,17 +2765,24 @@ fn asked(at: &impl Answers, handed: &Handed, which: &Which) -> anyhow::Result<Pr
     )?)
 }
 
+/// What a removal says first of the device it removes, `goes`, where this
+/// device knows it: by its words and then its name (decision 2026-11-11
+/// (plain words), rule 4), since a name can be forged.
+fn to_be_removed(handed: &Handed, goes: &[u8; 32]) -> String {
+    format!("\nTo be removed: {}.", named(&handed.label(goes), goes))
+}
+
 /// What `cordelia remove-device` says of a key that is in no list of the
 /// last change and was not added since (decision 2026-10-04 §10).
-const NO_DEVICE_IT_KNOWS: &str = "is no device of yours that this device knows of: it is in no \
-    list of the last change, and was not added since (`cordelia devices` lists those, each with \
-    its key).";
+const NO_DEVICE_IT_KNOWS: &str = "is not a device of yours that this device knows: it is not in \
+    the last change to your devices, and was not added since (`cordelia devices` lists those, each \
+    with its ID).";
 
 /// What removing such a key does, said before its answer is asked.
-const REFUSED_FOR_GOOD: &str = "Removing it refuses that key for good: the change lists it among \
-    its removed keys, no device of yours adds it after that, and no later change brings it back. \
-    That is for a key that was one of your devices before every device was added again, and \
-    that is not to be added.";
+const REFUSED_FOR_GOOD: &str = "Removing it refuses that device for good: the change lists it as \
+    removed, no device of yours can add it after that, and no later change brings it back. That \
+    is for a device that was yours before you added all your devices again, as after a recovery, \
+    and that must not come back.";
 
 /// The answer that removes a key which this device does not know.
 const REFUSES_THE_KEY: &str = "refuse";
@@ -2615,17 +2804,17 @@ const REFUSES_THE_KEY: &str = "refuse";
 fn refuses_a_key_it_does_not_know(at: &impl Answers, goes: &[u8; 32]) -> anyhow::Result<()> {
     if !cordelia_crypto::identity::is_usable_public_key(goes) {
         anyhow::bail!(
-            "that key is no device's key, and no device of yours: nothing is added under it, \
+            "that is not a device ID, and no device of yours: no device can be added with it, \
              so there is nothing to refuse. Nothing was done."
         );
     }
     println!(
-        "\nThe key ({}) {NO_DEVICE_IT_KNOWS}",
+        "\nThe device ({}) {NO_DEVICE_IT_KNOWS}",
         fingerprint::shown(goes)
     );
     println!("  {REFUSED_FOR_GOOD}");
     let typed = at.answer(&format!(
-        "  Type `{REFUSES_THE_KEY}` to refuse this key for good, or anything else to stop: "
+        "  Type `{REFUSES_THE_KEY}` to refuse this device for good, or anything else to stop: "
     ))?;
     match typed.as_deref() {
         Some(REFUSES_THE_KEY) => Ok(()),
@@ -2694,44 +2883,60 @@ fn own_addition(handed: &Handed, settles: bool) -> anyhow::Result<(String, Devic
         .find(|record| record.addition.device.key == own)
     else {
         anyhow::bail!(
-            "this device is not in the last change, and no record of its addition counts \
-             here: it makes no change. Add it again from a device that is in the last change."
+            "this device is not in the last change to your devices, and no record that adds it \
+             counts here, so it cannot make a change. Add it again from a device that is in the \
+             last change."
         );
     };
     let added = &record.addition;
     let applied = &handed.applied.statement;
     let this = named(&added.device.label, &own);
     let new = next_change(handed, settles);
+    // The numbers, with `-v` alone (decision 2026-11-11 (plain words),
+    // rule 4).
+    let number = |n: u64| number_shown(handed, n);
     let (signed_before, makes) = match (handed.heads.as_slice(), settles) {
         ([(apart, _, _)], true) => (
             format!(
-                "Neither change {} nor change {} lists this machine: both were made without it.",
-                applied.number, apart.statement.number
+                "Neither of the two changes{} includes this machine: both were made without it.",
+                match handed.verbose {
+                    true => format!(
+                        " (changes {} and {})",
+                        applied.number, apart.statement.number
+                    ),
+                    false => String::new(),
+                }
             ),
-            format!("This command makes change {new}, which settles the two."),
+            format!(
+                "This command makes a new change{} that settles the two.",
+                number(new)
+            ),
         ),
         ([_, ..], true) => (
             format!(
-                "None of the {} changes made apart lists this machine: each was made without \
-                 it.",
+                "None of the {} changes made separately includes this machine: each was made \
+                 without it.",
                 handed.heads.len() + 1
             ),
-            format!("This command makes change {new}, which joins them."),
+            format!(
+                "This command makes a new change{} that joins them.",
+                number(new)
+            ),
         ),
         _ => (
             format!(
-                "Your last change (change {}, made on {}) was signed before this machine was \
-                 added, so it does not list this machine.",
-                applied.number,
+                "Your last change{}, made on {}, was signed before this machine was added, so it \
+                 does not include this machine.",
+                number(applied.number),
                 lists_of(applied)?.made_on.named()
             ),
-            format!("This command makes change {new}."),
+            format!("This command makes a new change{}.", number(new)),
         ),
     };
     let says = format!(
         "\nA change is the list of your devices that your recovery phrase signs.\n\
          {signed_before} {} added this machine at {}, as {this}.\n\
-         {makes} The machine that makes a change is always in it, so change {new} will list \
+         {makes} The machine that makes a change is always in it, so the new change will include \
          this machine as {this}.",
         named(&handed.label(&added.adder), &added.adder),
         time_of(added.at)
@@ -2739,14 +2944,29 @@ fn own_addition(handed: &Handed, settles: bool) -> anyhow::Result<(String, Devic
     Ok((says, added.device.clone()))
 }
 
+/// A change's number as a line shows it after the change, where the
+/// command was given `-v`: " (change N)", and nothing otherwise (decision
+/// 2026-11-11 (plain words), rule 4).
+fn number_shown(handed: &Handed, number: u64) -> String {
+    match handed.verbose {
+        true => format!(" (change {number})"),
+        false => String::new(),
+    }
+}
+
 /// A statement's lists, a line each, read from the statement: each key
 /// with the first four words of its fingerprint. A removed key is listed
 /// bare in a statement, and is shown beside the label that this device
-/// knew it by.
+/// knew it by. The counts show with `-v` alone (decision 2026-11-11
+/// (plain words), rule 4); the words always, since a person decides here.
 fn lists_shown(statement: &Statement, handed: &Handed) -> anyhow::Result<Vec<String>> {
     let lists = lists_of(statement)?;
+    let counted = |n: usize| match handed.verbose {
+        true => format!(" ({n})"),
+        false => String::new(),
+    };
     let mut out = vec![format!("  made on {}", lists.made_on.named())];
-    out.push(format!("  devices ({}):", lists.devices.len()));
+    out.push(format!("  devices{}:", counted(lists.devices.len())));
     for (device, listed) in lists.devices.iter().zip(&statement.devices) {
         let own = match listed.key == handed.this_device {
             true => "  (this device)",
@@ -2762,20 +2982,18 @@ fn lists_shown(statement: &Statement, handed: &Handed) -> anyhow::Result<Vec<Str
         .collect();
     let earlier = statement.removed.len() - newly.len();
     if !newly.is_empty() {
-        out.push(format!("  removed keys ({}):", newly.len()));
+        out.push(format!("  removed devices{}:", counted(newly.len())));
     }
     for key in newly {
-        let known = match handed.label(key) {
-            label if label.is_empty() => String::new(),
-            label => format!(", known here as {label:?}"),
-        };
-        out.push(format!("    ({}){known}", fingerprint::shown(key)));
+        out.push(format!("    {}", named(&handed.label(key), key)));
     }
     if earlier > 0 {
-        out.push(format!(
-            "  and the {earlier} key{} that earlier changes removed",
-            if earlier == 1 { "" } else { "s" }
-        ));
+        out.push(match (handed.verbose, earlier) {
+            (true, 1) => "  and the 1 device that earlier changes removed".to_string(),
+            (true, n) => format!("  and the {n} devices that earlier changes removed"),
+            (false, 1) => "  and the device that earlier changes removed".to_string(),
+            (false, _) => "  and the devices that earlier changes removed".to_string(),
+        });
     }
     Ok(out)
 }
@@ -2832,8 +3050,7 @@ fn signed(at: &Terminal, prepared: Prepared, handed: &Handed) -> anyhow::Result<
     match prepared.sign(&phrase, &handed.held, &joined) {
         Ok(entry) => Ok(entry),
         Err(PersonError::Statement(StatementError::AnotherPhrase)) => anyhow::bail!(
-            "that is a recovery phrase, and it is not the one that this device follows: \
-             nothing was made."
+            "that is a recovery phrase, but not the one this device is under: nothing was made."
         ),
         Err(e) => anyhow::bail!("{e}: nothing was made."),
     }
@@ -2858,27 +3075,37 @@ pub const NOT_AT_EVERY_RELAY_STATUS: i32 = 3;
 /// What this process has said is written out first. Where the program
 /// cannot be run again (it was replaced where it lay, say), nothing waits
 /// in this process: the command says where to look, and ends.
-fn stays_in_a_new_process(config_path: &str, number: u64, made: &[u8; 32]) -> anyhow::Result<()> {
+fn stays_in_a_new_process(
+    config_path: &str,
+    number: u64,
+    made: &[u8; 32],
+    verbose: bool,
+) -> anyhow::Result<()> {
     use std::io::Write;
     // The change is made: a failure from here on gives the status of a
     // change not known to be at every relay, and never 1 (decision
     // 2026-10-19 §4, rule 8).
     if let Err(e) = std::io::stdout().flush() {
-        eprintln!("{}", wait::could_not_go_on(number, &e.into()));
+        eprintln!("{}", wait::could_not_go_on(number, &e.into(), verbose));
         std::process::exit(NOT_AT_EVERY_RELAY_STATUS);
     }
     #[cfg(unix)]
     let failed = {
         use std::os::unix::process::CommandExt;
         match std::env::current_exe() {
-            Ok(program) => std::process::Command::new(program)
-                .arg("--config")
-                .arg(config_path)
-                .arg(STAYS_COMMAND)
-                .arg(number.to_string())
-                .arg("--entry")
-                .arg(hex::encode(made))
-                .exec(),
+            Ok(program) => {
+                let mut wait = std::process::Command::new(program);
+                wait.arg("--config")
+                    .arg(config_path)
+                    .arg(STAYS_COMMAND)
+                    .arg(number.to_string())
+                    .arg("--entry")
+                    .arg(hex::encode(made));
+                if verbose {
+                    wait.arg("-v");
+                }
+                wait.exec()
+            }
             Err(e) => e,
         }
     };
@@ -2939,11 +3166,11 @@ fn status_of(waited: &anyhow::Result<Waited>) -> i32 {
 /// entry `made` names in hex, is made ([`stays`]). It asks nothing, and
 /// holds no phrase. Gives the command's exit status ([`status_of`]): an
 /// error during the wait is said on standard error first, with that the
-/// change is made.
-pub fn change_made(config_path: &str, number: u64, made: Option<&str>) -> i32 {
+/// change is made, and its number with `verbose`.
+pub fn change_made(config_path: &str, number: u64, made: Option<&str>, verbose: bool) -> i32 {
     let waited = stays(config_path, number, made);
     if let Err(e) = &waited {
-        eprintln!("{}", wait::could_not_go_on(number, e));
+        eprintln!("{}", wait::could_not_go_on(number, e, verbose));
     }
     status_of(&waited)
 }
@@ -3060,22 +3287,19 @@ fn after_a_change(seen: &Value, number: u64, own: &[u8; 32], now_at: i64) -> Vec
         now.push(match own_word.then(|| own_carried_line(seen)).flatten() {
             Some(line) => line,
             None => "keep this machine on: this device has not yet sent every relay what it \
-                     carried"
+                     copied over"
                 .into(),
         });
     }
     for device in list(seen, "devices").filter(|device| !is_own(device, own)) {
         let applied = device["applied"].as_u64() == Some(number);
         now.push(match (applied, device["sent"] == true) {
-            (true, true) => format!(
-                "{} has applied the change, and has sent what it held",
-                shown(device)
-            ),
+            (true, true) => format!("{} is up to date, and has sent all it has", shown(device)),
             // Its carried word (decision 2026-10-19, rule 6, S5).
             (true, false) if let Some(word) = carried_word_of(device) => {
                 let (held, not_yet) = held_by_another(&word, seen);
                 let mut said = format!(
-                    "{} has applied the change, and has sent what it held to {held}",
+                    "{} is up to date, and has sent what it has to {held}",
                     shown(device)
                 );
                 if not_yet > 0 {
@@ -3084,10 +3308,10 @@ fn after_a_change(seen: &Value, number: u64, own: &[u8; 32], now_at: i64) -> Vec
                 said
             }
             (true, false) => format!(
-                "{} has applied the change, and is still sending what it held",
+                "{} is up to date, and still sending what it has",
                 shown(device)
             ),
-            (false, _) => format!("{} has not applied the change yet", shown(device)),
+            (false, _) => format!("{} is not up to date yet", shown(device)),
         });
     }
     now
@@ -3182,6 +3406,12 @@ impl AfterAChange for TheNode<'_> {
     }
 }
 
+/// What the wait after a change ends with where this device has since
+/// taken in another change: whether that one is at every relay is the
+/// business of the command that made it.
+const ANOTHER_CHANGE: &str = "This device is now on another change to your devices: `cordelia \
+                              devices` shows it.";
+
 /// [`stays`], of what `node` says, with each line said by `say`: S1, then
 /// each line of each look that was not in the last, with its time, and
 /// once a minute where none comes ([`wait::Told`], decision 2026-10-24,
@@ -3221,7 +3451,7 @@ fn waits_after(
         }
         if seen["change"].as_u64() != Some(number) {
             say(wait::Told::ended(at));
-            say("This device has since applied another change: `cordelia devices` says.".into());
+            say(ANOTHER_CHANGE.into());
             return Ok(Waited::Another);
         }
         if let Some(line) = wait::no_longer_stands(&seen) {
@@ -3231,7 +3461,7 @@ fn waits_after(
         }
         if made.is_some_and(|made| seen["latest"].as_str() != Some(made)) {
             say(wait::Told::ended(at));
-            say("This device has since applied another change: `cordelia devices` says.".into());
+            say(ANOTHER_CHANGE.into());
             return Ok(Waited::Another);
         }
         let (relays, word, end) = wait::end_of_look(&seen, number, &own)?;
@@ -3282,32 +3512,34 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
     config.apply_env_overrides();
     let key_path = config.data_dir().join(cordelia_api::commands::KEY_FILE);
     if !key_path.exists() {
-        anyhow::bail!("this device has no key yet: `cordelia init` gives it one.");
+        anyhow::bail!("this device is not set up yet: run `cordelia init` first.");
     }
     let seen = look_with_what_waits(config_path)?;
-    names_this_device(&seen, &NodeIdentity::from_file(&key_path)?.public_key())?;
+    let own = NodeIdentity::from_file(&key_path)?.public_key();
+    names_this_device(&seen, &own)?;
     let leaves = match (text(&seen, "among"), seen["others"].as_u64().unwrap_or(0)) {
         ("several", others) => format!(
-            "It leaves the {others} device{} it is with, and says so to {} first. It still \
-             holds what it held, and its old key is still listed there: removing that key, \
-             with the phrase, is what cuts it off.",
-            if others == 1 { "" } else { "s" },
+            "It leaves {}, and tells {} first. It keeps everything it has, and its old ID stays \
+             on their list: only removing the old ID there, with the recovery phrase, cuts it \
+             off.",
+            others_named(&seen, &own),
             if others == 1 { "it" } else { "them" },
         ),
-        ("alone", _) => "The recovery phrase that it follows stops working here, and what the \
-                         relays hold under it is left behind."
+        ("alone", _) => "The recovery phrase it is under stops working here, and what the relays \
+                         keep under it is left behind."
             .into(),
-        ("no_phrase", _) => "It follows no recovery phrase, and has nothing to leave.".into(),
+        ("no_phrase", _) => "It is not under a recovery phrase, and has nothing to leave.".into(),
         _ => "It has stopped, and says nothing to the devices it was with.".into(),
     };
     if let Some(waits) = waits_says(&seen) {
         println!("{waits}");
     }
     let agreed = at.yes(&format!(
-        "This gives this device a new key. {leaves}\nIt keeps its memory folders and their \
-         mappings, and forgets everything else that it held of your devices: the phrase it \
-         followed, every secret, and what its folders had agreed. It then follows no recovery \
-         phrase, and is added as a new device."
+        "This starts this device over as a new device, with a new ID. {leaves}\nIt keeps its \
+         memory folders and their mappings, and forgets everything else it had of your devices: \
+         which recovery phrase it was under, every secret, and where its folders last agreed \
+         with your other devices. It is then not under a recovery phrase, and you add it as a \
+         new device."
     ))?;
     if !agreed {
         println!("{NOT_A_YES}");
@@ -3343,8 +3575,8 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
         }
         if !not_sent.is_empty() {
             let goes_on = at.yes(
-                "Under a new key nothing more can be sent in the old one's name. Go on \
-                 without having told them?",
+                "Once it starts over, this device can send nothing more as the old one. Go on \
+                 without telling them?",
             )?;
             if !goes_on {
                 // It leaves nobody: its word that it left is taken back,
@@ -3352,12 +3584,12 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
                 // word, none is sent it.
                 let back = api_post(config_path, "/api/v1/devices/leave/back", json!({}))?;
                 let word = match back["taken_back"] == true {
-                    true => ", and has taken back its word that it left",
+                    true => ", and has told them it is not leaving after all",
                     false => "",
                 };
                 println!(
-                    "Stopped. This device keeps its key and what it holds{word}: run `cordelia \
-                     init --new-key` again when a relay is reached."
+                    "Stopped. This device stays as it was{word}: run `cordelia init --new-key` \
+                     again once a relay is reached."
                 );
                 return Ok(());
             }
@@ -3389,7 +3621,7 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
     if config_file.exists() {
         written.save(&config_file)?;
     }
-    println!("\nThis device has a new key:\n  {key}");
+    println!("\nThis device has a new ID:\n  {key}");
     println!("{}", after_a_new_key_says(std::env::consts::OS));
     Ok(())
 }
@@ -3402,9 +3634,9 @@ pub fn new_key(config_path: &str) -> anyhow::Result<()> {
 /// that follows no phrase.
 fn after_a_new_key_says(os: &str) -> String {
     format!(
-        "It follows no recovery phrase. Its memory folders and their mappings are as they \
-         were.\nThe node still runs under the old key. Before anything else, restart the \
-         node:\n{}\nThe status then names the ways on.",
+        "It is not under a recovery phrase. Its memory folders and their mappings are as they \
+         were.\nThe node still runs as the old device. Before anything else, restart the \
+         node:\n{}\nThe status then says what to do next.",
         cordelia_api::commands::restart_says(os)
     )
 }
@@ -3446,8 +3678,8 @@ fn give_new_key(
 ) -> anyhow::Result<()> {
     let beside = write_beside(path, seed).map_err(|e| {
         anyhow::anyhow!(
-            "could not write the new key ({e}): nothing was changed. The key file is as it \
-             was, and this device keeps the key it had and what it holds of your devices."
+            "could not write the new ID ({e}): nothing was changed. This device keeps the ID it \
+             had, and what it has of your devices."
         )
     })?;
     let discarded = || {
@@ -3458,28 +3690,28 @@ fn give_new_key(
         Forgot::No(why) => {
             discarded();
             anyhow::bail!(
-                "{why}\nThe node did not forget what it holds of your devices, and the new key \
-                 was discarded: this device keeps the key it had and what it holds. Where it \
-                 said that it left, that word stands. Run `cordelia init --new-key` again."
+                "{why}\nThe node did not forget what it has of your devices, and the new ID was \
+                 thrown away: this device keeps the ID it had, and what it has. If it said that \
+                 it left, that stays said. Run `cordelia init --new-key` again."
             );
         }
         Forgot::NotKnown(why) => {
             discarded();
             anyhow::bail!(
-                "{why}\nIt is not known whether the node forgot what it holds of your devices: \
-                 its answer was lost. The new key was discarded, and this device keeps the key \
-                 it had. `cordelia devices` says where it stands: if it follows no recovery \
-                 phrase, the node has forgotten. Either way, run `cordelia init --new-key` \
-                 again to give it a new key."
+                "{why}\nIt is not known whether the node forgot what it had of your devices: its \
+                 answer was lost. The new ID was thrown away, and this device keeps the ID it \
+                 had. `cordelia devices` says where it stands: if it shows no recovery phrase, \
+                 the node has forgotten. Either way, run `cordelia init --new-key` again to start \
+                 it over."
             );
         }
     }
     if let Err(e) = std::fs::rename(&beside, path) {
         discarded();
         anyhow::bail!(
-            "the node has forgotten what it held of your devices, and the new key could not be \
-             put in the place of the old one ({e}): this device keeps the key it had, and \
-             follows no recovery phrase. Run `cordelia init --new-key` again."
+            "the node has forgotten what it had of your devices, and the new ID could not \
+             replace the old one ({e}): this device keeps the ID it had, and is not under a \
+             recovery phrase. Run `cordelia init --new-key` again."
         );
     }
     // The name is flushed too, as far as the volume can.
@@ -3532,31 +3764,58 @@ mod tests {
     const OTHER_PHRASE: &str =
         "letter advice cage absurd amount doctor acoustic avoid letter advice cage above";
 
-    /// `add-device`'s yes counts the shared channels the person holds, in
+    /// `add-device`'s yes names the shared channels the person holds, in
     /// one line, as the record writes it (decision 2026-10-10 §5.2, made
-    /// terser on 11 November 2026, issue #338), and says nothing of them
-    /// where the person holds none.
+    /// terser on 11 November 2026, issue #338): a few by name, and then
+    /// how many more (decision 2026-11-11 (plain words), rule 2); with
+    /// `-v`, every one, with how many devices are in it (rule 4). It says
+    /// nothing of them where the person holds none.
     #[test]
     fn add_device_counts_the_shared_channels_in_its_one_line() {
         const RECORD: &str =
             include_str!("../../../docs/decisions/2026-10-10-a-shared-channel-for-messages.md");
-        let yes = |would: &Value| add_device_yes("<device>", would);
+        let yes = |would: &Value| add_device_yes("<device>", would, false);
         let none = yes(&json!({ "shared": [] }));
         assert_eq!(none, yes(&json!({})));
         let one = yes(&json!({ "shared": [{ "name": "design", "keys": 1 }] }));
-        let two = yes(&json!({ "shared": [
+        let two = json!({ "shared": [
             { "name": "review-with-alice", "keys": 3 },
             { "name": "design", "keys": 1 },
-        ] }));
-        for line in [&none, &one, &two.replace("the 2 ", "the <n> ")] {
+        ] });
+        let both = "\"review-with-alice\" and \"design\"";
+        for line in [
+            none.clone(),
+            one.replace("\"design\"", "<name>"),
+            yes(&two).replace(both, "<names>"),
+        ] {
             assert!(
                 RECORD.contains(line.as_str()),
                 "the record does not say: {line}"
             );
         }
         assert!(
-            one.contains(", the shared channel you are in, and"),
+            one.contains(", the shared channel \"design\" you are in, and"),
             "{one}"
+        );
+        // Five: three by name, and how many more.
+        let five: Vec<Value> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|name| json!({ "name": name, "keys": 2 }))
+            .collect();
+        let five = json!({ "shared": five });
+        assert!(
+            yes(&five).contains("the shared channels \"a\", \"b\", \"c\" and 2 more you are in"),
+            "{}",
+            yes(&five)
+        );
+        // With `-v`, each, with how many devices are in it.
+        assert!(
+            add_device_yes("<device>", &two, true).contains(
+                "the shared channels \"review-with-alice\" (3 devices) and \"design\" (1 device) \
+                 you are in"
+            ),
+            "{}",
+            add_device_yes("<device>", &two, true)
         );
     }
 
@@ -3790,7 +4049,7 @@ mod tests {
         assert!(said.contains(&STAYS_AT_A_REMOVAL.to_string()), "{said:?}");
         for repository in ["example.org/team/project", "example.org/team/other"] {
             let line = format!(
-                "\nThis device follows {repository}: take the removed device's access to it \
+                "\nYou follow {repository} on this device: take the removed device's access to it \
                  away there, and delete its line from .cordelia/members in a pull request."
             );
             assert!(said.contains(&line), "{said:?}");
@@ -3816,10 +4075,7 @@ mod tests {
         let mut handed = f.handed(&f.statement, &[f.adds(key(5), "laptop")]);
         handed["this_device"] = encode_public_key(&key(5)).unwrap().into();
         let refused = Handed::of(&handed, &own).err().unwrap().to_string();
-        assert!(
-            refused.contains("does not name this device's key"),
-            "{refused}"
-        );
+        assert!(refused.contains("is not this device"), "{refused}");
         assert!(refused.contains(&fingerprint::shown(&own)), "{refused}");
         // The control: the device whose key that is reads the same answer.
         assert!(Handed::of(&handed, &key(5)).is_ok());
@@ -3914,7 +4170,7 @@ mod tests {
         assert_eq!(
             asked[2].says,
             format!(
-                "\n{}, added since the last change, from {} at {}:",
+                "\n{}, added since the last change to your devices, by {} at {}:",
                 named("tablet", &key(6)),
                 named("desktop", &key(5)),
                 time_of(7)
@@ -3935,6 +4191,101 @@ mod tests {
             .map(|asked| asked.device.key)
             .collect();
         assert_eq!(keys, [key(5), key(6), key(7)]);
+    }
+
+    /// **Every decision about a device shows its fingerprint words, then
+    /// its name** (decision 2026-11-11 (plain words), rule 4): a name can
+    /// be forged, and the words are the check. Each question of a
+    /// renewal, a removal and a settlement; the device a removal removes
+    /// and those it removes with it; who added this machine; and each
+    /// device of the lists the phrase signs: none names a device by its
+    /// name alone, `-v` or not.
+    #[test]
+    fn every_decision_about_a_device_shows_its_fingerprint_words() {
+        let f = Fixture::new();
+        let id = |n: u8| NodeIdentity::from_seed([n; 32]).unwrap();
+        let key = |n: u8| id(n).public_key();
+        // Each device, by its words and its name, as a decision names it;
+        // and its name alone, as the list of `cordelia devices` names it.
+        let devices = [
+            (f.own.public_key(), "laptop"),
+            (f.listed, "phone"),
+            (key(5), "desktop"),
+            (key(6), "tablet"),
+        ];
+        let words_first = |line: &str| {
+            for (key, label) in devices {
+                let alone = format!("{label:?}");
+                if line.contains(&alone) {
+                    assert!(
+                        line.contains(&format!("({}) {alone}", fingerprint::shown(&key))),
+                        "{label} without its words: {line}"
+                    );
+                }
+            }
+        };
+        // The phone has said that it left; this device added the desktop,
+        // which added the tablet.
+        let records = [
+            f.adds(key(5), "desktop"),
+            f.added_by(&id(5), key(6), "tablet"),
+        ];
+        let mut handed = f.handed(&f.statement, &records);
+        handed["left"] = json!([encode_public_key(&f.listed).unwrap()]);
+        for verbose in [false, true] {
+            let mut read = f.read(&handed).unwrap();
+            read.verbose = verbose;
+            // A renewal's questions, and the lists that the phrase signs.
+            let typed = Typed::of(&["stays", "stays", "stays"]);
+            let prepared = asked(&typed, &read, &Which::Renew).unwrap();
+            assert_eq!(typed.asked.borrow().len(), 3);
+            for question in typed.asked.borrow().iter() {
+                words_first(question);
+            }
+            let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+            let lists = lists_shown(&signs, &read).unwrap();
+            assert!(lists.len() > 4, "{lists:?}");
+            for line in &lists {
+                words_first(line);
+            }
+            // A removal of the desktop names it, and removes the tablet
+            // with it.
+            let goes = to_be_removed(&read, &key(5));
+            assert!(goes.contains(&named("desktop", &key(5))), "{goes}");
+            words_first(&goes);
+            let with_it = added_by_the_one_that_goes(&read, Some(key(5)));
+            words_first(&removed_with_it(&with_it));
+            assert!(removed_with_it(&with_it).contains(&named("tablet", &key(6))));
+            let typed = Typed::of(&["stays"]);
+            let prepared = asked(&typed, &read, &Which::Remove(key(5))).unwrap();
+            for question in typed.asked.borrow().iter() {
+                words_first(question);
+            }
+            let signs = Statement::from_bytes(prepared.bytes()).unwrap();
+            for line in lists_shown(&signs, &read).unwrap() {
+                words_first(&line);
+            }
+        }
+        // A machine added since: who added it, and as what.
+        let mut added = f.handed(&f.statement, &records);
+        added["this_device"] = encode_public_key(&key(5)).unwrap().into();
+        let read = Handed::of(&added, &key(5)).unwrap();
+        let (says, _) = own_addition(&read, false).unwrap();
+        assert!(says.contains(&named("desktop", &key(5))), "{says}");
+        words_first(&says);
+        // A settlement: each device of either change is asked about.
+        let (apart, apart_entry) = f.apart(2);
+        handed["heads"] = json!([{
+            "statement": hex::encode(apart.to_bytes().unwrap()),
+            "entry": hex::encode(apart_entry.to_wire()),
+        }]);
+        let read = f.read(&handed).unwrap();
+        let typed = Typed::of(&["stays", "stays", "stays", "stays"]);
+        asked(&typed, &read, &Which::Settle).unwrap();
+        assert!(!typed.asked.borrow().is_empty());
+        for question in typed.asked.borrow().iter() {
+            words_first(question);
+        }
     }
 
     /// A removal removes every key the device it removes added since the
@@ -4077,8 +4428,8 @@ mod tests {
         assert_eq!(
             asked[0].says,
             format!(
-                "\n{}, a device of the last change. It has said that it left, and started \
-                 again under another phrase: it still holds what it held:",
+                "\n{}, in the last change to your devices. It has said that it left, and \
+                 started again under another recovery phrase: it still has what it had:",
                 named("phone", &f.listed)
             )
         );
@@ -4129,7 +4480,7 @@ mod tests {
         handed["this_device"] = encode_public_key(&five).unwrap().into();
         let read = Handed::of(&handed, &five).unwrap();
         let refused = own_addition(&read, false).err().unwrap().to_string();
-        assert!(refused.contains("it makes no change"), "{refused}");
+        assert!(refused.contains("it cannot make a change"), "{refused}");
     }
 
     /// **The question to a device added since the last change says what a
@@ -4150,10 +4501,26 @@ mod tests {
             says,
             format!(
                 "\nA change is the list of your devices that your recovery phrase signs.\nYour \
-                 last change (change 2, made on {laptop}) was signed before this machine was \
-                 added, so it does not list this machine. {laptop} added this machine at {}, as \
-                 {desktop}.\nThis command makes change 3. The machine that makes a change is \
-                 always in it, so change 3 will list this machine as {desktop}.",
+                 last change, made on {laptop}, was signed before this machine was added, so it \
+                 does not include this machine. {laptop} added this machine at {}, as \
+                 {desktop}.\nThis command makes a new change. The machine that makes a change is \
+                 always in it, so the new change will include this machine as {desktop}.",
+                time_of(7)
+            )
+        );
+        // With `-v`, the numbers (decision 2026-11-11 (plain words), rule 4).
+        let mut verbose = Handed::of(&handed, &five).unwrap();
+        verbose.verbose = true;
+        let (says, _) = own_addition(&verbose, false).unwrap();
+        assert_eq!(
+            says,
+            format!(
+                "\nA change is the list of your devices that your recovery phrase signs.\nYour \
+                 last change (change 2), made on {laptop}, was signed before this machine was \
+                 added, so it does not include this machine. {laptop} added this machine at {}, \
+                 as {desktop}.\nThis command makes a new change (change 3). The machine that \
+                 makes a change is always in it, so the new change will include this machine as \
+                 {desktop}.",
                 time_of(7)
             )
         );
@@ -4163,16 +4530,30 @@ mod tests {
             "statement": hex::encode(apart.to_bytes().unwrap()),
             "entry": hex::encode(apart_entry.to_wire()),
         }]);
-        let read = Handed::of(&handed, &five).unwrap();
+        let mut read = Handed::of(&handed, &five).unwrap();
         let (says, _) = own_addition(&read, true).unwrap();
         assert_eq!(
             says,
             format!(
                 "\nA change is the list of your devices that your recovery phrase signs.\n\
-                 Neither change 2 nor change 3 lists this machine: both were made without it. \
-                 {laptop} added this machine at {}, as {desktop}.\nThis command makes change 4, \
-                 which settles the two. The machine that makes a change is always in it, so \
-                 change 4 will list this machine as {desktop}.",
+                 Neither of the two changes includes this machine: both were made without it. \
+                 {laptop} added this machine at {}, as {desktop}.\nThis command makes a new \
+                 change that settles the two. The machine that makes a change is always in it, \
+                 so the new change will include this machine as {desktop}.",
+                time_of(7)
+            )
+        );
+        read.verbose = true;
+        let (says, _) = own_addition(&read, true).unwrap();
+        assert_eq!(
+            says,
+            format!(
+                "\nA change is the list of your devices that your recovery phrase signs.\n\
+                 Neither of the two changes (changes 2 and 3) includes this machine: both were \
+                 made without it. {laptop} added this machine at {}, as {desktop}.\nThis command \
+                 makes a new change (change 4) that settles the two. The machine that makes a \
+                 change is always in it, so the new change will include this machine as \
+                 {desktop}.",
                 time_of(7)
             )
         );
@@ -4227,12 +4608,12 @@ mod tests {
         let listing = asked.last().unwrap();
         assert!(
             listing.contains(
-                "Neither change 2 nor change 3 lists this machine: both were made without it."
+                "Neither of the two changes includes this machine: both were made without it."
             ),
             "{listing}"
         );
         assert!(
-            listing.contains("This command makes change 4, which settles the two."),
+            listing.contains("This command makes a new change that settles the two."),
             "{listing}"
         );
         let signs = Statement::from_bytes(prepared.bytes()).unwrap();
@@ -4296,7 +4677,7 @@ mod tests {
             let refused = asked(&Typed::of(&[]), &read, &Which::Remove(goes));
             assert_eq!(
                 refused.err().unwrap().to_string(),
-                "that key was removed already, by an earlier change."
+                "that device was removed already, by an earlier change."
             );
         }
     }
@@ -4354,7 +4735,7 @@ mod tests {
         let signs = Statement::from_bytes(prepared.bytes()).unwrap();
         joins(&signs, &[&f.statement, &apart]);
         assert!(signs.lists(&f.listed));
-        assert!(typed.asked.borrow()[0].contains("a device of the change this device follows"));
+        assert!(typed.asked.borrow()[0].contains(", in the change this device is on"));
         // A device added since under the change followed is asked about
         // too, with the third answer: it is not left out unasked.
         let desktop = NodeIdentity::from_seed([5; 32]).unwrap().public_key();
@@ -4456,31 +4837,36 @@ mod tests {
         stay.push(Device::new(key(5), "desktop").unwrap());
         let prepared = prepare_change(&f.statement, &own, stay, &[key(6)]).unwrap();
         let signs = Statement::from_bytes(prepared.bytes()).unwrap();
-        let shown = lists_shown(&signs, &handed).unwrap();
-        assert_eq!(
-            shown,
+        let mut handed = handed;
+        let lines = |handed: &Handed| lists_shown(&signs, handed).unwrap();
+        let listed = |counted: &str, earlier: &str| {
             [
                 format!("  made on ({}) \"laptop\"", fingerprint::shown(&own)),
-                "  devices (3):".to_string(),
+                format!("  devices{counted}:"),
                 format!(
                     "    ({}) \"laptop\"  (this device)",
                     fingerprint::shown(&own)
                 ),
                 format!("    ({}) \"phone\"", fingerprint::shown(&f.listed)),
                 format!("    ({}) \"desktop\"", fingerprint::shown(&key(5))),
-                "  removed keys (1):".to_string(),
-                format!("    ({})", fingerprint::shown(&key(6))),
-                "  and the 1 key that earlier changes removed".to_string(),
+                format!("  removed devices{}:", counted.replace('3', "1")),
+                format!("    the device ({})", fingerprint::shown(&key(6))),
+                format!("  and the {earlier}device that earlier changes removed"),
             ]
-        );
+        };
+        // Without `-v`, no counts (decision 2026-11-11 (plain words), rule
+        // 4); the fingerprint words always, since a person decides here.
+        assert_eq!(lines(&handed), listed("", ""));
+        handed.verbose = true;
+        assert_eq!(lines(&handed), listed(" (3)", "1 "));
         // The statement that the device has applied, shown as it is: its
         // one removed key is its own.
         let shown = lists_shown(&f.statement.statement, &handed).unwrap();
         assert_eq!(shown.len(), 6);
-        assert_eq!(shown[4], "  removed keys (1):");
+        assert_eq!(shown[4], "  removed devices (1):");
         assert_eq!(
             shown[5],
-            format!("    ({})", fingerprint::shown(&f.removed))
+            format!("    the device ({})", fingerprint::shown(&f.removed))
         );
     }
 
@@ -4559,9 +4945,9 @@ mod tests {
         })
         .unwrap_err()
         .to_string();
-        assert!(refused.contains("could not write the new key"), "{refused}");
+        assert!(refused.contains("could not write the new ID"), "{refused}");
         assert!(refused.contains("nothing was changed"), "{refused}");
-        assert!(refused.contains("keeps the key it had"), "{refused}");
+        assert!(refused.contains("keeps the ID it had"), "{refused}");
 
         // The node refuses to forget: the device keeps its key and what
         // it holds.
@@ -4570,7 +4956,7 @@ mod tests {
             .to_string();
         assert!(refused.starts_with("the node is busy\n"), "{refused}");
         assert!(
-            refused.contains("keeps the key it had and what it holds"),
+            refused.contains("keeps the ID it had, and what it has"),
             "{refused}"
         );
         as_it_was();
@@ -4600,11 +4986,11 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            not_placed.contains("the node has forgotten what it held"),
+            not_placed.contains("the node has forgotten what it had"),
             "{not_placed}"
         );
         assert!(
-            not_placed.contains("keeps the key it had, and follows no recovery phrase"),
+            not_placed.contains("keeps the ID it had, and is not under a recovery phrase"),
             "{not_placed}"
         );
         assert!(!dir.path().join("a-folder.key.new").exists());
@@ -4869,7 +5255,7 @@ mod tests {
         );
         assert!(
             said.contains(
-                "keep this machine on: this device has not yet sent every relay what it carried"
+                "keep this machine on: this device has not yet sent every relay what it copied over"
             ),
             "{said}"
         );
@@ -5214,9 +5600,7 @@ mod tests {
                     let (relays, word, _) = wait::end_of_look(&seen, 3, &own).unwrap();
                     wait::end_lines(end, &relays, word, at)
                 }
-                Waited::Another => vec![
-                    "This device has since applied another change: `cordelia devices` says.".into(),
-                ],
+                Waited::Another => vec![ANOTHER_CHANGE.into()],
                 Waited::NoLongerStands => vec![wait::no_longer_stands(&seen).unwrap()],
                 Waited::Moved => unreachable!("no change was named, so none was moved from"),
             };
@@ -5240,8 +5624,8 @@ mod tests {
         use wait::OwnWord;
         use wait::tests::{KEPT, Scenario::Ok as Reached};
         let made = hex::encode(KEPT);
-        let says = "a change made apart on (w) \"desktop\" removed (x) \"tablet\", which this \
-                    change lists: this device follows that change now";
+        let says = "a change made separately on (w) \"desktop\" removed (x) \"tablet\", which \
+                    this change lists: this device is on that change now";
         let waited_on = |seen: Value| {
             let node = Looks::from(AT_10_53, vec![(AT_10_53 + 5, seen)]);
             let mut said = Vec::new();
@@ -5389,13 +5773,15 @@ mod tests {
         assert_eq!(look_asks(true), json!({ "sent_to_no_relay": true }));
         assert_eq!(
             waits_says(&seen(1, 1)).unwrap(),
-            "1 version of 1 name that this device holds has been sent to no relay yet: it is \
-             let go with everything else that it holds."
+            "1 version of 1 name on this device has not reached any relay yet: it is removed \
+             from this device, with everything else it has of your devices. The files in its \
+             memory folders stay."
         );
         assert_eq!(
             waits_says(&seen(5, 2)).unwrap(),
-            "5 versions of 2 names that this device holds have been sent to no relay yet: they \
-             are let go with everything else that it holds."
+            "5 versions of 2 names on this device have not reached any relay yet: they are \
+             removed from this device, with everything else it has of your devices. The files in \
+             its memory folders stay."
         );
     }
 
@@ -5406,8 +5792,8 @@ mod tests {
     /// §16). Where nothing waits, the yes says what it said.
     #[test]
     fn accepting_alone_says_what_the_device_has_sent_to_no_relay() {
-        let leaves = "The recovery phrase that this device follows stops working here: this \
-                      device leaves it, and joins the devices of the device (w1 w2 w3 w4).";
+        let leaves = "The recovery phrase this device is under stops working here: this device \
+                      leaves it, and joins the devices of the device (w1 w2 w3 w4).";
         let from = "the device (w1 w2 w3 w4)";
         let waits = json!({
             "among": "alone",
@@ -5416,8 +5802,9 @@ mod tests {
         assert_eq!(
             alone_says(&waits, from),
             format!(
-                "3 versions of 1 name that this device holds have been sent to no relay yet: \
-                 they are let go with everything else that it holds.\n{leaves}"
+                "3 versions of 1 name on this device have not reached any relay yet: they are \
+                 removed from this device, with everything else it has of your devices. The \
+                 files in its memory folders stay.\n{leaves}"
             )
         );
         let none = json!({
@@ -5442,8 +5829,9 @@ mod tests {
                 "sent_to_no_relay": { "versions": 2, "names": 1 },
             })
         };
-        let waits = "2 versions of 1 name that this device holds have been sent to no relay \
-                     yet: they are let go with everything else that it holds.";
+        let waits = "2 versions of 1 name on this device have not reached any relay yet: they \
+                     are removed from this device, with everything else it has of your devices. \
+                     The files in its memory folders stay.";
         for asks_a_yes in ["alone", "several"] {
             let said = waits_before_a_new_phrase(&seen(asks_a_yes));
             assert_eq!(said.as_deref(), Some(waits), "{asks_a_yes}");
@@ -5500,21 +5888,21 @@ mod tests {
                   "key": "cordelia_pk1notshown" },
             ],
         });
-        let lines = devices_lines(&seen, &key(1)).join("\n");
+        let lines = devices_lines(&seen, &key(1), true).join("\n");
         // A key that is not in the last change is shown by its label,
         // and its key is asked for as that device prints it. One that a
         // recovery could not show is shown with its key (§9).
         assert!(
             lines.contains(
-                "(t t t t) \"tablet\": add it again, or it was meant to go. Its key is the one \
-                 it prints (`cordelia id`)."
+                "(t t t t) \"tablet\": add it again, unless you meant it to go. Its ID is what \
+                 `cordelia id` prints on it."
             ),
             "{lines}"
         );
         assert!(
             lines.contains(
-                "(n n n n) \"added 7\"  cordelia_pk1notshown: the recovery could not show it, \
-                 and asked nothing of it."
+                "(n n n n) \"added 7\"  cordelia_pk1notshown: the recovery could not show this \
+                 device, so it asked you nothing about it."
             ),
             "{lines}"
         );
@@ -5535,25 +5923,25 @@ mod tests {
         assert!(lines.contains("(w) \"desktop\": this device"), "{lines}");
         assert!(!lines.contains("\"laptop\": this device"), "{lines}");
         assert!(
-            lines.contains("(w) \"laptop\": has applied change 2, and has sent what it held"),
+            lines.contains("(w) \"laptop\": up to date (change 2)\n"),
             "{lines}"
         );
         assert!(
             lines.contains(
-                "(w) \"tablet\": has applied change 2, and is still sending what it held (if it \
-                 is lost now, what it had not sent is lost with it; `cordelia sync carry` brings \
-                 in what it had sent before)"
+                "(w) \"tablet\": up to date (change 2), and still sending what it has (if you \
+                 lose it now, what it has not sent is lost; `cordelia sync carry` copies in what \
+                 it sent before)"
             ),
             "{lines}"
         );
-        // A device that has not applied the change is not said to have
+        // A device that has not taken in the change is not said to have
         // sent anything, whatever its word of an earlier one says.
         assert!(
-            lines.contains("(w) \"phone\": has not applied change 2 yet"),
+            lines.contains("(w) \"phone\": not yet on change 2, as far as this device knows"),
             "{lines}"
         );
         assert!(
-            lines.contains("`cordelia sync carry` brings in what it had sent to the relays"),
+            lines.contains("`cordelia sync carry` copies in what it had sent to the relays"),
             "{lines}"
         );
         assert!(
@@ -5562,23 +5950,44 @@ mod tests {
         );
         assert!(
             lines.contains(
-                "Names that no device lists yet since the last change (`cordelia sync carry \
-                 <name>` brings one in, and `cordelia sync map` does for a folder that comes to \
-                 sync it):\n  old-notes: synced before by (w w w w) \"laptop\"; what the relays \
-                 hold of it can be brought in for 89 more days"
+                "Names no device syncs yet since the last change to your devices (`cordelia sync \
+                 carry <name>` copies one in, as `cordelia sync map` does for a folder you map to \
+                 it):\n  old-notes: synced before by (w w w w) \"laptop\"; you can copy in what \
+                 the relays have of it for 89 more days"
             ),
             "{lines}"
         );
         assert!(
             lines.contains(
-                "Names that only a device which no longer counts had synced (they stay behind: \
-                 `cordelia sync carry <name> --from <device>` brings one in, with the recovery \
-                 phrase):\n  its-own: synced before by the device (w w w w); it can be brought \
-                 in for 1 more day"
+                "Names only a device no longer on your list had synced (they stay behind: \
+                 `cordelia sync carry <name> --from <device>` copies one in, with the recovery \
+                 phrase):\n  its-own: synced before by the device (w w w w); you can copy it in \
+                 for 1 more day"
             ),
             "{lines}"
         );
-        assert!(lines.contains("Not carried at the last change"), "{lines}");
+        assert!(
+            lines.contains("Not copied over at the last change"),
+            "{lines}"
+        );
+
+        // Without `-v` (decision 2026-11-11 (plain words), rule 4): a
+        // device by its name alone; by its words first where it has none,
+        // or where another device in the list has its name (the tablet,
+        // and the laptop that names a name); and no change number.
+        let plain = devices_lines(&seen, &key(1), false).join("\n");
+        for line in [
+            "\n  \"desktop\": this device\n",
+            "\n  (w) \"laptop\": up to date\n",
+            "\n  (w) \"tablet\": up to date, and still sending what it has",
+            "\n  \"phone\": not up to date yet, as far as this device knows",
+            "\n  (t t t t) \"tablet\": add it again",
+            "\n  \"added 7\"  cordelia_pk1notshown: the recovery",
+            "synced before by the device (w w w w); you can copy it in",
+        ] {
+            assert!(plain.contains(line), "{line}\n{plain}");
+        }
+        assert!(!plain.contains("change 2"), "{plain}");
         assert!(lines.contains("  ghost.md in lab"), "{lines}");
         // A file's name is printed as local history prints names, and no
         // more than its first characters (§16).
@@ -5606,7 +6015,7 @@ mod tests {
         // With nothing to say of names, nothing is said of them.
         let quiet = json!({ "this_device": "k", "change": 2, "devices": [],
             "names": { "sent": ["lab"], "to_go": [] } });
-        assert!(names_lines(&quiet).is_empty());
+        assert!(names_lines(&quiet, &super::shown).is_empty());
     }
 
     /// `cordelia devices` shows what your devices keep at a relay past
@@ -5647,11 +6056,10 @@ mod tests {
                 },
             })
         };
-        let past = devices_lines_at(&seen_at(13_002_342), &key(1), 0, &LOOKED_UP);
+        let past = devices_lines_at(&seen_at(13_002_342), &key(1), 0, &LOOKED_UP, true);
         assert!(
             past.contains(
-                &"Your devices keep 12.4 MiB of the 16 MiB a relay holds for them (names: 11.8 \
-                  MiB)"
+                &"Your devices use 12.4 MiB of the 16 MiB a relay keeps for them (names: 11.8 MiB)"
                     .to_string()
             ),
             "{past:#?}"
@@ -5682,14 +6090,14 @@ mod tests {
             seen_at(line),
             json!({ "this_device": written(1), "change": 1 }),
         ] {
-            let lines = devices_lines_at(&seen, &key(1), 0, &LOOKED_UP).join("\n");
+            let lines = devices_lines_at(&seen, &key(1), 0, &LOOKED_UP, true).join("\n");
             assert!(!lines.contains("MiB"), "{lines}");
         }
-        let just_past = devices_lines_at(&seen_at(line + 256), &key(1), 0, &LOOKED_UP);
+        let just_past = devices_lines_at(&seen_at(line + 256), &key(1), 0, &LOOKED_UP, true);
         assert!(
             just_past
                 .iter()
-                .any(|l| l.starts_with("Your devices keep 12.0 MiB of the 16"))
+                .any(|l| l.starts_with("Your devices use 12.0 MiB of the 16"))
         );
     }
 
@@ -5706,10 +6114,11 @@ mod tests {
         let written = |n: u8| encode_public_key(&key(n)).unwrap();
         let (now, wait) = (1_800_000_000_i64, STATUS_AMBER_WAIT_SECS as i64);
         assert_eq!(wait, 300);
-        let advice = "has not applied change 1 yet, as far as this device has heard: adding it \
-                      again from a device that has (`cordelia add-device`)";
+        let advice = "not yet on change 1, as far as this device knows: to send it the last \
+                      change, add it again from a device that is up to date (`cordelia \
+                      add-device`)";
         let says_of = |seen: &Value, own: u8, label: &str, at: i64| -> String {
-            let lines = devices_lines_at(seen, &key(own), at, &LOOKED_UP);
+            let lines = devices_lines_at(seen, &key(own), at, &LOOKED_UP, true);
             let of_it = format!("\"{label}\"");
             let line = lines.iter().find(|line| line.contains(&of_it));
             line.unwrap_or_else(|| panic!("no line for {label}: {lines:?}"))
@@ -5785,7 +6194,7 @@ mod tests {
         };
         let line = says_of(&joined(true), 2, "laptop", now + wait - 1);
         assert!(
-            line.ends_with(": not heard from yet; the change was made on it"),
+            line.ends_with(": not heard from yet; it made the last change"),
             "{line}"
         );
         assert!(says_of(&joined(true), 2, "laptop", now + wait).contains(advice));
@@ -5799,7 +6208,7 @@ mod tests {
         let mut heard = adder.clone();
         heard["added"][0]["applied"] = json!(1);
         let line = says_of(&heard, 1, "desktop", now + 1);
-        assert!(line.contains("has applied change 1"), "{line}");
+        assert!(line.contains("up to date (change 1)"), "{line}");
     }
 
     /// What `cordelia devices` says of each relay, one case each
@@ -5946,7 +6355,7 @@ mod tests {
             ],
             "waiting": [{ "relay": "192.0.2.1:9474", "name": "b.example:9474", "waits": 2 }],
         });
-        let lines = devices_lines_at(&seen, &key, now, &LOOKED_UP);
+        let lines = devices_lines_at(&seen, &key, now, &LOOKED_UP, true);
         let from = lines.iter().position(|line| line == "Relays:").unwrap();
         // The device's wake, as the look says it.
         assert!(
@@ -5994,7 +6403,7 @@ mod tests {
                 { "relay": "192.0.2.8:9474", "name": null, "waits": 0 },
             ],
         });
-        let lines = devices_lines(&seen, &key(1));
+        let lines = devices_lines(&seen, &key(1), true);
         let from = lines.iter().position(|line| line == "Relays:").unwrap();
         assert_eq!(
             lines[from..],
@@ -6046,7 +6455,7 @@ mod tests {
                 { "relay": "192.0.2.9:9474", "name": null, "waits": 5 },
             ],
         });
-        let lines = devices_lines(&seen, &key(1));
+        let lines = devices_lines(&seen, &key(1), true);
         let from = lines.iter().position(|line| line == "Relays:").unwrap();
         assert_eq!(
             lines[from..],
@@ -6072,7 +6481,7 @@ mod tests {
             { "relay": "127.0.0.1:9474", "name": "other.example:9474", "waits": 3 },
             { "relay": "192.0.2.9:9474", "name": null, "waits": 5 },
         ]);
-        let lines = devices_lines(&two, &key(1));
+        let lines = devices_lines(&two, &key(1), true);
         let from = lines.iter().position(|line| line == "Relays:").unwrap();
         assert_eq!(
             lines[from..],
@@ -6116,7 +6525,7 @@ mod tests {
             found(name)
         }
         let relays_of = |lookup: &Lookup| -> Vec<String> {
-            let lines = devices_lines_at(&seen, &key(1), 0, lookup);
+            let lines = devices_lines_at(&seen, &key(1), 0, lookup, true);
             let from = lines.iter().position(|line| line == "Relays:").unwrap();
             lines[from + 1..].to_vec()
         };
@@ -6183,8 +6592,8 @@ mod tests {
     #[test]
     fn a_line_of_its_own_begins_with_a_capital() {
         assert_eq!(
-            capitalised("this device has joined: it has applied change 1"),
-            "This device has joined: it has applied change 1"
+            capitalised("this device has joined your devices, and is up to date"),
+            "This device has joined your devices, and is up to date"
         );
         assert_eq!(
             capitalised("new device: (w w w w) \"desktop\""),
@@ -6406,10 +6815,10 @@ mod tests {
             assert_eq!(
                 not_this_devices_key_says(&own, os),
                 format!(
-                    "what answered at the node's address does not name this device's key, \
-                     which is the one in its key file ({}). Nothing was done. A node goes on \
-                     under the key it was started with. If this device was given a new key, \
-                     restart the node:{how}",
+                    "what answered at the node's address is not this device ({}), as its key \
+                     file says. Nothing was done. A node goes on as the device it was started \
+                     as. If you started this device over as a new device, restart the \
+                     node:{how}",
                     fingerprint::shown(&own)
                 )
             );
@@ -6449,12 +6858,12 @@ mod tests {
             assert_eq!(
                 says,
                 format!(
-                    "It follows no recovery phrase. Its memory folders and their mappings are \
-                     as they were.\nThe node still runs under the old key. Before anything \
+                    "It is not under a recovery phrase. Its memory folders and their mappings \
+                     are as they were.\nThe node still runs as the old device. Before anything \
                      else, restart the node:\n  {restart}\nThen run `cordelia status`.\nWhere \
                      the node does not run as the service that the install script set up, stop \
-                     it and start it again with whatever started it.\nThe status then names \
-                     the ways on."
+                     it and start it again with whatever started it.\nThe status then says what \
+                     to do next."
                 )
             );
             assert!(!says.contains("cordelia start"), "{says}");
@@ -6529,7 +6938,7 @@ mod tests {
         let own = NodeIdentity::from_seed([1; 32]).unwrap().public_key();
         let (a, b, unknown) = (written_key(10), written_key(11), written_key(12));
         let row_of_2 = |seen: &Value| {
-            let lines = devices_lines_at(seen, &own, 0, &LOOKED_UP);
+            let lines = devices_lines_at(seen, &own, 0, &LOOKED_UP, true);
             let at = lines
                 .iter()
                 .position(|line| line.starts_with("  (w2)"))
@@ -6547,15 +6956,15 @@ mod tests {
         assert_eq!(
             row_of_2(&seen),
             format!(
-                "  (w2) \"desktop\": has applied change 3, and has sent what it held to \
+                "  (w2) \"desktop\": up to date (change 3), and has sent what it has to \
                  a.example:9474 and the relay with key {unknown}; not yet to 1 other relay \
-                 that it is set up with (if it is lost now, what it held is at a.example:9474 \
-                 and the relay with key {unknown} alone)"
+                 that it is set up with (if you lose it now, what it has is only at \
+                 a.example:9474 and the relay with key {unknown})"
             )
         );
         assert!(waited(&seen).contains(&format!(
-            "(w2) \"desktop\" has applied the change, and has sent what it held to \
-             a.example:9474 and the relay with key {unknown}; not yet to 1 other relay"
+            "(w2) \"desktop\" is up to date, and has sent what it has to a.example:9474 and \
+             the relay with key {unknown}; not yet to 1 other relay"
         )));
         // At every relay it is set up with: no `<not yet>`. Two not yet,
         // and more counted.
@@ -6566,12 +6975,12 @@ mod tests {
         );
         assert_eq!(
             row_of_2(&seen),
-            "  (w2) \"desktop\": has applied change 3, and has sent what it held to b.example:9474"
+            "  (w2) \"desktop\": up to date (change 3), and has sent what it has to \
+             b.example:9474"
         );
         assert!(
             waited(&seen).contains(
-                &"(w2) \"desktop\" has applied the change, and has sent what it held to \
-              b.example:9474"
+                &"(w2) \"desktop\" is up to date, and has sent what it has to b.example:9474"
                     .to_string()
             )
         );
@@ -6591,7 +7000,7 @@ mod tests {
             "{row}"
         );
         assert!(
-            row.contains("has sent what it held to a.example:9474, the relay with key"),
+            row.contains("has sent what it has to a.example:9474, the relay with key"),
             "{row}"
         );
 
@@ -6603,7 +7012,7 @@ mod tests {
         );
         let lines = waited(&seen);
         assert!(lines.contains(
-            &"this device has sent what it carried to a.example:9474; not yet to b.example:9474 \
+            &"this device has sent what it copied over to a.example:9474; not yet to b.example:9474 \
               and c.example:9474"
                 .to_string()
         ), "{lines:?}");
@@ -6620,7 +7029,7 @@ mod tests {
         );
         assert!(
             waited(&seen).contains(
-                &"this device has sent what it carried to a.example:9474, b.example:9474 and \
+                &"this device has sent what it copied over to a.example:9474, b.example:9474 and \
               c.example:9474"
                     .to_string()
             )
@@ -6636,7 +7045,7 @@ mod tests {
         let lines = waited(&seen);
         assert!(
             lines.contains(
-                &"keep this machine on: this device has not yet sent every relay what it carried"
+                &"keep this machine on: this device has not yet sent every relay what it copied over"
                     .to_string()
             ),
             "{lines:?}"
@@ -6650,18 +7059,15 @@ mod tests {
         let seen = look_with_words(Value::Null, Value::Null, [Some(true), None, None]);
         assert!(
             waited(&seen).contains(
-                &"keep this machine on: this device has not yet sent every relay what it carried"
+                &"keep this machine on: this device has not yet sent every relay what it copied over"
                     .to_string()
             )
         );
         // Without the word of the other device, the line of today too.
-        assert!(
-            waited(&seen).contains(
-                &"(w2) \"desktop\" has applied the change, and is still sending what it held"
-                    .to_string()
-            )
-        );
-        assert!(row_of_2(&seen).contains("is still sending what it held"));
+        assert!(waited(&seen).contains(
+            &"(w2) \"desktop\" is up to date, and still sending what it has".to_string()
+        ));
+        assert!(row_of_2(&seen).contains("still sending what it has"));
     }
 
     /// `<held>` and `<not yet>` come from two sets that never overlap

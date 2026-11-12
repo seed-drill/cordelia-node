@@ -1,7 +1,7 @@
 # Decision: a scale test for R1
 
 **Date**: 2026-10-22
-**Status**: Accepted by the person's decision (sections 0 and 13): gate 10 for R1 is stages 100 and 190, with changes C and D in. The counters, the harness and changes C, D and E are built, E in alpha.16; change A is proposed; change B and stages 250 and 500 are after R1. [The record of memory across connections](2026-10-22-memory-across-connections.md) amends W with change F (section 2.5).
+**Status**: Accepted by the person's decision (sections 0 and 13): gate 10 for R1 is stages 100 and 190, with changes C and D in. Its quoted lines amended by decision 2026-11-11 (plain words). The counters, the harness and changes C, D and E are built, E in alpha.16; change A is proposed; change B and stages 250 and 500 are after R1. [The record of memory across connections](2026-10-22-memory-across-connections.md) amends W with change F (section 2.5).
 **Cited as**: "decision 2026-10-22 §3, rule 4". The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -115,7 +115,7 @@ What a relay has written and a peer has not acknowledged is not measured: quinn 
 
 | Measure | Unit | How it is read |
 |---|---|---|
-| A removal's spread | seconds, from the moment `cordelia remove-device` prints "The change is made (change N)" to the moment each other running device of that person has applied change N, and to the moment each relay holds it | The harness timestamps the line as it reads it at the pseudo-terminal. It polls each device's `/api/v1/person` once a second for the applied statement; a relay's holding is read from what each remaining device says of it (`cordelia devices --json`) |
+| A removal's spread | seconds, from the moment `cordelia remove-device -v` prints "The change is made (change N)" (without `-v` it says "The change is made", with no number) to the moment each other running device of that person has applied change N, and to the moment each relay holds it | The harness timestamps the line as it reads it at the pseudo-terminal. It polls each device's `/api/v1/person` once a second for the applied statement; a relay's holding is read from what each remaining device says of it (`cordelia devices --json`) |
 | A removal's carry | seconds, from the same line to the moment each remaining device has sent what it carried and holds every version the other remaining devices carried; and the bytes carried | `outbox_waiting`, what `cordelia devices --json` says the device has sent, and the harness's own count of what each device holds (bar 10) |
 | Churn | churns at each relay; connections each closed by warm churn, of devices and of relays; how long each device so closed took to be connected again | The relay's counters; the device's connections in its status, once a minute, and its log line for each connection made |
 | A relay that stops | seconds, from the relay's start again to the moment each device set up with it is connected to it again; the relay's requests, lock and memory in the five minutes after | The relay's gauge; each device's status |

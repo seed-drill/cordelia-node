@@ -4158,7 +4158,7 @@ fn a_relay_unreachable_from_here_is_dialled_as_today_until_a_change() {
     );
 
     let mut at = renews(&desktop, &["stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     wait_for("the laptop applies the change", &all, 60, || {
         (person_of(&laptop)["change"] == 2).then_some(())

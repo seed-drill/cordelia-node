@@ -192,6 +192,9 @@ enum Commands {
         /// A name for the new machine, such as "desktop"
         #[arg(long)]
         name: Option<String>,
+        /// Also say how many devices are in each shared channel it gets
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Join this device to your other devices
     ///
@@ -230,6 +233,10 @@ enum Commands {
         /// Take a shared channel from that key, and file it under this name
         #[arg(long, value_name = "NAME")]
         channel: Option<String>,
+        /// Also say which change to your devices this device is on, once
+        /// it joins
+        #[arg(short = 'v', long, conflicts_with = "channel")]
+        verbose: bool,
     },
     /// Hand a shared channel to another person's device
     ///
@@ -365,6 +372,9 @@ enum Commands {
         /// The key of the device to remove, as `cordelia devices` or
         /// `cordelia id` shows it
         key: String,
+        /// Also show the change numbers, and how many devices each list has
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// Give the devices that stay a new secret
     ///
@@ -382,7 +392,11 @@ enum Commands {
     /// reached, or refuses it, the command says so and ends with status 3,
     /// without saying that you can. Any status other than 0, 1 and 2 means
     /// that the change is made: do not make it again.
-    Renew,
+    Renew {
+        /// Also show the change numbers, and how many devices each list has
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
     /// Join changes that were made apart, with your recovery phrase.
     /// Run it on a device that keeps a change made apart. Asks at a
     /// terminal.
@@ -392,7 +406,11 @@ enum Commands {
     /// reached, or refuses it, the command says so and ends with status 3,
     /// without saying that you can. Any status other than 0, 1 and 2 means
     /// that the change is made: do not make it again.
-    Settle,
+    Settle {
+        /// Also show the change numbers, and how many devices each list has
+        #[arg(short = 'v', long)]
+        verbose: bool,
+    },
     /// Recover on a new machine when you have no device you trust
     ///
     /// Run it in a terminal, on a machine that has no recovery phrase
@@ -457,26 +475,29 @@ enum Commands {
         /// wait with status 3 (decision 2026-10-24 (removal), rule 9)
         #[arg(long)]
         entry: Option<String>,
+        /// The change's number, where the wait says the change is made
+        #[arg(short = 'v', long)]
+        verbose: bool,
     },
     /// List your devices and what each relay has
     ///
     /// It is the one place to look. It lists:
     ///
-    /// - every device of the last change, and whether it has applied that
-    ///   change and sent what it had;
+    /// - every device of the last change, and whether it is up to date;
     ///
     /// - every device added since, and which device added it;
     ///
-    /// - every removed key;
+    /// - every removed device;
     ///
-    /// - the names that no device lists yet since the last change, and
+    /// - the names that no device syncs yet since the last change, and
     ///   what this device still has to send;
     ///
     /// - for each relay, whether it has the last change.
     ///
-    /// Each device is shown with the first four words of its key's
-    /// fingerprint. Two devices can have the same label, and the words
-    /// tell them apart.
+    /// Each device is shown by the name you gave it. A device with no
+    /// name, or whose name another device has too, is shown with the
+    /// first four words of its fingerprint, which tell the two apart. -v
+    /// shows the words of every device, and the change numbers.
     Devices {
         /// Go through what this device has to tell you, such as a device
         /// that was added
@@ -486,6 +507,10 @@ enum Commands {
         /// terminal.
         #[arg(long)]
         clear: bool,
+        /// Also show the change numbers, and the fingerprint words of
+        /// every device
+        #[arg(short = 'v', long, conflicts_with = "clear")]
+        verbose: bool,
     },
     /// Sync an agent's memory across your devices
     Sync {
@@ -983,13 +1008,20 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Id { words: false }) => cmd_pubkey(&cli.config),
         Some(Commands::Id { words: true }) => shared_cmd::id_words(&cli.config),
         Some(Commands::Phrase { name }) => person_cmd::phrase(&cli.config, name),
-        Some(Commands::AddDevice { key, name }) => person_cmd::add_device(&cli.config, &key, name),
+        Some(Commands::AddDevice { key, name, verbose }) => {
+            person_cmd::add_device(&cli.config, &key, name, verbose)
+        }
         // Two commands under one name, on two paths and two routes
         // (decision 2026-10-10 §3.2).
-        Some(Commands::Accept { key, channel: None }) => person_cmd::accept(&cli.config, &key),
+        Some(Commands::Accept {
+            key,
+            channel: None,
+            verbose,
+        }) => person_cmd::accept(&cli.config, &key, verbose),
         Some(Commands::Accept {
             key,
             channel: Some(name),
+            ..
         }) => shared_cmd::accept(&cli.config, &key, &name),
         Some(Commands::Share { name, key, words }) => {
             shared_cmd::share(&cli.config, &name, &key, words.as_deref())
@@ -1043,14 +1075,23 @@ fn main() -> anyhow::Result<()> {
                 shared_cmd::stay(&cli.config, &name, words.as_deref())
             }
         },
-        Some(Commands::RemoveDevice { key }) => person_cmd::remove_device(&cli.config, &key),
-        Some(Commands::Renew) => person_cmd::renew(&cli.config),
-        Some(Commands::Settle) => person_cmd::settle(&cli.config),
+        Some(Commands::RemoveDevice { key, verbose }) => {
+            person_cmd::remove_device(&cli.config, &key, verbose)
+        }
+        Some(Commands::Renew { verbose }) => person_cmd::renew(&cli.config, verbose),
+        Some(Commands::Settle { verbose }) => person_cmd::settle(&cli.config, verbose),
         // Its own exit status: 3 where the change is made and not known
         // to be at every relay (decision 2026-10-19 §4, rule 8).
-        Some(Commands::ChangeMade { number, entry }) => std::process::exit(
-            person_cmd::change_made(&cli.config, number, entry.as_deref()),
-        ),
+        Some(Commands::ChangeMade {
+            number,
+            entry,
+            verbose,
+        }) => std::process::exit(person_cmd::change_made(
+            &cli.config,
+            number,
+            entry.as_deref(),
+            verbose,
+        )),
         Some(Commands::Recover { name }) => recover_cmd::recover(&cli.config, name),
         Some(Commands::RecoverMade {
             number,
@@ -1063,7 +1104,9 @@ fn main() -> anyhow::Result<()> {
                 recover_cmd::CutShort::handed(cut_short, channel_read, carried_to, carried_relays);
             std::process::exit(recover_cmd::recover_made(&cli.config, number, cut_short))
         }
-        Some(Commands::Devices { clear }) => person_cmd::devices(&cli.config, clear),
+        Some(Commands::Devices { clear, verbose }) => {
+            person_cmd::devices(&cli.config, clear, verbose)
+        }
         Some(Commands::Sync { what }) => cmd_sync(&cli.config, what),
         Some(Commands::History {
             of,
@@ -9258,12 +9301,143 @@ mod tests {
                 "fn names_held(",
                 "fn cmd_stats(",
                 "fn storage_line(",
+                // Slice 2a: `cordelia id`.
+                "fn cmd_pubkey(",
             ],
         ),
         (
             "cordelia-node/src/person_cmd.rs",
             include_str!("person_cmd.rs"),
-            &["pub fn status_lines(", "fn relay_says("],
+            &[
+                "pub fn status_lines(",
+                "fn relay_says(",
+                // Slice 2a: `devices`, `phrase`, `add-device`, `accept`,
+                // `remove-device`, `renew`, `settle`, `init --new-key`, and
+                // the wait after a change.
+                "const WHOSE_WORDS",
+                "const HAS_ONE_ALREADY",
+                "const SEE_THE_WORDS",
+                "pub(crate) const NOT_A_YES",
+                "fn no_look_says(",
+                "pub(crate) fn own_key(",
+                "fn not_this_devices_key_says(",
+                "pub(crate) fn words_then(",
+                "fn other_relays(",
+                "fn own_carried_line(",
+                "fn waits_says(",
+                "fn alone_says(",
+                "pub fn phrase(",
+                "fn not_typed_back_says(",
+                "fn words_in_a_row(",
+                "pub fn add_device(",
+                "fn add_device_yes(",
+                "fn shared_handed(",
+                "pub fn accept(",
+                "pub fn devices(",
+                "fn devices_lines_at(",
+                "impl InTheList {",
+                "fn names_lines(",
+                "fn clear_notices(",
+                "pub fn remove_device(",
+                "impl Handed {",
+                "fn shared_at_a_removal(",
+                "const ACCESS_ELSEWHERE",
+                "const STAYS_AT_A_REMOVAL",
+                "fn not_shown_stay_behind(",
+                "fn asks_of(",
+                "const SAID_IT_LEFT",
+                "fn questions(",
+                "fn removed_with_it(",
+                "const REPLACING",
+                "fn change(",
+                "fn asked(",
+                "fn to_be_removed(",
+                "fn others_named(",
+                "const NO_DEVICE_IT_KNOWS",
+                "const REFUSED_FOR_GOOD",
+                "fn refuses_a_key_it_does_not_know(",
+                "fn own_listing(",
+                "fn own_addition(",
+                "fn number_shown(",
+                "fn lists_shown(",
+                "pub(crate) fn typed_phrase(",
+                "fn signed(",
+                "fn wait_not_started(",
+                "fn after_a_change(",
+                "const UNNAMED_RELAY",
+                "const ANOTHER_CHANGE",
+                "fn waits_after(",
+                "pub fn new_key(",
+                "fn after_a_new_key_says(",
+                "fn give_new_key(",
+            ],
+        ),
+        // Slice 2a: the words the node builds for those commands, and the
+        // faults that reach a person through them.
+        (
+            "cordelia-api/src/adding.rs",
+            include_str!("../../cordelia-api/src/adding.rs"),
+            &[
+                "fn stood(",
+                "fn stands(",
+                "impl Accepted {",
+                "impl NotAccepted {",
+            ],
+        ),
+        (
+            "cordelia-api/src/commands.rs",
+            include_str!("../../cordelia-api/src/commands.rs"),
+            &[
+                "fn under_the_old_key_says(",
+                "fn says(",
+                "pub async fn add(",
+                "fn not_fetched(",
+                "pub async fn change_prepare(",
+            ],
+        ),
+        (
+            "cordelia-api/src/person.rs",
+            include_str!("../../cordelia-api/src/person.rs"),
+            &["pub enum PersonError", "fn moved_says("],
+        ),
+        (
+            "cordelia-crypto/src/statement.rs",
+            include_str!("../../cordelia-crypto/src/statement.rs"),
+            &["pub enum StatementError"],
+        ),
+        (
+            "cordelia-crypto/src/change_entry.rs",
+            include_str!("../../cordelia-crypto/src/change_entry.rs"),
+            &["pub enum ChangeEntryError"],
+        ),
+        (
+            "cordelia-crypto/src/addition.rs",
+            include_str!("../../cordelia-crypto/src/addition.rs"),
+            &["pub enum AdditionError"],
+        ),
+        (
+            "cordelia-crypto/src/hand_over.rs",
+            include_str!("../../cordelia-crypto/src/hand_over.rs"),
+            &["pub enum HandOverError"],
+        ),
+        (
+            "cordelia-crypto/src/derive.rs",
+            include_str!("../../cordelia-crypto/src/derive.rs"),
+            &["pub enum DeriveError"],
+        ),
+        (
+            "cordelia-crypto/src/reached.rs",
+            include_str!("../../cordelia-crypto/src/reached.rs"),
+            &["pub enum NotAWord"],
+        ),
+        (
+            "cordelia-node/src/device_entries/leave.rs",
+            include_str!("device_entries/leave.rs"),
+            &[
+                "pub async fn pair(",
+                "pub async fn left(",
+                "pub async fn shared(",
+            ],
         ),
         // The wait after a change says what each relay has (record §6:
         // every relay line is slice 1's).
@@ -9484,6 +9658,72 @@ mod tests {
         ));
         said.extend(shown.holds.iter().map(indicator::Holds::detail));
         said
+    }
+
+    /// Looks of `cordelia devices` that between them show each of its
+    /// parts (decision 2026-11-11 (plain words), slice 2a): a device that
+    /// is not under a phrase, and one with every list, each kind of
+    /// device, a change put aside, names, a typed ID and a notice.
+    fn plain_devices_looks() -> Vec<serde_json::Value> {
+        use serde_json::json;
+        let key = |n: u8| cordelia_crypto::bech32::encode_public_key(&[n; 32]).unwrap();
+        let device = |n: u8, label: &str| json!({ "key": key(n), "label": label, "words": format!("w{n} x{n} y{n} z{n}") });
+        let with = |n: u8, label: &str, more: serde_json::Value| {
+            let mut device = device(n, label);
+            for (field, value) in more.as_object().unwrap() {
+                device[field] = value.clone();
+            }
+            device
+        };
+        let mib = 1024 * 1024;
+        vec![
+            json!({ "says": ["no recovery phrase yet: memory stays on this machine."] }),
+            json!({
+                "change": 4,
+                "phrase_words": "able bake cold dune east fold",
+                "statements_left": 3,
+                "cannot_go_on": "the node cannot go on",
+                "personal_channel": { "total": 13 * mib, "words": mib, "by": [] },
+                "devices": [
+                    with(1, "laptop", json!({ "applied": 4, "sent": true, "maker": true })),
+                    with(2, "desktop", json!({ "applied": 4, "sent": true, "left": true })),
+                    with(3, "phone", json!({ "applied": 4, "sent": false })),
+                    with(4, "", json!({ "applied": 3 })),
+                    with(5, "desktop", json!({ "applied": 4, "sent": true })),
+                ],
+                "added": [
+                    with(6, "tablet", json!({
+                        "by": device(1, "laptop"), "at": 1_794_398_400_u64,
+                        "counted": true, "applied": 4, "sent": true,
+                    })),
+                    with(7, "kiosk", json!({
+                        "by": device(6, "tablet"), "at": 1_794_398_400_u64,
+                        "counted": false, "why_not": "it was added by a device added since",
+                    })),
+                ],
+                "removed": [device(8, "old laptop"), device(9, "")],
+                "left_out": [device(10, "spare"), with(11, "", json!({ "key": key(11) }))],
+                "set_aside": [{
+                    "number": 5, "made_on": device(2, "desktop"),
+                    "says": "it removed the device (w8 x8 y8 z8)",
+                    "devices": [device(2, "desktop")], "removed": [device(1, "laptop")],
+                }],
+                "relays": [{ "relay": "relay-a.example:9474", "holds_latest": true, "heard_since_woke": true }],
+                "names": { "to_go": ["lab"], "sent": ["team"] },
+                "names_not_listed": [
+                    { "name": "notes", "by": [device(2, "desktop")], "days_left": 3 },
+                    { "name": "old", "by_gone": [device(8, "old laptop")], "days_left": 1 },
+                ],
+                "names_not_shown": 2,
+                "not_carried": [{ "file": "a.md", "name": "lab" }],
+                "accepting": [
+                    { "words": "a b c d", "taken": true, "said": "this device has joined" },
+                    { "words": "e f g h", "asking": true },
+                    { "words": "i j k l" },
+                ],
+                "notices": [{ "says": "a device was added: (w6 x6 y6 z6) \"tablet\"" }],
+            }),
+        ]
     }
 
     /// **No line of the status uses an old word** (decision 2026-11-11
@@ -9829,6 +10069,19 @@ mod tests {
         );
         let after = plain_status(&well, &people[1], &[]);
         assert!(after.contains(&format!("    {not_clean}")), "{after:#?}");
+
+        // `cordelia devices` as a person sees it, without `-v` (slice 2a).
+        let mut listed = 0;
+        for seen in plain_devices_looks() {
+            for line in person_cmd::devices_lines(&seen, &[1; 32], false) {
+                listed += 1;
+                let old = old_words_in(&line);
+                if !old.is_empty() {
+                    found.push(format!("`cordelia devices` says {line:?}: {old:?}"));
+                }
+            }
+        }
+        assert!(listed > 40, "{listed} lines of `cordelia devices`");
         found.sort();
         found.dedup();
         assert!(found.is_empty(), "old words:\n{}", found.join("\n"));

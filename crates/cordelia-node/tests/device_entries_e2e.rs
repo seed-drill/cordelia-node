@@ -1949,10 +1949,7 @@ async fn a_relay_that_holds_a_change_the_device_refuses_is_said_to() {
             why: Some(said.clone())
         })
     );
-    assert!(
-        said.contains("lacks a key that the applied one removed"),
-        "{said}"
-    );
+    assert!(said.contains("keeps a device that one removed"), "{said}");
     assert_eq!(device.status().cannot_go_on, None);
 
     // The relay holds the device's own entry again: leave, and nothing

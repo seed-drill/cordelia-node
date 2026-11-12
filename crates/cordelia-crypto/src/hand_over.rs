@@ -73,47 +73,47 @@ use crate::statement::{Reader, SignedStatement, StatementError, put_count};
 /// Why bytes are not a hand-over, or why one was not made.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum HandOverError {
-    #[error("the hand-over ends before it is whole")]
+    #[error("what the other device sent ends before it is whole")]
     Truncated,
 
-    #[error("there are bytes after the hand-over's end")]
+    #[error("what the other device sent has bytes after its end")]
     TrailingBytes,
 
-    #[error("the statement that is handed over is no statement: {0}")]
+    #[error("the change to your devices that was sent is damaged: {0}")]
     Statement(#[from] StatementError),
 
-    #[error("the secret is not the one that the statement commits to")]
+    #[error("the secret that was sent is not the one the change names")]
     SecretNotCommitted,
 
-    #[error("the change entry that is handed over is no entry: {0}")]
+    #[error("the change that was sent is damaged: {0}")]
     Entry(#[from] EntryError),
 
-    #[error("the change entry is not the entry of the statement that is handed over")]
+    #[error("the change that was sent does not match the list of devices sent with it")]
     NotTheStatementsEntry,
 
-    #[error("the change entry is not opened: {0}")]
+    #[error("the change that was sent could not be opened: {0}")]
     ChangeEntry(#[from] ChangeEntryError),
 
-    #[error("a hand-over carries at most 2 records, and this carries {0}")]
+    #[error("a device sends at most 2 records of added devices, and this sends {0}")]
     TooManyRecords(usize),
 
     #[error("a record is at most 226 bytes, and this is {0}")]
     RecordLength(usize),
 
-    #[error("a record that is handed over is no record: {0}")]
+    #[error("a record of an added device that was sent is damaged: {0}")]
     Record(#[from] AdditionError),
 
-    #[error("a record is made under another statement than the one that is handed over")]
+    #[error("a record of an added device names another change than the one sent")]
     RecordUnderAnotherStatement,
 
-    #[error("a record adds a key that the statement lists as removed")]
+    #[error("a record adds a device that you removed")]
     AddsARemovedKey,
 
-    #[error("a record adds a key that the statement already lists as a device")]
+    #[error("a record adds a device that is already one of yours")]
     AddsAListedKey,
 
     #[error(
-        "the device that adds is no device of the statement, and no record of its own addition comes with it"
+        "the device that adds is not on your list of devices, and nothing that was sent shows who added it"
     )]
     AdderNotKnown,
 
@@ -121,11 +121,13 @@ pub enum HandOverError {
     NotTheAddersOwn,
 
     #[error(
-        "the adder was itself added by a device that is no device of the statement: a chain is two long at most"
+        "the device that adds was added since the last change by a device that was itself added since: it cannot add another"
     )]
     ChainTooLong,
 
-    #[error("the record of the adder's own addition is not needed: the statement lists the adder")]
+    #[error(
+        "the record of who added the adding device is not needed: that device is on your list already"
+    )]
     RecordNotNeeded,
 }
 

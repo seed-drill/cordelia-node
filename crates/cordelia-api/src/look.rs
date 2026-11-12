@@ -1483,7 +1483,7 @@ fn not_counted(why: NotCounted) -> &'static str {
             "the device that added it was itself added, since the last change, by a device \
              added since"
         }
-        NotCounted::NoRoom => "64 devices count already: a change makes room",
+        NotCounted::NoRoom => "you have 64 devices already: a change to your devices makes room",
     }
 }
 

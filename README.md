@@ -210,11 +210,11 @@ not yet cleared`.
 ## Your devices
 
 ```bash
-cordelia devices                 # every device, what each has applied, what each relay has
+cordelia devices                 # every device, whether each is up to date, what each relay has
 cordelia devices --clear         # go through what this device has to tell you
 cordelia remove-device <key>     # remove a device (asks for the phrase)
 cordelia renew                   # a new secret for the devices that stay (asks for the phrase)
-cordelia settle                  # join two changes made apart (asks for the phrase)
+cordelia settle                  # join two changes made separately (asks for the phrase)
 cordelia recover                 # on a new machine, with no device left (asks for the phrase)
 cordelia sync carry [<name>]     # bring in what a device that never came back sent to the relays
 ```

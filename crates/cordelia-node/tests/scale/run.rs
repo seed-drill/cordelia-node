@@ -628,7 +628,7 @@ impl Run {
         let mut at = new.node.at_terminal(&["accept", &accept]);
         at.says("Type yes to go on").types("yes");
         let accepted = at.done();
-        if accepted.contains("Nothing was taken yet") {
+        if accepted.contains("Nothing has arrived yet") {
             wait_within(
                 "a hand-over is read with the key typed at accept",
                 600,
@@ -1023,7 +1023,11 @@ impl Run {
             .cloned()
             .unwrap_or_default();
         let key = self.fleet.made[self.fleet.device(k, removed)].key.clone();
-        let mut at = self.node(k, remover).at_terminal(&["remove-device", &key]);
+        // `-v`: the line that the spread runs from names the change's
+        // number (decision 2026-11-11 (plain words), rule 4).
+        let mut at = self
+            .node(k, remover)
+            .at_terminal(&["remove-device", "-v", &key]);
         let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             loop {
                 // Of each other device added since the last change: it

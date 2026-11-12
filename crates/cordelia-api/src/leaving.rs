@@ -201,7 +201,8 @@ fn write_word(
     let before = entries::author_entry(conn, &channel, &slot, &own)?.map(|held| held.entry.rev);
     let rev = next_under(before, standing.number()).ok_or_else(|| {
         PersonError::Held(
-            "this device's own word in that slot is at the last revision under the statement"
+            "this device can say again that it left only after the next change to your devices \
+             (`cordelia renew` makes one)"
                 .into(),
         )
     })?;

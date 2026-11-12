@@ -1175,7 +1175,7 @@ fn t20_a_key_that_is_no_devices_is_not_added_accepted_or_removed() {
 
     // It is not added: the device that is in refuses it before it asks
     // its yes, and writes nothing.
-    let no_devices_key = "that is this device's own key, or no device's key";
+    let no_devices_key = "that is this device's own ID, or no device's ID";
     let said = a
         .at_terminal(&["add-device", &listed_as, "--name", "laptop"])
         .refused();
@@ -1303,7 +1303,7 @@ async fn t16_a_removed_devices_last_entries_are_kept_and_its_later_ones_are_not(
     // margin of ten minutes, so all it wrote is left out.
     let r_key = key_of(&r);
     let mut at = removes(&a, &r_key, &[], &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     let held: BTreeMap<String, Option<String>> = [
         ("deleted.md".to_string(), text("by a")),
         ("edited.md".to_string(), text("by a")),
@@ -1556,10 +1556,10 @@ fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
     // until it does, and says of B that it has not applied the change.
     b.stop();
     let mut at = removes(&a, &r_key, &["stays"], &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     let said = at.done();
     assert!(said.contains("has the change"), "{said}");
-    assert!(said.contains("has not applied the change yet"), "{said}");
+    assert!(said.contains("is not up to date yet"), "{said}");
     // The relay loses everything it held.
     relay.stop();
     for file in ["cordelia.db", "cordelia.db-wal", "cordelia.db-shm"] {
@@ -1578,8 +1578,8 @@ fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
         "a does not show b as waiting: {}",
         person_of(&a)
     );
-    let said = a.cli(&["devices"]);
-    assert!(said.contains("has not applied change 2 yet"), "{said}");
+    let said = a.cli(&["devices", "-v"]);
+    assert!(said.contains("not yet on change 2"), "{said}");
 
     // The relay is back, with nothing. A shows it the removal again. B
     // applies it and says so.
@@ -1592,9 +1592,9 @@ fn t16_a_removal_is_offered_again_when_the_relay_loses_it() {
     wait_for("a hears that b holds it", &all, 120, || {
         (applied_as_heard_by(&a, &b_key) == Some(2)).then_some(())
     });
-    let said = a.cli(&["devices"]);
-    assert!(said.contains("has applied change 2"), "{said}");
-    assert!(!said.contains("has not applied change 2 yet"), "{said}");
+    let said = a.cli(&["devices", "-v"]);
+    assert!(said.contains("up to date (change 2)"), "{said}");
+    assert!(!said.contains("not yet on change 2"), "{said}");
 }
 
 /// A client of a relay that is not a node: it connects as any node may, and

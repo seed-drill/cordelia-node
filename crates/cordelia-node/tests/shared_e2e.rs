@@ -309,7 +309,7 @@ fn accept_with_channel_never_moves_the_device_and_accept_without_never_takes_a_s
     let mut at = carol.at_terminal(&["accept", &key_of(&alice)]);
     at.says("Type yes to go on").types("yes");
     let said = at.done();
-    assert!(said.contains("Nothing was taken yet"), "{said}");
+    assert!(said.contains("Nothing has arrived yet"), "{said}");
     let seen = person_of(&carol);
     assert_eq!(seen["state"], "no_phrase", "{seen}");
     let shared = listed(&carol);
@@ -1675,11 +1675,11 @@ fn a_subscription_and_an_unsubscription_survive_a_statement_and_the_removal_of_t
     // A statement, and then the tablet's removal, long after the acts.
     acts_taken_long_ago(&[&laptop, &phone]);
     let mut at = renews(&laptop, &["stays", "stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     has_applied(&phone, 2, &all);
     let mut at = removes(&laptop, &key_of(&tablet), &[], &words);
-    at.says("The change is made (change 3)");
+    at.says("The change is made");
     drop(at);
     has_applied(&phone, 3, &all);
     let after_removal = [&relay, &laptop, &bob, &phone];
@@ -2220,21 +2220,22 @@ fn a_removal_makes_each_shared_channel_anew_and_the_removed_device_reads_nothing
     let before_desktop = at_the_relay_by(&relay, &old, &key_of(&desktop));
 
     let mut at = removes_from_an_added(&desktop, &key_of(&tablet), &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     let before_yes = at.said.clone();
     assert!(
         before_yes.contains(
-            "These shared channels are made anew without the device removed, in this change: \
-             \"review\". The other people in each move with a yes of their own"
+            "This change resets these shared channels without the removed device: \"review\". \
+             The other people in each move to the new channel with a yes of their own"
         ),
         "{before_yes}"
     );
     // Who stays, before the yes (rule 24).
     assert!(
         before_yes.contains(
-            "In each, your own devices stay. A channel that follows a repository this device \
-             follows keeps the keys its list names. Any other keeps a key only where this device \
-             saw it in the channel and a device of yours that still counts labelled it."
+            "In each, your own devices stay. The channel of a repository you follow on this \
+             device keeps the devices on the repository's list. Any other channel keeps a device \
+             only where this device saw it there, and a device of yours that stays gave it a \
+             name."
         ),
         "{before_yes}"
     );
@@ -2410,16 +2411,16 @@ fn no_move_goes_into_a_channel_a_removed_key_reads() {
     );
     let old = id_filed(&laptop, "review").unwrap();
     let old_card = card_of_node(&laptop, &old);
-    let unreached = "These shared channels are not reached from this device, so they are not \
-                     made anew in this change: \"review\". Your devices send nothing in each \
-                     until you make it anew with cordelia shared reset <name> on a device of \
-                     yours that reaches its relays.";
+    let unreached = "This device cannot reach these shared channels, so this change does not \
+                     reset them: \"review\". Your devices send nothing in each until you reset \
+                     it: run cordelia shared reset <name> on a device of yours that reaches its \
+                     relays.";
 
     let mut at = removes_from_an_added(&desktop, &key_of(&tablet), &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     assert!(at.said.contains(unreached), "{}", at.said);
     assert!(
-        !at.said.contains("These shared channels are made anew"),
+        !at.said.contains("This change resets these shared channels"),
         "{}",
         at.said
     );
@@ -2602,10 +2603,13 @@ fn a_removal_lists_what_the_removed_key_did_with_the_command_that_undoes_each() 
         ),
     ];
     let mut at = removes_from_an_added(&desktop, &key_of(&laptop), &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     let before_yes = at.said.clone();
     assert!(
-        before_yes.contains("What the device removed did in your shared channels, still in force"),
+        before_yes.contains(
+            "What the removed device did in your shared channels that still stands, each with the \
+             command that undoes it:"
+        ),
         "{before_yes}"
     );
     for line in &lines {
@@ -3008,7 +3012,7 @@ fn after_a_removal_each_device_makes_a_shared_channel_anew_once() {
         .says("Type yes to go on")
         .types("yes");
     at.says(ASKS_THE_PHRASE).types(&words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     at.says("The wait has ended.")
         .says("\"review\" is made anew without the device removed: it is channel ");
     drop(at);

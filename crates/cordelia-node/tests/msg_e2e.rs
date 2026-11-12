@@ -1696,7 +1696,7 @@ fn a_removed_device_is_shown_nothing_and_sends_nothing() {
     );
     summary_with(&two.all(), &two.desktop, "work", &before);
     let mut at = removes(&two.laptop, &key_of(&two.desktop), &[], &two.words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     wait_for("desktop hears that it was removed", &two.all(), 120, || {
         (person_of(&two.desktop)["state"] == "removed").then_some(())
     });
@@ -1759,7 +1759,7 @@ fn a_message_whose_signer_no_longer_counts_is_refused_by_read_and_listed_by_log(
     let shown = summary_with(&all, &two.desktop, "work", &id);
     assert!(shown.contains("on \"tablet\""), "{shown}");
     let mut at = removes(&two.laptop, &key_of(&tablet), &["stays"], &two.words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     has_applied(&two.desktop, 2, &all);
     drop(at);
     refused_with(
@@ -2533,7 +2533,7 @@ fn a_statement_starts_an_empty_messages_channel_and_what_was_held_is_shown_until
     let old_secret = messages_secret_of(&two.desktop);
 
     let mut at = removes(&two.laptop, &key_of(&tablet), &["stays"], &two.words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     has_applied(&two.desktop, 2, &all);
     drop(at);
     let new_secret = messages_secret_of(&two.laptop);
@@ -2650,7 +2650,7 @@ fn a_removed_device_reads_what_was_sent_in_its_generation_and_nothing_after_its_
     summary_with(&two.all(), &two.desktop, "work", &before);
     let old_secret = messages_secret_of(&two.desktop);
     let mut at = removes(&two.laptop, &key_of(&two.desktop), &[], &two.words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     wait_for("desktop hears that it was removed", &two.all(), 120, || {
         (person_of(&two.desktop)["state"] == "removed").then_some(())
     });

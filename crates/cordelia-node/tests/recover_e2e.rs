@@ -725,11 +725,13 @@ fn a_device_that_the_person_still_has_stops_and_is_added_again() {
     // still has is not in the last change, by its label.
     let listed = new.cli(&["devices"]);
     assert!(
-        listed.contains("Not in the last change (each holds what your devices held before it):"),
+        listed.contains(
+            "Left out of the last change (each still has what your devices had before it):"
+        ),
         "{listed}"
     );
     assert!(
-        listed.contains("\"desktop\": add it again, or it was meant to go."),
+        listed.contains("\"desktop\": add it again, unless you meant it to go."),
         "{listed}"
     );
     let seen = person_of(&new);
@@ -876,7 +878,7 @@ fn a_device_that_signs_hundreds_of_records_pushes_no_device_out_of_a_recovery() 
     let mut two = two_devices(&[&relay], None);
     // A change that lists both, the laptop first.
     let mut at = renews(&two.laptop, &["stays"], &two.words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     let all = [&relay, &two.laptop, &two.desktop];
     wait_for("the desktop applies change 2", &all, 120, || {
@@ -976,7 +978,7 @@ fn a_device_that_signs_hundreds_of_records_pushes_no_device_out_of_a_recovery() 
     let first = left_out[0]["key"].as_str().unwrap();
     assert!(
         listed.contains(&format!(
-            "{first}: the recovery could not show it, and asked nothing of it."
+            "{first}: the recovery could not show this device, so it asked you nothing about it."
         )),
         "{listed}"
     );
@@ -1034,7 +1036,7 @@ fn a_phone_that_the_64_keep_out() -> KeptOut {
     let mut two = two_devices(&[&relay], None);
     // A change that lists both, the laptop first.
     let mut at = renews(&two.laptop, &["stays"], &two.words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     let all = [&relay, &two.laptop, &two.desktop];
     wait_for("the desktop applies change 2", &all, 120, || {
@@ -1240,16 +1242,16 @@ fn a_device_that_the_64_kept_out_and_was_not_asked_about_is_removed_by_its_key()
     // It is in no list of the change, and is removed all the same, after
     // the typed word.
     let mut at = new.at_terminal(&["remove-device", &phone_key]);
-    at.says("is no device of yours that this device knows of")
-        .says("Type `refuse` to refuse this key for good, or anything else to stop")
+    at.says("is not a device of yours that this device knows")
+        .says("Type `refuse` to refuse this device for good, or anything else to stop")
         .types("refuse");
-    at.says("The change that the recovery phrase will sign (change 4):")
+    at.says("The change your recovery phrase will sign:")
         .says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&two.words);
-    at.says("The change is made (change 4).");
+    at.says("The change is made.");
     let said = at.done();
     assert!(
         said.contains("has sent all it has: you may close this machine"),
@@ -1460,7 +1462,7 @@ fn a_recovery_reads_more_names_than_one_connection_has_places_for() {
     });
     // A change: each name is in two generations at the relay.
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     wait_for("the relay was sent what was carried", &all, 180, || {
         let applied = person_of(&laptop)["change"] == 2;
@@ -1758,7 +1760,7 @@ fn a_recovery_says_at_which_relay_the_personal_channel_was_not_read() {
     // A second change, which lists both: the first is a generation
     // before, whose personal channel a recovery reads for names.
     let mut at = renews(&two.laptop, &["stays"], &two.words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     let all = [&first, &second, &two.laptop, &two.desktop];
     wait_for("the desktop applies change 2", &all, 120, || {
@@ -1853,7 +1855,7 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
     adds(&laptop, &desktop, "desktop");
     // A change that lists both, which both apply.
     let mut at = renews(&laptop, &["stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     let all = [&first, &second, &laptop, &desktop];
     wait_for("the desktop applies change 2", &all, 120, || {
@@ -1868,7 +1870,7 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
     desktop.stop();
     second.stop();
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     wait_for(
         "the first relay holds the laptop's change",
@@ -1900,7 +1902,7 @@ fn two_changes_made_apart_are_found_and_settled_at_a_recovery() {
         },
     );
     let mut at = renews(&desktop, &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     wait_for(
         "the second relay holds the desktop's change",
@@ -2453,7 +2455,7 @@ fn a_recovery_says_before_its_yes_where_what_was_carried_is_at_a_relay_it_did_no
     // done once B is out of reach, and it writes that what it carried is
     // at A.
     let mut at = renews(&two.laptop, &["removed"], &two.words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     assert_eq!(status, Some(3), "{said}");
     let own = key_of(&two.laptop);

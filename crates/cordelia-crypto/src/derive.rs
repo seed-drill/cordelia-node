@@ -47,13 +47,13 @@ pub enum DeriveError {
     #[error("a channel's name is in its one spelling, and this one is not")]
     NameNotTidy,
 
-    #[error("a pair channel is between two devices, and that is this device's own key")]
+    #[error("a channel between two devices needs another device, and that is this device's own ID")]
     OwnKey,
 
-    #[error("the other device's key is not a usable public key")]
+    #[error("the other device's ID is not a valid device ID")]
     KeyNotUsable,
 
-    #[error("the two keys give a secret that anyone can work out")]
+    #[error("those two device IDs give a secret that anyone could work out")]
     SecretAnyoneCanWorkOut,
 
     #[error(transparent)]

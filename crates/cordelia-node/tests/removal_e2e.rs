@@ -192,7 +192,7 @@ fn a_record_that_hands_a_removed_device_the_secret_closes_a_device() {
 
     // The laptop removes the tablet: change 2.
     let mut at = removes(&laptop, &key_of(&tablet), &["stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     has_applied(&desktop, 2, &all);
     wait_for("the tablet reads that it was removed", &all, 120, || {
@@ -246,7 +246,7 @@ fn a_record_that_hands_a_removed_device_the_secret_closes_a_device() {
 
     // (c) A change made with the phrase is the way on.
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     assert_eq!(stands(&laptop).0, "applied");
     has_applied(&desktop, 3, &all);
@@ -479,7 +479,7 @@ fn the_fault_with(renewals: u64, phone: bool) -> Fault {
         None => &["stays", "stays"],
     };
     let mut at = renews(&laptop, stays, &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     has_applied(&desktop, 2, &all);
     has_applied(&tablet, 2, &all);
@@ -495,7 +495,7 @@ fn the_fault_with(renewals: u64, phone: bool) -> Fault {
 
     // The desktop removes the tablet: its change 3, through relay B.
     let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     let removal = person_of(&desktop)["latest"].as_str().unwrap().to_string();
     desktop_applied(&desktop);
@@ -505,7 +505,7 @@ fn the_fault_with(renewals: u64, phone: bool) -> Fault {
     let mut own_secrets = Vec::new();
     for n in 3..3 + renewals {
         let mut at = renews(&laptop, &[], &words);
-        at.says(&format!("The change is made (change {n})."));
+        at.says("The change is made.");
         drop(at);
         let own_change = person_of(&laptop)["latest"].as_str().unwrap().to_string();
         assert_ne!(own_change, removal);
@@ -969,7 +969,7 @@ fn two_removals_made_apart_close_both_sides_until_settle() {
     });
     // All on change 2, which lists each.
     let mut at = renews(&laptop, &["stays"; 3], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     for device in [&desktop, &tablet, &phone] {
         has_applied(device, 2, &all!());
@@ -984,7 +984,7 @@ fn two_removals_made_apart_close_both_sides_until_settle() {
     // The laptop removes the phone, through relay A: its change 3, which
     // the tablet applies.
     let mut at = removes(&laptop, &key_of(&phone), &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     let laptops_3 = person_of(&laptop)["latest"].as_str().unwrap().to_string();
     has_applied(&tablet, 3, &all!());
@@ -995,7 +995,7 @@ fn two_removals_made_apart_close_both_sides_until_settle() {
     // The desktop removes the tablet, through relay B: its change 3, which
     // the phone applies.
     let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     let desktops_3 = person_of(&desktop)["latest"].as_str().unwrap().to_string();
     assert_ne!(laptops_3, desktops_3);
@@ -1088,21 +1088,24 @@ fn two_removals_made_apart_close_both_sides_until_settle() {
     // (d) `cordelia settle` on the laptop: the prompt asks of the desktop
     // alone; the tablet and the phone are removed, and asked of by no one.
     let mut at = laptop.at_terminal(&["settle"]);
-    at.says("This device knows 1 key to be removed by a change made apart");
-    at.says("2 changes were made apart. Each is shown from its signed bytes.");
+    at.says("A change made separately from the one this device is on removed the device below");
+    at.says(
+        "These changes to your devices were made separately, neither knowing of the other. Each \
+         is shown as it was signed.",
+    );
     at.says("undoes no removal");
     at.says(&format!(
-        "({}) {:?}, a device of every change shown:",
+        "({}) {:?}, in every change shown:",
         cordelia_crypto::fingerprint::shown(&desktop_key),
         desktop.name
     ));
     at.says("Type `stays` or `removed`").types("stays");
-    at.says("The change that the recovery phrase will sign (change 4):");
+    at.says("The change your recovery phrase will sign:");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says(ASKS_THE_PHRASE).types(&words);
-    at.says("The change is made (change 4).");
+    at.says("The change is made.");
     drop(at);
     let seen = person_of(&laptop);
     assert_eq!(seen["state"], "applied", "(d): {seen}");
@@ -1595,7 +1598,7 @@ fn a_closed_device_shows_every_head_at_a_relay_that_keeps_heads() {
         };
     }
     let mut at = renews(&laptop, &["stays"; 4], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     for device in [&work, &desktop, &phone, &tablet] {
         has_applied(device, 2, &all!());
@@ -1609,14 +1612,14 @@ fn a_closed_device_shows_every_head_at_a_relay_that_keeps_heads() {
     // The desktop uses relay B alone from here, and the laptop relay A.
     moves_relay(&mut desktop, &relay_a, &relay_b);
     let mut at = removes(&laptop, &key_of(&phone), &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     has_applied(&work, 3, &all!());
     let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     let mut at = renews(&desktop, &[], &words);
-    at.says("The change is made (change 4).");
+    at.says("The change is made.");
     drop(at);
     let change_4 = person_of(&desktop)["latest"].as_str().unwrap().to_string();
     let laptops_3 = person_of(&laptop)["latest"].as_str().unwrap().to_string();
@@ -1893,7 +1896,7 @@ fn the_window_before_a_device_reads_a_removal_is_bounded() {
     let (l_notes, l_mem) = notes_of(&laptop);
     syncs_lab(&laptop, &l_notes);
     let mut at = renews(&laptop, &["stays", "stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     has_applied(&desktop, 2, &[&relay_c, &laptop, &desktop, &tablet]);
     has_applied(&tablet, 2, &[&relay_c, &laptop, &desktop, &tablet]);
@@ -1904,7 +1907,7 @@ fn the_window_before_a_device_reads_a_removal_is_bounded() {
     // tablet.
     moves_relay(&mut desktop, &relay_c, &relay_b);
     let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     let removal = person_of(&desktop)["latest"].as_str().unwrap().to_string();
     wait_for(
@@ -1918,7 +1921,7 @@ fn the_window_before_a_device_reads_a_removal_is_bounded() {
         .find(|bytes| hex::encode(Entry::from_wire(bytes).unwrap().id()) == removal)
         .expect("relay B holds the removal");
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     let old = channels_of(&applied_secret_of(&laptop));
     let laptop_key = key_bytes(&laptop);
@@ -2249,7 +2252,7 @@ fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_kn
     }
     // All on change 2, which lists each.
     let mut at = renews(&laptop, &["stays", "stays", "stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     for n in [&desktop, &tablet, &phone] {
         has_applied(n, 2, &everyone);
@@ -2260,7 +2263,7 @@ fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_kn
     // The desktop uses relay B alone, and removes the tablet: its change 3.
     moves_relay(&mut desktop, &relay_a, &relay_b);
     let mut at = removes(&desktop, &key_of(&tablet), &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     let removal = person_of(&desktop)["latest"].as_str().unwrap().to_string();
     let moved_to = applied_secret_of(&desktop);
@@ -2299,7 +2302,7 @@ fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_kn
     // The laptop renews, apart from the removal, and carries h.md; the
     // tablet applies its change.
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     let own = applied_secret_of(&laptop);
     has_applied(&tablet, 3, &all);
@@ -2612,7 +2615,7 @@ fn a_device_in_a_fork_judges_what_it_kept_when_it_starts() {
     let words = makes_a_phrase(&laptop, "laptop");
     adds(&laptop, &desktop, "desktop");
     let mut at = renews(&laptop, &["stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     has_applied(&desktop, 2, &[&relay, &laptop, &desktop]);
 
@@ -2620,7 +2623,7 @@ fn a_device_in_a_fork_judges_what_it_kept_when_it_starts() {
     relay.stop();
     for device in [&laptop, &desktop] {
         let mut at = renews(device, &[], &words);
-        at.says("The change is made (change 3).");
+        at.says("The change is made.");
         drop(at);
     }
     relay.start();

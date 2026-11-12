@@ -1649,7 +1649,10 @@ pub fn makes_a_phrase(device: &Node, label: &str) -> String {
     at.says("Now type the words back");
     at.types(&words);
     let said = at.done();
-    assert!(said.contains("follows the new recovery phrase"), "{said}");
+    assert!(
+        said.contains("is now under the new recovery phrase"),
+        "{said}"
+    );
     words
 }
 
@@ -1683,7 +1686,7 @@ pub fn adds(adder: &Node, new: &Node, label: &str) -> (String, String) {
 /// ended, and a test that went on at once would go on before the device
 /// stands where the test takes it to stand.
 pub fn became_of_the_key(device: &Node, key: &str, said: String) -> String {
-    if !said.contains("Nothing was taken yet") {
+    if !said.contains("Nothing has arrived yet") {
         return said;
     }
     let became = wait_for(
@@ -1775,7 +1778,7 @@ pub fn clears_what_it_tells(n: &Node) {
     assert_eq!(told, 1, "{}: one thing to clear", n.name);
     let mut at = n.at_terminal(&["devices", "--clear"]);
     at.says("Type yes to go on").types("yes");
-    assert!(at.done().contains("Cleared on this device."));
+    assert!(at.done().contains("Marked seen on this device."));
 }
 
 /// The folder Claude Code keeps for a session started in `dir`.

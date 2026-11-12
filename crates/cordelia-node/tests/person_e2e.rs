@@ -236,7 +236,7 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     wait_for("the relay holds the first change", &all, 60, || {
         relay_holds_latest(&laptop)
     });
-    let devices = laptop.cli(&["devices"]);
+    let devices = laptop.cli(&["devices", "-v"]);
     assert!(devices.contains("change 1"), "{devices}");
     assert!(devices.contains("this device"), "{devices}");
     assert!(
@@ -382,7 +382,7 @@ fn a_relay_whose_name_does_not_resolve_is_waited_for_and_named() {
     // A command that makes a change says what it could not fetch, and
     // which relay does not hold the change. It goes on saying so.
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     assert!(
         at.said
             .contains(&format!("Could not fetch: {NO_SUCH_NAME} did not answer.")),
@@ -467,7 +467,7 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
             "On the other device, within the hour, run:".to_string(),
             format!("  cordelia accept {laptop_key}"),
             format!(
-                "It shows these words for this device's key before it asks its yes: {}",
+                "Before you type yes there, check that it shows these words for this device: {}",
                 words_of(&laptop_key)
             ),
         ],
@@ -490,7 +490,9 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     let accepted = at.done();
     println!("{accepted}");
     assert!(
-        accepted.contains("\nThis device has joined") && accepted.contains("applied change 1"),
+        accepted.contains("\nThis device has joined your devices")
+            && accepted.contains("and is up to date.")
+            && !accepted.contains("change 1"),
         "{accepted}"
     );
 
@@ -512,15 +514,18 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
             (seen["added"][0]["applied"] == 1).then_some(())
         },
     );
+    // With `-v`, each device's words and the change's number (decision
+    // 2026-11-11 (plain words), rule 4).
     for device in [&laptop, &desktop] {
-        let listed = device.cli(&["devices"]);
+        let listed = device.cli(&["devices", "-v"]);
         println!("{listed}");
         for says in [
             format!("({}) \"laptop\"", words_of(&laptop_key)),
-            format!("({}) \"desktop\", added from (", words_of(&desktop_key)),
+            format!("({}) \"desktop\", added by (", words_of(&desktop_key)),
             laptop_key.clone(),
             desktop_key.clone(),
             "has the latest change to your devices".to_string(),
+            "It is on change 1 to your devices.".to_string(),
         ] {
             assert!(
                 listed.contains(&says),
@@ -529,9 +534,22 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
             );
         }
     }
+    let listed = laptop.cli(&["devices", "-v"]);
+    assert!(
+        listed.contains("\"desktop\", added by (") && listed.contains("up to date (change 1)"),
+        "{listed}"
+    );
+    // Without it, each by the name you gave it alone, and no number.
     let listed = laptop.cli(&["devices"]);
     assert!(
-        listed.contains("\"desktop\", added from (") && listed.contains("has applied change 1"),
+        listed.contains("  \"desktop\", added by \"laptop\" at ")
+            && listed.contains("  \"laptop\": this device")
+            && listed.contains(": up to date")
+            && !listed.contains(&format!(
+                "({}) \"desktop\", added by",
+                words_of(&desktop_key)
+            ))
+            && !listed.contains("change 1"),
         "{listed}"
     );
 
@@ -566,7 +584,7 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     // Cleared with one, on that device and on no other.
     let mut at = laptop.at_terminal(&["devices", "--clear"]);
     at.says(&asked).says("Type yes to go on").types("yes");
-    assert!(at.done().contains("Cleared on this device."));
+    assert!(at.done().contains("Marked seen on this device."));
     assert!(notices(&laptop).is_empty());
     assert!(!laptop.cli(&["status"]).contains("new device:"));
     assert_eq!(notices(&desktop).len(), 1);
@@ -574,7 +592,7 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
     // nothing else.
     assert_eq!(look(&laptop)["added"][0]["counted"], true);
     let at = laptop.at_terminal(&["devices", "--clear"]);
-    assert!(at.done().contains("nothing to clear"));
+    assert!(at.done().contains("nothing to mark seen"));
 }
 
 // ── A command without a terminal, and a phrase typed back wrongly ────
@@ -667,7 +685,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     // refusal says the way on.
     let said = laptop.at_terminal(&["add-device", &other]).refused();
     assert!(
-        said.contains("this device follows no recovery phrase yet.\r\n  - This is your first"),
+        said.contains("this device is not under a recovery phrase yet.\r\n  - This is your first"),
         "{said}"
     );
     assert!(
@@ -677,7 +695,10 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     // Nor removed, renewed or settled.
     for args in [&["renew"][..], &["remove-device", &other], &["settle"]] {
         let said = laptop.at_terminal(args).refused();
-        assert!(said.contains("follows no recovery phrase yet"), "{said}");
+        assert!(
+            said.contains("is not under a recovery phrase yet"),
+            "{said}"
+        );
     }
 
     // The routes behind the commands refuse what the commands refuse,
@@ -695,7 +716,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
         let (status, said) = asks(&laptop, path, body);
         assert_eq!(status, 400, "{path}: {said}");
         assert!(
-            said.contains("follows no recovery phrase yet"),
+            said.contains("is not under a recovery phrase yet"),
             "{path}: {said}"
         );
     }
@@ -830,8 +851,8 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     let made = look(&laptop);
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
     at.says(
-        "This replaces the recovery phrase that this device follows: the old one stops working \
-         here, and what the relays hold under it is left behind.",
+        "This replaces the recovery phrase this device is under: the old one stops working \
+         here, and what the relays keep under it is left behind.",
     );
     at.says("Type yes to go on").types("y");
     let said = at.done();
@@ -869,8 +890,7 @@ fn a_command_without_a_terminal_refuses_and_a_phrase_typed_back_wrongly_makes_no
     let said = at.refused();
     assert!(
         said.contains(
-            "that is a recovery phrase, and it is not the one that this device follows: nothing \
-             was made."
+            "that is a recovery phrase, but not the one this device is under: nothing was made."
         ),
         "{said}"
     );
@@ -1032,13 +1052,13 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     let said = laptop
         .at_terminal(&["remove-device", &laptop_key])
         .refused();
-    assert!(said.contains("that is this device's own key"), "{said}");
+    assert!(said.contains("that is this device's own ID"), "{said}");
     // A key that is nobody's device: the command says so, and asks a
     // typed answer before anything else. No answer is suggested: Enter
     // answers nothing, and nothing is made.
     let mut at = laptop.at_terminal(&["remove-device", &key_of(&relay)]);
-    at.says("is no device of yours that this device knows of");
-    at.says("Type `refuse` to refuse this key for good, or anything else to stop")
+    at.says("is not a device of yours that this device knows");
+    at.says("Type `refuse` to refuse this device for good, or anything else to stop")
         .types("");
     let said = at.refused();
     assert!(
@@ -1060,23 +1080,20 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         // The tablet was added by the device that is being removed: it is
         // removed with it, with no question, in one line.
         at.says(&format!(
-            "Removed with it, as the device being removed added them since the last change: \
+            "Removed with it, since the device you remove added them after the last change: \
              ({}) \"tablet\".",
             words_of(&tablet_key)
         ));
         // The lists, from the bytes that will be signed.
-        at.says("The change that the recovery phrase will sign (change 2):");
+        at.says("The change your recovery phrase will sign:");
         at.says(&format!("made on ({}) \"laptop\"", words_of(&laptop_key)));
-        at.says("devices (1):");
+        at.says("devices:");
         at.says(&format!(
             "({}) \"laptop\"  (this device)",
             words_of(&laptop_key)
         ));
-        at.says("removed keys (2):");
-        at.says(&format!(
-            "({}), known here as \"desktop\"",
-            words_of(&desktop_key)
-        ));
+        at.says("removed devices:");
+        at.says(&format!("({}) \"desktop\"", words_of(&desktop_key)));
         at.says("Make this change?")
             .says("Type yes to go on")
             .types("yes");
@@ -1104,8 +1121,7 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     let said = removes(&[other_phrase]).refused();
     assert!(
         said.contains(
-            "that is a recovery phrase, and it is not the one that this device follows: nothing \
-             was made."
+            "that is a recovery phrase, but not the one this device is under: nothing was made."
         ),
         "{said}"
     );
@@ -1128,10 +1144,10 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     let mut at = removes(&[&first, &second, "xyzzy"]);
     at.says("That is not a word from the list. Type word 1 again.\r\n   1. ")
         .types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     at.says(
-        "It must not be made again on another device, even if this command is stopped now: two \
-         changes made apart have to be settled with the phrase.",
+        "Do not make it again on another device, even if you stop this command now: two changes \
+         made separately must be settled with the recovery phrase.",
     );
     at.says(
         "You may close this machine once every relay has the change, and what this device copied \
@@ -1179,12 +1195,19 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     wait_for("the tablet learns that it was removed", &all, 120, || {
         (text(&look(&tablet), "state") == "removed").then_some(())
     });
-    let listed = laptop.cli(&["devices"]);
+    // Without `-v`, a removed device is named by the name you gave it
+    // alone (decision 2026-11-11 (plain words), rule 4).
+    let plain = laptop.cli(&["devices"]);
+    assert!(
+        plain.contains(&format!("  \"desktop\"  {desktop_key}")),
+        "{plain}"
+    );
+    let listed = laptop.cli(&["devices", "-v"]);
     println!("{listed}");
-    assert!(listed.contains("Removed keys:"), "{listed}");
+    assert!(listed.contains("Removed devices:"), "{listed}");
     // The tablet is among them, by its words: its record, which gave its
     // label, was under the change before.
-    let removed_keys = listed.split("Removed keys:").nth(1).unwrap_or_default();
+    let removed_keys = listed.split("Removed devices:").nth(1).unwrap_or_default();
     assert!(
         removed_keys.contains(&tablet_key) && removed_keys.contains(&words_of(&tablet_key)),
         "{listed}"
@@ -1225,7 +1248,7 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     assert!(said.contains("this device was removed"), "{said}");
     let said = desktop.at_terminal(&["accept", &laptop_key]).refused();
     assert!(
-        said.contains("this device was removed: `cordelia init --new-key` first"),
+        said.contains("this device was removed: run `cordelia init --new-key` to start it over"),
         "{said}"
     );
     let said = desktop.at_terminal(&["renew"]).refused();
@@ -1235,7 +1258,7 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         .at_terminal(&["phrase", "--name", "desktop"])
         .refused();
     assert!(
-        said.contains("A device that has stopped makes no phrase of its own"),
+        said.contains("A stopped device cannot make a recovery phrase"),
         "{said}"
     );
     assert!(
@@ -1264,14 +1287,14 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
         .at_terminal(&["add-device", &desktop_key, "--name", "desktop"])
         .refused();
     assert!(
-        said.contains("that key was removed, and a removed key is not added again"),
+        said.contains("that device was removed, and a removed device is never added again"),
         "{said}"
     );
     // And when it is removed again.
     let said = laptop
         .at_terminal(&["remove-device", &desktop_key])
         .refused();
-    assert!(said.contains("that key was removed already"), "{said}");
+    assert!(said.contains("that device was removed already"), "{said}");
 }
 
 /// A key that this device knows nothing of is removed by key (decision
@@ -1298,12 +1321,12 @@ fn a_key_that_no_device_knows_is_removed_by_key_and_refused_for_good() {
     let asks_its_answer = |answer: &str| {
         let mut at = laptop.at_terminal(&["remove-device", &old_key]);
         at.says(&format!(
-            "The key ({}) is no device of yours that this device knows of: it is in no list \
-             of the last change, and was not added since",
+            "The device ({}) is not a device of yours that this device knows: it is not in the \
+             last change to your devices, and was not added since",
             words_of(&old_key)
         ));
-        at.says("Removing it refuses that key for good");
-        at.says("Type `refuse` to refuse this key for good, or anything else to stop")
+        at.says("Removing it refuses that device for good");
+        at.says("Type `refuse` to refuse this device for good, or anything else to stop")
             .types(answer);
         at
     };
@@ -1333,19 +1356,19 @@ fn a_key_that_no_device_knows_is_removed_by_key_and_refused_for_good() {
         words_of(&desktop_key)
     ));
     at.says("Type `stays` or `removed`").types("stays");
-    at.says("The change that the recovery phrase will sign (change 2):");
-    at.says("devices (2):");
-    at.says("removed keys (1):");
+    at.says("The change your recovery phrase will sign:");
+    at.says("devices:");
+    at.says("removed devices:");
     at.says(&format!("({})", words_of(&old_key)));
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let said = at.done();
     assert!(
-        !said.contains(&format!("({}), known here as", words_of(&old_key))),
+        !said.contains(&format!("({}) \"", words_of(&old_key))),
         "{said}"
     );
     assert!(
@@ -1363,7 +1386,7 @@ fn a_key_that_no_device_knows_is_removed_by_key_and_refused_for_good() {
         assert_eq!(removed[0]["key"], old_key.as_str(), "{removed}");
     }
     let listed = laptop.cli(&["devices"]);
-    assert!(listed.contains("Removed keys:"), "{listed}");
+    assert!(listed.contains("Removed devices:"), "{listed}");
     assert!(listed.contains(&old_key), "{listed}");
 
     // The key is refused for good: no device of the person's adds it.
@@ -1372,13 +1395,13 @@ fn a_key_that_no_device_knows_is_removed_by_key_and_refused_for_good() {
             .at_terminal(&["add-device", &old_key, "--name", "tablet"])
             .refused();
         assert!(
-            said.contains("that key was removed, and a removed key is not added again"),
+            said.contains("that device was removed, and a removed device is never added again"),
             "{said}"
         );
     }
     // And it is removed once: a second time says that it was.
     let said = laptop.at_terminal(&["remove-device", &old_key]).refused();
-    assert!(said.contains("that key was removed already"), "{said}");
+    assert!(said.contains("that device was removed already"), "{said}");
     // The machine of that key followed no phrase, and follows none.
     assert_eq!(text(&look(&old), "state"), "no_phrase");
     let _ = laptop_key;
@@ -1411,7 +1434,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     // answer is suggested for it. The lists are then shown.
     let mut at = laptop.at_terminal(&["renew"]);
     at.says(&format!(
-        "({}) \"desktop\", added since the last change, from ({}) \"laptop\"",
+        "({}) \"desktop\", added since the last change to your devices, by ({}) \"laptop\"",
         words_of(&desktop_key),
         words_of(&laptop_key)
     ));
@@ -1420,8 +1443,8 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     at.says("Type `stays` or `removed`").types("");
     at.says("That is none of the answers. No answer is suggested: type one.");
     at.says("Type `stays` or `removed`").types("stays");
-    at.says("The change that the recovery phrase will sign (change 2):");
-    at.says("devices (2):");
+    at.says("The change your recovery phrase will sign:");
+    at.says("devices:");
     at.says("Make this change?").says("Type yes to go on");
 
     // While the prompt stands, the desktop adds the tablet, and the
@@ -1433,7 +1456,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     at.types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let said = at.done();
     assert!(!said.contains("This asks again"), "{said}");
     assert!(
@@ -1480,20 +1503,23 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     );
     assert_eq!(notices(&laptop), std::slice::from_ref(&not_in));
     let listed = laptop.cli(&["devices"]);
-    assert!(listed.contains("Not in the last change"), "{listed}");
+    assert!(listed.contains("Left out of the last change"), "{listed}");
     assert!(!listed.contains(&tablet_key), "{listed}");
 
     // It is added again, by the same two commands. `add-device` shows
     // the key as not in the last change before its yes.
     let mut at = laptop.at_terminal(&["add-device", &tablet_key, "--name", "tablet"]);
-    at.says("This key was not in the last change. This device knew it as \"tablet\"");
+    at.says(
+        "That device was left out of the last change to your devices. This device knew it as \
+         \"tablet\"",
+    );
     at.says("Type yes to go on").types("yes");
     at.done();
     let mut at = tablet.at_terminal(&["accept", &laptop_key]);
     at.says(&format!(
-        "This device takes, within the hour, only what the device ({}) hands over under the \
-         recovery phrase that it already follows, with the change that stopped it or one made \
-         after that. It keeps its folders, and carries what it holds.",
+        "Within the hour, this device takes only what the device ({}) sends under the \
+         recovery phrase it is already under: the change that stopped it, or a later one. It \
+         keeps its folders, and copies over what it has.",
         words_of(&laptop_key)
     ));
     at.says("Type yes to go on").types("yes");
@@ -1501,9 +1527,11 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     // last line, and it begins with a capital: read from what the command
     // printed, and from nothing that the harness made of it.
     let printed = at.done();
-    if !printed.contains("Nothing was taken yet") {
+    if !printed.contains("Nothing has arrived yet") {
         assert!(
-            printed.ends_with("\nThis device has applied change 2, which it was handed.\r\n"),
+            printed.ends_with(
+                "\nThis device is up to date with the change the other device sent.\r\n"
+            ),
             "{printed:?}"
         );
     }
@@ -1512,7 +1540,7 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     let said = became_of_the_key(&tablet, &laptop_key, printed);
     assert!(
         said.to_lowercase()
-            .contains("this device has applied change 2, which it was handed"),
+            .contains("this device is up to date with the change the other device sent"),
         "{said}"
     );
     let seen = look(&tablet);
@@ -1541,7 +1569,11 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
     }
     at.done();
     assert!(notices(&laptop).is_empty());
-    assert!(!laptop.cli(&["devices"]).contains("Not in the last change"));
+    assert!(
+        !laptop
+            .cli(&["devices"])
+            .contains("Left out of the last change")
+    );
 
     // At the next change the tablet, added since, is asked about, and
     // the person says that it is removed: it is among the removed keys
@@ -1552,19 +1584,16 @@ fn a_renewal_lists_who_stays_and_a_record_that_arrives_after_the_prompt_restarts
         words_of(&tablet_key)
     ));
     at.says("Type `stays` or `removed`").types("removed");
-    at.says("The change that the recovery phrase will sign (change 3):");
-    at.says("devices (2):");
-    at.says("removed keys (1):");
-    at.says(&format!(
-        "({}), known here as \"tablet\"",
-        words_of(&tablet_key)
-    ));
+    at.says("The change your recovery phrase will sign:");
+    at.says("devices:");
+    at.says("removed devices:");
+    at.says(&format!("({}) \"tablet\"", words_of(&tablet_key)));
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     at.done();
     wait_for("the tablet learns that it was removed", &all, 120, || {
         (text(&look(&tablet), "state") == "removed").then_some(())
@@ -1590,7 +1619,7 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     // The laptop's command stands at its phrase prompt.
     let mut at = laptop.at_terminal(&["renew"]);
     at.says("Type `stays` or `removed`").types("stays");
-    at.says("The change that the recovery phrase will sign (change 2):");
+    at.says("The change your recovery phrase will sign:");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
@@ -1614,14 +1643,14 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     let mut on_desktop = desktop.at_terminal(&["renew"]);
     on_desktop
         .says("A change is the list of your devices that your recovery phrase signs.")
-        .says("Your last change (change 1, made on ")
+        .says("Your last change, made on ")
         .says("laptop")
         .says("was signed before this machine was added")
         .says("laptop")
         .says("added this machine at ")
         .says("desktop")
-        .says("This command makes change 2.")
-        .says("will list this machine as ")
+        .says("This command makes a new change.")
+        .says("will include this machine as ")
         .says("desktop")
         .says("Type `list` to list this machine and go on.")
         .types("list");
@@ -1641,13 +1670,13 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     at.types(&words);
     at.says("A change reached this device while you were answering.");
     at.says("This asks again");
-    at.says("The change that the recovery phrase will sign (change 3):");
+    at.says("The change your recovery phrase will sign:");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     let said = at.done();
     // What is typed is shown again once the phrase has been read: each
     // of the two yeses is on the terminal, and the phrase never is.
@@ -1670,7 +1699,7 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     // the change: what it is handed brings none, and nothing is done.
     let mut at = laptop.at_terminal(&["add-device", &key_of(&desktop), "--name", "another"]);
     at.says(&format!(
-        "({}) \"desktop\" is one of your devices already: this hands it the last change again, and \
+        "({}) \"desktop\" is one of your devices already: this sends it the last change to your devices again, and \
          adds nothing.",
         words_of(&key_of(&desktop))
     ));
@@ -1685,8 +1714,8 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     at.says("This device is one of several.");
     at.says("Type yes to go on").types("yes");
     at.says(
-        "So far: what was handed over brings no change that this device has not applied: \
-         nothing was done.",
+        "So far: what the other device sent has no change that this device does not have \
+         already: nothing was done.",
     );
     drop(at);
     assert_eq!(look(&desktop)["change"], 3);
@@ -1702,12 +1731,12 @@ fn a_change_that_arrives_between_the_prompt_and_the_phrase_has_the_command_ask_a
     at.says("Type yes to go on").types("yes");
     at.done();
     let mut at = desktop.at_terminal(&["accept", &key_of(&other)]);
-    at.says("This device is one of several. It takes, within the hour, only what the device (");
-    at.says("Anything else moves nothing.");
+    at.says("This device is one of several. Within the hour, it takes only what the device (");
+    at.says("Anything else changes nothing.");
     at.says("Type yes to go on").types("yes");
     at.says(
-        "So far: what was handed over is under another recovery phrase than the one this device \
-         follows, and this device is one of several: nothing moved.",
+        "So far: what the other device sent is under another recovery phrase than the one this \
+         device is under, and this device is one of several: nothing changed.",
     );
     drop(at);
     let mut now = holds(&desktop);
@@ -1756,9 +1785,10 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
 
     // `cordelia phrase` on one of several: it asks first.
     let mut at = desktop.at_terminal(&["phrase", "--name", "desktop"]);
-    at.says(
-        "This device leaves the 2 devices it is with and starts again alone, under a new phrase.",
-    );
+    // It names each device it leaves, by its words and then its name
+    // (decision 2026-11-11 (plain words), rule 2).
+    at.says("This device leaves (")
+        .says(", the other devices it is with, and starts again alone, under a new phrase.");
     at.says("Type yes to go on").types("yes");
     at.says("Press Enter when you have");
     let new_words = words_shown(&at.said);
@@ -1817,7 +1847,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     // The desktop is alone under a phrase. The laptop hands it what it
     // holds again: it still counts there.
     let mut at = laptop.at_terminal(&["add-device", &desktop_key, "--name", "desktop"]);
-    at.says("This key counts as one of your devices already");
+    at.says("That device is one of yours already");
     at.says("Type yes to go on").types("yes");
     at.done();
     // While sync is on there, `accept` is refused: sending its folders
@@ -1836,11 +1866,13 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     assert_eq!(text(&look(&desktop), "among"), "alone");
     desktop.cli(&["sync", "off"]);
     let mut at = desktop.at_terminal(&["accept", &laptop_key]);
-    at.says("The recovery phrase that this device follows stops working here");
+    at.says("The recovery phrase this device is under stops working here");
     at.says("Type yes to go on").types("yes");
     let said = at.done();
     assert!(
-        said.contains("This device has left the recovery phrase it followed alone, and has joined"),
+        said.contains(
+            "This device has left the recovery phrase it was alone under, and joined your devices"
+        ),
         "{said}"
     );
     assert_eq!(text(&look(&desktop), "among"), "several");
@@ -1865,7 +1897,8 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     );
 
     let mut at = tablet.at_terminal(&["init", "--new-key"]);
-    at.says("This gives this device a new key. It leaves the 2 devices it is with");
+    at.says("This starts this device over as a new device, with a new ID. It leaves (")
+        .says(", the other devices it is with, and tells them first.");
     at.says("It keeps its memory folders and their mappings");
     at.says("Type yes to go on").types("yes");
     let said = at.done();
@@ -1876,7 +1909,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
         "{said}"
     );
     assert!(!said.contains("Could not send it"), "{said}");
-    assert!(said.contains("This device has a new key:"), "{said}");
+    assert!(said.contains("This device has a new ID:"), "{said}");
     let new_key = key_of(&tablet);
     assert_ne!(new_key, tablet_key);
     assert!(said.contains(&new_key), "{said}");
@@ -1885,7 +1918,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
     assert!(
         said.contains(&format!(
-            "The node still runs under the old key. Before anything else, restart the \
+            "The node still runs as the old device. Before anything else, restart the \
              node:\r\n  {restart}\r\nThen run `cordelia status`.\r\n"
         )),
         "{said}"
@@ -1896,7 +1929,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     let said = tablet.refused(&["devices"]);
     assert!(
         said.contains(&format!(
-            "this device was given a new key, and the node still runs under the old one. \
+            "this device was started over as a new device, and the node still runs as the old one. \
              Restart the node:\n  {restart}\nThen run `cordelia status`.\n"
         )),
         "{said}"
@@ -1992,7 +2025,9 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     // nothing to settle.
     let said = laptop.at_terminal(&["settle"]).refused();
     assert!(
-        said.contains("this device has seen no two changes made apart: there is nothing to settle"),
+        said.contains(
+            "this device has seen no two changes made separately: there is nothing to settle"
+        ),
         "{said}"
     );
 
@@ -2000,7 +2035,7 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     relay.stop();
     for device in [&laptop, &desktop] {
         let mut at = renews(device, &[], &words);
-        at.says("The change is made (change 3).");
+        at.says("The change is made.");
         at.says("keep this machine on:");
         // It stays, and does not say that the machine may be closed:
         // no relay holds the change.
@@ -2039,10 +2074,10 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
         "{status}"
     );
     assert!(status.contains(set_aside), "{status}");
-    let listed = forked.cli(&["devices"]);
+    let listed = forked.cli(&["devices", "-v"]);
     assert!(listed.contains(set_aside), "{listed}");
     assert!(
-        listed.contains("The change made apart (change 3, made on"),
+        listed.contains("A change made separately, on ") && listed.contains(" (change 3):"),
         "{listed}"
     );
     // A change made there is the settlement (rule 21): the route hands
@@ -2056,27 +2091,30 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
 
     // The settlement, made by `cordelia renew`.
     let mut at = forked.at_terminal(&["renew"]);
-    at.says("2 changes were made apart. Each is shown from its signed bytes.");
-    at.says("Change 3 (this device follows):");
-    at.says("Change 3 (set aside):");
+    at.says(
+        "These changes to your devices were made separately, neither knowing of the other. Each \
+         is shown as it was signed.",
+    );
+    at.says("The change this device is on:");
+    at.says("A change put aside:");
     at.says("undoes no removal");
     at.says(&format!(
-        "({}) {:?}, a device of every change shown:",
+        "({}) {:?}, in every change shown:",
         words_of(&key_of(other)),
         other.name
     ));
     at.says(
-        "Type `stays` or `removed`, or `neither` (it is in no list, and is added again by hand)",
+        "Type `stays` or `removed`, or `neither` (it goes on no list, and you add it again yourself)",
     )
     .types("stays");
-    at.says("The change that the recovery phrase will sign (change 4):");
-    at.says("devices (2):");
+    at.says("The change your recovery phrase will sign:");
+    at.says("devices:");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 4).");
+    at.says("The change is made.");
     at.done();
     let seen = look(forked);
     assert_eq!(
@@ -2133,7 +2171,7 @@ fn no_word_of_the_phrase_reaches_the_node_its_log_or_its_files_at_a_removal() {
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let shown = at.done();
     wait_for("the desktop learns that it was removed", &all, 120, || {
         (text(&look(&desktop), "state") == "removed").then_some(())
@@ -2314,7 +2352,7 @@ fn a_phrase_is_not_shown_inside_a_terminal_that_keeps_what_is_shown() {
         .says("Type yes to go on")
         .types("yes");
     at.says(ASKS_THE_PHRASE).types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     assert_eq!(look(&laptop)["change"], 2);
 }
@@ -2456,15 +2494,15 @@ fn a_new_key_that_is_stopped_takes_back_the_word_that_the_device_left() {
 
     // Stopped at the second yes.
     let mut at = tablet.at_terminal(&["init", "--new-key"]);
-    at.says("This gives this device a new key")
+    at.says("This starts this device over as a new device")
         .says("Type yes to go on")
         .types("yes");
     at.says("Telling the relays what this device leaves behind");
     assert_eq!(own_entries(), (stood + 1, 0), "its word that it left");
-    at.says("Go on without having told them?")
+    at.says("Go on without telling them?")
         .says("Type yes to go on")
         .types("no");
-    at.says("Stopped. This device keeps its key and what it holds, and has taken back its word");
+    at.says("Stopped. This device stays as it was, and has told them it is not leaving after all");
     at.done();
     assert_eq!(std::fs::read(&key_file).unwrap(), key_before);
     assert_eq!(
@@ -2478,10 +2516,10 @@ fn a_new_key_that_is_stopped_takes_back_the_word_that_the_device_left() {
     // Gone on with: the key file is replaced whole.
     let mut at = tablet.at_terminal(&["init", "--new-key"]);
     at.says("Type yes to go on").types("yes");
-    at.says("Go on without having told them?")
+    at.says("Go on without telling them?")
         .says("Type yes to go on")
         .types("yes");
-    at.says("This device has a new key");
+    at.says("This device has a new ID");
     at.done();
     let key_after = std::fs::read(&key_file).unwrap();
     assert_eq!(key_after.len(), 32);
@@ -2568,7 +2606,10 @@ fn ctrl_c_is_read_as_a_key_and_what_was_typed_ahead_answers_nothing() {
     let typed_back = at.says_one_of(&["All twelve match.", "\u{2717}"]);
     assert_eq!(typed_back, 0, "a word got a cross:\n{}", at.said);
     let said = at.done();
-    assert!(said.contains("follows the new recovery phrase"), "{said}");
+    assert!(
+        said.contains("is now under the new recovery phrase"),
+        "{said}"
+    );
     assert!(
         said.contains(&format!("{ASKS_THE_WORDS_BACK}\r\n\r\n{}", ticks(1, 12))),
         "{said:?}"
@@ -2589,7 +2630,7 @@ fn ctrl_c_is_read_as_a_key_and_what_was_typed_ahead_answers_nothing() {
     // An Enter pressed twice at the yes: the second is dropped before the
     // screen that shows the new phrase goes up, and the screen stays.
     let mut at = laptop.at_terminal(&["phrase", "--name", "laptop"]);
-    at.says("This replaces the recovery phrase that this device follows")
+    at.says("This replaces the recovery phrase this device is under")
         .says("Type yes to go on")
         .presses(b"yes\n\n");
     at.says("Press Enter when you have");
@@ -2704,11 +2745,11 @@ fn each_word_of_the_list_gets_a_tick_and_nothing_that_is_typed_is_shown() {
 
     let mut at = renews_to_the_phrase(&laptop);
     types_each(&mut at, ASKS_THE_PHRASE, &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let said = at.said.clone();
     drop(at);
     let typed = format!(
-        "{ASKS_THE_PHRASE}\r\n\r\n{}\r\nThe change is made (change 2).",
+        "{ASKS_THE_PHRASE}\r\n\r\n{}\r\nThe change is made.",
         ticks(1, 12)
     );
     assert!(said.contains(&typed), "{said:?}");
@@ -2759,7 +2800,7 @@ fn twelve_words_on_one_line_are_taken_in_their_order() {
     at.types(&last_first.join(" "));
     let judged = at.says_one_of(&[
         "It was mistyped: nothing was made.",
-        "it is not the one that this device follows: nothing was made.",
+        "but not the one this device is under: nothing was made.",
         "The change is made",
         "\u{2717}",
     ]);
@@ -2775,9 +2816,9 @@ fn twelve_words_on_one_line_are_taken_in_their_order() {
     let mut at = renews_to_the_phrase(&laptop);
     at.types(&one_line);
     let judged = at.says_one_of(&[
-        "The change is made (change 2).",
+        "The change is made.",
         "It was mistyped",
-        "it is not the one that this device follows",
+        "but not the one this device is under",
         "\u{2717}",
     ]);
     assert_eq!(judged, 0, "{}", at.said);
@@ -2860,14 +2901,14 @@ fn a_word_that_is_not_in_the_list_is_asked_again_and_is_no_miss() {
     at.says(&not_in_the_list(3)).says("   3. ");
     at.types(&shown[2..].join(" "));
     let judged = at.says_one_of(&[
-        "The change is made (change 2).",
+        "The change is made.",
         "It was mistyped",
-        "it is not the one that this device follows",
+        "but not the one this device is under",
         "Type word",
     ]);
     assert_eq!(judged, 0, "{}", at.said);
     let typed = format!(
-        "{ASKS_THE_PHRASE}\r\n\r\n{}{}{}\r\nThe change is made (change 2).",
+        "{ASKS_THE_PHRASE}\r\n\r\n{}{}{}\r\nThe change is made.",
         ticks(1, 2),
         not_in_the_list(3),
         ticks(3, 12)
@@ -2951,8 +2992,8 @@ fn where_a_phrase_is_proved_a_wrong_word_of_the_list_gets_the_tick_of_the_right_
     let with_anothers = at.refused_within(Duration::from_secs(60));
     assert!(
         with_anothers.contains(&format!(
-            "{all_ticks}Error: that is a recovery phrase, and it is not the one that this device \
-             follows: nothing was made."
+            "{all_ticks}Error: that is a recovery phrase, but not the one this device is under: \
+             nothing was made."
         )),
         "{with_anothers:?}"
     );
@@ -2978,7 +3019,7 @@ fn where_a_phrase_is_proved_a_wrong_word_of_the_list_gets_the_tick_of_the_right_
     );
     // And then the device's own, at the same command.
     at.says(ASKS_THE_PHRASE).types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let with_its_own = at.said.clone();
     drop(at);
 
@@ -2996,7 +3037,7 @@ fn where_a_phrase_is_proved_a_wrong_word_of_the_list_gets_the_tick_of_the_right_
         "{with_its_own:?}"
     );
     assert!(
-        with_its_own.contains(&format!("{all_ticks}\r\nThe change is made (change 2).")),
+        with_its_own.contains(&format!("{all_ticks}\r\nThe change is made.")),
         "{with_its_own:?}"
     );
 
@@ -3009,7 +3050,7 @@ fn where_a_phrase_is_proved_a_wrong_word_of_the_list_gets_the_tick_of_the_right_
     // other from the line that asks.)
     let mut at = renews_to_the_phrase(&laptop);
     at.types(&words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     let with_the_right = at.said.clone();
     drop(at);
     assert_eq!(
@@ -3115,7 +3156,10 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
         "{said:?}"
     );
     assert!(!said.contains("All twelve match."), "{said}");
-    assert!(!said.contains("follows the new recovery phrase"), "{said}");
+    assert!(
+        !said.contains("is now under the new recovery phrase"),
+        "{said}"
+    );
     // Nothing was made, and the node was asked to make nothing.
     assert_eq!(asked_to_make(), 0);
     assert!(
@@ -3144,7 +3188,10 @@ fn a_word_typed_back_that_is_not_the_word_shown_is_said_and_the_third_stops_the_
         )),
         "{said:?}"
     );
-    assert!(said.contains("follows the new recovery phrase"), "{said}");
+    assert!(
+        said.contains("is now under the new recovery phrase"),
+        "{said}"
+    );
     assert_eq!(asked_to_make(), 1);
     let seen = look(&laptop);
     assert_eq!(
@@ -3453,12 +3500,12 @@ fn where_a_phrase_is_proved_a_right_word_and_a_wrong_one_are_ticked_alike_in_tim
     let wrong = ticked_in(&mut at, anothers);
     let said = at.refused_within(Duration::from_secs(60));
     assert!(
-        said.contains("it is not the one that this device follows: nothing was made."),
+        said.contains("but not the one this device is under: nothing was made."),
         "{said}"
     );
     let mut at = renews_to_the_phrase(&laptop);
     let right = ticked_in(&mut at, &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
 
     let bound = Duration::from_secs(PHRASE_MISS_PAUSE_SECS) * 3 / 4;
@@ -3668,14 +3715,14 @@ fn where_a_phrase_is_proved_what_is_typed_on_after_a_cross_is_not_taken_for_the_
     assert!(at.said.ends_with(&so_far), "{:?}", at.said);
     at.types(&own[2..].join(" "));
     let judged = at.says_one_of(&[
-        "The change is made (change 2).",
+        "The change is made.",
         "It was mistyped",
-        "it is not the one that this device follows",
+        "but not the one this device is under",
         "Type word",
     ]);
     assert_eq!(judged, 0, "{}", at.said);
     let all = format!(
-        "{ASKS_THE_PHRASE}\r\n\r\n{}{}{}\r\nThe change is made (change 2).",
+        "{ASKS_THE_PHRASE}\r\n\r\n{}{}{}\r\nThe change is made.",
         ticks(1, 2),
         not_in_the_list(3),
         ticks(3, 12)
@@ -3748,9 +3795,9 @@ fn the_prompt_ends_with_the_line_that_the_twelfth_word_is_on() {
     at.sends(format!("{words} thirteenth\n").as_bytes());
     let (made, said, left) = at.ends_and_leaves();
     assert!(made, "{said}");
-    let typed = |change: u64| {
+    let typed = |_change: u64| {
         format!(
-            "{ASKS_THE_PHRASE}\r\n\r\n{}\r\nThe change is made (change {change}).",
+            "{ASKS_THE_PHRASE}\r\n\r\n{}\r\nThe change is made.",
             ticks(1, 12)
         )
     };
@@ -3898,22 +3945,22 @@ fn a_chain_of_two_is_removed_with_the_device_that_added_it() {
     let mut at = laptop.at_terminal(&["remove-device", &desktop_key]);
     at.says("To be removed:");
     // The tablet and the phone go with it, in one line, with no question.
-    at.says("Removed with it, as the device being removed added them since the last change:")
+    at.says("Removed with it, since the device you remove added them after the last change:")
         .says("tablet")
         .says("phone");
-    at.says("was signed before this machine was added, so it does not list this machine.")
+    at.says("was signed before this machine was added, so it does not include this machine.")
         .says("Type `list` to list this machine and go on.")
         .types("list");
-    at.says("The change that the recovery phrase will sign (change 2):");
-    at.says("devices (1):");
+    at.says("The change your recovery phrase will sign:");
+    at.says("devices:");
     at.says("(this device)");
-    at.says("removed keys (3):");
+    at.says("removed devices:");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let said = at.done();
     // Neither was asked about.
     assert!(!said.contains("Type `stays` or `removed`"), "{said}");
@@ -3950,7 +3997,7 @@ fn a_devices_word_that_it_left_outlives_the_next_change() {
 
     // The tablet leaves, by a person's own command there.
     let mut at = tablet.at_terminal(&["phrase", "--name", "tablet"]);
-    at.says("This device leaves the ")
+    at.says("This device leaves (")
         .says("Type yes to go on")
         .types("yes");
     at.says("Press Enter when you have");
@@ -3979,16 +4026,16 @@ fn a_devices_word_that_it_left_outlives_the_next_change() {
     at.says("Type `list` to list this machine and go on.")
         .types("list");
     at.says("tablet")
-        .says("added since the last change, from")
-        .says("It has said that it left, and started again under another phrase");
+        .says("added since the last change to your devices, by")
+        .says("It has said that it left, and started again under another recovery phrase");
     at.says("Type `stays` or `removed`").types("stays");
-    at.says("devices (3):");
+    at.says("devices:");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     assert_eq!(look(&desktop)["change"], 2);
     // The notice is still on the desktop afterwards.
@@ -4017,18 +4064,18 @@ fn a_devices_word_that_it_left_outlives_the_next_change() {
     // suggested.
     let mut at = desktop.at_terminal(&["renew"]);
     at.says("tablet")
-        .says("a device of the last change. It has said that it left");
+        .says("in the last change to your devices. It has said that it left");
     at.says("Type `stays` or `removed`").types("");
     at.says("That is none of the answers. No answer is suggested: type one.");
     at.says("Type `stays` or `removed`").types("removed");
-    at.says("devices (2):");
-    at.says("removed keys (1):");
+    at.says("devices:");
+    at.says("removed devices:");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     has_applied(&laptop, 3, &[&relay, &laptop, &desktop]);
     // The word goes with the device.
@@ -4113,7 +4160,7 @@ fn a_process_that_holds_the_phrase_cannot_be_dumped_and_the_wait_is_in_another_i
     at.types("yes");
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
 
     // The wait: the same process, and another image of the program in
     // it, which was given the change's number and its entry, and nothing
@@ -4300,7 +4347,7 @@ fn a_command_refuses_what_names_another_key_as_this_device() {
     let said = laptop
         .at_terminal_through(passes_on.port, &["devices"])
         .done();
-    assert!(said.contains("Added since:"), "{said}");
+    assert!(said.contains("Added since the last change:"), "{said}");
     let mut at = laptop.at_terminal_through(passes_on.port, &["renew"]);
     at.says("added since the last change")
         .says("Type `stays` or `removed`");
@@ -4309,7 +4356,7 @@ fn a_command_refuses_what_names_another_key_as_this_device() {
     // A command that is refused here asks nothing first: it ends by
     // itself, and is not waited for where it asks.
     let soon = std::time::Duration::from_secs(60);
-    let refusal = "does not name this device's key";
+    let refusal = "is not this device";
     let said = laptop
         .at_terminal_through(stand_in.port, &["renew"])
         .refused_within(soon);
@@ -4319,7 +4366,7 @@ fn a_command_refuses_what_names_another_key_as_this_device() {
     let restart = cordelia_api::commands::restart_command(std::env::consts::OS);
     assert!(
         said.contains(&format!(
-            "If this device was given a new key, restart the node:\r\n  {restart}\r\n"
+            "If you started this device over as a new device, restart the node:\r\n  {restart}\r\n"
         )),
         "{said}"
     );
@@ -4424,7 +4471,7 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
         .unwrap();
     let told_by = cordelia_crypto::fingerprint::shown(&key);
     assert!(
-        said.contains(&format!("shown there as ({told_by})")),
+        said.contains(&format!("the new one is ({told_by})")),
         "{said}"
     );
     assert_eq!(text(&look(&laptop), "state"), "no_phrase");
@@ -4444,7 +4491,10 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
     at.says("Now type the words back").types(&words);
     at.says("The node's answer was lost. Asking it again...");
     let said = at.done();
-    assert!(said.contains("follows the new recovery phrase"), "{said}");
+    assert!(
+        said.contains("is now under the new recovery phrase"),
+        "{said}"
+    );
     assert!(!said.contains("it is not known"), "{said}");
     let key = cordelia_crypto::phrase::Phrase::parse(&words)
         .unwrap()
@@ -4458,7 +4508,7 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
     let listed = laptop.cli(&["devices"]);
     assert!(
         listed.contains(&format!(
-            "The recovery phrase it follows: ({}).",
+            "It is under the recovery phrase with the fingerprint ({}).",
             phrase_words(&laptop)
         )),
         "{listed}"
@@ -4477,7 +4527,7 @@ fn a_command_whose_answer_was_lost_asks_the_node_again_before_it_says_anything()
     at.says("Type your recovery phrase, one word at a time")
         .types(&words);
     at.says("The node's answer was lost. Asking it again...");
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     assert_eq!(look(&laptop)["change"], 2);
 
@@ -5196,9 +5246,9 @@ fn changes_made_while_passes_are_in_flight_leave_nothing_of_a_channel_left() {
 
     // Three changes, one after another, each made while that goes on.
     renews(&laptop, &["stays"], &words).done();
-    for number in [3, 4] {
+    for _ in [3, 4] {
         let mut at = renews(&laptop, &[], &words);
-        at.says(&format!("The change is made (change {number})."));
+        at.says("The change is made.");
         at.done();
     }
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -5379,13 +5429,16 @@ fn not_heard_from_yet_runs_only_from_a_time_of_this_devices_own() {
         let said = device.cli(&["devices"]);
         let line = said
             .lines()
-            .find(|line| line.contains("\"tablet\", added from"));
+            .find(|line| line.contains("\"tablet\", added by"));
         line.unwrap_or_else(|| panic!("no line for the tablet:\n{said}"))
             .to_string()
     };
     let on_the_laptop = line_of(&laptop);
     assert!(
-        on_the_laptop.contains("yet, as far as this device has heard: adding it again"),
+        on_the_laptop.contains(
+            "not up to date yet, as far as this device knows: to send it the last change, add it \
+             again"
+        ),
         "{on_the_laptop}"
     );
     assert!(
@@ -5457,7 +5510,7 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
         &[(reached.clone(), None), (NO_SUCH_NAME.to_string(), None)],
     );
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let made = Instant::now();
     at.says(&format!("{reached} has the change"));
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
@@ -5539,7 +5592,7 @@ fn a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_th
     let words = makes_a_phrase(&laptop, "laptop");
     adds(&laptop, &desktop, "desktop");
     let mut at = removes(&laptop, &key_of(&desktop), &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     let all = [&relay, &laptop, &desktop];
     wait_for("the relay holds the removal", &all, 60, || {
@@ -5606,7 +5659,7 @@ fn a_change_ends_not_done_where_the_relay_it_reaches_refuses_it() {
         &[(reached.clone(), None), (NO_SUCH_NAME.to_string(), None)],
     );
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let made = Instant::now();
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     assert!(
@@ -5658,7 +5711,7 @@ fn a_change_ends_not_done_where_the_other_relay_has_the_wrong_key_at_the_same_ad
         ],
     );
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let (status, said) = at.ends_with_status_within(OUT_OF_REACH_WAITED);
     assert_eq!(status, Some(3), "{said}");
     for line in [
@@ -5700,7 +5753,7 @@ fn a_relay_that_comes_back_within_five_minutes_does_not_end_the_wait() {
     );
     b.stop();
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let said = at.hears_for(Duration::from_secs(120)).to_string();
     assert!(!said.contains("This command ends here"), "{said}");
     says_not_that_it_may_be_closed(&said);
@@ -5798,19 +5851,19 @@ fn a_device_added_since_the_last_change_is_asked_to_list_itself() {
     let all = [&relay, &laptop, &desktop];
     let words = makes_a_phrase(&laptop, "laptop");
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     adds(&laptop, &desktop, "desktop");
     has_applied(&desktop, 2, &all);
 
     let mut at = desktop.at_terminal(&["renew"]);
     at.says("A change is the list of your devices that your recovery phrase signs.")
-        .says("Your last change (change 2, made on ")
+        .says("Your last change, made on ")
         .says("laptop")
-        .says("was signed before this machine was added, so it does not list this machine.")
+        .says("was signed before this machine was added, so it does not include this machine.")
         .says("laptop")
         .says("added this machine at ")
-        .says("This command makes change 3. The machine that makes a change is always in it, ")
+        .says("This command makes a new change. The machine that makes a change is always in it, ")
         .says(
             "Type `list` to list this machine and go on. Anything else stops here, and nothing \
                is changed:",
@@ -5825,15 +5878,15 @@ fn a_device_added_since_the_last_change_is_asked_to_list_itself() {
     assert_eq!(look(&desktop)["change"], 2);
     assert!(
         desktop
-            .cli(&["devices"])
-            .contains("The last change it has applied: change 2."),
+            .cli(&["devices", "-v"])
+            .contains("It is on change 2 to your devices."),
     );
 
     let mut at = desktop.at_terminal(&["renew"]);
-    at.says("This command makes change 3.")
+    at.says("This command makes a new change.")
         .says("Type `list` to list this machine and go on.")
         .types("list");
-    at.says("The change that the recovery phrase will sign (change 3):");
+    at.says("The change your recovery phrase will sign:");
     at.says("Make this change?")
         .says("Type yes to go on")
         .types("no");
@@ -5856,7 +5909,7 @@ fn the_wait_names_a_relay_as_configured() {
     let name = format!("localhost:{}", relay.p2p);
     let (laptop, words) = phrase_made_at(&relay, &[(name.clone(), None)]);
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     at.says(&format!(
         " of this device's channels still to send to {name}"
     ));
@@ -5887,7 +5940,7 @@ fn the_wait_that_cannot_start_ends_with_3() {
     laptop.bin = None;
     std::fs::remove_file(&program).unwrap();
     at.types(&words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
     assert_eq!(status, Some(3), "{said}");
     assert!(
@@ -5954,7 +6007,9 @@ fn the_wait_ends_with_3_on_an_error_and_where_another_change_was_applied() {
     let said = String::from_utf8_lossy(&out.stdout);
     assert_eq!(out.status.code(), Some(3), "{said}");
     assert!(
-        said.contains("This device has since applied another change: `cordelia devices` says."),
+        said.contains(
+            "This device is now on another change to your devices: `cordelia devices` shows it."
+        ),
         "{said}"
     );
     // A node of another version in this one's place during the wait, and
@@ -5980,13 +6035,15 @@ fn the_wait_ends_with_3_on_an_error_and_where_another_change_was_applied() {
         let (status, said) = at.ends_with_status_within(std::time::Duration::from_secs(60));
         assert_eq!(status, Some(3), "{said}");
         assert!(
-            said.contains("The change is made (change 1). This command could not go on: "),
+            said.contains("The change is made. This command could not go on: "),
             "{said}"
         );
         assert!(said.contains(why), "{said}");
     }
     laptop.stop();
-    let out = laptop.command(&["change-made", "1"]);
+    // With `-v`, the change's number (decision 2026-11-11 (plain words),
+    // rule 4).
+    let out = laptop.command(&["change-made", "1", "-v"]);
     let error = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(3), "{error}");
     assert!(

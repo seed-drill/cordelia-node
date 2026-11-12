@@ -2478,7 +2478,9 @@ fn recovery_status(
 ) -> i32 {
     let ended = after_the_recovery(number, cut_short, node, say);
     if let Err(e) = &ended {
-        say_error(wait::could_not_go_on(number, e));
+        // A recovery says its number until its own slice of plain words
+        // (decision 2026-11-11 (plain words), §6, slice 2b).
+        say_error(wait::could_not_go_on(number, e, true));
     }
     recovered_status(&ended)
 }
@@ -6460,7 +6462,8 @@ mod tests {
             errors,
             [wait::could_not_go_on(
                 3,
-                &anyhow::anyhow!("the node did not answer")
+                &anyhow::anyhow!("the node did not answer"),
+                true
             )]
         );
         // And nothing is said apart where the wait ends.

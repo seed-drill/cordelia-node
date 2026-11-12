@@ -48,82 +48,84 @@ use crate::identity::{NodeIdentity, is_usable_public_key, verify_signature};
 /// was not judged.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum StatementError {
-    #[error("the statement ends before it is whole")]
+    #[error("the change to your devices ends before it is whole")]
     Truncated,
 
-    #[error("there are bytes after the statement's end")]
+    #[error("the change to your devices has bytes after its end")]
     TrailingBytes,
 
-    #[error("a statement's number is from 1 to 256, and this is {0}: a phrase makes no more")]
+    #[error(
+        "changes to your devices are numbered 1 to 256, and this is {0}: a recovery phrase makes no more"
+    )]
     Number(u64),
 
-    #[error("a statement's chain names at most 256 statements, and this names {0}")]
+    #[error("a change names at most 256 changes before it, and this names {0}")]
     ChainTooLong(usize),
 
-    #[error("a statement's chain is in order of number and hash, with none named twice")]
+    #[error("a change names the changes before it out of order, or one of them twice")]
     ChainOrder,
 
-    #[error("a statement's chain goes from the first statement to the one before it")]
+    #[error("a change names each change from the first to the one before it, and this does not")]
     ChainNumbers,
 
-    #[error("a statement lists at most 64 devices, and this lists {0}")]
+    #[error("you can have at most 64 devices, and this change lists {0}")]
     TooManyDevices(usize),
 
-    #[error("a statement lists a device once")]
+    #[error("a change lists one device twice")]
     DeviceTwice,
 
-    #[error("the device a statement was made on is among its devices")]
+    #[error("a change does not list the device it was made on")]
     MakerNotListed,
 
-    #[error("a device's key is not a usable public key")]
+    #[error("a device's ID is not a valid device ID")]
     DeviceKeyNotUsable,
 
-    #[error("the key of the device a statement was made on is not a usable public key")]
+    #[error("the ID of the device a change was made on is not a valid device ID")]
     MakerKeyNotUsable,
 
-    #[error("a device's label is from 1 to 64 bytes, and this is {0}")]
+    #[error("a device's name is 1 to 64 bytes, and this is {0}")]
     LabelLength(usize),
 
-    #[error("a device's label is printable ASCII text")]
+    #[error("a device's name is printable ASCII: letters, digits, spaces and signs")]
     LabelNotPrintable,
 
-    #[error("a device's label has no space at either end")]
+    #[error("a device's name cannot start or end with a space")]
     LabelSpaceAtAnEnd,
 
-    #[error("a statement lists at most 256 removed keys, and this lists {0}")]
+    #[error("a change lists at most 256 removed devices, and this lists {0}")]
     TooManyRemoved(usize),
 
-    #[error("a statement's removed keys are in order, with none listed twice")]
+    #[error("a change lists its removed devices out of order, or one of them twice")]
     RemovedOrder,
 
-    #[error("a key is among a statement's devices and among its removed keys")]
+    #[error("a change lists one device as both kept and removed")]
     InBothLists,
 
-    #[error("the field that a statement keeps empty is not empty")]
+    #[error("a change has data where it must have none")]
     Reserved,
 
-    #[error("the key given to sign with is not the statement's phrase key")]
+    #[error("a change was to be signed with another recovery phrase than its own")]
     NotThePhrasesKey,
 
-    #[error("the statement's phrase key is not a usable public key")]
+    #[error("the change names a recovery phrase that cannot be checked")]
     PhraseKeyNotUsable,
 
-    #[error("the statement is not signed by its phrase's key")]
+    #[error("the change was not signed with its recovery phrase")]
     Signature,
 
-    #[error("the statement is under another phrase")]
+    #[error("the change was made under another recovery phrase")]
     AnotherPhrase,
 
-    #[error("a settlement joins two changes or more, each given once")]
+    #[error("settling joins two changes or more, each named once")]
     NotApart,
 
     #[error(
-        "the statement was made after the applied one, and lacks a key that the applied one removed"
+        "the change comes after the one this device is on, and keeps a device that one removed"
     )]
     UndoesARemoval,
 
     #[error(
-        "the statement commits to the secret of the statement it was made after: its channels would be that one's"
+        "the change reuses the secret of the change before it, so its channels would be the old ones"
     )]
     SameSecret,
 }

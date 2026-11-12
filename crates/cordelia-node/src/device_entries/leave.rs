@@ -1281,7 +1281,9 @@ impl Leave {
                 // (removal), rule 5).
                 let known = adding::know_what_is_handed(&lock(db), identity, typed, entry, now);
                 if let Err(e) = known {
-                    return Err(not(&format!("could not judge a hand-over: {e}")));
+                    return Err(not(&format!(
+                        "could not judge what another device sent: {e}"
+                    )));
                 }
                 // It is a change of settings only where the hand-over was
                 // taken: a statement was applied, or the device's state
@@ -1315,7 +1317,11 @@ impl Leave {
                     // The key reads nothing more: it was spent, or typed
                     // again, or its hour went by.
                     Ok(None) => return Ok(PairRead::Read(read)),
-                    Err(e) => return Err(not(&format!("could not judge a hand-over: {e}"))),
+                    Err(e) => {
+                        return Err(not(&format!(
+                            "could not judge what another device sent: {e}"
+                        )));
+                    }
                 }
             }
             // A page that holds nothing, or that leaves the place where it
@@ -1419,7 +1425,7 @@ impl Leave {
             _ => return Err(not("a pull was not answered with a page")),
         };
         if page.entries.len() > ENTRY_PAGE_MAX_ENTRIES as usize {
-            return Err(not("a page holds more than a page may"));
+            return Err(not("a page has more entries than a page may"));
         }
         // Each entry is checked as whatever a device is sent is checked,
         // with no database held, and only an entry of that channel is
@@ -1557,7 +1563,7 @@ impl Leave {
             (SharedAsk::Pull { .. }, WireMessage::EntryPulled(page)) => {
                 if page.entries.len() > ENTRY_PAGE_MAX_ENTRIES as usize {
                     return Err(SharedRefused::NotAnswered(
-                        "a page holds more than a page may".into(),
+                        "a page has more entries than a page may".into(),
                     ));
                 }
                 // What the relay handed counts against the share, whatever
@@ -1577,7 +1583,7 @@ impl Leave {
                     .collect();
                 let Some(entries) = entries else {
                     return Err(SharedRefused::NotAnswered(
-                        "a page holds an entry that does not check".into(),
+                        "a page has an entry that does not check".into(),
                     ));
                 };
                 let now = self.clock.unix_from(state.sync_control.now());
@@ -1599,7 +1605,7 @@ impl Leave {
                 .map_err(store)?;
                 let Some(taken) = taken else {
                     return Err(SharedRefused::NotAnswered(
-                        "a page holds an entry of another channel".into(),
+                        "a page has an entry of another channel".into(),
                     ));
                 };
                 // What the door did not store, as no honest member writes

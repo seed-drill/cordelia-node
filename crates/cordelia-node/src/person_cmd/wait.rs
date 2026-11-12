@@ -380,9 +380,9 @@ pub(crate) fn no_longer_stands(seen: &Value) -> Option<String> {
 
 /// Where the device moved from the change whose entry `made` names, in hex
 /// (decision 2026-10-24 (removal), rule 9), what the wait after it says
-/// before it ends with status 3: "a change made apart on <label> removed
-/// <label>, which this change lists: this device follows that change
-/// now", as the node noted it at the move.
+/// before it ends with status 3: "a change made separately on <label>
+/// removed <label>, which this change lists: this device is on that
+/// change now", as the node noted it at the move.
 pub(crate) fn moved_from(seen: &Value, made: &str) -> Option<String> {
     list(seen, "moved")
         .filter(|moved| moved["from"].as_str() == Some(made))
@@ -927,11 +927,16 @@ fn why_not_done(relays: &[RelayAt]) -> String {
 }
 
 /// What the wait says on standard error where it could not go on, once
-/// the change is made (decision 2026-10-19 §5).
-pub(crate) fn could_not_go_on(number: u64, error: &anyhow::Error) -> String {
+/// the change is made (decision 2026-10-19 §5): with `verbose`, the
+/// change's number (decision 2026-11-11 (plain words), rule 4).
+pub(crate) fn could_not_go_on(number: u64, error: &anyhow::Error, verbose: bool) -> String {
+    let number = match verbose {
+        true => format!(" (change {number})"),
+        false => String::new(),
+    };
     format!(
-        "The change is made (change {number}). This command could not go on: {error:#}. Do not \
-         make the change again. `cordelia devices` shows whether each relay has it."
+        "The change is made{number}. This command could not go on: {error:#}. Do not make the \
+         change again. `cordelia devices` shows whether each relay has it."
     )
 }
 
@@ -2303,9 +2308,15 @@ pub(crate) mod tests {
 
         // An error in the wait.
         assert_eq!(
-            could_not_go_on(4, &anyhow::anyhow!("the node did not answer")),
+            could_not_go_on(4, &anyhow::anyhow!("the node did not answer"), true),
             "The change is made (change 4). This command could not go on: the node did not answer. \
              Do not make the change again. `cordelia devices` shows whether each relay has it."
+        );
+        // Without `-v`, no number (decision 2026-11-11 (plain words), rule 4).
+        assert_eq!(
+            could_not_go_on(4, &anyhow::anyhow!("the node did not answer"), false),
+            "The change is made. This command could not go on: the node did not answer. Do not \
+             make the change again. `cordelia devices` shows whether each relay has it."
         );
 
         // H1, in the help of each command that makes a change, and H2.

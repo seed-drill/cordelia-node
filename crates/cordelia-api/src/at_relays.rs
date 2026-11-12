@@ -910,7 +910,8 @@ pub fn say_sent(
         let number = alone.number;
         let rev = next_under(Some(alone.applied_rev), number).ok_or_else(|| {
             PersonError::Held(
-                "this device's own word in that slot is at the last revision under the statement"
+                "this device can say again that it has sent its memory only after the next change \
+                 to your devices (`cordelia renew` makes one)"
                     .into(),
             )
         })?;
@@ -971,7 +972,9 @@ fn write_reached(
 ) -> Result<(), PersonError> {
     let rev = next_under(held, alone.number).ok_or_else(|| {
         PersonError::Held(
-            "this device's carried word is at the last revision under the statement".into(),
+            "this device can say again which relays have its memory only after the next change \
+             to your devices (`cordelia renew` makes one)"
+                .into(),
         )
     })?;
     let inside = Inside {
@@ -1169,9 +1172,11 @@ pub fn say_reached(
         let Some(alone) = alone(conn, identity)? else {
             return Ok(false);
         };
-        let value = value
-            .to_value()
-            .map_err(|e| PersonError::Held(format!("the carried word: {e}")))?;
+        let value = value.to_value().map_err(|e| {
+            PersonError::Held(format!(
+                "this device's note of which relays have its memory: {e}"
+            ))
+        })?;
         let held = own_reached(conn, &alone, &identity.public_key())?;
         let rev = held.map(|held| held.rev);
         write_reached(conn, identity, &alone, rev, Value::Other(value), now)?;

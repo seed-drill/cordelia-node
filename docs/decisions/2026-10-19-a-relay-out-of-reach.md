@@ -207,11 +207,11 @@ Each is on standard output unless it says otherwise. "Changes" means section 5 g
 | `person_cmd.rs:2295` | "keep this machine on: <n> of this device's channels still to send to <relay>" | Its words stay; the relay is named as configured (decision 2026-10-24, rule 2) |
 | `person_cmd.rs:2308` | "keep this machine on: <N names> still to send (<k> sent)" | Stays |
 | `person_cmd.rs:2312` | "<N names> sent", said only while every relay is reached | Stays, and is said too where each relay that is not reached is out of reach |
-| `person_cmd.rs:2321` | "keep this machine on: this device has not yet sent every relay what it carried" | Stays while the device's own word is neither `sent` nor the carried word. With the carried word it changes (S4) |
-| `person_cmd.rs:2332` | "<device> has applied the change, and is still sending what it held" | Changes for a device whose carried word is read (S5) |
+| `person_cmd.rs:2321` | "keep this machine on: this device has not yet sent every relay what it copied over" | Stays while the device's own word is neither `sent` nor the carried word. With the carried word it changes (S4) |
+| `person_cmd.rs:2332` | "<device> is up to date, and still sending what it has" | Changes for a device whose carried word is read (S5) |
 | `person_cmd.rs:2370` | "Every relay has the change, and this device has sent all it has: you may close this machine. `cordelia devices` shows which devices are up to date." | Stays (end 1 of rule 8) |
 | `person_cmd.rs:2210` (the wait could not be started) | "... Keep this machine on until every relay has the change and nothing is left to send." | Words stay; the status becomes 3 (rule 8) |
-| `person_cmd.rs:977` (`cordelia devices`) | "has applied change <n>, and is still sending what it held (if it is lost now, what it had not sent is lost with it; `cordelia sync carry` brings in what it had sent before)" | Changes for a device whose carried word is read (D1) |
+| `person_cmd.rs:977` (`cordelia devices`) | "up to date, and still sending what it has (if you lose it now, what it has not sent is lost; `cordelia sync carry` copies in what it sent before)" | Changes for a device whose carried word is read (D1) |
 | `person_cmd.rs:1126` (`cordelia devices`, a relay) | "has not answered since this device woke: a change made while it was off may not have reached it" | Changes (D2, D3) |
 | `person_cmd.rs:1130` | "does not have the latest change to your devices yet" | Stays for a relay that is reached. For one out of reach, D4 |
 | `person_cmd.rs:1129` | "has the latest change to your devices" | Stays. For one out of reach, D5 |
@@ -231,7 +231,7 @@ Each is on standard output unless it says otherwise. "Changes" means section 5 g
 | `main.rs:220, 244` (help of `remove-device`, `renew`) | "Keep this machine on until the command says you can close it." | Changes (H1), and `settle` is given the same |
 | `main.rs` (help of `recover`) | (says nothing of it) | H2 is added |
 | `main.rs:311` (help of `devices`) | "- for each relay, whether it has the last change." | Stays |
-| `person_cmd.rs:561` (`cordelia phrase`) | "Each relay is shown the change first, before anything else is sent there: `cordelia devices` says which hold it." | Stays |
+| `person_cmd.rs:561` (`cordelia phrase`) | "Each relay gets the change first, before anything else is sent there: `cordelia devices` says which have it." | Stays |
 | `msg_cmd.rs:1343` | "Message <id> from this device may not have reached every relay." | Stays: messages have rules of their own (decision 2026-10-09) |
 | `person_cmd.rs` (leaving, `init --new-key`) | "any relay: none is reached", "Could not send it to <relay>: ..." | Stay |
 
@@ -353,7 +353,7 @@ In place of "is still sending what it held", and of nothing else (D1, S5). A rel
 
 ### Rule 7. What the device says of itself
 
-- **In the wait after a change,** where its own word is the carried word under this change, S4 in place of "keep this machine on: this device has not yet sent every relay what it carried".
+- **In the wait after a change,** where its own word is the carried word under this change, S4 in place of "keep this machine on: this device has not yet sent every relay what it copied over".
 - **In `cordelia devices`,** its own row stays "this device". The relay lines say which relays are out of reach (rule 12).
 
 ### Rule 8. The wait after a change ends in one of three ways
@@ -407,7 +407,7 @@ It looks every second, as today, and says each line as it comes (S2 to S5). Its 
 | B connected, and its shows are answered "not signed", or "show it whole" to the whole entry | each is an answer of the third kind, a failed attempt at every pass (section 1); B OUT, lacking, while connected | 3 |
 | A's connection drops and comes back every three minutes; B is down | the wake that each return causes does not move B's reference (section 1); B OUT, lacking, five minutes after the change | 3 |
 | B is given no key, answered "took" from one host, and its name now resolves to another, which cannot be reached | B lacks the change while not connected to the key that answered (section 1); B OUT, lacking | 3 |
-| A answers with a later change, which the device applies | the kept entry is no longer this command's change: the wait ends at "This device has since applied another change", as today | 3 (below) |
+| A answers with a later change, which the device applies | the kept entry is no longer this command's change: the wait ends at "This device is now on another change to your devices", as today | 3 (below) |
 
 While no end holds, the wait goes on and says what is missing, as today. Each relay comes to a class within five minutes and the time of an attempt, or a show of five minutes' refusals: within fifteen minutes where its whole shows are answered "not signed" or "show it whole" (section 1). The word is written at the next whole pass.
 
@@ -540,8 +540,8 @@ When the node starts, or reaches a relay after having reached none, or wakes fro
 - **S1, its first line:** "You may close this machine once every relay has the change, and what this device copied over is at a relay that it reaches. This command stays until then, and says what is missing. It ends sooner, with status 3, where for five minutes a relay that may not have the change cannot be reached or refuses it, or where no relay that this machine reaches has what this device copied over. It then does not say that you may close this machine. Stopping it stops nothing: the node goes on. Until the wait ends, each line below starts with the time it was said, in UTC." (decision 2026-10-24, rule 3)
 - **S2,** for a relay that lacks the change and is out of reach, while the wait goes on: "keep this machine on: <relay> cannot be reached from here, and may not have the change yet: it <since>"
 - **S3,** for a relay that holds the change and is out of reach: "<relay> has the change, but cannot be reached from here: it <since>"
-- **S4,** where the device's own word is the carried word: "this device has sent what it carried to <held>; not yet to <not yet>"
-- **S5,** of another device whose carried word is read: "<device> has applied the change, and has sent what it held to <held>; not yet to <not yet> other relay<s>"
+- **S4,** where the device's own word is the carried word: "this device has sent what it copied over to <held>; not yet to <not yet>"
+- **S5,** of another device whose carried word is read: "<device> is up to date, and has sent what it has to <held>; not yet to <not yet> other relay<s>"
 - **S6,** end 2, for each relay that is OUT and holding, one of:
   - in `<held>`: "  <relay> has the change and all that this device copied over, but cannot be reached from here: it <since>."
   - not in `<held>`: "  <relay> has the change, but cannot be reached from here: it <since>. Some of what this device copied over is not there yet."
@@ -592,7 +592,7 @@ When the node starts, or reaches a relay after having reached none, or wakes fro
 
 **`cordelia devices`:**
 
-- **D1,** of another device whose carried word is read: "has applied change <n>, and has sent what it held to <held>". Then, where `<not yet>` is not 0: "; not yet to <not yet> other relay<s> that it is set up with (if it is lost now, what it held is at <held> alone)".
+- **D1,** of another device whose carried word is read: "up to date, and has sent what it has to <held>", with "up to date (change <n>)" under `-v` (decision 2026-11-11 (plain words), rule 4). Then, where `<not yet>` is not 0: "; not yet to <not yet> other relay<s> that it is set up with (if you lose it now, what it has is only at <held>)".
 - **D2,** a relay not heard since the device woke: "  <relay>: has not answered since this device started or woke at <when>. A change made while this device was off may be there, and not have reached it."
 - **D3,** the same, out of reach: "  <relay>: has not answered since this device started or woke at <when>, and cannot be reached from here. A change made while this device was off may be there, and not have reached it."
 - **D4,** lacks the change and out of reach: "  <relay>: cannot be reached from here, and may not have the latest change to your devices: it <since>. A device of yours that reaches only this relay may not know of that change. If you know that <relay> is gone for good, take it out of the configuration of every device. Do not do so only because this machine cannot reach it: it may still serve a device that does."

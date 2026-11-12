@@ -39,25 +39,27 @@ use crate::statement::Reader;
 /// reads any of these as no word.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NotAWord {
-    #[error("the carried word is a value of kind 2, and this is not")]
+    #[error(
+        "a device's note of the relays it sent its memory to is a value of kind 2, and this is not"
+    )]
     Kind,
 
-    #[error("the carried word ends before its four fields")]
+    #[error("a device's note of the relays it sent its memory to ends before its four fields")]
     Short,
 
-    #[error("the carried word has bytes after its four fields")]
+    #[error("a device's note of the relays it sent its memory to has bytes after its four fields")]
     Long,
 
-    #[error("the carried word names from 1 to 8 keys, and this names {0}")]
+    #[error("a device's note names 1 to 8 relays, and this names {0}")]
     Keys(usize),
 
-    #[error("the carried word names a key twice")]
+    #[error("a device's note names one relay twice")]
     Twice,
 
-    #[error("the carried word counts more relays only where it names 8 keys")]
+    #[error("a device's note counts more relays only where it names 8")]
     MoreWithFewKeys,
 
-    #[error("a count of the carried word is at most 256, and this is {0}")]
+    #[error("a count in a device's note is at most 256, and this is {0}")]
     Count(u64),
 }
 

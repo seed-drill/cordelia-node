@@ -1470,7 +1470,7 @@ fn a_removed_device_still_listed_is_never_handed_the_new_channel() {
     laptop.stop();
     let on = [&relay, &desktop, &tablet];
     let mut at = removes_from_an_added(&desktop, &tablet_key, &words);
-    at.says("The change is made (change 2)")
+    at.says("The change is made")
         .says("The wait has ended.")
         .says(&format!(
             "\"{NAME}\" is made anew without the device removed: it is channel "

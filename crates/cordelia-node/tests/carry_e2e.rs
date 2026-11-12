@@ -143,7 +143,7 @@ fn what_a_device_that_never_returned_had_sent_is_carried_by_command() {
     laptop.start();
     wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
     let mut at = renews(&laptop, &["stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     assert_eq!(change_of(&laptop), 2);
     relay.start();
@@ -244,7 +244,7 @@ fn a_device_that_comes_to_sync_a_name_carries_it_first() {
     // A change, on the laptop, which does not sync the name.
     sync_is_turned_on(&laptop);
     let mut at = renews(&laptop, &["stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     wait_for("the relay holds the change", &all, 120, || {
         has_sent_everything(&laptop)
@@ -367,7 +367,7 @@ fn from_holds_a_name_only_once_something_is_taken_and_unmap_lets_go_of_it() {
     // The desktop is removed, on the laptop, which holds no name.
     let all = [&relay, &laptop];
     let mut at = removes(&laptop, &desktop_key, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     wait_for("the relay holds the change", &all, 180, || {
         has_sent_everything(&laptop)
@@ -542,7 +542,7 @@ fn what_a_removed_device_wrote_comes_in_only_by_from_with_the_phrase() {
     laptop.start();
     wait_for("laptop healthy", &[&laptop], 30, || healthy(&laptop));
     let mut at = removes(&laptop, &desktop_key, &[], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     relay.start();
     let all = [&relay, &laptop];
@@ -791,7 +791,7 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
     // The desktop is off. A change is made, and the phone applies it.
     desktop.stop();
     let mut at = renews(&laptop, &["stays", "stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     wait_for(
         "the phone applies change 2",
@@ -815,7 +815,7 @@ fn a_generation_that_a_device_never_held_is_read_with_the_phrase() {
 
     // A second change, and the desktop returns: it applies it directly.
     let mut at = renews(&laptop, &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     wait_for("the relay holds change 3", &[&relay, &laptop], 120, || {
         has_sent_everything(&laptop)
@@ -987,7 +987,7 @@ fn the_desktop_wrote_lab_and_left() -> (Node, Node, Node, String) {
     );
     desktop.stop();
     let mut at = renews(&laptop, &["stays"], &words);
-    at.says("The change is made (change 2).");
+    at.says("The change is made.");
     drop(at);
     wait_for(
         "the relay holds the change",
@@ -1313,7 +1313,7 @@ fn a_removed_device_lets_go_of_a_carried_name_only_on_a_typed_discard() {
     });
     has_applied(&desktop, 2, &[&relay, &desktop]);
     let mut at = removes(&desktop, &laptop_key, &[], &words);
-    at.says("The change is made (change 3).");
+    at.says("The change is made.");
     drop(at);
     wait_for(
         "the relay holds the change",

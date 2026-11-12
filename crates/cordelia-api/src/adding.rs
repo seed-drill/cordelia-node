@@ -302,7 +302,8 @@ fn record_written(
         .map(|held| held.entry.rev);
     let rev = next_under(own, standing.number()).ok_or_else(|| {
         PersonError::Held(
-            "this device's own record in that slot is at the last revision under the statement"
+            "this device can write the record that adds a device again only after the next \
+             change to your devices (`cordelia renew` makes one)"
                 .into(),
         )
     })?;
@@ -543,20 +544,20 @@ impl Row {
     /// Where a device in this row stood, in words.
     fn stood(self) -> &'static str {
         match self {
-            Self::NoPhrase => "followed no recovery phrase",
+            Self::NoPhrase => "was not under a recovery phrase",
             Self::Alone => "was alone under a recovery phrase",
             Self::Several => "was one of several devices",
-            Self::NotListed => "was in no list of the last change",
+            Self::NotListed => "was not in the last change to your devices",
         }
     }
 
     /// Where a device in this row stands, in words.
     fn stands(self) -> &'static str {
         match self {
-            Self::NoPhrase => "follows no recovery phrase",
+            Self::NoPhrase => "is not under a recovery phrase",
             Self::Alone => "is alone under a recovery phrase",
             Self::Several => "is one of several devices",
-            Self::NotListed => "is in no list of the last change",
+            Self::NotListed => "is not in the last change to your devices",
         }
     }
 }
@@ -978,23 +979,19 @@ impl Accepted {
     /// What became of the hand-over, in words for a person.
     pub fn says(&self) -> String {
         match self {
-            Self::Joined(applied) => format!(
-                "this device has joined: it follows the recovery phrase of the device whose key \
-                 was typed, and has applied change {}",
-                applied.number
-            ),
-            Self::Moved(applied) => format!(
-                "this device has left the recovery phrase it followed alone, and has joined: it \
-                 has applied change {}",
-                applied.number
-            ),
-            Self::Applied(applied) => format!(
-                "this device has applied change {}, which it was handed",
-                applied.number
-            ),
-            Self::SetAside => "what was handed over is a change made apart from the one this \
-                               device follows: it is set aside, and this device goes on. The two \
-                               are joined with the phrase (`cordelia settle`)"
+            Self::Joined(_) => "this device has joined your devices, under the recovery phrase \
+                                of the device whose ID you typed, and is up to date"
+                .into(),
+            Self::Moved(_) => "this device has left the recovery phrase it was alone under, and \
+                               joined your devices: it is up to date"
+                .into(),
+            Self::Applied(_) => {
+                "this device is up to date with the change the other device sent".into()
+            }
+            Self::SetAside => "the other device sent a change made separately from the one this \
+                               device is on, neither knowing of the other: this device put it \
+                               aside, and goes on. To join the two, run `cordelia settle`, with \
+                               your recovery phrase"
                 .into(),
             Self::Closed => crate::look::CLOSED_BY_HEADS_WHY.into(),
             Self::Refused(why) => why.says(),
@@ -1007,67 +1004,71 @@ impl NotAccepted {
     pub fn says(&self) -> String {
         match self {
             Self::NotTypedInTheLastHour => {
-                "the hour in which that key could hand this device what it needs has gone".into()
+                "the hour in which that device could send this one what it needs has passed".into()
             }
-            Self::NoPairChannel => "that key has no channel with this device: it is this \
-                                    device's own key, or no device's"
-                .into(),
+            Self::NoPairChannel => {
+                "that ID is this device's own, or no device's: nothing can come from it".into()
+            }
             Self::NotThePairChannel | Self::SignedByAnotherKey | Self::NotAHandOver => {
-                "what was found is not a hand-over from the device whose key was typed".into()
+                "what was found was not sent by the device whose ID you typed".into()
             }
-            Self::HandOver(why) => format!("what was handed over does not hold together: {why}"),
-            Self::NotMadeWithinTheHour => "what was handed over was made more than an hour \
-                                           before or after the key was typed here: it is an \
+            Self::HandOver(why) => format!("what the other device sent is damaged: {why}"),
+            Self::NotMadeWithinTheHour => "what the other device sent was made more than an \
+                                           hour before or after you typed its ID here: it is an \
                                            old one, or the clocks of the two devices are more \
                                            than an hour apart. Run `cordelia add-device` again \
                                            on the other device"
                 .into(),
             Self::NotForThisDevice => {
-                "what was handed over is for another device than this one".into()
+                "what the other device sent is for another device, not this one".into()
             }
-            Self::AddedByAnotherKey => "what was handed over adds this device in the name of \
-                                        another device than the one whose key was typed"
+            Self::AddedByAnotherKey => "what the other device sent adds this device in the name \
+                                        of another device, not the one whose ID you typed"
                 .into(),
             Self::RecordDoesNotCount(why) => format!(
-                "the device whose key was typed cannot add this one now ({})",
+                "the device whose ID you typed cannot add this one now ({})",
                 match why {
-                    NotCounted::Removed => "this device's key was removed",
-                    NotCounted::CountsAlready => "this device counts already",
+                    NotCounted::Removed => "this device was removed",
+                    NotCounted::CountsAlready => "this device is one of yours already",
                     NotCounted::MayNotAdd =>
                         "it was itself added, since the last change, by a device added since",
-                    NotCounted::NoRoom => "64 devices count already: a change makes room",
+                    NotCounted::NoRoom => {
+                        "you have 64 devices already: a change to your devices makes room"
+                    }
                 }
             ),
             Self::SyncIsOn => "sync is on here: `cordelia sync off` first, and then `cordelia \
                                accept` again"
                 .into(),
-            Self::AnotherPhrase => "what was handed over is under another recovery phrase than \
-                                    the one this device follows, and this device is one of \
-                                    several: nothing moved. To join other devices it leaves \
-                                    these first: it is removed from them, or `cordelia init \
-                                    --new-key` starts it afresh"
+            Self::AnotherPhrase => "what the other device sent is under another recovery \
+                                    phrase than the one this device is under, and this device \
+                                    is one of several: nothing changed. To join other devices, \
+                                    it must leave these first: remove it from them, or start it \
+                                    over with `cordelia init --new-key`"
                 .into(),
-            Self::BringsNoChange => "what was handed over brings no change that this device has \
-                                     not applied: nothing was done"
+            Self::BringsNoChange => "what the other device sent has no change that this device \
+                                     does not have already: nothing was done"
                 .into(),
             Self::Statement(why) => {
-                format!("the change that was handed over is none that this device takes: {why}")
+                format!("this device cannot use the change the other device sent: {why}")
             }
-            Self::NotAfterTheChangeThatStoppedIt => "what was handed over is not the change \
-                                                     that stopped this device, nor one made \
-                                                     after it: add this device again from a \
+            Self::NotAfterTheChangeThatStoppedIt => "what the other device sent is not the \
+                                                     change that stopped this device, nor a \
+                                                     later one: add this device again from a \
                                                      device that has that change"
                 .into(),
-            Self::Removed => "this device was removed: `cordelia init --new-key` first".into(),
-            Self::NotClear => "the change that was handed over lists a device that this device \
-                               knows was removed, or hands one its secret: it was not taken. \
-                               Add this device from a device whose last change lists no \
-                               removed device"
+            Self::Removed => {
+                "this device was removed: start it over with `cordelia init --new-key` first".into()
+            }
+            Self::NotClear => "the change the other device sent keeps a device that this \
+                               device knows was removed, or gives one its secret: this device \
+                               refused it. Add this device from a device whose last change keeps \
+                               no removed device"
                 .into(),
             Self::StoodElsewhere { typed, now } => format!(
-                "that key was typed {}, and its yes was for that. This device {} now: what the \
-                 key handed over was not taken. Run `cordelia accept` again, and read what its \
-                 yes says",
+                "you typed that ID {}, and your yes was for that. This device {} now, so it did \
+                 not use what that device sent. Run `cordelia accept` again, and read what its \
+                 yes does",
                 match typed {
                     Some(row) => format!("while this device {}", row.stood()),
                     None => "before this device kept what a yes was for".to_string(),
@@ -1326,7 +1327,8 @@ impl<'a> Brought<'a> {
             }
             other => {
                 return Err(PersonError::Held(format!(
-                    "a hand-over for this device was judged {other:?}"
+                    "what another device sent this one ended as {other:?}, which this version \
+                     does not expect"
                 )));
             }
         })
@@ -2298,9 +2300,9 @@ mod tests {
         assert_eq!((kept.taken_at, kept.said), (None, Some(refused.says())));
         assert_eq!(
             refused.says(),
-            "that key was typed while this device followed no recovery phrase, and its yes was \
-             for that. This device is alone under a recovery phrase now: what the key handed \
-             over was not taken. Run `cordelia accept` again, and read what its yes says"
+            "you typed that ID while this device was not under a recovery phrase, and your yes \
+             was for that. This device is alone under a recovery phrase now, so it did not use \
+             what that device sent. Run `cordelia accept` again, and read what its yes does"
         );
 
         // The control: typed again where the device stands, with its yes
@@ -2441,7 +2443,7 @@ mod tests {
         assert!(
             refused
                 .to_string()
-                .contains("each holds its place for an hour from when it was typed"),
+                .contains("each keeps its place for an hour from when you typed it"),
             "{refused}"
         );
         assert_eq!(kept(), 8);
@@ -2607,7 +2609,11 @@ mod tests {
                 .says()
                 .contains("`cordelia init --new-key`")
         );
-        assert!(NotAccepted::AnotherPhrase.says().contains("nothing moved"));
+        assert!(
+            NotAccepted::AnotherPhrase
+                .says()
+                .contains("nothing changed")
+        );
         assert!(Accepted::SetAside.says().contains("`cordelia settle`"));
         assert!(Accepted::Closed.says().contains("`cordelia settle`"));
         assert_eq!(

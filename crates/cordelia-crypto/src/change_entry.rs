@@ -129,57 +129,57 @@ use zeroize::{Zeroize, Zeroizing};
 /// Why a change entry's content was not made, or not opened.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ChangeEntryError {
-    #[error("a change entry's content is 32768 bytes, and this is {0}")]
+    #[error("a change to your devices, as a relay keeps it, is 32768 bytes, and this is {0}")]
     Size(usize),
 
-    #[error("a part of the change entry would say {needed} bytes, and has room for {room}")]
+    #[error("a part of a change to your devices needs {needed} bytes, and has room for {room}")]
     DoesNotFit { needed: usize, room: usize },
 
     #[error("the entry is not in the channel of the phrase")]
     AnotherChannel,
 
-    #[error("the entry was not written by the phrase's key")]
+    #[error("this change was not written with your recovery phrase")]
     AnotherAuthor,
 
-    #[error("the entry is not in the change entry's slot")]
+    #[error("this change is not where a relay keeps a change to your devices")]
     AnotherSlot,
 
     #[error("the entry says it is a delete")]
     Delete,
 
-    #[error("the part did not open: it is not under this key, or not of this entry")]
+    #[error("a part of the change did not open: it is not for this device, or not of this change")]
     DidNotOpen,
 
     #[error("what the part says is not in its form")]
     Malformed,
 
-    #[error("the entry is for statement {entry}, and the statement in it is number {statement}")]
+    #[error("the change says number {entry} outside and {statement} inside")]
     Number { entry: u64, statement: u64 },
 
-    #[error("the entry's lineage does not match its statement")]
+    #[error("the change does not fit the changes before it")]
     LineageNotItsStatement,
 
-    #[error("the statement in the entry is under another phrase")]
+    #[error("the change was made under another recovery phrase")]
     AnotherPhrase,
 
-    #[error("the secret is not the one that the statement commits to")]
+    #[error("the secret in the change is not the one the change names")]
     SecretNotCommitted,
 
-    #[error("the part for the phrase holds at most 8 earlier secrets, and this holds {0}")]
+    #[error(
+        "a change keeps at most 8 earlier secrets for your recovery phrase, and this keeps {0}"
+    )]
     TooManyEarlier(usize),
 
-    #[error(
-        "the earlier secrets are the newest first, each of a statement before this one, none twice"
-    )]
+    #[error("the change's earlier secrets are out of order, or one of them is there twice")]
     EarlierOrder,
 
-    #[error("device {0} of the statement has a key that nothing can be sealed to")]
+    #[error("device {0} of the change has an ID that nothing can be encrypted for")]
     DeviceKey(usize),
 
     #[error(transparent)]
     Statement(#[from] StatementError),
 
-    #[error("sealing failed: {0}")]
+    #[error("encrypting failed: {0}")]
     Crypto(String),
 }
 

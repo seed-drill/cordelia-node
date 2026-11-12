@@ -164,8 +164,8 @@ pub fn restart_says(os: &str) -> String {
 /// ([`restart_says`]).
 fn under_the_old_key_says(os: &str) -> String {
     format!(
-        "this device was given a new key, and the node still runs under the old one. Restart \
-         the node:\n{}",
+        "this device was started over as a new device, and the node still runs as the old one. \
+         Restart the node:\n{}",
         restart_says(os)
     )
 }
@@ -190,21 +190,23 @@ fn says(e: &PersonError) -> String {
         // has lost every device is pointed to `cordelia recover`, and
         // not to a new phrase.
         PersonError::FollowsNoPhrase => format!(
-            "this device follows no recovery phrase yet.\n{}",
+            "this device is not under a recovery phrase yet.\n{}",
             crate::look::WAYS_ON
         ),
         // A head set aside, or a closed device (decision 2026-10-24
         // (removal), rules 10 and 11).
-        PersonError::Stopped(State::Fork) => "two changes were made apart, and this device has \
-                                              seen both, or a device that was removed holds the \
-                                              secret of the change it follows: `cordelia \
-                                              devices` says the way on (a change made with the \
-                                              recovery phrase, `cordelia renew`, joins two \
-                                              changes made apart)."
+        PersonError::Stopped(State::Fork) => "two changes to your devices were made \
+                                              separately, neither knowing of the other, and \
+                                              this device has seen both; or a device you \
+                                              removed still has the secret of the change this \
+                                              device is on. `cordelia devices` says what to do \
+                                              (a change made with the recovery phrase, \
+                                              `cordelia renew`, joins two changes made \
+                                              separately)."
             .into(),
-        PersonError::Stopped(State::Removed) => "this device was removed. `cordelia init \
-                                                 --new-key` gives it a new key; it is then \
-                                                 added as a new device."
+        PersonError::Stopped(State::Removed) => "this device was removed. To use it again, \
+                                                 run `cordelia init --new-key` to start it \
+                                                 over, then add it as a new device."
             .into(),
         PersonError::Stopped(State::NotListed) => "this device is not in the last change: add \
                                                    it again from a device that is."
@@ -213,23 +215,25 @@ fn says(e: &PersonError) -> String {
                                                    device: add it again from a device that has \
                                                    the change."
             .into(),
-        PersonError::KeyRemoved => "that key was removed, and a removed key is not added again. \
-                                    `cordelia init --new-key` on that device gives it a new \
-                                    one."
+        PersonError::KeyRemoved => "that device was removed, and a removed device is never \
+                                    added again. Run `cordelia init --new-key` on it to start \
+                                    it over as a new device."
             .into(),
-        PersonError::TwinOfADevice => "that key is a twin of the key of one of your devices: \
-                                       the two are one device, so it is not added."
+        PersonError::TwinOfADevice => "that ID is another form of the ID of one of your \
+                                       devices: the two are one device, so it is not added."
             .into(),
         PersonError::MayNotAdd => "this device may not add another yet: it was itself added, \
                                    since the last change, by a device added since. Add from \
                                    another device, or make a change first (`cordelia renew`)."
             .into(),
         PersonError::NoRoom => {
-            "64 devices count already: a change makes room (`cordelia renew`).".into()
+            "you have 64 devices already: a change to your devices makes room (`cordelia \
+             renew`)."
+                .into()
         }
-        PersonError::Derive(_) => "that is this device's own key, or no device's key.".into(),
-        PersonError::ChangedSincePrompt => "what this device holds changed while you were \
-                                            answering: nothing was made."
+        PersonError::Derive(_) => "that is this device's own ID, or no device's ID.".into(),
+        PersonError::ChangedSincePrompt => "your devices changed while you were answering: \
+                                            nothing was made."
             .into(),
         other => other.to_string(),
     }
@@ -730,8 +734,8 @@ pub async fn add(
             Some(yes_was_for) if yes_was_for == would => {}
             Some("add" | "hand_again") => {
                 return Err(ApiError::Conflict(
-                    "what adding that key would do changed while you were answering: nothing \
-                     was done."
+                    "what adding that device would do changed while you were answering: \
+                     nothing was done."
                         .into(),
                 ));
             }
@@ -1050,8 +1054,8 @@ fn not_fetched(fetched: Waited, cycled: Waited, fork: bool) -> Vec<String> {
         Waited::Done => {}
         Waited::EndedEarly if fork => {}
         Waited::EndedEarly => lines.push(
-            "the fetch ended before every channel was read to its end at every relay: a relay \
-             gave no leave or stopped answering, or holds more of a channel than one pass takes"
+            "the fetch ended before everything was read from every relay: a relay refused, \
+             stopped answering, or has more than one fetch can take"
                 .to_string(),
         ),
         Waited::NotEnded => lines.push(format!(
@@ -1061,13 +1065,12 @@ fn not_fetched(fetched: Waited, cycled: Waited, fork: bool) -> Vec<String> {
     match cycled {
         Waited::Done => {}
         Waited::EndedEarly => lines.push(
-            "the sync cycle stopped before its end: the folders here may not hold what was \
-             fetched"
+            "the sync stopped early: the folders here may not have what was fetched yet"
                 .to_string(),
         ),
         Waited::NotEnded => lines.push(format!(
-            "no sync cycle ended within {CHANGE_FETCH_MAX_SECS} seconds: the folders here may \
-             not hold what was fetched"
+            "the sync did not finish within {CHANGE_FETCH_MAX_SECS} seconds: the folders here \
+             may not have what was fetched yet"
         )),
     }
     lines
@@ -1172,13 +1175,14 @@ pub async fn change_prepare(
                 Err(refused(PersonError::RemovedAsKnown))
             }
             (State::Applied | State::Fork, _, _) if too_many => Err(ApiError::BadRequest(format!(
-                "this device knows {} keys to be removed, and a change lists every one of them: \
-                 a change lists at most {MAX_STATEMENT_REMOVED}. No change can be made on this \
-                 device. Nothing was done.",
+                "this device knows of {} removed devices, and a change must list each of them: \
+                 a change can list at most {MAX_STATEMENT_REMOVED}. No change can be made on \
+                 this device. Nothing was done.",
                 removed.len()
             ))),
             (State::Applied | State::Fork, false, true) => Err(ApiError::BadRequest(
-                "this device has seen no two changes made apart: there is nothing to settle."
+                "this device has seen no two changes made separately: there is nothing to \
+                 settle."
                     .into(),
             )),
             (State::Applied | State::Fork, _, _) => Ok(held.state),
@@ -1213,7 +1217,7 @@ pub async fn change_prepare(
     let statement = held.statement.to_bytes().map_err(|e| refused(e.into()))?;
     let latest = person::kept_followed(&conn)
         .map_err(refused)?
-        .ok_or_else(|| ApiError::Internal("no change entry is kept".into()))?;
+        .ok_or_else(|| ApiError::Internal("this device has no record of its last change".into()))?;
     let mut heads: Vec<serde_json::Value> = Vec::new();
     for head in heads_to_join(&conn, &state.identity, &held)? {
         heads.push(json!({
@@ -1752,8 +1756,8 @@ mod tests {
             assert_eq!(
                 says,
                 format!(
-                    "this device was given a new key, and the node still runs under the old \
-                     one. Restart the node:\n  {restart}\nThen run `cordelia status`.\nWhere \
+                    "this device was started over as a new device, and the node still runs as \
+                     the old one. Restart the node:\n  {restart}\nThen run `cordelia status`.\nWhere \
                      the node does not run as the service that the install script set up, stop \
                      it and start it again with whatever started it."
                 )
@@ -2385,18 +2389,13 @@ exit 0"#,
         let early = not_fetched(Waited::EndedEarly, Waited::EndedEarly, false);
         assert_eq!(early.len(), 2, "{early:?}");
         assert!(
-            early[0].starts_with(
-                "the fetch ended before every channel was read to its end at every relay"
-            ),
+            early[0].starts_with("the fetch ended before everything was read from every relay"),
             "{early:?}"
         );
-        assert!(
-            early[1].starts_with("the sync cycle stopped before its end"),
-            "{early:?}"
-        );
+        assert!(early[1].starts_with("the sync stopped early"), "{early:?}");
         let not_ended = not_fetched(Waited::NotEnded, Waited::NotEnded, false);
         assert!(not_ended[0].starts_with("the fetch did not end within 120 seconds"));
-        assert!(not_ended[1].starts_with("no sync cycle ended within 120 seconds"));
+        assert!(not_ended[1].starts_with("the sync did not finish within 120 seconds"));
         // A device in a fork fetches nothing, and that is no failure of
         // the fetch.
         assert!(not_fetched(Waited::EndedEarly, Waited::Done, true).is_empty());
@@ -2510,7 +2509,7 @@ exit 0"#,
         for settle in [false, true] {
             match prepared(&state, settle).await {
                 Err(ApiError::BadRequest(said)) => {
-                    assert!(said.contains("knows 257 keys to be removed"), "{said}")
+                    assert!(said.contains("knows of 257 removed devices"), "{said}")
                 }
                 other => panic!("{other:?}"),
             }

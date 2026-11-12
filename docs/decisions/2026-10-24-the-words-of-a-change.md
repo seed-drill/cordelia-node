@@ -88,16 +88,18 @@ Anything but `stays` ends with "That was not \`stays\`. Nothing was done." (`per
 **The new words** (`cordelia renew`, `cordelia remove-device`):
 
 > A change is the list of your devices that your recovery phrase signs.
-> Your last change (change `<last>`, made on `<maker>`) was signed before this machine was added, so it does not list this machine. `<adder>` added this machine at `<added at>`, as `<this>`.
-> This command makes change `<new>`. The machine that makes a change is always in it, so change `<new>` will list this machine as `<this>`.
+> Your last change, made on `<maker>`, was signed before this machine was added, so it does not include this machine. `<adder>` added this machine at `<added at>`, as `<this>`.
+> This command makes a new change. The machine that makes a change is always in it, so the new change will include this machine as `<this>`.
 >   Type \`list\` to list this machine and go on. Anything else stops here, and nothing is changed:
 
 **`cordelia settle`** says the same, with its second and third sentences so:
 
-> Neither change `<a>` nor change `<b>` lists this machine: both were made without it. `<adder>` added this machine at `<added at>`, as `<this>`.
+> Neither of the two changes includes this machine: both were made without it. `<adder>` added this machine at `<added at>`, as `<this>`.
 
 ("Both were made without it", and not "signed before it was added": an addition counts under one change only, so the change made apart may have been signed later, on a device that never saw this machine's addition.)
-> This command makes change `<new>`, which settles the two. The machine that makes a change is always in it, so change `<new>` will list this machine as `<this>`.
+> This command makes a new change that settles the two. The machine that makes a change is always in it, so the new change will include this machine as `<this>`.
+
+With `-v` (decision 2026-11-11 (plain words), rule 4), the numbers show: "Your last change (change `<last>`), made on", "the two changes (changes `<a>` and `<b>`)", and "a new change (change `<new>`)".
 
 **Any answer but `list`:** "You did not type \`list\`. Nothing was changed." **The input ends:** "The input ended before you typed an answer. Nothing was changed." Both with status 1, as today.
 
@@ -119,7 +121,7 @@ Placeholders:
 **Rule 1.**
 
 1. `own_listing` says the words above, and goes on only where `list` is typed.
-2. `<new>` is the number that "The change that the recovery phrase will sign (change N)" shows next (`person_cmd.rs:1971-1974`). A unit test holds the two equal for a renewal, a removal and a settlement.
+2. `<new>` is the number that "The change your recovery phrase will sign (change N)" shows next, with `-v`, (`person_cmd.rs:1971-1974`). A unit test holds the two equal for a renewal, a removal and a settlement.
 3. The other question, "Type \`stays\` or \`removed\`" about another device (`person_cmd.rs:1841`), is not changed here.
 
 ### Rule 2. A relay is named as it is configured, in every line
@@ -285,7 +287,7 @@ Section 2 found item 6 to be the words. **Today:**
 
 **Today.** Before its questions, a change says each line of `could_not_fetch` (`person_cmd.rs:1963-1965`), from `not_fetched` (`commands.rs:994-1021`) and `change_prepare` (`commands.rs:1119-1127`):
 
-> Could not fetch: the fetch ended before every channel was read to its end at every relay: a relay gave no leave or stopped answering, or holds more of a channel than one pass takes.
+> Could not fetch: the fetch ended before everything was read from every relay: a relay refused, stopped answering, or has more than one fetch can take.
 
 and "Could not fetch: <relay> did not answer." for a relay that has not answered since the node woke. That second line is said in a fork too (`commands.rs:1120-1123`).
 
@@ -422,7 +424,7 @@ The tests that answer "Type \`stays\` or \`removed\`" (`common/mod.rs:1499-1502`
 
 **New tests.** Each fails on an assertion if its rule is taken out.
 
-- **Rule 1.** `person_e2e.rs`, `a_device_added_since_the_last_change_is_asked_to_list_itself`: a device added after change 2 runs `cordelia renew`; the prompt says "A change is the list of your devices", "Your last change (change 2, made on", the adder, "This command makes change 3", and "Type \`list\`"; typing `stays` stops with "You did not type \`list\`. Nothing was changed." and `cordelia devices` still shows change 2; typing `list` goes on, and "The change that the recovery phrase will sign (change 3)" follows. A unit test in `person_cmd.rs` holds `<new>` equal to the number signed, for a renewal, a removal and a settlement; another, `a_settlement_on_a_machine_that_neither_change_lists_names_the_settlement`, answers the settlement's questions on a machine that neither change lists, and the question names the change above both, which is the one prepared.
+- **Rule 1.** `person_e2e.rs`, `a_device_added_since_the_last_change_is_asked_to_list_itself`: a device added after change 2 runs `cordelia renew`; the prompt says "A change is the list of your devices", "Your last change, made on", the adder, "This command makes a new change", and "Type \`list\`"; typing `stays` stops with "You did not type \`list\`. Nothing was changed." and `cordelia devices -v` still shows change 2; typing `list` goes on, and "The change your recovery phrase will sign" follows. A unit test in `person_cmd.rs` holds `<new>` equal to the number signed, for a renewal, a removal and a settlement; another, `a_settlement_on_a_machine_that_neither_change_lists_names_the_settlement`, answers the settlement's questions on a machine that neither change lists, and the question names the change above both, which is the one prepared.
 - **Rule 2.** `p2p.rs`, `each_connection_says_the_configured_relay_it_was_made_to`. `commands.rs`, `a_relay_given_no_key_is_named_in_its_row_as_configured`. `person_e2e.rs`, `the_wait_names_a_relay_as_configured`: the device is set up with a relay by a name that resolves to its address (`localhost:<port>`), something waits there, and the wait's line says `localhost:<port>` and never `127.0.0.1:<port>`. `commands.rs`, `a_connection_that_two_relays_given_no_key_share_names_both`. `person_cmd.rs`, `init_new_key_names_each_relay_it_could_not_send_to_as_configured`.
 - **Rule 3.** `person_cmd.rs`, with a clock that the test moves: `each_line_of_the_wait_starts_with_its_time_and_is_said_once` (two looks with the same lines at different times say each line once; every line after the first matches `^  \d\d:\d\d:\d\d  `); `still_waiting_is_said_after_a_minute_with_no_new_line` (nothing at 59 seconds, the line at 60 naming the last line's time, again at 120 naming the same time); `each_end_begins_with_the_wait_has_ended`; `no_still_waiting_line_comes_beside_the_end`. The same in `recover_cmd.rs` for R0 and the recovery's wait, and that a recovery whose first look gives R1 says its lines with no time.
 - **Rule 4.** `person_cmd.rs`, `the_count_of_a_relay_waited_out`: a relay not reached, its reference 30 seconds ago, gives no count; at 3 minutes and 10 seconds, "has not been reached for 3 of the 5 minutes"; at 4 minutes, "4 of the 5"; at 5 and 6 minutes and in no class, "has not been reached in the 6 minutes that this command has waited for it. This command stops waiting for it once this machine has tried it again and failed."; out of reach, no count. The same for a relay that refuses. `recover_cmd.rs`, `a_recoverys_wait_counts_the_minutes_of_a_relay_that_lacks_the_change`.

@@ -365,7 +365,7 @@ async fn test_a_change_is_prepared_after_a_whole_pass_that_the_node_was_asked_fo
     assert_eq!(state.own_channels.whole_passes(), (1 + asked, 1 + asked));
     let could_not = handed["could_not_fetch"].to_string();
     assert!(
-        could_not.contains("the fetch ended before every channel was read to its end"),
+        could_not.contains("the fetch ended before everything was read from every relay"),
         "{could_not}"
     );
 }
@@ -503,7 +503,7 @@ async fn test_a_carry_by_command_holds_the_name_and_reads_each_generation_that_w
     let (status, said) = asks!(app, "/api/v1/carry", carry.clone());
     assert_eq!(status, 400, "{said}");
     assert!(
-        said.to_string().contains("follows no recovery phrase"),
+        said.to_string().contains("is not under a recovery phrase"),
         "{said}"
     );
 
@@ -837,7 +837,7 @@ async fn test_a_recovery_is_made_at_the_route_and_its_look_is_begun() {
     .into();
     let (status, said) = asks!(app, "/api/v1/recover/make", changed);
     assert_eq!(status, 400, "{said}");
-    assert!(said.to_string().contains("does not hold here"), "{said}");
+    assert!(said.to_string().contains("does not count here"), "{said}");
     let (_, seen) = asks!(app, "/api/v1/devices/list", json!({}));
     assert_eq!(seen["state"], "no_phrase");
     assert_eq!(woken(&state).await, (false, false));
@@ -884,7 +884,7 @@ async fn test_a_recovery_is_made_at_the_route_and_its_look_is_begun() {
     // It is made once.
     let (status, said) = asks!(app, "/api/v1/recover/make", body);
     assert_eq!(status, 400, "{said}");
-    assert!(said.to_string().contains("already follows"), "{said}");
+    assert!(said.to_string().contains("is already under"), "{said}");
 }
 
 /// Once a device was given a new key, the node that still runs under the
@@ -919,7 +919,8 @@ async fn test_a_node_under_a_key_that_is_the_devices_no_longer_makes_nothing_for
         let (status, said) = asks!(app, path, body);
         assert_eq!(status, 409, "{path}: {said}");
         assert!(
-            said.to_string().contains("this device was given a new key"),
+            said.to_string()
+                .contains("this device was started over as a new device"),
             "{path}: {said}"
         );
         // It names the command that restarts the service on this

@@ -116,70 +116,73 @@ use cordelia_storage::sync_state;
 /// Why something was not done with what a device holds of its person.
 #[derive(Debug, thiserror::Error)]
 pub enum PersonError {
-    #[error("this device follows no recovery phrase")]
+    #[error("this device is not under a recovery phrase")]
     FollowsNoPhrase,
 
-    #[error("this device already follows a recovery phrase")]
+    #[error("this device is already under a recovery phrase")]
     FollowsAPhrase,
 
-    #[error("the statement is not the first of a phrase, made on this device and listing it alone")]
+    #[error(
+        "this is not the first change of a new recovery phrase, made here with only this device \
+         in it"
+    )]
     NotAFirstStatement,
 
     #[error(
-        "the statement is not a recovery's: made on this device and listing it alone, after \
-         another statement"
+        "this is not a recovery's change: one made here, with only this device in it, after \
+         another change"
     )]
     NotARecovery,
 
     #[error("this device has stopped ({0:?}): the way on is a person's")]
     Stopped(State),
 
-    #[error("the statement is not one this device applies: it is {0:?}")]
+    #[error("this device cannot use that change: it is {0:?}")]
     NotApplied(Judgement),
 
-    #[error("the secret is not the one that the statement commits to")]
+    #[error("the secret does not match the change it came with")]
     SecretNotCommitted,
 
-    #[error("the change entry carries another statement than the one given with it")]
+    #[error("the change does not match the list of devices given with it")]
     NotTheStatementsEntry,
 
-    #[error("the record is made under another statement than the one this device has applied")]
+    #[error("the record was made under another change than the one this device is on")]
     RecordUnderAnotherStatement,
 
-    #[error("the record was signed by a key that does not count")]
+    #[error("the record was signed by a device that is not one of yours")]
     RecordByAKeyThatDoesNotCount,
 
-    #[error("the record of this device's addition does not count under the statement: {0:?}")]
+    #[error("the record that adds this device does not count under your last change: {0:?}")]
     RecordNotCounted(NotCounted),
 
-    #[error("what this device holds of its person changed since the prompt: nothing was made")]
+    #[error("your devices changed while you were answering: nothing was made")]
     ChangedSincePrompt,
 
-    #[error("the statement was made on another device than this one: nothing was made")]
+    #[error("the change was made on another device, not this one: nothing was made")]
     MadeOnAnotherDevice,
 
     #[error(
-        "the change does not list as removed every key that this device knows to be removed: \
-         nothing was made. A change lists each of them (`cordelia devices` names them)."
+        "the change does not remove every device that this device knows was removed: nothing \
+         was made. A change must remove each of them (`cordelia devices` lists them)."
     )]
     LeavesOutARemovedKey,
 
     #[error(
-        "the change lists as a device a key that this device knows to be removed: nothing was \
-         made. A removed key is not added again; `cordelia init --new-key` on that device gives \
-         it a new one."
+        "the change keeps a device that this device knows was removed: nothing was made. A \
+         removed device is never added again: run `cordelia init --new-key` on it to start it \
+         over as a new device."
     )]
     ListsARemovedKey,
 
     #[error(
-        "the change does not join every change that this device keeps set aside: nothing was \
-         made. A change made here joins each of them, with the recovery phrase."
+        "the change does not join every change that this device put aside: nothing was made. \
+         A change made here joins each of them, with the recovery phrase."
     )]
     JoinsNotEveryHead,
 
     #[error(
-        "a recovery lists the removals of every change it read, and the changes it read do not \
-         hold the one it recovers from: nothing was made"
+        "a recovery must keep the removals of every change it read, and the changes it read do \
+         not include the one it recovers from: nothing was made"
     )]
     NotAllRead,
 
@@ -190,51 +193,55 @@ pub enum PersonError {
     SyncIsOn,
 
     #[error(
-        "8 keys that were typed at `cordelia accept` are within their hour on this device, and \
-         a ninth is refused: each holds its place for an hour from when it was typed."
+        "you typed 8 device IDs at `cordelia accept` within the hour on this device, so a ninth \
+         is refused: each keeps its place for an hour from when you typed it."
     )]
     TooManyTypedKeys,
 
-    #[error("this device does not hold the name {0}")]
+    #[error("this device does not have the name {0}")]
     NameNotHeld(String),
 
     #[error(
-        "a device that was removed holds the secret of this change, as far as this device \
-         knows: nothing is sealed under it. A change made with the recovery phrase on this \
-         device (`cordelia renew`) lists no removed device, and goes on; where this device is \
-         itself one that was removed, `cordelia devices` says so, and its way on is a new key."
+        "a device you removed still has the secret of this change, as far as this device knows, \
+         so this device writes nothing with it. A change made with the recovery phrase on this \
+         device (`cordelia renew`) leaves out every removed device, and goes on. If this device \
+         is itself one you removed, `cordelia devices` says so: start it over with `cordelia \
+         init --new-key`."
     )]
     NotClear,
 
     #[error(
-        "this device was removed: a change of the recovery phrase that it has seen removes \
-         it, and nothing is sealed under a change that lists it. `cordelia init --new-key` \
-         gives it a new key; it is then added as a new device."
+        "this device was removed: it has seen a change to your devices that removes it, so it \
+         writes nothing more for them. Run `cordelia init --new-key` to start it over, then add \
+         it as a new device."
     )]
     RemovedAsKnown,
 
     #[error(
-        "the word that was given with the recovery phrase does not hold here: the phrase that \
-         this device follows did not give it, or it was given for another device or before the \
-         last change, or its ten minutes have gone by. Nothing was taken."
+        "the proof of your recovery phrase does not count here: the recovery phrase this \
+         device is under did not give it, or it was given for another device or before the last \
+         change, or its ten minutes are up. Nothing was copied in."
     )]
     NoWord,
 
     #[error("{0}")]
     NotCarried(String),
 
-    #[error("a merge is written over a version, and the slot holds none")]
+    #[error("a merged version was to replace an earlier one, and there is none")]
     MergeOverNoVersion,
 
-    #[error("the statement lists that key as removed: it is not added again without a new key")]
+    #[error(
+        "your last change lists that device as removed: it is never added again unless it \
+         starts over as a new device"
+    )]
     KeyRemoved,
 
-    #[error("that key is the twin of a key of one of the person's devices: the two are one device")]
+    #[error("that ID is another form of the ID of one of your devices: the two are one device")]
     TwinOfADevice,
 
     #[error(
-        "the change lists the device {0} and removes its twin, which is the same device: \
-         nothing was made. Remove that device too; then run `cordelia init --new-key` on it, and \
+        "the change keeps the device {0} and removes another form of its ID, which is the same \
+         device: nothing was made. Remove that device too; then run `cordelia init --new-key` on it, and \
          add it again from a device of yours."
     )]
     TwinInBothLists(String),
@@ -244,15 +251,13 @@ pub enum PersonError {
     )]
     MayNotAdd,
 
-    #[error("this device counts 64 devices already: a statement makes room")]
+    #[error("you have 64 devices already: a change to your devices makes room (`cordelia renew`)")]
     NoRoom,
 
-    #[error(
-        "a device of the applied statement is neither among those that stay nor among the removed"
-    )]
+    #[error("a device of the change this device is on is neither kept nor removed in the new one")]
     NeitherStaysNorRemoved,
 
-    #[error("what this device holds of its person does not hold together: {0}")]
+    #[error("this device's record of your devices is damaged: {0}")]
     Held(String),
 
     #[error(transparent)]
@@ -299,15 +304,15 @@ pub fn held(conn: &Connection) -> Result<Option<Held>, PersonError> {
         return Ok(None);
     };
     let statement = SignedStatement::from_bytes(&person.statement)
-        .map_err(|e| PersonError::Held(format!("the applied statement: {e}")))?;
+        .map_err(|e| PersonError::Held(format!("the change this device is on: {e}")))?;
     if statement.statement.phrase_key != person.following.phrase_key {
         return Err(PersonError::Held(
-            "the applied statement is under another phrase than the one followed".into(),
+            "the change this device is on is under another recovery phrase than the one it is under".into(),
         ));
     }
     statement
         .verify()
-        .map_err(|e| PersonError::Held(format!("the applied statement: {e}")))?;
+        .map_err(|e| PersonError::Held(format!("the change this device is on: {e}")))?;
     Ok(Some(Held {
         state: person.state,
         following: person.following,
@@ -1404,7 +1409,7 @@ pub(crate) fn set_aside_heads(
     identity: &NodeIdentity,
     following: &Following,
 ) -> Result<Vec<Head>, PersonError> {
-    let not_held = |what: String| PersonError::Held(format!("a head set aside: {what}"));
+    let not_held = |what: String| PersonError::Held(format!("a change put aside: {what}"));
     let mut heads = Vec::new();
     for kept in held_rows::set_aside_entries(conn)? {
         let entry = kept.entry.check().map_err(|e| not_held(e.to_string()))?;
@@ -1872,9 +1877,9 @@ pub fn moves_made(conn: &Connection) -> Result<Vec<MovedFrom>, PersonError> {
 }
 
 /// What a command that waits after the change `held` follows says where the
-/// device moves from it to `to` (rule 9): "a change made apart on <label>
-/// removed <label>, which this change lists: this device follows that
-/// change now". The key is one that the change left lists, or hands its
+/// device moves from it to `to` (rule 9): "a change made separately on
+/// <label> removed <label>, which this change lists: this device is on
+/// that change now". The key is one that the change left lists, or hands its
 /// secret to by a record, and that the device knows to be removed; the
 /// device named first is the one on which a change it keeps that removes
 /// that key was made: `to`, where it does.
@@ -1924,8 +1929,8 @@ fn moved_says(
     }
     let Some((key, label, is_listed)) = listed.or(held_by) else {
         return Ok(format!(
-            "a change made apart on {} is clear of every removed device, and this change is \
-             not: this device follows that change now",
+            "a change made separately on {} leaves out every removed device, and this change \
+             does not: this device is on that change now",
             lists_of(to)?.made_on.named()
         ));
     };
@@ -1936,20 +1941,20 @@ fn moved_says(
     let removed = Named::of(&key, &label)?.named();
     let how = match is_listed {
         true => "which this change lists",
-        false => "to which this change hands its secret",
+        false => "to which this change gives its secret",
     };
     // Where a head set aside removed the key, and not the change moved
     // to, the words name both: "that change" would be the head (the
     // review of the whole build, its L9).
-    let follows = match by.link()? == to.link()? {
-        true => "this device follows that change now".to_string(),
+    let now_on = match by.link()? == to.link()? {
+        true => "this device is on that change now".to_string(),
         false => format!(
-            "this device follows the change made on {} now",
+            "this device is on the change made on {} now",
             lists_of(to)?.made_on.named()
         ),
     };
     Ok(format!(
-        "a change made apart on {} removed {removed}, {how}: {follows}",
+        "a change made separately on {} removed {removed}, {how}: {now_on}",
         lists_of(by)?.made_on.named()
     ))
 }
@@ -2254,7 +2259,9 @@ fn stop(conn: &Connection, state: State, entry: &CheckedEntry) -> Result<(), Per
 /// keeps one.
 pub(crate) fn followed_entry(conn: &Connection) -> Result<CheckedEntry, PersonError> {
     kept_followed(conn)?.ok_or_else(|| {
-        PersonError::Held("a device that follows a phrase keeps a change entry".into())
+        PersonError::Held(
+            "this device is under a recovery phrase, and has no record of its last change".into(),
+        )
     })
 }
 
@@ -2263,9 +2270,9 @@ pub(crate) fn followed_entry(conn: &Connection) -> Result<CheckedEntry, PersonEr
 pub(crate) fn kept_followed(conn: &Connection) -> Result<Option<CheckedEntry>, PersonError> {
     held_rows::followed_entry(conn)?
         .map(|entry| {
-            entry
-                .check()
-                .map_err(|e| PersonError::Held(format!("a change entry that is kept: {e}")))
+            entry.check().map_err(|e| {
+                PersonError::Held(format!("the record of this device's last change: {e}"))
+            })
         })
         .transpose()
 }
@@ -2704,7 +2711,8 @@ pub(crate) fn apply_added(
             AdditionSeen::NotCounted(why) => return Err(PersonError::RecordNotCounted(why)),
             AdditionSeen::SeenBefore => {
                 return Err(PersonError::Held(
-                    "a record of an addition is kept under a statement just applied".into(),
+                    "the record that adds a device was kept already under the change just made"
+                        .into(),
                 ));
             }
         }
@@ -3198,11 +3206,12 @@ pub(crate) fn applied_secret(
     conn: &Connection,
     applied: &Statement,
 ) -> Result<[u8; 32], PersonError> {
-    let held = held_rows::applied_secret(conn)?
-        .ok_or_else(|| PersonError::Held("the applied statement's secret is not held".into()))?;
+    let held = held_rows::applied_secret(conn)?.ok_or_else(|| {
+        PersonError::Held("this device does not have the secret of the change it is on".into())
+    })?;
     if held.number != applied.number || !applied.commits_to(&held.secret) {
         return Err(PersonError::Held(
-            "the secret held is not the applied statement's".into(),
+            "the secret this device has is not that of the change it is on".into(),
         ));
     }
     Ok(held.secret)
@@ -3280,7 +3289,7 @@ impl Carry<'_> {
                 let entry = carried_entry_at(self.identity, to, target, rev)?;
                 if entries::store(conn, &entry, self.now)? != Outcome::Stored {
                     return Err(PersonError::Held(
-                        "the store holds an entry of this device's in a generation it has not come to"
+                        "this device's store has an entry of its own from a change it has not reached yet"
                             .into(),
                     ));
                 }
@@ -3305,7 +3314,7 @@ impl Carry<'_> {
             let entry = carried_entry_at(self.identity, to, &version, rev)?;
             if entries::store(conn, &entry, self.now)? != Outcome::Stored {
                 return Err(PersonError::Held(
-                    "the store holds an entry of this device's in a generation it has not come to"
+                    "this device's store has an entry of its own from a change it has not reached yet"
                         .into(),
                 ));
             }
@@ -3510,9 +3519,12 @@ fn write_applied(
     let read = version::current(&held, &personal, statement.number, |key| {
         statement.lists(key)
     })?;
-    let rev = read
-        .next
-        .ok_or_else(|| PersonError::Held("the word has no next revision".into()))?;
+    let rev = read.next.ok_or_else(|| {
+        PersonError::Held(
+            "this device can write this note again only after the next change to your devices"
+                .into(),
+        )
+    })?;
     let inside = Inside {
         name,
         value: Value::Text(statement.number.to_string()),
@@ -7644,7 +7656,7 @@ mod tests {
             let before = everything(&conn);
             let failed = shown(&conn, &device(1), &entry, NOW);
             assert!(
-                matches!(&failed, Err(PersonError::Held(why)) if why.contains("has not come to")),
+                matches!(&failed, Err(PersonError::Held(why)) if why.contains("has not reached yet")),
                 "{rev}: {failed:?}"
             );
             assert_eq!(everything(&conn), before, "{rev}");
@@ -9896,11 +9908,10 @@ mod tests {
             assert_eq!(moves.len(), 1, "{case}");
             assert_eq!(moves[0].from, hex::encode(left_entry.id()), "{case}");
             assert!(
-                moves[0].says.starts_with("a change made apart on ")
+                moves[0].says.starts_with("a change made separately on ")
                     && moves[0].says.contains("\"device 1\" removed ")
                     && moves[0].says.ends_with(
-                        "\"device 2\", which this change lists: this device follows that \
-                         change now"
+                        "\"device 2\", which this change lists: this device is on that change now"
                     ),
                 "{case}: {}",
                 moves[0].says
@@ -10126,8 +10137,8 @@ mod tests {
             if case == "past the bound" {
                 assert!(
                     says.ends_with(
-                        "is clear of every removed device, and this change is not: this \
-                         device follows that change now"
+                        "leaves out every removed device, and this change does not: this \
+                         device is on that change now"
                     ),
                     "{case}: {says}"
                 );
@@ -10135,7 +10146,7 @@ mod tests {
                 assert!(
                     says.contains(" removed ")
                         && says.ends_with(
-                            ", to which this change hands its secret: this device follows \
+                            ", to which this change gives its secret: this device is on \
                              that change now"
                         ),
                     "{case}: {says}"

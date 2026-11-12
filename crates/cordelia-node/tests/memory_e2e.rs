@@ -359,7 +359,7 @@ fn a_removed_devices_later_edit_reaches_nobody_and_the_others_go_on_syncing() {
     // which was added since the phrase was made, it is asked whether it
     // stays.
     let mut at = removes(&a, &key_of(&c), &["stays"], &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     has_applied(&b, 2, &all);
     wait_for("the tablet hears that it was removed", &all, 90, || {
         (person_of(&c)["state"] == "removed").then_some(())
@@ -377,10 +377,8 @@ fn a_removed_devices_later_edit_reaches_nobody_and_the_others_go_on_syncing() {
         &all,
         120,
         || {
-            let listed = a.cli(&["devices"]);
-            listed
-                .contains("has applied change 2, and has sent what it held")
-                .then_some(())
+            let listed = a.cli(&["devices", "-v"]);
+            listed.contains("up to date (change 2)").then_some(())
         },
     );
 
@@ -509,7 +507,7 @@ fn an_edit_made_before_a_device_heard_of_a_change_arrives_as_an_edit_of_the_carr
     // which the laptop stays.
     b.stop();
     let mut at = renews(&a, &["stays"], &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     let said = at.done();
     assert!(
         said.contains("has sent all it has: you may close this machine"),
@@ -645,7 +643,7 @@ fn a_removal_cut_short_after_its_transaction_is_shown_and_sent_when_the_node_sta
     // killed as soon as the change is made.
     relay.stop();
     let mut at = removes(&a, &b_key, &[], &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     a.crash();
     drop(at);
 
@@ -765,7 +763,7 @@ fn a_removed_device_writes_late_while_another_is_off() -> LateWrite {
     lacks.stop();
     {
         let mut at = removes(&desktop, &key_of(&tablet), &["stays"], &words);
-        at.says("The change is made (change 2)");
+        at.says("The change is made");
         // The relay's own store is asked, and not the desktop's status:
         // what a device says of a relay is what the relay last answered,
         // and the desktop is turned off as soon as the relay holds it.
@@ -1027,7 +1025,7 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
     // to it before anything else; of what the device carried, the names
     // have not gone.
     let mut at = removes(&a, &key_of(&b), &[], &words);
-    at.says("The change is made (change 2)");
+    at.says("The change is made");
     wait_for("the relay holds the change", &[&relay, &a], 30, || {
         let seen = person_of(&a);
         let relays = seen["relays"].as_array()?;
@@ -1060,7 +1058,7 @@ fn a_relay_lost_before_the_names_went_does_not_end_the_wait_after_a_change() {
     );
     assert!(
         said.contains(
-            "keep this machine on: this device has not yet sent every relay what it carried"
+            "keep this machine on: this device has not yet sent every relay what it copied over"
         ),
         "{said}"
     );

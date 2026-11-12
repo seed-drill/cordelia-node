@@ -46,28 +46,28 @@ pub enum AdditionError {
     #[error("there are bytes after the record's end")]
     TrailingBytes,
 
-    #[error("the new device's label is not one a statement may carry: {0}")]
+    #[error("the new device's name cannot be used: {0}")]
     Label(StatementError),
 
-    #[error("the new device's key is not a usable public key")]
+    #[error("the new device's ID is not a valid device ID")]
     KeyNotUsable,
 
     #[error("a device does not add itself")]
     AddsItself,
 
-    #[error("a record is made under a statement numbered from 1 to 256, and this is {0}")]
+    #[error("the record of a new device names change {0}, and changes are numbered 1 to 256")]
     Number(u64),
 
-    #[error("the key given to sign with is not the key of the device that adds")]
+    #[error("the device that adds must sign as itself, and this signs as another device")]
     NotTheAdder,
 
-    #[error("the key of the device that adds is not a usable public key")]
+    #[error("the ID of the device that adds is not a valid device ID")]
     AdderKeyNotUsable,
 
     #[error("the record is not signed by the device that adds")]
     Signature,
 
-    #[error("the statement the record would be made under is no statement: {0}")]
+    #[error("the change to your devices that the record names is damaged: {0}")]
     Statement(StatementError),
 }
 
