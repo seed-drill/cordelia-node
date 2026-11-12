@@ -2068,7 +2068,7 @@ fn carried_elsewhere_says(
 }
 
 /// R2's second ending (decision 2026-10-19 §5): set up on this machine
-/// the relay whose key is `key`, which the configuration of the device
+/// the relay with key `key`, which the configuration of the device
 /// named names. Where this machine is set up with relays that it is given
 /// no key for, of `known`, and did not reach them, that relay may be one of
 /// them: reaching them is then the remedy, and setting it up only where it
@@ -2081,9 +2081,9 @@ fn set_it_up(key: &str, known: &[(String, Option<String>)]) -> String {
         .collect();
     if keyless.is_empty() {
         return format!(
-            "To bring it in by this recovery, answer no. On this machine, set up the relay whose \
-             key is {key}: the configuration of that device (its `[[network.bootnodes]]`) names \
-             it. Then run `cordelia recover` again."
+            "To bring it in by this recovery, answer no. On this machine, set up the relay with \
+             key {key}: the configuration of that device (its `[[network.bootnodes]]`) names it. \
+             Then run `cordelia recover` again."
         );
     }
     let may_be = match keyless.len() {
@@ -2092,7 +2092,7 @@ fn set_it_up(key: &str, known: &[(String, Option<String>)]) -> String {
     };
     format!(
         "To bring it in by this recovery, answer no. Make sure this machine can reach {}: the \
-         relay whose key is {key} may be {may_be}. If it is not, set it up on this machine: the \
+         relay with key {key} may be {may_be}. If it is not, set it up on this machine: the \
          configuration of that device (its `[[network.bootnodes]]`) names it. Then run `cordelia \
          recover` again.",
         joined(&keyless)
@@ -3669,7 +3669,7 @@ mod tests {
             ("not held", 0, NotHeld),
             ("not reached", 0, Nothing),
             (changed, 0, Nothing),
-            ("not read: the node is held up", 0, Nothing),
+            ("not read: the node cannot go on", 0, Nothing),
             // Handed at an earlier reading, and not read to its end.
             ("not reached", 2, Part),
             (changed, 1, Part),
@@ -5693,7 +5693,7 @@ mod tests {
         let elsewhere = CutShort::of(&generation, &read_at(&b), &known).unwrap();
         let to = elsewhere.carried_to.clone().unwrap();
         assert_eq!(to.relays, 1);
-        assert_eq!(to.held, format!("the relay whose key is {a}"));
+        assert_eq!(to.held, format!("the relay with key {a}"));
         let says = elsewhere.says();
         assert!(
             says.starts_with("The device that this was recovered from"),
@@ -5704,7 +5704,7 @@ mod tests {
         assert_eq!(
             args.split_off(4),
             [
-                format!("--carried-to=the relay whose key is {a}"),
+                format!("--carried-to=the relay with key {a}"),
                 "--carried-relays".to_string(),
                 "1".to_string()
             ]
@@ -5733,7 +5733,7 @@ mod tests {
             "{r2}"
         );
         assert!(
-            r2.contains(&format!("set up the relay whose key is {a}")),
+            r2.contains(&format!("set up the relay with key {a}")),
             "{r2}"
         );
         assert_eq!(
@@ -5804,14 +5804,14 @@ mod tests {
         assert_eq!(
             carried_elsewhere_says(laptop, &two, &elsewhere),
             format!(
-                "(w1 w2 w3 w4) \"laptop\" wrote that it had sent what it carried to the relay \
-                 whose key is {a} and the relay whose key is {b}. This machine has read none of \
-                 them. The look of this recovery is made once, so what that device carried may \
-                 be only there. To bring it in by this recovery, answer no. On this machine, set \
-                 up the relay whose key is {a}: the configuration of that device (its \
-                 `[[network.bootnodes]]`) names it. Then run `cordelia recover` again. If you \
-                 answer yes, it comes in later only by `cordelia sync carry <name> --from \
-                 <device>`, with the phrase, once this machine reaches that relay."
+                "(w1 w2 w3 w4) \"laptop\" wrote that it had sent what it carried to the relay with \
+                 key {a} and the relay with key {b}. This machine has read none of them. The look \
+                 of this recovery is made once, so what that device carried may be only there. To \
+                 bring it in by this recovery, answer no. On this machine, set up the relay with \
+                 key {a}: the configuration of that device (its `[[network.bootnodes]]`) names it. \
+                 Then run `cordelia recover` again. If you answer yes, it comes in later only by \
+                 `cordelia sync carry <name> --from <device>`, with the phrase, once this machine \
+                 reaches that relay."
             )
         );
         // R2, where it is set up with a relay that it is given no key for
@@ -5829,14 +5829,14 @@ mod tests {
                 carried_elsewhere_says(laptop, &one, relays),
                 format!(
                     "(w1 w2 w3 w4) \"laptop\" wrote that it had sent what it carried to the relay \
-                     whose key is {a}. It had not yet sent it to 1 other relay that it was set up \
+                     with key {a}. It had not yet sent it to 1 other relay that it was set up \
                      with. This machine has read none of it. The look of this recovery is made \
                      once, so what that device carried may be only there. To bring it in by this \
-                     recovery, answer no. Make sure this machine can reach {names}: the relay \
-                     whose key is {a} may be {may_be}. If it is not, set it up on this machine: \
-                     the configuration of that device (its `[[network.bootnodes]]`) names it. \
-                     Then run `cordelia recover` again. If you answer yes, it comes in later only \
-                     by `cordelia sync carry <name> --from <device>`, with the phrase, once this \
+                     recovery, answer no. Make sure this machine can reach {names}: the relay with \
+                     key {a} may be {may_be}. If it is not, set it up on this machine: the \
+                     configuration of that device (its `[[network.bootnodes]]`) names it. Then run \
+                     `cordelia recover` again. If you answer yes, it comes in later only by \
+                     `cordelia sync carry <name> --from <device>`, with the phrase, once this \
                      machine reaches that relay."
                 )
             );

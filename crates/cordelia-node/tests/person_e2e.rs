@@ -239,10 +239,13 @@ fn a_phrase_is_made_at_a_terminal_and_the_relay_holds_its_first_change() {
     let devices = laptop.cli(&["devices"]);
     assert!(devices.contains("change 1"), "{devices}");
     assert!(devices.contains("this device"), "{devices}");
-    assert!(devices.contains("holds the latest change"), "{devices}");
+    assert!(
+        devices.contains("has the latest change to your devices"),
+        "{devices}"
+    );
     let status = laptop.cli(&["status"]);
     assert!(
-        status.contains("Devices:   this device alone, under a recovery phrase (change 1)"),
+        status.contains("Devices:   this device alone, under a recovery phrase"),
         "{status}"
     );
     // The node was handed no word of it: nothing it logged has the
@@ -362,7 +365,7 @@ fn a_relay_whose_name_does_not_resolve_is_waited_for_and_named() {
         "{devices}"
     );
     assert!(
-        devices.contains(&format!("{reached}: holds the latest change")),
+        devices.contains(&format!("{reached}: has the latest change to your devices")),
         "{devices}"
     );
 
@@ -517,7 +520,7 @@ fn a_device_is_added_by_two_commands_and_each_device_shows_it_until_it_is_cleare
             format!("({}) \"desktop\", added from (", words_of(&desktop_key)),
             laptop_key.clone(),
             desktop_key.clone(),
-            "holds the latest change".to_string(),
+            "has the latest change to your devices".to_string(),
         ] {
             assert!(
                 listed.contains(&says),
@@ -1204,8 +1207,8 @@ fn a_device_is_removed_with_the_phrase_and_stops_and_the_others_apply() {
     );
     assert!(
         status.contains(
-            "this device was removed. `cordelia init --new-key` gives it a new key; it is then \
-             added as a new device"
+            "this device was removed from your devices. To use it again, run `cordelia init \
+             --new-key`, then add it as a new device"
         ),
         "{status}"
     );
@@ -1769,9 +1772,9 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     // Each device it left shows that it left, until a person clears it
     // there.
     let left = format!(
-        "({}) \"desktop\" left, and started again under another phrase. It still holds the secret \
-         it had, and is still listed: removing it, with the phrase, is what cuts it off \
-         (`cordelia remove-device`)",
+        "({}) \"desktop\" left, and started again under another recovery phrase. It still has the \
+         secret it had, and is still on your list of devices: to cut it off, remove it with \
+         `cordelia remove-device` and your recovery phrase",
         words_of(&desktop_key)
     );
     for device in [&laptop, &tablet] {
@@ -1929,7 +1932,7 @@ fn a_device_that_leaves_says_so_and_a_new_key_starts_it_afresh() {
     assert_eq!(sync_after["mappings"], sync_before["mappings"]);
     // The devices it left show that it left, under the key they knew.
     let left = format!(
-        "({}) \"tablet\" left, and started again under another phrase.",
+        "({}) \"tablet\" left, and started again under another recovery phrase.",
         words_of(&tablet_key)
     );
     wait_for(
@@ -2019,10 +2022,11 @@ fn two_changes_made_apart_are_settled_with_the_phrase() {
     for device in [forked, other] {
         assert_eq!(text(&look(device), "state"), "applied", "{}", device.name);
     }
-    let set_aside = "is set aside: settle it with the phrase (`cordelia settle`)";
+    let set_aside =
+        "was put aside. To settle it, run `cordelia settle` and type your recovery phrase";
     let status = forked.cli(&["status"]);
     assert!(
-        status.contains("Devices:   a change made apart is set aside"),
+        status.contains("Devices:   a change to your devices was made separately, and put aside"),
         "{status}"
     );
     assert!(status.contains(set_aside), "{status}");
@@ -5120,9 +5124,9 @@ fn a_command_that_opens_the_database_asks_the_data_directorys_lock() {
         key
     );
     let stats = laptop.cli(&["stats"]);
-    assert!(stats.contains("Names:            0 held"), "{stats}");
+    assert!(stats.contains("Names:            0\n"), "{stats}");
     let channels = laptop.cli(&["channels"]);
-    assert!(channels.starts_with("No names."), "{channels}");
+    assert!(channels.starts_with("No names yet."), "{channels}");
 }
 
 // ── A change made while a pass is in flight ──────────────────────────
@@ -5463,12 +5467,13 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     // since this device applied the change.
     for line in [
         format!(
-            "keep this machine on: {NO_SUCH_NAME} cannot be reached from here, and is not known \
-             to hold the change yet: it has not answered since this device applied the change at "
+            "keep this machine on: {NO_SUCH_NAME} cannot be reached from here, and is not known to \
+             hold the change yet: it has not answered since this device took in the latest change \
+             at "
         ),
         format!(
             "  {NO_SUCH_NAME} cannot be reached from here, and is not known to hold the change: \
-             it has not answered since this device applied the change at "
+             it has not answered since this device took in the latest change at "
         ),
         format!(
             "A device of yours that reaches only {NO_SUCH_NAME} may not have heard of the change."
@@ -5486,7 +5491,7 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     // 11), and that the relay is out of reach (decision 2026-10-24, rule
     // 7): the command ends at five minutes, and the line once they are
     // over, at the node's next pass. `cordelia devices` says D4.
-    let says = "memory: a relay out of reach, not known to hold the latest change";
+    let says = "memory: a relay is out of reach and may not have the latest change to your devices";
     wait_for("the status line is amber", &[&relay, &laptop], 30, || {
         amber_with(&laptop, says)
     });
@@ -5495,8 +5500,8 @@ fn a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached() {
     let devices = laptop.cli(&["devices"]);
     assert!(
         devices.contains(&format!(
-            "  {NO_SUCH_NAME}: cannot be reached from here, and is not known to hold the latest \
-             change: it has not answered since this device applied the change at "
+            "  {NO_SUCH_NAME}: cannot be reached from here, and may not have the latest change to \
+             your devices: it has not answered since this device took in the latest change at "
         )),
         "{devices}"
     );
@@ -5551,9 +5556,12 @@ fn a_removal_made_on_alpha_12_leaves_a_relay_that_never_answers_lacking_after_th
     assert_eq!(seen["relays"][1]["reach"]["holds"], "lacks", "{seen}");
     // It never answers, and so is out of reach by then too: the line says
     // so (decision 2026-10-24, rule 7).
-    let says = "memory: a relay out of reach, not known to hold the latest change";
+    let says = "memory: a relay is out of reach and may not have the latest change to your devices";
     // Not before five minutes, in either form of the line.
-    for early in [says, "memory: a relay not known to hold the latest change"] {
+    for early in [
+        says,
+        "memory: a relay may not have the latest change to your devices",
+    ] {
         assert!(
             amber_with(&laptop, early).is_none(),
             "amber before five minutes: {early}"
@@ -5745,7 +5753,8 @@ fn a_relay_that_holds_the_change_and_cannot_be_reached_ends_at_end_two() {
     laptop.stop();
     laptop.start();
     let d5 = format!(
-        "  {name_b}: cannot be reached from here, and holds the latest change (as it said at "
+        "  {name_b}: cannot be reached from here, and has the latest change to your devices (as it \
+         said at "
     );
     wait_for("D5 is said of B", &[&a, &laptop], 420, || {
         let devices = laptop.cli(&["devices"]);

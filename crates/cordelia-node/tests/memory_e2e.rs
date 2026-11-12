@@ -267,14 +267,17 @@ fn a_phrase_is_made_its_folders_are_published_and_a_second_devices_folders_meet_
     // still tells of the device that was added, which nobody has
     // cleared: that is amber, and says so (decision 2026-10-04 §10.1).
     std::fs::remove_file(a_mem.join(&copies[0])).unwrap();
-    for n in [&a, &b] {
+    for (n, added) in [(&a, "\"laptop\""), (&b, "this device")] {
         wait_for("the device is synced", &all, 90, || {
             let s = state(n);
             (s["state"] == "synced" && s["level"] == "amber").then_some(())
         });
         assert_eq!(
             state(n)["summary"],
-            "memory: 1 device added, not yet cleared"
+            format!(
+                "memory: {added} was added. If you did not add it, remove it; if you did, run \
+                 cordelia devices --clear"
+            )
         );
         clears_what_it_tells(n);
         let s = state(n);
@@ -943,7 +946,10 @@ fn a_device_that_reaches_only_a_relay_without_the_change_takes_a_late_write_and_
     let history = laptop.cli(&["history", "lab"]);
     assert!(history.contains("set aside"), "{history}");
     let status = laptop.cli(&["status"]);
-    assert!(status.contains("set aside"), "{status}");
+    assert!(
+        status.contains("put aside when you removed a device"),
+        "{status}"
+    );
 
     // The desktop, which had applied the removal and never took what the
     // tablet wrote late, takes none of it from the laptop's carry: the two

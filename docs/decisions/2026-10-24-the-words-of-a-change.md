@@ -1,7 +1,7 @@
 # Decision: the words of a change
 
 **Date**: 2026-10-24
-**Status**: Rules 1 to 7 accepted, and built in `v0.2.0-alpha.17`. Rules 8 and 9, and the parts of rule 10 that state them, are held: the person ruled on 24 October that a removal must fail safe by construction (`2026-10-24-removal-fails-safe.md`), and under that record a fork can no longer let a removed device back in, so what rule 9 warns of changes. They are written again against that record before they are built. It amends the record of 2026-10-04, the record of reach and `channels-api.md` (section 5), and that record amends it (below).
+**Status**: Rules 1 to 7 accepted, and built in `v0.2.0-alpha.17`. Its quoted lines amended by decision 2026-11-11 (plain words). Rules 8 and 9, and the parts of rule 10 that state them, are held: the person ruled on 24 October that a removal must fail safe by construction (`2026-10-24-removal-fails-safe.md`), and under that record a fork can no longer let a removed device back in, so what rule 9 warns of changes. They are written again against that record before they are built. It amends the record of 2026-10-04, the record of reach and `channels-api.md` (section 5), and that record amends it (below).
 
 **Under the record of a removal that fails safe, as built** (its section 5, item 35): "in a fork" here is "closed, or keeping a head set aside" (that record's rules 10 and 11). Rule 9's sentence "Until you do, a device that the other change removed may still be listed in this one, and may read what your devices write after it" holds only until each device has read both changes: from then each follows a clear one (its rule 8), and the next change made on a device that has seen both joins them (its rule 21), with no `settle` asked.
 **Cited as**: "decision 2026-10-24, rule 3". The numbers do not change. A number that is not used stays unused.
@@ -215,7 +215,7 @@ For a relay that is reached and refuses the change, once each minute counted, fr
 
 **The new words.**
 
-> `  Memory:    a relay not known to hold the latest change`
+> `  Memory:    a relay may not have the latest change to your devices`
 
 and so for every line: "Memory:    not syncing: two changes made apart", "Memory:    sync error", "Memory:    node stopped".
 
@@ -233,13 +233,13 @@ and so for every line: "Memory:    not syncing: two changes made apart", "Memory
 **The new words.** `<since>` is one of:
 
 - "has not been reached since `<when>`", where the relay was reached after its reference ("from here" goes: every line that says `<since>` now says "cannot be reached from here" first, rule 7);
-- "has not answered since this device applied the change at `<when>`", where the reference is the change of the kept entry. On the device that made the change that is when it made it; on another, when the change came to it;
+- "has not answered since this device took in the latest change at `<when>`", where the reference is the change of the kept entry. On the device that made the change that is when it made it; on another, when the change came to it;
 - "has not answered since this device started at `<when>`", where it is the node's start;
 - "has not answered since this device woke from sleep at `<when>`", where it is a sleep.
 
 Then, in the last three, where the relay was reached before the reference since the node started: " (it was last reached at `<when>`)".
 
-So the test's line reads: "has not answered since this device applied the change at 10:53 UTC (it was last reached at 10:48 UTC)".
+So the test's line reads: "has not answered since this device took in the latest change at 10:53 UTC (it was last reached at 10:48 UTC)".
 
 **Rule 6.**
 
@@ -263,16 +263,16 @@ Section 2 found item 6 to be the words. **Today:**
 
 **The new words** (`<since>` as rule 6):
 
-- **D4:** "  `<relay>`: cannot be reached from here, and is not known to hold the latest change: it `<since>`. A device of yours that reaches only it may not have heard of that change. If you know that `<relay>` is gone for good, take it out of the configuration of every device. Do not do so only because this machine cannot reach it: it may still serve a device that does."
-- **D5:** "  `<relay>`: cannot be reached from here, and holds the latest change (as it said at `<when>`): it `<since>`"
-- **T2:** "`<relay>` cannot be reached from here, and is not known to hold the latest change: it `<since>`"
-- **T3:** "`<relay>` cannot be reached from here: it `<since>`. It holds the latest change, and this device sends through the others"
+- **D4:** "  `<relay>`: cannot be reached from here, and may not have the latest change to your devices: it `<since>`. A device of yours that reaches only this relay may not know of that change. If you know that `<relay>` is gone for good, take it out of the configuration of every device. Do not do so only because this machine cannot reach it: it may still serve a device that does."
+- **D5:** "  `<relay>`: cannot be reached from here, and has the latest change to your devices (as it said at `<when>`): it `<since>`"
+- **T2:** "`<relay>` cannot be reached from here, and may not have the latest change to your devices: it `<since>`"
+- **T3:** "`<relay>` cannot be reached from here: it `<since>`. It has the latest change to your devices, and this device sends through your other relays"
 - **S2:** "keep this machine on: `<relay>` cannot be reached from here, and is not known to hold the change yet: it `<since>`"
 - **S3:** "`<relay>` holds the change, and cannot be reached from here: it `<since>`"
 - **S6,** in `<held>`: "  `<relay>` holds the change and all that this device carried, and cannot be reached from here: it `<since>`." Not in `<held>`: "  `<relay>` holds the change, and cannot be reached from here: it `<since>`. Some of what this device carried is not there yet."
 - **S8, OUT and lacking:** "  `<relay>` cannot be reached from here, and is not known to hold the change: it `<since>`."
 - **S8, OUT and holding:** "  `<relay>` holds the change, and cannot be reached from here: it `<since>`."
-- **The status line,** where every relay it counts is out of reach: "memory: a relay out of reach, not known to hold the latest change", or "memory: `<n>` relays out of reach, not known to hold the latest change". Where some are out of reach and some not: "memory: `<n>` relays not known to hold the latest change, `<k>` out of reach". Otherwise as today.
+- **The status line,** where every relay it counts is out of reach: "memory: a relay is out of reach and may not have the latest change to your devices", or "memory: some relays are out of reach and may not have the latest change to your devices". Where some are out of reach and some not: "memory: some relays may not have the latest change to your devices, and one of them is out of reach" (or "some of them"). Otherwise as today.
 
 **Rule 7.**
 
@@ -414,7 +414,7 @@ The sentences of section 5 for the record of 2026-10-04 describe the design as i
 | `person_e2e.rs:5436`, `5439`, `5464`, `5561`, `5601` | S2, S8 and D4 as today | S2, S8 and D4 of rule 7, with `<since>` of rule 6 |
 | `recover_e2e.rs:2327`, `2330` | S2, S8 | S2, S8 of rule 7; R0 with its sentence on times |
 | `memory_e2e.rs:1024` | S8 "is not known to hold the change, and has not been reached from here since" | rule 7's S8 |
-| `devices_e2e.rs:4576` | the line "memory: a relay not known to hold the latest change" | the line of rule 7 once the relay is out of reach, and today's line before |
+| `devices_e2e.rs:4576` | the line "memory: a relay may not have the latest change to your devices" | the line of rule 7 once the relay is out of reach, and today's line before |
 | `first_start_e2e.rs:1796` | "Memory:    memory: 1 folder stopped syncing" | "Memory:    1 folder stopped syncing" |
 | units: `person_cmd.rs` (the wait's lines, `3742-3833`; D4 and D5, `4337`, `4428`), `person_cmd/wait.rs`, `look.rs:3239` (T2, T3), `recover_cmd.rs:5845-6111`, `commands.rs:2165` (`not_fetched`), `main.rs:6913` and the status tests, `indicator.rs` (the line of a relay not known) | today's words | the new words |
 
@@ -427,8 +427,8 @@ The tests that answer "Type \`stays\` or \`removed\`" (`common/mod.rs:1499-1502`
 - **Rule 3.** `person_cmd.rs`, with a clock that the test moves: `each_line_of_the_wait_starts_with_its_time_and_is_said_once` (two looks with the same lines at different times say each line once; every line after the first matches `^  \d\d:\d\d:\d\d  `); `still_waiting_is_said_after_a_minute_with_no_new_line` (nothing at 59 seconds, the line at 60 naming the last line's time, again at 120 naming the same time); `each_end_begins_with_the_wait_has_ended`; `no_still_waiting_line_comes_beside_the_end`. The same in `recover_cmd.rs` for R0 and the recovery's wait, and that a recovery whose first look gives R1 says its lines with no time.
 - **Rule 4.** `person_cmd.rs`, `the_count_of_a_relay_waited_out`: a relay not reached, its reference 30 seconds ago, gives no count; at 3 minutes and 10 seconds, "has not been reached for 3 of the 5 minutes"; at 4 minutes, "4 of the 5"; at 5 and 6 minutes and in no class, "has not been reached in the 6 minutes that this command has waited for it. This command stops waiting for it once this machine has tried it again and failed."; out of reach, no count. The same for a relay that refuses. `recover_cmd.rs`, `a_recoverys_wait_counts_the_minutes_of_a_relay_that_lacks_the_change`.
 - **Rule 5.** `main.rs`, `the_plain_status_says_memory_once`: for each summary of `indicator.rs`, the plain status line starts "  Memory:    " and does not contain "memory" right after it; `--line` keeps "memory: ".
-- **Rule 6.** `look.rs`, `since_says_since_what`: one case for each `reference_by`, with and without `last_reached`; the case of the test reads "has not answered since this device applied the change at 10:53 UTC (it was last reached at 10:48 UTC)". `reach.rs`, `the_reference_says_which_moment_it_is`.
-- **Rule 7.** `look.rs` and `person_cmd.rs`: D4, D5, T2 and T3 each contain "cannot be reached from here"; `person_cmd/wait.rs`: S2, S3, S6 (both forms) and S8 (both forms) each contain it. `indicator.rs`, `the_line_says_out_of_reach_where_every_relay_it_counts_is`: two relays out of reach and lacking give "memory: 2 relays out of reach, not known to hold the latest change"; one of each gives "..., 1 out of reach"; a relay that holds and is out of reach still gives "a relay out of reach for <m> minutes", last. The ignored real-process test `a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached` (`person_e2e.rs:5405`) asserts rule 7's S8 and D4.
+- **Rule 6.** `look.rs`, `since_says_since_what`: one case for each `reference_by`, with and without `last_reached`; the case of the test reads "has not answered since this device took in the latest change at 10:53 UTC (it was last reached at 10:48 UTC)". `reach.rs`, `the_reference_says_which_moment_it_is`.
+- **Rule 7.** `look.rs` and `person_cmd.rs`: D4, D5, T2 and T3 each contain "cannot be reached from here"; `person_cmd/wait.rs`: S2, S3, S6 (both forms) and S8 (both forms) each contain it. `indicator.rs`, `the_line_says_out_of_reach_where_every_relay_it_counts_is`: two relays out of reach and lacking give "memory: some relays are out of reach and may not have the latest change to your devices"; one of each gives "..., and one of them is out of reach"; a relay that holds and is out of reach still gives "a relay out of reach for <m> minutes", last. The ignored real-process test `a_change_ends_not_done_where_a_relay_that_lacks_it_cannot_be_reached` (`person_e2e.rs:5405`) asserts rule 7's S8 and D4.
 - **Rule 8,** units in `device_entries.rs` and `commands.rs`:
   - `a_whole_pass_notes_asked_and_read_by_relay`: `Held` with every channel caught up is ASKED and READ; `Held` then a pull that times out is ASKED and not READ; no answer is neither.
   - `a_relay_read_by_any_pass_after_the_asking_is_read`: the first pass misses it, the second reads it.
@@ -449,10 +449,10 @@ The tests that answer "Type \`stays\` or \`removed\`" (`common/mod.rs:1499-1502`
 **The record of reach.**
 
 - **§3, the row of `person_cmd.rs:2295`.** "Stays (said only of a relay that is connected)" becomes "Its words stay; the relay is named as configured (decision 2026-10-24, rule 2)".
-- **§5, `<since>`.** Its two phrases become the four of decision 2026-10-24, rule 6. The sentence "So a relay reached before a change, and not since, 'has not answered since' the change" becomes "So a relay reached before a change, and not since, 'has not answered since this device applied the change at <when>', and says when it was last reached."
+- **§5, `<since>`.** Its two phrases become the four of decision 2026-10-24, rule 6. The sentence "So a relay reached before a change, and not since, 'has not answered since' the change" becomes "So a relay reached before a change, and not since, 'has not answered since this device took in the latest change at <when>', and says when it was last reached."
 - **§5, S1, and R0.** One sentence is added at the end of each: "Each line below starts with the time it was said, in UTC." (decision 2026-10-24, rule 3).
 - **§5, D4, D5, T2, T3, S2, S3, S6 and S8.** Each becomes its words in decision 2026-10-24, rule 7.
-- **§5, the line.** Its first form gains the forms "memory: a relay out of reach, not known to hold the latest change", "memory: <n> relays out of reach, not known to hold the latest change" and "memory: <n> relays not known to hold the latest change, <k> out of reach".
+- **§5, the line.** Its first form gains the forms "memory: a relay is out of reach and may not have the latest change to your devices", "memory: some relays are out of reach and may not have the latest change to your devices" and "memory: some relays may not have the latest change to your devices, and one of them is out of reach" (or "some of them").
 - **Rule 11.** After "For a relay that is out of reach and holds the change, while another relay is reached: the warning of the ruling.", add: "It is never said of a relay that lacks the change: that relay is counted by the line above, which says that it is out of reach (decision 2026-10-24, rule 7)."
 
 **`docs/specs/channels-api.md:1120`** (`POST /api/v1/change/prepare`). "and what it could not fetch" becomes "each relay it could not ask for its latest change and each it could not read to the end, by configured name, with why and what was not read, and whether the sync cycle went to its end".

@@ -2260,7 +2260,7 @@ fn a_recovery_whose_personal_channel_stays_read_in_part_goes_on_to_the_look() {
     let stopped_so = why == "not reached"
         || (why.starts_with("not read: ")
             && why != cordelia_api::carrying::CONNECTION_CHANGED
-            && why != "not read: the node is held up");
+            && why != "not read: the node cannot go on");
     assert!(stopped_so, "{why}: {said}");
     let yes = said.find("Recover on this machine?").unwrap();
     assert!(warned < yes, "{said}");
@@ -2524,7 +2524,7 @@ fn a_recovery_says_before_its_yes_where_what_was_carried_is_at_a_relay_it_did_no
     let new = device_at("new", &[&b]);
     let said = refused_by_no(&new);
     println!("{said}");
-    carried(&said, &format!("the relay whose key is {a_key}"));
+    carried(&said, &format!("the relay with key {a_key}"));
     assert!(
         said.contains(&format!(
             "To bring it in by this recovery, answer no. On this machine, set up the relay whose \

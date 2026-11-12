@@ -1476,7 +1476,7 @@ async fn t16_a_relays_refusal_is_not_taken_for_delivery() {
     assert!(waiting.unwrap() >= 1, "{}", person_of(&a));
     let said = a.cli(&["devices"]);
     assert!(
-        said.contains("does not hold the latest change yet"),
+        said.contains("does not have the latest change to your devices yet"),
         "{said}"
     );
     let offered_while_refused = relay.pushes_of(&item);

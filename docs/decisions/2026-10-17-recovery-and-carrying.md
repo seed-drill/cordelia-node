@@ -1,7 +1,7 @@
 # Decision: four changes to recovery and carrying
 
 **Date**: 2026-10-17
-**Status**: Built. It changes [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) in sections 6, 9 and 16, and that record now says what this one decides.
+**Status**: Built. Its quoted lines amended by decision 2026-11-11 (plain words). It changes [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) in sections 6, 9 and 16, and that record now says what this one decides.
 **Cited as**: code comments cite the sections of this record ("decision 2026-10-17 §3.2"), and the numbered properties ("§1, property 5"). The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -425,7 +425,7 @@ or carried, to no relay. If this device is added again, it carries what it holds
 go now is not among it.
 ```
 
-The words in brackets are those of its status: "it was removed", "it is in no list of the last change", "it could not open the last change", "two changes were made apart". The last sentence is said only where the device can be added again (it is in no list, or could not open a change). With no terminal there, the command says the first paragraph and "To let it go now, with them, run `cordelia sync unmap lab` at a terminal.", on standard error, with status 1.
+The words in brackets are those of its status: "it was removed", "it is in no list of the last change", "it could not open the last change", "two changes to your devices were made separately, neither knowing of the other". The last sentence is said only where the device can be added again (it is in no list, or could not open a change). With no terminal there, the command says the first paragraph and "To let it go now, with them, run `cordelia sync unmap lab` at a terminal.", on standard error, with status 1.
 
 On a device that has stopped, the second sentence of the second paragraph says what is true there, where a carry is refused, and says no days: "A version that a carry brought into lab is still at the relays, in the channel it was carried from. This device carries nothing while it has stopped: on another of your devices, `cordelia sync carry lab` brings in again what a device that counts wrote, and `cordelia sync carry lab --from <device>`, with the recovery phrase, what a removed device wrote." And on `discard` it read no relay, so the line says what its notes said: "This device holds lab no longer, and 3 versions that its own notes said it sent to no relay went with it."
 

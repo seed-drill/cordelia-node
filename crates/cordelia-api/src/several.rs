@@ -2169,7 +2169,7 @@ mod tests {
         assert_eq!(seen.not_carried, std::slice::from_ref(&ghost));
         assert!(
             seen.says.iter().any(|line| line.contains("ghost.md in lab")
-                && line.contains("meets its channel as a new file does")),
+                && line.contains("Each will sync as a new file")),
             "{:?}",
             seen.says
         );
@@ -2367,8 +2367,9 @@ mod tests {
         let says = seen.says.join("\n");
         assert!(
             says.contains(
-                "1 name that your devices synced before the last change is listed by no device \
-                 yet: team."
+                "1 name that your devices synced before the last change to your devices is \
+                 synced by no device yet: team. You can still bring it back from the relays for \
+                 89 more days: cordelia sync carry <name>"
             ),
             "{says}"
         );

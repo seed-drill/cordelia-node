@@ -213,14 +213,13 @@ fn a_record_that_hands_a_removed_device_the_secret_closes_a_device() {
     });
     let (_, why) = stands(&laptop);
     assert!(
-        why.contains("a removed device holds the secret of the change"),
+        why.contains("a device you removed still has the secret this device uses, so"),
         "{why}"
     );
     assert_eq!(person_of(&laptop)["change"].as_u64(), Some(2));
     let status = laptop.cli(&["status"]);
     assert!(
-        status.contains("a removed device holds the secret this device follows")
-            || status.contains("a removed device holds this change's secret"),
+        status.contains("a device you removed still has the secret this device uses"),
         "{status}"
     );
 
@@ -337,8 +336,9 @@ fn moves_relay(node: &mut Node, from: &Node, to: &Node) {
 /// apart (rule 11; test 1's point (c)). From slice 6 a relay keeps the
 /// laptop's change 3 beside the removal and hands it to the desktop, which
 /// sets it aside, as it is not clear, and goes on: its status line says so
-/// in amber ("a change made apart is set aside"), and never says the words
-/// of a closed device (rule 10). Every head it sets aside is not clear.
+/// in amber ("a change to your devices was made separately, and put
+/// aside"), and never says the words of a closed device (rule 10). Every
+/// head it sets aside is not clear.
 fn desktop_applied(desktop: &Node) {
     let seen = person_of(desktop);
     assert_eq!(seen["state"], "applied", "(c): {seen}");
@@ -347,7 +347,7 @@ fn desktop_applied(desktop: &Node) {
     }
     let status = desktop.cli(&["status"]);
     assert!(
-        !status.contains("two changes were made apart"),
+        !status.contains("two changes to your devices were made separately"),
         "(c): {status}"
     );
 }
@@ -835,8 +835,9 @@ fn closed_among_heads(n: &Node, followed: &str, listed: &[u8; 32]) {
             .any(|device| device["key"] == listed.as_str()),
         "{seen}"
     );
-    let why = "two changes were made apart, and none that lists this device is clear of a \
-               removed device: settle it with the phrase (`cordelia settle`)";
+    let why = "two changes to your devices were made separately, neither knowing of the other, \
+               and a device you removed has the secret of each one that includes this device. \
+               To go on, run `cordelia settle` here and type your recovery phrase";
     assert_eq!(seen["cannot_go_on"].as_str(), Some(why), "{seen}");
     let status: serde_json::Value = serde_json::from_str(&n.cli(&["status", "--json"])).unwrap();
     assert_eq!(status["level"], "red", "{status}");
@@ -2402,7 +2403,10 @@ fn nothing_a_removed_device_sends_after_its_removal_is_taken_by_a_device_that_kn
         "(a): {history}"
     );
     let status = laptop.cli(&["status"]);
-    assert!(status.contains("set aside"), "(a): {status}");
+    assert!(
+        status.contains("put aside when you removed a device"),
+        "(a): {status}"
+    );
     // (h), (i), (a), (j): the laptop's folder holds none of it.
     for text in folder_texts(&l_mem) {
         for late in LATE {
