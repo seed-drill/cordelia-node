@@ -37,6 +37,14 @@ jobs:
       - name: Install Rust toolchain (pinned in rust-toolchain.toml)
         run: rustup toolchain install
 
+      # The cache of `target` unpacks to more than some runners have free:
+      # three jobs ran out of disk as they restored it, on 4 and 5
+      # November. What these jobs never use goes first.
+      - name: Room for the cache
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -96,6 +104,14 @@ jobs:
 
       - name: Install Rust toolchain (pinned in rust-toolchain.toml)
         run: rustup toolchain install
+
+      # The cache of `target` unpacks to more than some runners have free:
+      # three jobs ran out of disk as they restored it, on 4 and 5
+      # November. What these jobs never use goes first.
+      - name: Room for the cache
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -173,9 +189,14 @@ jobs:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
           SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
         continue-on-error: true
+        timeout-minutes: 10
 
+      # An upload that fails or hangs does not fail the job, whose tests
+      # passed: on 11 November this one hung until the runner was lost.
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
+        continue-on-error: true
+        timeout-minutes: 10
         with:
           name: coverage-report
           path: coverage.lcov

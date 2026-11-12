@@ -971,21 +971,37 @@ pub fn to_ask(conn: &Connection, now: i64) -> Result<Vec<Typing>, PersonError> {
 
 /// Whether the node's `typing` reads now, as rule 1 of §3.2 says of a
 /// person's (rule 4.4): the node typed its key for its follow at that
-/// time, within the hour, and has not asked for it since.
+/// time or later, within the hour, and has not asked for it since
+/// ([`read_at`]).
 pub fn reads_now(conn: &Connection, typing: &Typing, now: i64) -> Result<bool, PersonError> {
-    Ok(follows::typed(conn, &typing.of)?.iter().any(|typed| {
-        typed.key == typing.key
-            && typed.typed_at == typing.typed_at
-            && typed.became.is_none()
-            && crate::adding::within_its_hour(typed.typed_at, now)
-    }))
+    Ok(read_at(conn, typing, now)?.is_some())
+}
+
+/// The read the node's `typing` reads at now: the latest that typed its
+/// key, where that is the typing's own read or a later one, within the
+/// hour, and the key has not been asked for since.
+///
+/// A read that types the key again while a pass asks for it does not end
+/// that ask (#336): else reads that meet every pass would leave the key
+/// never asked for. What the ask finds is judged against the latest read
+/// (rule 4.4's hour), at [`judge`] and again at [`take`].
+fn read_at(conn: &Connection, typing: &Typing, now: i64) -> Result<Option<i64>, PersonError> {
+    Ok(follows::typed(conn, &typing.of)?
+        .into_iter()
+        .find(|typed| {
+            typed.key == typing.key
+                && typed.typed_at >= typing.typed_at
+                && typed.became.is_none()
+                && crate::adding::within_its_hour(typed.typed_at, now)
+        })
+        .map(|typed| typed.typed_at))
 }
 
 /// Judge `entry`, handed from the share pair channel of the key of
 /// `typing`, at `now`, by rules 2 to 8 of §3.2
 /// ([`crate::shared::judge_share`]): a share made an hour or more from the
-/// read that typed the key is not one to take. `None` where the typing
-/// reads nothing now.
+/// latest read that typed the key is not one to take. `None` where the
+/// typing reads nothing now.
 pub fn judge(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -993,10 +1009,10 @@ pub fn judge(
     entry: &CheckedEntry,
     now: i64,
 ) -> Result<Option<Judged>, PersonError> {
-    if !reads_now(conn, typing, now)? {
+    let Some(read) = read_at(conn, typing, now)? else {
         return Ok(None);
-    }
-    crate::shared::judge_share(identity, &typing.key, typing.typed_at, entry).map(Some)
+    };
+    crate::shared::judge_share(identity, &typing.key, read, entry).map(Some)
 }
 
 /// Take, for the node's `typing`, the one share among `found` of the
@@ -1012,6 +1028,12 @@ pub fn judge(
 /// with it, and so is a take that failed, once its write is undone: else a
 /// typing that failed at every pass would keep its place among those asked
 /// for, ahead of every later follow's ([`to_ask`]).
+///
+/// Where a read typed the key again during the ask, what the ask came to
+/// is kept for that read too (#336): the ask read the relays as that read
+/// came. Kept only of the typing's own read, a read that met every pass
+/// would have its key asked for at every pass, and never kept as asked or
+/// failed, and a typing that failed at every pass would keep its place.
 ///
 /// Nothing is kept where it is [`Became::NotNow`], and that does not come
 /// again at the next pass: the typing that does not read now is not given
@@ -1047,9 +1069,21 @@ fn take_in_one(
     now: i64,
 ) -> Result<Became, PersonError> {
     in_one(conn, || {
-        if !reads_now(conn, typing, now)? {
+        let Some(read) = read_at(conn, typing, now)? else {
             return Ok(Became::NotNow);
-        }
+        };
+        // What was found is judged again against the latest read: one may
+        // have come since it was judged.
+        let found: Vec<CheckedEntry> = found
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    crate::shared::judge_share(identity, &typing.key, read, entry),
+                    Ok(Judged::Share(_))
+                )
+            })
+            .cloned()
+            .collect();
         let Some(follow) = follows::follow_of(conn, &typing.of)? else {
             return Ok(Became::NotNow);
         };
@@ -1069,7 +1103,7 @@ fn take_in_one(
             only: Some(looks.line.channel),
         };
         Ok(
-            match sharing::take_one(conn, identity, &taker, found, own_relays, now)? {
+            match sharing::take_one(conn, identity, &taker, &found, own_relays, now)? {
                 Took::NotNow => Became::NotNow,
                 Took::Nothing => {
                     became(ASKED, None)?;
