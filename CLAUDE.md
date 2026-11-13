@@ -83,9 +83,13 @@ The design today is 2026-10-04 with 2026-09-30, and the later records that add t
 cargo test --all                                      # everything, the real-process tests too
 cargo test -p cordelia-node --test devices_e2e        # one test file
 cargo test -p cordelia-network <name> -- --nocapture  # one test, with output
+cargo nextest run                                     # each test in a process of its own, as CI runs them (no doc tests)
+cargo nextest run --profile ci --partition slice:1/8  # one of CI's eight shards
 ```
 
-The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" job runs them. A few tests need the binary of the version before, alpha.19 (`CORDELIA_TEST_BINARY_BEFORE`); without it they pass without running, except in CI. TESTING.md has the rest.
+A pull request's gate (`ci.yml`) is fmt, clippy, the doc tests, the install script's tests (`sh scripts/test-install.sh`), and every other test that `cargo test --all` runs: built once, and run by cargo nextest in eight shards at once (`.config/nextest.toml`). The job `test` passes only when all of it passed and the shards ran every test listed. Beside them, the ignored tests of cordelia-node run in two shards of their own, and the job `out of reach` passes only when both passed; a merge waits for `test` and `out of reach`. Coverage runs on a push to main, each night and by hand, not on a pull request; when it fails, the run on main fails.
+
+The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" jobs run them. A few tests need the binary of the version before, alpha.19 (`CORDELIA_TEST_BINARY_BEFORE`); without it they pass without running, except in CI. TESTING.md has the rest.
 
 ## Public text
 

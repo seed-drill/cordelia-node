@@ -1,10 +1,29 @@
 name: CI
 
+# A pull request's gate: fmt and clippy, the doc tests, and every test
+# that `cargo test --all` runs, built once and run by cargo nextest in
+# shards at once; the job `test` passes only when all of it passed. Beside
+# them, from the same build, the ignored tests of cordelia-node in shards
+# of their own; the job `out of reach` passes only when they all passed.
+#
+# On a push to main, each night and when run by hand, coverage runs too.
+# It does not gate a pull request; when it fails, the run on main fails.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main, 'feat/**']
+  schedule:
+    - cron: '30 3 * * *'
+  workflow_dispatch:
+
+# A new commit on a pull request cancels the run of the one before, so a
+# run that is overtaken ends cancelled, not red. Every other run (a push
+# to main, a night's, one by hand) is a group of its own: none of them is
+# cancelled, and none waits for another.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -18,14 +37,121 @@ env:
   # together, and only so.
   VERSION_BEFORE: v0.2.0-alpha.19
   VERSION_BEFORE_SHA256: e7f15e59c089a3d839ad77e25b21abd174cf99c1896c21f474822d765ede4bd6
+  # The cargo nextest that every job here installs.
+  NEXTEST_VERSION: 0.9.151
 
 jobs:
-  test:
+  lint:
+    name: fmt, clippy and doc tests
     runs-on: ubuntu-latest
-    # About twice what the job takes on main (43 minutes). A test that waits
-    # for ever then fails the job in this time, where it held it until
-    # GitHub's limit of six hours; each test over real QUIC is bounded too.
-    timeout-minutes: 90
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # The cache of `target` unpacks to more than some runners have free:
+      # three jobs ran out of disk as they restored it, on 4 and 5
+      # November. What these jobs never use goes first.
+      - name: Room for the cache
+        run: |
+          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            sudo rm -rf "$dir" &
+          done
+          wait
+          df -h /
+
+      # Kept from main's runs only; a pull request reads main's.
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # cargo nextest runs no doc tests: `cargo test --all` runs them, and
+      # so they run here.
+      - name: Doc tests
+        run: cargo test --doc --workspace
+
+      - name: Install script
+        run: sh scripts/test-install.sh
+
+  # Every test binary of the workspace, built once, in one archive that
+  # each shard below downloads and runs its part of.
+  build:
+    name: build the tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Of the debug information, the lines only: the archive that every
+      # shard downloads is much smaller, and a panic still says its file
+      # and line. No test reads the rest.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install
+
+      # As in the job above.
+      - name: Room for the cache
+        run: |
+          for dir in /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL; do
+            sudo rm -rf "$dir" &
+          done
+          wait
+          df -h /
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Install cargo nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Build the tests, into one archive
+        run: cargo nextest archive --workspace --archive-file nextest-archive.tar.zst
+
+      # The archive is compressed already. It is kept three days: a job
+      # run again after that finds no archive, and the whole run must be
+      # run again.
+      - name: Upload the archive
+        uses: actions/upload-artifact@v4
+        timeout-minutes: 10
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 3
+          compression-level: 0
+
+  # Every test that is not ignored, as `cargo test --all` runs them but
+  # the doc tests (the first job runs those): each shard runs one part,
+  # the parts dealt out in turn, one test to each shard, across every
+  # test binary. Each test runs in a process of its own, as many at once
+  # as the runner has threads. A shard runs every test of its part,
+  # whatever fails, and runs none again.
+  shards:
+    name: tests, shard ${{ matrix.shard }} of ${{ strategy.job-total }}
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,25 +163,16 @@ jobs:
       - name: Install Rust toolchain (pinned in rust-toolchain.toml)
         run: rustup toolchain install
 
-      # The cache of `target` unpacks to more than some runners have free:
-      # three jobs ran out of disk as they restored it, on 4 and 5
-      # November. What these jobs never use goes first.
-      - name: Room for the cache
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Install cargo nextest
+        uses: taiki-e/install-action@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          tool: nextest@${{ env.NEXTEST_VERSION }}
 
-      - name: Build
-        run: cargo build --all-targets
+      - name: Download the archive
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          name: nextest-archive
 
       - name: Download the version before
         # The Linux binary of that release, checked against the hash that
@@ -70,33 +187,40 @@ jobs:
           chmod +x "$dir/cordelia-linux-amd64"
           echo "CORDELIA_TEST_BINARY_BEFORE=$dir/cordelia-linux-amd64" >> "$GITHUB_ENV"
 
-      - name: Test
-        run: cargo test --all
+      # The archive is unpacked into this checkout's `target`, where the
+      # build job had it: the real-process tests run the `cordelia` that
+      # was built there, by the path that was built into them.
+      - name: Tests, shard ${{ matrix.shard }} of ${{ strategy.job-total }}
+        run: >-
+          cargo nextest run --profile ci
+          --archive-file nextest-archive.tar.zst
+          --workspace-remap "$GITHUB_WORKSPACE"
+          --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
+          --partition slice:${{ matrix.shard }}/${{ strategy.job-total }}
 
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      # An upload that fails or hangs does not fail the job.
+      - name: Upload the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        timeout-minutes: 10
+        with:
+          name: junit-shard-${{ matrix.shard }}
+          path: target/nextest/ci/junit.xml
+          if-no-files-found: ignore
 
-      - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Install script
-        run: sh scripts/test-install.sh
-
-  # The real-process tests that wait out a relay's five minutes out of
-  # reach, or a dial's wait growing to its cap (decision 2026-10-19 §11):
-  # each is ignored in `cargo test --all`, so that the job above is not
-  # made longer, and is run here, on every pull request, beside it. They
-  # are the ignored tests of cordelia-node's test files, and only those:
-  # the other crates' ignored tests are timed for a release build, or are
-  # no part of this. Each runs whatever another fails. The scale test's
-  # ignored tests return at once here: its stages and its small runs run
-  # only where their variables are set (scale.yml runs the small runs).
-  out-of-reach:
-    name: out of reach
+  # How many tests the shards must run between them, listed from the
+  # archive beside the shards: the jobs `test` and `out of reach` check it
+  # against the shards' reports. A count that cannot be read is left
+  # empty, and the check fails.
+  count:
+    name: count the tests
+    needs: build
     runs-on: ubuntu-latest
-    # About twice what the job takes on main (53 minutes): a test that
-    # waits for ever fails the job in this time.
-    timeout-minutes: 120
+    timeout-minutes: 15
+    outputs:
+      tests: ${{ steps.count.outputs.tests }}
+      out-of-reach: ${{ steps.count.outputs.out-of-reach }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,32 +229,172 @@ jobs:
       - name: Install Rust toolchain (pinned in rust-toolchain.toml)
         run: rustup toolchain install
 
-      # The cache of `target` unpacks to more than some runners have free:
-      # three jobs ran out of disk as they restored it, on 4 and 5
-      # November. What these jobs never use goes first.
-      - name: Room for the cache
-        run: |
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - name: Install cargo nextest
+        uses: taiki-e/install-action@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          tool: nextest@${{ env.NEXTEST_VERSION }}
 
-      - name: Build
-        run: cargo build --all-targets
+      - name: Download the archive
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          name: nextest-archive
+
+      - name: Count the tests
+        id: count
+        run: |
+          count() {
+            cargo nextest list --archive-file nextest-archive.tar.zst \
+              --workspace-remap "$GITHUB_WORKSPACE" \
+              --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+              --message-format json "$@" \
+              | jq '[."rust-suites"[].testcases[] | select(."filter-match".status == "matches")] | length'
+          }
+          tests=$(count) || tests=
+          out_of_reach=$(count -E 'package(cordelia-node)' --run-ignored only) || out_of_reach=
+          echo "tests: $tests; out of reach: $out_of_reach"
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+          echo "out-of-reach=$out_of_reach" >> "$GITHUB_OUTPUT"
+
+  # The check that a pull request needs: it passes only when every job of
+  # the gate passed, and the shards' reports between them count every
+  # test listed from the archive. It runs when a job failed too, and fails
+  # then; when the run is cancelled, it is cancelled.
+  test:
+    name: test
+    needs: [lint, build, shards, count]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Every job of the gate passed
+        env:
+          LINT: ${{ needs.lint.result }}
+          BUILD: ${{ needs.build.result }}
+          SHARDS: ${{ needs.shards.result }}
+          COUNT: ${{ needs.count.result }}
+        run: |
+          echo "fmt, clippy and doc tests: $LINT; build: $BUILD; tests: $SHARDS; count: $COUNT"
+          [ "$LINT" = success ] && [ "$BUILD" = success ] && [ "$SHARDS" = success ] && [ "$COUNT" = success ]
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Download the shards' reports
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          pattern: junit-shard-*
+          path: reports
+
+      - name: Every test listed was run
+        env:
+          LISTED: ${{ needs.count.outputs.tests }}
+        run: python3 .github/count-runs.py "$LISTED" reports
+
+  # The real-process tests that wait out a relay's five minutes out of
+  # reach, or a dial's wait growing to its cap (decision 2026-10-19 §11):
+  # each is ignored in `cargo test --all`, so that the shards above are
+  # not made longer, and is run here, on every pull request, in two shards
+  # beside them. They are the ignored tests of cordelia-node's test files,
+  # and only those: the other crates' ignored tests are timed for a
+  # release build, or are no part of this. Each runs whatever another
+  # fails. The scale test's ignored tests return at once here: its stages
+  # and its small runs run only where their variables are set (scale.yml
+  # runs the small runs).
+  out-of-reach-shards:
+    name: out of reach, shard ${{ matrix.shard }} of ${{ strategy.job-total }}
+    needs: build
+    runs-on: ubuntu-latest
+    # About twice the longest of these tests (14 minutes): a test that
+    # waits for ever fails the job in this time.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Install cargo nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Download the archive
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          name: nextest-archive
 
       - name: The tests of a relay out of reach, ignored for their length
-        run: cargo test -p cordelia-node --tests --no-fail-fast -- --ignored
+        run: >-
+          cargo nextest run --profile ci-out-of-reach
+          --archive-file nextest-archive.tar.zst
+          --workspace-remap "$GITHUB_WORKSPACE"
+          --extract-to "$GITHUB_WORKSPACE" --extract-overwrite
+          -E 'package(cordelia-node)' --run-ignored only
+          --partition slice:${{ matrix.shard }}/${{ strategy.job-total }}
+
+      # An upload that fails or hangs does not fail the job.
+      - name: Upload the report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        continue-on-error: true
+        timeout-minutes: 10
+        with:
+          name: junit-out-of-reach-${{ matrix.shard }}
+          path: target/nextest/ci-out-of-reach/junit.xml
+          if-no-files-found: ignore
+
+  # The check that a merge into main needs as well (decision 2026-10-19
+  # §11): it passes only when both shards above passed, and their reports
+  # between them count every test listed for them from the archive. It
+  # runs when a shard failed too, and fails then; when the run is
+  # cancelled, it is cancelled.
+  out-of-reach:
+    name: out of reach
+    needs: [out-of-reach-shards, count]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Both shards passed
+        env:
+          SHARDS: ${{ needs.out-of-reach-shards.result }}
+          COUNT: ${{ needs.count.result }}
+        run: |
+          echo "out of reach: $SHARDS; count: $COUNT"
+          [ "$SHARDS" = success ] && [ "$COUNT" = success ]
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Download the shards' reports
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          pattern: junit-out-of-reach-*
+          path: reports
+
+      - name: Every test listed was run
+        env:
+          LISTED: ${{ needs.count.outputs.out-of-reach }}
+        run: python3 .github/count-runs.py "$LISTED" reports
 
   coverage:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
-    # The test job runs every test; this one only measures. The shared
+    # The gate runs every test; this one only measures. The shared
     # channel's library tests run slowly under coverage: on slice 8 the
     # job passed two hours with the next crate still running, so it has
     # four.
@@ -162,13 +426,13 @@ jobs:
           CARGO_INCREMENTAL: 0
           # `--cfg coverage` leaves out the test of what timing a take of
           # the node's lock costs (lock.rs): under coverage its counters are
-          # in what it measures. The test job runs it.
+          # in what it measures. The gate runs it.
           RUSTFLAGS: '-Cinstrument-coverage --cfg coverage'
           LLVM_PROFILE_FILE: '/tmp/cordelia-cov/cordelia-%p-%m.profraw'
         run: |
           mkdir -p /tmp/cordelia-cov
           # The sequences of cordelia-sync take hours under coverage and are
-          # run in full by the test job.
+          # run in full by the gate.
           cargo test --lib --test two_node -- --skip test_bv19 --skip claude::sequences::
 
       - name: Generate LCOV report
