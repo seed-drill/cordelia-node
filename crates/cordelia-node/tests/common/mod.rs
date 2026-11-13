@@ -646,17 +646,34 @@ impl Node {
 /// the time the node binds it, some client's connection may have been
 /// given the same number, and the node fails to start. A test that starts
 /// a node late (a relay that comes up after its device) hit that in CI.
+///
+/// `cargo nextest` runs each test in a process of its own, several at
+/// once, and they share no counter: two tests whose process IDs are close
+/// would walk the same ports, and one could take a port that the other
+/// has given out and not yet bound. So a test there takes its ports from
+/// the block of its slot (`NEXTEST_TEST_GLOBAL_SLOT`), a number that
+/// nextest gives no other test running at the same time. There are 25
+/// blocks of 400 ports, for up to 25 tests at once.
 pub fn free_port() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     const FIRST: u16 = 20_000;
     const COUNT: u16 = 10_000;
+    const BLOCK: u16 = 400;
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    // Each test binary starts somewhere of its own, so that binaries run
-    // one after another do not walk over each other's lingering sockets.
-    let start = (std::process::id() % u32::from(COUNT)) as u16;
+    let slot = std::env::var("NEXTEST_TEST_GLOBAL_SLOT")
+        .ok()
+        .and_then(|slot| slot.parse::<u16>().ok());
+    let (first, count) = match slot {
+        Some(slot) => (FIRST + slot % (COUNT / BLOCK) * BLOCK, BLOCK),
+        None => (FIRST, COUNT),
+    };
+    // Each test process starts somewhere of its own in its range, so that
+    // processes run one after another do not walk over each other's
+    // lingering sockets.
+    let start = (std::process::id() % u32::from(count)) as u16;
     loop {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed) % COUNT;
-        let port = FIRST + (start + n) % COUNT;
+        let n = NEXT.fetch_add(1, Ordering::Relaxed) % count;
+        let port = first + (start + n) % count;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
             && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok()
         {

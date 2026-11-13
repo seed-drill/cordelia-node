@@ -52,6 +52,44 @@ cargo test -p cordelia-network --test receive_batching -- --ignored --nocapture
 **Baseline:** every test of `cargo test --all` passes. (The count changes with
 almost every change: the pull request that changed it last says what it is.)
 
+## What CI runs, and cargo nextest
+
+A pull request's gate (`.github/workflows/ci.yml`) is:
+
+- fmt, `clippy -D warnings`, the doc tests and the install script's tests, in one job;
+- every other test that `cargo test --all` runs, built once into an
+  archive (`cargo nextest archive`) and run by `cargo nextest run` in
+  eight shards at once;
+- the job `test`, which passes only when all of the above passed: the
+  check that a merge waits for.
+
+nextest runs each test in a process of its own, as many at once as the
+machine has threads. Each shard runs one part: the tests are dealt out in
+turn, one to each shard, across every test binary (`--partition
+slice:k/8`). The profile `ci` in `.config/nextest.toml` runs every test
+whatever fails, runs none again, and stops a test that has run for 15
+minutes.
+
+On a push to main, each night and when run by hand, two more run: the
+ignored tests of cordelia-node (the jobs "out of reach", in two shards,
+profile `ci-out-of-reach`), and coverage. They do not gate a pull
+request. When one fails, the run on main fails.
+
+To run the tests as CI does (install nextest once, with
+`cargo install cargo-nextest --locked`):
+
+```bash
+cargo nextest run                                      # what cargo test --all runs, but the doc tests
+cargo test --doc --workspace                           # the doc tests
+cargo nextest run --profile ci --partition slice:1/8   # shard 1 of 8, as CI runs it
+cargo nextest run -p cordelia-node --test devices_e2e  # one test file
+```
+
+The real-process tests take their ports from 20000 to 29999. Under
+nextest, a test takes them from the block of its slot
+(`NEXTEST_TEST_GLOBAL_SLOT`), so two tests that run at the same time
+never share a port (`free_port` in `crates/cordelia-node/tests/common/mod.rs`).
+
 ## Tests with real processes
 
 They are in `crates/cordelia-node/tests/`, and `cargo test --all` runs them.
@@ -64,9 +102,9 @@ and log), and prints where.
 **Tests that wait out a relay's five minutes out of reach,** or a dial's
 wait growing to its cap (decision 2026-10-19 §11), are marked `#[ignore]`
 with the reason, so that `cargo test --all` does not take longer. The CI
-job "out of reach" in `ci.yml` runs the ignored tests of cordelia-node's
-test files, and no other crate's, on every pull request: the test files
-one after another and the tests of each together, within two hours. The
+jobs "out of reach" in `ci.yml` run the ignored tests of cordelia-node's
+test files, and no other crate's, on a push to main, each night and when
+run by hand, in two shards: not on a pull request. The
 scale test's ignored tests (`scale.rs`, decision 2026-10-22) are among
 them and return at once there: its run of a stage does nothing unless
 `CORDELIA_SCALE_STAGE` is set, and its small runs (§6, tests 4 and 5)
@@ -75,6 +113,8 @@ tests here:
 
 ```bash
 cargo test -p cordelia-node --tests --no-fail-fast -- --ignored
+# or, each test in a process of its own, as CI runs them:
+cargo nextest run -E 'package(cordelia-node)' --run-ignored only --no-fail-fast
 ```
 
 `CORDELIA_TEST_BINARY_BEFORE` names the binary of the version before:
@@ -92,7 +132,8 @@ not by the version it prints. CI downloads it from the release that
 `ci.yml` names in `VERSION_BEFORE`, and checks it against the SHA-256
 that `ci.yml` names beside it (`VERSION_BEFORE_SHA256`), and not against
 a checksum taken from the same release, which would not catch an asset
-replaced there. The job's checkout keeps no token on disk while it runs.
+replaced there. The checkout of each job that runs it keeps no token on
+disk.
 Where the variable is not set, each test says so and passes without
 running, but where `CI` is `true`, as GitHub sets it, it fails. To run
 them here:
