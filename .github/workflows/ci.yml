@@ -125,14 +125,16 @@ jobs:
       - name: Build the tests, into one archive
         run: cargo nextest archive --workspace --archive-file nextest-archive.tar.zst
 
-      # The archive is compressed already.
+      # The archive is compressed already. It is kept three days: a job
+      # run again after that finds no archive, and the whole run must be
+      # run again.
       - name: Upload the archive
         uses: actions/upload-artifact@v4
         timeout-minutes: 10
         with:
           name: nextest-archive
           path: nextest-archive.tar.zst
-          retention-days: 1
+          retention-days: 3
           compression-level: 0
 
   # Every test that is not ignored, as `cargo test --all` runs them but
@@ -207,24 +209,90 @@ jobs:
           path: target/nextest/ci/junit.xml
           if-no-files-found: ignore
 
+  # How many tests the shards must run between them, listed from the
+  # archive beside the shards: the jobs `test` and `out of reach` check it
+  # against the shards' reports. A count that cannot be read is left
+  # empty, and the check fails.
+  count:
+    name: count the tests
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      tests: ${{ steps.count.outputs.tests }}
+      out-of-reach: ${{ steps.count.outputs.out-of-reach }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (pinned in rust-toolchain.toml)
+        run: rustup toolchain install
+
+      - name: Install cargo nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+
+      - name: Download the archive
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          name: nextest-archive
+
+      - name: Count the tests
+        id: count
+        run: |
+          count() {
+            cargo nextest list --archive-file nextest-archive.tar.zst \
+              --workspace-remap "$GITHUB_WORKSPACE" \
+              --extract-to "$GITHUB_WORKSPACE" --extract-overwrite \
+              --message-format json "$@" \
+              | jq '[."rust-suites"[].testcases[] | select(."filter-match".status == "matches")] | length'
+          }
+          tests=$(count) || tests=
+          out_of_reach=$(count -E 'package(cordelia-node)' --run-ignored only) || out_of_reach=
+          echo "tests: $tests; out of reach: $out_of_reach"
+          echo "tests=$tests" >> "$GITHUB_OUTPUT"
+          echo "out-of-reach=$out_of_reach" >> "$GITHUB_OUTPUT"
+
   # The check that a pull request needs: it passes only when every job of
-  # the gate passed. It runs when one of them failed too, and fails then,
-  # but not when the run was cancelled.
+  # the gate passed, and the shards' reports between them count every
+  # test listed from the archive. It runs when a job failed too, and fails
+  # then; when the run is cancelled, it is cancelled.
   test:
     name: test
-    needs: [lint, build, shards]
+    needs: [lint, build, shards, count]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Every job of the gate passed
         env:
           LINT: ${{ needs.lint.result }}
           BUILD: ${{ needs.build.result }}
           SHARDS: ${{ needs.shards.result }}
+          COUNT: ${{ needs.count.result }}
         run: |
-          echo "fmt, clippy and doc tests: $LINT; build: $BUILD; tests: $SHARDS"
-          [ "$LINT" = success ] && [ "$BUILD" = success ] && [ "$SHARDS" = success ]
+          echo "fmt, clippy and doc tests: $LINT; build: $BUILD; tests: $SHARDS; count: $COUNT"
+          [ "$LINT" = success ] && [ "$BUILD" = success ] && [ "$SHARDS" = success ] && [ "$COUNT" = success ]
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Download the shards' reports
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          pattern: junit-shard-*
+          path: reports
+
+      - name: Every test listed was run
+        env:
+          LISTED: ${{ needs.count.outputs.tests }}
+        run: python3 .github/count-runs.py "$LISTED" reports
 
   # The real-process tests that wait out a relay's five minutes out of
   # reach, or a dial's wait growing to its cap (decision 2026-10-19 §11):
@@ -287,22 +355,41 @@ jobs:
           if-no-files-found: ignore
 
   # The check that a merge into main needs as well (decision 2026-10-19
-  # §11): it passes only when both shards above passed. It runs when one
-  # of them failed too, and fails then, but not when the run was
-  # cancelled.
+  # §11): it passes only when both shards above passed, and their reports
+  # between them count every test listed for them from the archive. It
+  # runs when a shard failed too, and fails then; when the run is
+  # cancelled, it is cancelled.
   out-of-reach:
     name: out of reach
-    needs: out-of-reach-shards
+    needs: [out-of-reach-shards, count]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Both shards passed
         env:
           SHARDS: ${{ needs.out-of-reach-shards.result }}
+          COUNT: ${{ needs.count.result }}
         run: |
-          echo "out of reach: $SHARDS"
-          [ "$SHARDS" = success ]
+          echo "out of reach: $SHARDS; count: $COUNT"
+          [ "$SHARDS" = success ] && [ "$COUNT" = success ]
+
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github
+
+      - name: Download the shards' reports
+        uses: actions/download-artifact@v4
+        timeout-minutes: 10
+        with:
+          pattern: junit-out-of-reach-*
+          path: reports
+
+      - name: Every test listed was run
+        env:
+          LISTED: ${{ needs.count.outputs.out-of-reach }}
+        run: python3 .github/count-runs.py "$LISTED" reports
 
   coverage:
     if: github.event_name != 'pull_request'

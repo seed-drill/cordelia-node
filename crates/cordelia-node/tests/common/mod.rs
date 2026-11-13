@@ -652,19 +652,33 @@ impl Node {
 /// would walk the same ports, and one could take a port that the other
 /// has given out and not yet bound. So a test there takes its ports from
 /// the block of its slot (`NEXTEST_TEST_GLOBAL_SLOT`), a number that
-/// nextest gives no other test running at the same time. There are 25
-/// blocks of 400 ports, for up to 25 tests at once.
+/// nextest gives no other test of the same run while it runs. There are 25
+/// blocks of 400 ports: a slot of 25 or more, from more than 25 test
+/// threads, panics, and so does a test that would go round its block and
+/// give a port out again.
+///
+/// Ports can still be shared between two runs at once on one machine:
+/// each nextest run numbers its slots from 0, and `cargo test` walks the
+/// whole range.
 pub fn free_port() -> u16 {
     use std::sync::atomic::{AtomicU16, Ordering};
     const FIRST: u16 = 20_000;
     const COUNT: u16 = 10_000;
     const BLOCK: u16 = 400;
+    const BLOCKS: u16 = COUNT / BLOCK;
     static NEXT: AtomicU16 = AtomicU16::new(0);
     let slot = std::env::var("NEXTEST_TEST_GLOBAL_SLOT")
         .ok()
         .and_then(|slot| slot.parse::<u16>().ok());
     let (first, count) = match slot {
-        Some(slot) => (FIRST + slot % (COUNT / BLOCK) * BLOCK, BLOCK),
+        Some(slot) => {
+            assert!(
+                slot < BLOCKS,
+                "nextest slot {slot}: the ports are in {BLOCKS} blocks, one for each \
+                 test that runs at once; run with {BLOCKS} test threads or fewer"
+            );
+            (FIRST + slot * BLOCK, BLOCK)
+        }
         None => (FIRST, COUNT),
     };
     // Each test process starts somewhere of its own in its range, so that
@@ -672,8 +686,13 @@ pub fn free_port() -> u16 {
     // lingering sockets.
     let start = (std::process::id() % u32::from(count)) as u16;
     loop {
-        let n = NEXT.fetch_add(1, Ordering::Relaxed) % count;
-        let port = first + (start + n) % count;
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            slot.is_none() || n < BLOCK,
+            "this test has gone through the {BLOCK} ports of its nextest block, \
+             and would give one out again"
+        );
+        let port = first + (start + n % count) % count;
         if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
             && std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok()
         {

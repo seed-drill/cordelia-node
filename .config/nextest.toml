@@ -4,8 +4,13 @@
 
 # The slot numbers that the real-process tests take their ports by
 # (crates/cordelia-node/tests/common/mod.rs, `free_port`) came in 0.9.90,
-# and the priorities below in 0.9.91.
-nextest-version = { required = "0.9.91" }
+# the priorities below in 0.9.91, and the partitions by slice that CI
+# runs in 0.9.127.
+nextest-version = { required = "0.9.127" }
+
+# Tests that run one at a time, in every profile.
+[test-groups]
+one-at-a-time = { max-threads = 1 }
 
 [profile.default]
 # A test is said to be slow after each minute, and is stopped after 30.
@@ -18,6 +23,15 @@ slow-timeout = { period = "60s", terminate-after = 30 }
 [[profile.default.overrides]]
 filter = '(package(cordelia-sync) | package(cordelia-storage)) & kind(lib)'
 priority = 50
+
+# Five ignored tests take a lock of their process so that they never run
+# beside each other: the two timed reads of a large personal channel
+# (cordelia-sync, claude/tests/personal_reads.rs), and the scale test's
+# stage and small runs (scale.rs). Under nextest each test is a process of
+# its own, and the lock holds nothing back: this group does it instead.
+[[profile.default.overrides]]
+filter = '(binary_id(cordelia-sync) & test(/^claude::tests::personal_reads::/)) | (binary_id(cordelia-node::scale) & (test(=a_stage_of_the_scale_test) | test(=a_small_run_end_to_end) | test(=a_small_run_that_must_fail)))'
+test-group = 'one-at-a-time'
 
 # The tests that `cargo test --all` runs, as a pull request's gate runs
 # them. Every test runs, whatever fails, and none is run again: a test
