@@ -804,7 +804,7 @@ pub fn accept(
             crate::person::know_removed_if_signed(conn, identity, &statement, Some(&content), now)?;
             // What it knows of removals grew: where the change it follows
             // is no longer clear, it is closed (rule 8).
-            crate::person::close_if_not_clear(conn).map(|_| ())
+            crate::person::close_if_not_clear(conn, now).map(|_| ())
         })?;
     }
     match accepted {
@@ -856,7 +856,7 @@ pub fn know_what_is_handed(
             Some(&hand_over.change_entry.content),
             now,
         )?;
-        crate::person::close_if_not_clear(conn)
+        crate::person::close_if_not_clear(conn, now)
     })
 }
 

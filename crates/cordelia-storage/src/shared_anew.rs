@@ -414,13 +414,34 @@ pub fn clean(conn: &Connection, channel: &[u8; 32]) -> Result<(), CordeliaError>
     Ok(())
 }
 
-/// Everything of step 26 goes: the device leaves its person.
+/// `channel` is not clean from `since`, where it is clean now: a mark kept
+/// already stays as it is (decision 2026-10-24, rule 25, amended 13
+/// November: a device whose change stops being clear marks each channel it
+/// holds, as often as it moves or closes, and its seven days are not
+/// counted again for it).
+pub fn not_clean_where_clean(
+    conn: &Connection,
+    channel: &[u8; 32],
+    since: i64,
+) -> Result<(), CordeliaError> {
+    conn.execute(
+        "INSERT INTO shared_anew_not_clean (channel, since, owed) VALUES (?1, ?2, 0)
+             ON CONFLICT (channel) DO NOTHING",
+        params![&channel[..], since],
+    )
+    .map_err(storage)?;
+    Ok(())
+}
+
+/// Everything of step 26 goes: the device leaves its person. So does what
+/// it kept of the channels it first held after a removal.
 pub fn forget_all(conn: &Connection) -> Result<(), CordeliaError> {
     conn.execute_batch(
         "DELETE FROM shared_anew_offers; DELETE FROM shared_anew_made;
          DELETE FROM shared_anew_not_clean;",
     )
-    .map_err(storage)
+    .map_err(storage)?;
+    crate::meta::remove(conn, crate::meta::SHARED_FIRST_HELD)
 }
 
 #[cfg(test)]

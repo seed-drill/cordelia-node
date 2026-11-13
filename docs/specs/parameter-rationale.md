@@ -1772,6 +1772,23 @@ holds up to that many versions of itself in the store.
 **Why 1,024:** chosen as room to spare over the arrivals of a file between
 two changes of an honest person; no measurement behind it yet.
 
+#### PERSONAL_MADE_PREFIX = "made/", PERSONAL_MADE_VALUE_BYTES = 24
+
+**Derivation:** the value is the number of a change, eight bytes, and its
+hash, `STATEMENT_HASH_BYTES`.
+
+**Rationale:** The entry that a device which knows of a removal writes in
+the personal channel of the change it follows beside a channel it makes
+with `shared new` (decision 2026-10-24 (removal), rule 25, amended 13
+November): `made/` and the channel's ID in hex, holding that change's
+number and hash, so that another device on that change holds the channel
+clean. It is not carried, so it ends at the next change. A prefix of its
+own, which begins no other of the personal channel and which none begins:
+a device of the version before stores it and reads nothing of it.
+`protocol.rs` checks that it seals at `MIN_ENTRY_CONTENT_BYTES`, and so is
+counted in the personal channel's room at 1,280 bytes, as a word is: one
+for each channel made after a removal, until the next change.
+
 #### KEPT_OUT_PER_ADDER = 3
 
 **Derivation:** the lesser of

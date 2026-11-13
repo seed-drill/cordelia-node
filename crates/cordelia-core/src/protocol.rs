@@ -2682,6 +2682,33 @@ pub const SHARED_READ_PREFIX: &str = "sread/";
 /// the device's key follows it, and only its own entry there is its list.
 pub const PERSONAL_SHARED_PREFIX: &str = "shared/";
 
+/// The first part of the name, in the personal channel, of the entry that
+/// a device which knows of a removal writes beside a channel it makes with
+/// `shared new` (decision 2026-10-24 (removal), rule 25, amended 13
+/// November): the channel's ID follows it, in hex. It names the change the
+/// device follows, and is not carried to the next change.
+pub const PERSONAL_MADE_PREFIX: &str = "made/";
+
+/// The value of that entry: the number of the change the device follows,
+/// as eight bytes big-endian, and its hash.
+/// Derived: 8 + STATEMENT_HASH_BYTES.
+pub const PERSONAL_MADE_VALUE_BYTES: usize = 8 + STATEMENT_HASH_BYTES;
+
+// Checked at compile time: the entry, with its name, is one content of the
+// smallest size, so that it is counted in the personal channel's room as a
+// word is.
+const _: () = assert!(
+    ITEM_SEAL_OVERHEAD_BYTES
+        + 2
+        + PERSONAL_MADE_PREFIX.len()
+        + 2 * 32
+        + 1
+        + 2
+        + PERSONAL_MADE_VALUE_BYTES
+        + 2
+        <= MIN_ENTRY_CONTENT_BYTES
+);
+
 // ── A repository's list (decision 2026-11-06 (joining)) ─────────────
 
 /// The most bytes of a repository's `.cordelia/members` that a device
@@ -4516,6 +4543,32 @@ mod tests {
         assert!(SHARED_ACT_TIME_MAX > last_rfc_3339_second);
         // A time or a count at the bound is eight bytes as an act writes it.
         const { assert!(SHARED_ACT_TIME_MAX < u64::MAX) };
+    }
+
+    /// The entry that a channel made after a removal is written with
+    /// (decision 2026-10-24 (removal), rule 25, amended 13 November): its
+    /// prefix begins no other of the personal channel, and none begins it;
+    /// its value is a change's number and hash; and it seals at the
+    /// smallest content, as a word does, counted at 1,280 bytes.
+    #[test]
+    fn test_the_entry_of_a_channel_made_decision_2026_10_24_25() {
+        assert_eq!(PERSONAL_MADE_PREFIX, "made/");
+        for other in [
+            PERSONAL_NAME_PREFIX,
+            PERSONAL_ADDED_PREFIX,
+            PERSONAL_APPLIED_PREFIX,
+            PERSONAL_LEFT_PREFIX,
+            PERSONAL_REACHED_PREFIX,
+            PERSONAL_SHARED_PREFIX,
+        ] {
+            assert!(!PERSONAL_MADE_PREFIX.starts_with(other), "{other}");
+            assert!(!other.starts_with(PERSONAL_MADE_PREFIX), "{other}");
+        }
+        assert_eq!(PERSONAL_MADE_VALUE_BYTES, 24);
+        let said = 2 + PERSONAL_MADE_PREFIX.len() + 64 + 1 + 2 + PERSONAL_MADE_VALUE_BYTES + 2;
+        assert_eq!(said + ITEM_SEAL_OVERHEAD_BYTES, 128);
+        assert!(said + ITEM_SEAL_OVERHEAD_BYTES <= MIN_ENTRY_CONTENT_BYTES);
+        assert_eq!(entry_cost(MIN_ENTRY_CONTENT_BYTES), 1_280);
     }
 
     /// The messages channel with a `sread/` list for each device (decision

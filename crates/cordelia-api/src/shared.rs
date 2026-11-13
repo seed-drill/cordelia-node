@@ -51,18 +51,20 @@ use rusqlite::Connection;
 use crate::at_relays::Stands;
 use cordelia_core::protocol::{
     AGENT_MESSAGE_CONTENT_BYTES, AGENT_MESSAGE_KEPT_DAYS, AGENT_MESSAGE_RING,
-    MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, REV_BAND_HALF, SHARED_ANEW_CONTENT_BYTES, SHARED_KEYS_KEPT,
-    SHARED_MAX_CHANNELS, SHARED_MAX_KEYS, SHARED_READ_AGAIN_SECS, SHARED_TAKE_OUT_STEP_ENTRIES,
-    entry_cost,
+    MAX_ENTRY_CHANNEL_BYTES_AT_RELAY, PERSONAL_MADE_PREFIX, PERSONAL_MADE_VALUE_BYTES,
+    REV_BAND_HALF, SHARED_ANEW_CONTENT_BYTES, SHARED_KEYS_KEPT, SHARED_MAX_CHANNELS,
+    SHARED_MAX_KEYS, SHARED_READ_AGAIN_SECS, SHARED_TAKE_OUT_STEP_ENTRIES, entry_cost,
 };
-use cordelia_crypto::acts::Came as FiledAs;
+use cordelia_core::revision::next_under;
+use cordelia_crypto::acts::{Came as FiledAs, Filing};
 use cordelia_crypto::derive;
-use cordelia_crypto::entry::{CheckedEntry, Entry, Value};
+use cordelia_crypto::entry::{CheckedEntry, Entry, Inside, Value};
 use cordelia_crypto::identity::{Holders, NodeIdentity};
 use cordelia_crypto::message::{message_id, message_name, message_rev, number_of};
 use cordelia_crypto::share::Card;
 use cordelia_crypto::shared::{self as forms, Anew, NotShared, SharedTaken, anew_name};
 use cordelia_crypto::slots::slot_id;
+use cordelia_crypto::statement::Link;
 use cordelia_storage::entries::{self, Outcome};
 use cordelia_storage::meta;
 use cordelia_storage::person as held_rows;
@@ -72,6 +74,7 @@ use cordelia_storage::shared::{
 use cordelia_storage::shared_pass::{self as pass_rows, ChannelOut};
 
 use crate::person::{Counting, Held, PersonError, held, in_one};
+use crate::publish::Standing;
 use crate::take::{NotTaken, Taken};
 
 /// How long after this device last first held an entry of a key that the
@@ -499,11 +502,20 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
     // so nothing here can show that the removed key never read it. One
     // way stays clean: a channel made anew out of one this device holds
     // clean now. Its seed was made after that channel's, which no removed
-    // key holds, and was sealed to the keys of that channel alone.
-    let removal_known = match held(conn)? {
-        Some(held) => !crate::person::removed_known(conn, &held.statement.statement)?.is_empty(),
-        None => false,
+    // key holds, and was sealed to the keys of that channel alone. And one
+    // more (decision 2026-10-24 (removal), rule 25, amended 13 November): a
+    // channel made under the change this device follows, by a device that
+    // knew of the removal and wrote so beside it in that change's personal
+    // channel ([`made_under_the_change_followed`]).
+    let (removal_known, followed) = match held(conn)? {
+        Some(held) => (
+            !crate::person::removed_known(conn, &held.statement.statement)?.is_empty(),
+            Some(held.statement.statement.link()?),
+        ),
+        None => (false, None),
     };
+    let kept_before = first_held_kept(conn)?;
+    let mut first_held = kept_before.clone();
     for (act, _) in &holds.filings {
         let filing = &act.item;
         // A channel whose every entry is being taken out is held again
@@ -515,8 +527,24 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
             Some(row) => !matches!(row.state, State::Held | State::NotInForce),
             None => true,
         };
-        if comes_to_be_held && removal_known && !made_anew_out_of_a_clean_one(conn, &filing.came)? {
-            cordelia_storage::shared_anew::not_clean(conn, &filing.channel, now, false)?;
+        if comes_to_be_held
+            && removal_known
+            && let Some(followed) = &followed
+            && !made_anew_out_of_a_clean_one(conn, &filing.came)?
+        {
+            let clean = made_under_the_change_followed(conn, filing)?;
+            if !clean {
+                cordelia_storage::shared_anew::not_clean(conn, &filing.channel, now, false)?;
+            }
+            // Kept with the change followed now: the test is asked again
+            // where its entry comes after the list ([`ask_again`]).
+            first_held.retain(|kept| kept.channel != hex::encode(filing.channel));
+            first_held.push(FirstHeld {
+                channel: hex::encode(filing.channel),
+                number: followed.number,
+                hash: hex::encode(followed.hash),
+                clean,
+            });
         }
         let came = match filing.came {
             FiledAs::Made => Came::Made,
@@ -599,6 +627,10 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
     for older in moved.iter().skip(SHARED_MAX_CHANNELS) {
         kept::drop_index_rows(conn, older.id)?;
     }
+    ask_again(conn, &holds, followed.as_ref(), &mut first_held, now)?;
+    if first_held != kept_before {
+        keep_first_held(conn, &first_held)?;
+    }
     Ok(())
 }
 
@@ -617,6 +649,231 @@ fn made_anew_out_of_a_clean_one(conn: &Connection, came: &FiledAs) -> Result<boo
     };
     Ok(matches!(row.state, State::Held | State::NotInForce)
         && cordelia_storage::shared_anew::not_clean_of(conn, from)?.is_none())
+}
+
+// ── A channel made after a removal ───────────────────────────────────
+
+/// The name of the entry, in the personal channel, that says a device made
+/// `channel` under the change it followed (decision 2026-10-24 (removal),
+/// rule 25, amended 13 November): `made/` and the channel's ID in hex.
+pub(crate) fn made_name(channel: &[u8; 32]) -> String {
+    format!("{PERSONAL_MADE_PREFIX}{}", hex::encode(channel))
+}
+
+/// What that entry holds: the change's number, eight bytes big-endian, and
+/// its hash.
+pub(crate) fn made_value(change: &Link) -> Vec<u8> {
+    let mut value = Vec::with_capacity(PERSONAL_MADE_VALUE_BYTES);
+    value.extend_from_slice(&change.number.to_be_bytes());
+    value.extend_from_slice(&change.hash);
+    value
+}
+
+/// Write, in the personal channel of the change this device follows, that
+/// it made `channel` under that change, where it knows of a removal
+/// (decision 2026-10-24 (removal), rule 25, amended 13 November): the entry
+/// `made/<channel ID>`, holding the change's number and hash, signed by
+/// this device as each of its entries is. It waits in the store to be sent,
+/// and is not carried to the next change (`person::is_its_word_to_carry`).
+/// Nothing is written where the device knows of no removal: a device of the
+/// version before then reads the same as ever.
+pub(crate) fn write_made(
+    conn: &Connection,
+    identity: &NodeIdentity,
+    channel: &[u8; 32],
+    now: i64,
+) -> Result<(), PersonError> {
+    let standing = Standing::to_write(conn)?;
+    let statement = &standing.held.statement.statement;
+    if crate::person::removed_known(conn, statement)?.is_empty() {
+        return Ok(());
+    }
+    let link = statement.link()?;
+    let personal = derive::personal_secret(&standing.secret)?;
+    let personal_id = derive::channel_id(&personal)?;
+    let name = made_name(channel);
+    let slot = slot_id(&derive::slot_key(&personal)?, &name);
+    let before = entries::author_entry(conn, &personal_id, &slot, &identity.public_key())?
+        .map(|held| held.entry.rev);
+    let rev = next_under(before, link.number).ok_or_else(|| {
+        PersonError::Held("the entry of a channel made has no next revision".into())
+    })?;
+    let inside = Inside {
+        name,
+        value: Value::Other(made_value(&link)),
+        chain: Some(Vec::new()),
+    };
+    let entry = Entry::seal(&personal, identity, rev, &inside)?.check()?;
+    entries::store(conn, &entry, now)?;
+    Ok(())
+}
+
+/// Whether the channel of `filing`, which this device first holds after a
+/// removal, was made under the change this device follows, and so is clean
+/// here (decision 2026-10-24 (removal), rule 25, amended 13 November). All
+/// of these hold:
+///
+/// - the filing in force is one made;
+/// - the personal channel of the change this device follows holds the entry
+///   `made/<its ID>`, signed by a device that counts there now (asked here,
+///   and not only when the door stored it), naming that change by its
+///   number and hash;
+/// - that change is clear here, and the device stands applied under it.
+///
+/// Such a card was put only in that change's lists, which no removed key
+/// reads. A removed key cannot pass: nothing it signs counts, it cannot
+/// write in the personal channel of a change made after its removal, and a
+/// copy carried into a later change still names the change it was written
+/// under.
+fn made_under_the_change_followed(conn: &Connection, filing: &Filing) -> Result<bool, PersonError> {
+    if filing.came != FiledAs::Made {
+        return Ok(false);
+    }
+    let standing = match Standing::to_write(conn) {
+        Ok(standing) => standing,
+        Err(PersonError::FollowsNoPhrase | PersonError::Stopped(_) | PersonError::NotClear) => {
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
+    let link = standing.held.statement.statement.link()?;
+    let personal = derive::personal_secret(&standing.secret)?;
+    let personal_id = derive::channel_id(&personal)?;
+    let name = made_name(&filing.channel);
+    let slot = slot_id(&derive::slot_key(&personal)?, &name);
+    let names_it = Value::Other(made_value(&link));
+    for entry in entries::slot_entries(conn, &personal_id, &slot)? {
+        if !standing.counting.counts(&entry.author) {
+            continue;
+        }
+        if entry
+            .open(&personal)
+            .is_ok_and(|inside| inside.name == name && inside.value == names_it)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A shared channel that this device first held after a removal (decision
+/// 2026-10-24 (removal), rule 25, amended 13 November), as it is kept
+/// (`meta::SHARED_FIRST_HELD`): the change it followed then, and whether
+/// [`made_under_the_change_followed`] held it clean.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FirstHeld {
+    channel: String,
+    number: u64,
+    hash: String,
+    clean: bool,
+}
+
+fn first_held_kept(conn: &Connection) -> Result<Vec<FirstHeld>, PersonError> {
+    Ok(meta::get(conn, meta::SHARED_FIRST_HELD)?
+        .and_then(|kept| serde_json::from_str(&kept).ok())
+        .unwrap_or_default())
+}
+
+fn keep_first_held(conn: &Connection, kept: &[FirstHeld]) -> Result<(), PersonError> {
+    if kept.is_empty() {
+        meta::remove(conn, meta::SHARED_FIRST_HELD)?;
+        return Ok(());
+    }
+    let written = serde_json::to_string(kept)
+        .map_err(|e| PersonError::Held(format!("the channels first held: {e}")))?;
+    meta::set(conn, meta::SHARED_FIRST_HELD, &written)?;
+    Ok(())
+}
+
+/// What this device kept of the channels it first held goes where it
+/// comes to know of a new removal, or recovers (decision 2026-10-24
+/// (removal), rules 23 and 25): every channel it holds is marked then, and
+/// no mark set then is cleared by the test of a channel made.
+pub(crate) fn forget_first_held(conn: &Connection) -> Result<(), PersonError> {
+    meta::remove(conn, meta::SHARED_FIRST_HELD)?;
+    Ok(())
+}
+
+/// Each channel this device first held after a removal, judged again at
+/// each read of the lists (decision 2026-10-24 (removal), rule 25, amended
+/// 13 November):
+///
+/// - **One marked not clean when first held,** where the list came before
+///   the entry `made/`: while the device follows the change it followed
+///   then, and knows of no new removal ([`forget_first_held`]), the test is
+///   asked again, and clears that mark alone where it holds now.
+/// - **One held clean by that test** is marked not clean once the filing
+///   in force of it is no longer one made: a take, say, by a device that
+///   had not read the removal.
+///
+/// What is kept of a channel goes once it is held no more, or its mark is
+/// set or cleared otherwise.
+fn ask_again(
+    conn: &Connection,
+    holds: &crate::lists::Holds,
+    followed: Option<&Link>,
+    first_held: &mut Vec<FirstHeld>,
+    now: i64,
+) -> Result<(), PersonError> {
+    let filed = |channel: &[u8; 32]| -> Option<FiledAs> {
+        let in_force = holds.filings.iter().map(|(act, _)| &act.item);
+        let past_bound = holds.left_out.iter().filter_map(|(act, _)| match act {
+            crate::lists::AnyAct::Filing(filing) => Some(&filing.item),
+            _ => None,
+        });
+        in_force
+            .chain(past_bound)
+            .find(|filing| filing.channel == *channel)
+            .map(|filing| filing.came)
+    };
+    let mut kept = Vec::new();
+    for mut one in std::mem::take(first_held) {
+        let Some(channel) = hex::decode(&one.channel)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        else {
+            continue;
+        };
+        let held_now = kept::channel(conn, &channel)?
+            .is_some_and(|row| matches!(row.state, State::Held | State::NotInForce));
+        if !held_now {
+            continue;
+        }
+        let mark = cordelia_storage::shared_anew::not_clean_of(conn, &channel)?;
+        if one.clean {
+            if mark.is_some() {
+                continue;
+            }
+            if filed(&channel) != Some(FiledAs::Made) {
+                cordelia_storage::shared_anew::not_clean(conn, &channel, now, false)?;
+                continue;
+            }
+        } else {
+            if mark.is_none() {
+                continue;
+            }
+            let same_change = followed.is_some_and(|followed| {
+                followed.number == one.number && hex::encode(followed.hash) == one.hash
+            });
+            if !same_change {
+                continue;
+            }
+            let filing = holds
+                .filings
+                .iter()
+                .map(|(act, _)| &act.item)
+                .find(|filing| filing.channel == channel);
+            if let Some(filing) = filing
+                && made_under_the_change_followed(conn, filing)?
+            {
+                cordelia_storage::shared_anew::clean(conn, &channel)?;
+                one.clean = true;
+            }
+        }
+        kept.push(one);
+    }
+    *first_held = kept;
+    Ok(())
 }
 
 /// Keep what each key of the channel of `row` is to the person (decision
