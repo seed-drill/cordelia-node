@@ -148,13 +148,14 @@ pub const PERSON_JUDGE_KEPT: &str = "person.judge_kept";
 pub const PERSON_MOVED_FROM: &str = "person.moved_from";
 
 /// JSON array of the shared channels this device first held after a
-/// removal (decision 2026-10-24 (removal), rule 25, amended 13 November):
-/// each with the change it followed then, and whether the test of a
-/// channel made under that change held it clean. One marked not clean
-/// then is asked again at each read of the lists, while the device follows
-/// that change and knows of no new removal; one held clean is marked not
-/// clean once the filing in force of it is no longer one made. It goes
-/// when the device leaves its person.
+/// removal while the filing in force is one made, or made itself after one
+/// (decision 2026-10-24 (removal), rule 25, amended 13 November): each with
+/// the change it followed then, and whether it holds it clean, by the test
+/// of a channel made under that change or as its maker. One marked not
+/// clean then is asked again at each read of the lists, while the device
+/// follows that change, knows of no new removal and the filing in force is
+/// one made; one held clean is marked not clean once the filing in force of
+/// it is no longer one made. It goes when the device leaves its person.
 pub const SHARED_FIRST_HELD: &str = "shared.first_held";
 
 /// How many times in a row the device's list of what its agents read was

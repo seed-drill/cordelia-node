@@ -3833,7 +3833,8 @@ fn writes_made(
 /// amended 13 November): the desktop removes the tablet, and the laptop,
 /// on that change, makes "notes" with `shared new`, writing beside it the
 /// entry `made/` that names change 2. The desktop first holds "notes"
-/// clean, and writes there.
+/// clean, and writes there. No list that the tablet reads, of change 1,
+/// files "notes", in what either device holds.
 #[test]
 fn a_channel_made_after_a_removal_is_clean_on_each_device_of_its_change() {
     let mut s = bob(3);
@@ -3852,6 +3853,14 @@ fn a_channel_made_after_a_removal_is_clean_on_each_device_of_its_change() {
     assert_eq!(desktop.state, State::Held);
     assert!(!is_not_clean(&s[1].conn, &notes.id).unwrap(), "rule 25");
     assert!(writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
+    let mut held = s[0].stored();
+    held.extend(s[1].stored());
+    let tablet_reads =
+        crate::lists::lists_in(&held, &s[2].personal(), &[s.key(0), s.key(1), s.key(2)]).unwrap();
+    assert!(
+        !filings_of(&tablet_reads).contains(&notes.id),
+        "the tablet reads no list that files it"
+    );
 }
 
 /// A channel made before its maker read the removal is not clean where it
@@ -4367,4 +4376,165 @@ fn a_channel_taken_is_not_cleared_when_its_entry_made_comes_after() {
     crate::lists::follow(&s[1].conn, &s[1].identity, now + 2).unwrap();
     out(&s, 1, now + 2);
     assert!(is_not_clean(&s[1].conn, &notes.id).unwrap(), "taken");
+}
+
+// ── Rule 25, amended 13 November: the fix round after its review ────
+
+/// Bob's laptop (0), desktop (1), tablet (2) and phone (3) meet; the
+/// desktop removes the tablet (change 2), and the laptop follows that
+/// change. The phone is off, on change 1. The time after.
+fn the_desktop_removed_the_tablet_with_the_phone_off(s: &mut Several) -> i64 {
+    s.meet(&[0, 1, 2, 3]);
+    s.change(1, &[0, 1, 3], &[2]);
+    s.pass(1, 0);
+    assert_eq!(s[0].number(), 2, "the laptop follows the removal");
+    assert_eq!(s[3].number(), 1, "the phone is off");
+    s.now + 10
+}
+
+/// The phone, on change 1, takes the channel the laptop filed as `name`
+/// from a share at `now`, so its card is in a list the tablet reads; it
+/// then applies the removal, and carries its list into change 2.
+fn the_phone_takes_before_it_reads_the_removal(s: &mut Several, name: &str, now: i64) {
+    let filed = sharing::filed(&s[0].conn)
+        .unwrap()
+        .into_iter()
+        .find(|filing| filing.name == name)
+        .unwrap();
+    let channel = filed.channel;
+    let taken = Filing {
+        came: Came::Taken(member(1).public_key()),
+        ..filed
+    };
+    acts(s, 3, Do::File(taken), now);
+    let tablet_reads =
+        crate::lists::lists_in(&s[3].stored(), &s[2].personal(), &[s.key(3)]).unwrap();
+    assert!(
+        filings_of(&tablet_reads).contains(&channel),
+        "the window: the tablet reads the phone's list"
+    );
+    s.pass(1, 3);
+    assert_eq!(s[3].number(), 2, "the phone applies the removal");
+}
+
+/// The channels that the filings of `lists` name.
+fn filings_of(lists: &[([u8; 32], cordelia_crypto::acts::SharedList)]) -> Vec<[u8; 32]> {
+    lists
+        .iter()
+        .flat_map(|(_, list)| crate::lists::acts_of(list))
+        .filter_map(|act| match act {
+            crate::lists::AnyAct::Filing(filing) => Some(filing.item.channel),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A mark set where the filing in force is not one made is kept, though a
+/// newer filing made comes after it (rule 25, amended 13 November, as its
+/// review found): the laptop makes "notes" after the removal; the phone,
+/// which has not read it, takes "notes" from a share, and its card is in a
+/// list the tablet reads. The phone applies the removal and carries its
+/// list, and the desktop first holds "notes" under the phone's filing, and
+/// marks it. The laptop, which has not read the phone's list, renames
+/// "notes": a newer filing made, with its entry `made/`. The desktop keeps
+/// the mark, as a device that first held "notes" clean and then saw the
+/// take does. So it does where it first held "notes" under the laptop's
+/// filing, before its entry `made/` came, and then read the take.
+#[test]
+fn a_mark_set_under_a_take_is_kept_though_a_filing_made_comes_after() {
+    for made_first in [false, true] {
+        let mut s = bob(4);
+        let now = the_desktop_removed_the_tablet_with_the_phone_off(&mut s);
+        let notes = made_new(&s, 0, "notes", now);
+        if made_first {
+            let personal = s[0].personal();
+            for entry in s[0].stored() {
+                if !is_made(&entry, &personal) {
+                    crate::shared::tests::given(&s, 1, &entry, now);
+                }
+            }
+            crate::lists::follow(&s[1].conn, &s[1].identity, now).unwrap();
+            out(&s, 1, now);
+            assert_eq!(row(&s, 1, &notes).state, State::Held);
+            assert!(is_not_clean(&s[1].conn, &notes.id).unwrap(), "no entry");
+        }
+        the_phone_takes_before_it_reads_the_removal(&mut s, "notes", now + 1);
+        follows(&mut s, 3, 1, now + 1);
+        assert_eq!(row(&s, 1, &notes).state, State::Held);
+        assert!(is_not_clean(&s[1].conn, &notes.id).unwrap(), "taken");
+        sharing::rename(&s[0].conn, &s[0].identity, "notes", "design", None, now + 2).unwrap();
+        follows(&mut s, 0, 1, now + 2);
+        let desktop = row(&s, 1, &notes);
+        assert_eq!(desktop.name, "design", "the filing made is in force");
+        assert!(
+            is_not_clean(&s[1].conn, &notes.id).unwrap(),
+            "kept; made first: {made_first}"
+        );
+        assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
+    }
+}
+
+/// The maker too marks a channel it made once the filing in force of it is
+/// no longer one made (rule 25, amended 13 November, as its review found):
+/// the laptop makes "notes" after the removal, and holds it clean at its
+/// next read of the lists. The phone, which has not read the removal,
+/// takes "notes", and carries its list into change 2 once it applies the
+/// removal. The laptop reads that list, marks "notes" not clean, and
+/// writes nothing there.
+#[test]
+fn the_maker_marks_a_channel_it_made_once_its_filing_is_no_longer_made() {
+    let mut s = bob(4);
+    let now = the_desktop_removed_the_tablet_with_the_phone_off(&mut s);
+    let notes = made_new(&s, 0, "notes", now);
+    crate::lists::follow(&s[0].conn, &s[0].identity, now).unwrap();
+    out(&s, 0, now);
+    assert!(!is_not_clean(&s[0].conn, &notes.id).unwrap(), "made here");
+    the_phone_takes_before_it_reads_the_removal(&mut s, "notes", now + 1);
+    follows(&mut s, 3, 0, now + 1);
+    let laptop = row(&s, 0, &notes);
+    assert_eq!(laptop.state, State::Held);
+    assert!(is_not_clean(&s[0].conn, &notes.id).unwrap(), "taken");
+    assert!(!writes_there(&s[0].conn, &s[0].identity, &laptop).unwrap());
+}
+
+/// An act of the removed key's taken inside the removal's margin counts
+/// for nothing, and the channel it filed, held later by a rename from a
+/// device that took the act earlier, is not clean (rule 25, amended 13
+/// November; rule 6): the tablet files "thief". The laptop takes its list
+/// and copies the act; the desktop takes it inside the ten minutes before
+/// the removal, which then cuts it there. The desktop does not hold
+/// "thief" until the laptop renames it, and then holds it not clean.
+#[test]
+fn an_act_inside_the_margin_held_later_by_a_rename_is_not_clean() {
+    let mut s = bob(3);
+    let now = s.now + 10;
+    s.meet(&[0, 1, 2]);
+    let thief = holds(&s, 2, 31, "thief", now);
+    s.pass(2, 0);
+    crate::lists::follow(&s[0].conn, &s[0].identity, now).unwrap();
+    out(&s, 0, now);
+    s.now += cordelia_core::protocol::REMOVAL_TAKEN_MARGIN_SECS as i64 + 1;
+    s.pass(2, 1);
+    s.change(1, &[0, 1], &[2]);
+    s.pass(1, 0);
+    assert_eq!(s[0].number(), 2);
+    let now = s.now + 10;
+    assert_eq!(
+        row(&s, 0, &thief).state,
+        State::Held,
+        "taken before its cut"
+    );
+    follows(&mut s, 0, 1, now);
+    assert!(
+        kept::channel(&s[1].conn, &thief.id)
+            .unwrap()
+            .is_none_or(|row| row.state != State::Held),
+        "cut on the desktop"
+    );
+    sharing::rename(&s[0].conn, &s[0].identity, "thief", "loot", None, now + 1).unwrap();
+    follows(&mut s, 0, 1, now + 1);
+    let desktop = row(&s, 1, &thief);
+    assert_eq!(desktop.state, State::Held, "held by the rename");
+    assert!(is_not_clean(&s[1].conn, &thief.id).unwrap());
+    assert!(!writes_there(&s[1].conn, &s[1].identity, &desktop).unwrap());
 }

@@ -537,14 +537,11 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
                 cordelia_storage::shared_anew::not_clean(conn, &filing.channel, now, false)?;
             }
             // Kept with the change followed now: the test is asked again
-            // where its entry comes after the list ([`ask_again`]).
+            // where its entry comes after the list, while the filing in
+            // force is one made. What is kept under any other filing goes
+            // at the end of this read, and its mark stays ([`ask_again`]).
             first_held.retain(|kept| kept.channel != hex::encode(filing.channel));
-            first_held.push(FirstHeld {
-                channel: hex::encode(filing.channel),
-                number: followed.number,
-                hash: hex::encode(followed.hash),
-                clean,
-            });
+            first_held.push(FirstHeld::of(&filing.channel, followed, clean));
         }
         let came = match filing.came {
             FiledAs::Made => Came::Made,
@@ -676,7 +673,10 @@ pub(crate) fn made_value(change: &Link) -> Vec<u8> {
 /// this device as each of its entries is. It waits in the store to be sent,
 /// and is not carried to the next change (`person::is_its_word_to_carry`).
 /// Nothing is written where the device knows of no removal: a device of the
-/// version before then reads the same as ever.
+/// version before then reads the same as ever. The maker keeps the channel
+/// as first held clean under that change, as each other device of the
+/// change does, so that it too marks it once the filing in force of it is
+/// no longer one made ([`ask_again`]).
 pub(crate) fn write_made(
     conn: &Connection,
     identity: &NodeIdentity,
@@ -705,7 +705,10 @@ pub(crate) fn write_made(
     };
     let entry = Entry::seal(&personal, identity, rev, &inside)?.check()?;
     entries::store(conn, &entry, now)?;
-    Ok(())
+    let mut first_held = first_held_kept(conn)?;
+    first_held.retain(|kept| kept.channel != hex::encode(channel));
+    first_held.push(FirstHeld::of(channel, &link, true));
+    keep_first_held(conn, &first_held)
 }
 
 /// Whether the channel of `filing`, which this device first holds after a
@@ -756,16 +759,29 @@ fn made_under_the_change_followed(conn: &Connection, filing: &Filing) -> Result<
     Ok(false)
 }
 
-/// A shared channel that this device first held after a removal (decision
+/// A shared channel that this device first held after a removal, while the
+/// filing in force is one made, or made itself after one (decision
 /// 2026-10-24 (removal), rule 25, amended 13 November), as it is kept
-/// (`meta::SHARED_FIRST_HELD`): the change it followed then, and whether
-/// [`made_under_the_change_followed`] held it clean.
+/// (`meta::SHARED_FIRST_HELD`): the change it followed then, and whether it
+/// holds the channel clean, by [`made_under_the_change_followed`] or as its
+/// maker.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct FirstHeld {
     channel: String,
     number: u64,
     hash: String,
     clean: bool,
+}
+
+impl FirstHeld {
+    fn of(channel: &[u8; 32], change: &Link, clean: bool) -> Self {
+        Self {
+            channel: hex::encode(channel),
+            number: change.number,
+            hash: hex::encode(change.hash),
+            clean,
+        }
+    }
 }
 
 fn first_held_kept(conn: &Connection) -> Result<Vec<FirstHeld>, PersonError> {
@@ -798,13 +814,16 @@ pub(crate) fn forget_first_held(conn: &Connection) -> Result<(), PersonError> {
 /// each read of the lists (decision 2026-10-24 (removal), rule 25, amended
 /// 13 November):
 ///
-/// - **One marked not clean when first held,** where the list came before
-///   the entry `made/`: while the device follows the change it followed
-///   then, and knows of no new removal ([`forget_first_held`]), the test is
-///   asked again, and clears that mark alone where it holds now.
-/// - **One held clean by that test** is marked not clean once the filing
-///   in force of it is no longer one made: a take, say, by a device that
-///   had not read the removal.
+/// - **One marked not clean when first held under a filing made,** where
+///   the list came before the entry `made/`: while the device follows the
+///   change it followed then, knows of no new removal
+///   ([`forget_first_held`]), and the filing in force is one made, the test
+///   is asked again, and clears that mark alone where it holds now. At a
+///   read where the filing in force is not one made, what is kept goes and
+///   the mark stays: a filing made again, a rename say, clears nothing.
+/// - **One held clean,** by that test or by its maker, is marked not clean
+///   once the filing in force of it is no longer one made: a take, say, by
+///   a device that had not read the removal.
 ///
 /// What is kept of a channel goes once it is held no more, or its mark is
 /// set or cleared otherwise.
@@ -840,16 +859,17 @@ fn ask_again(
             continue;
         }
         let mark = cordelia_storage::shared_anew::not_clean_of(conn, &channel)?;
+        let made = filed(&channel) == Some(FiledAs::Made);
         if one.clean {
             if mark.is_some() {
                 continue;
             }
-            if filed(&channel) != Some(FiledAs::Made) {
+            if !made {
                 cordelia_storage::shared_anew::not_clean(conn, &channel, now, false)?;
                 continue;
             }
         } else {
-            if mark.is_none() {
+            if mark.is_none() || !made {
                 continue;
             }
             let same_change = followed.is_some_and(|followed| {
