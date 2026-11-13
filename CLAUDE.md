@@ -87,9 +87,9 @@ cargo nextest run                                     # each test in a process o
 cargo nextest run --profile ci --partition slice:1/8  # one of CI's eight shards
 ```
 
-A pull request's gate (`ci.yml`) is fmt, clippy, the doc tests, and every other test that `cargo test --all` runs: built once, and run by cargo nextest in eight shards at once (`.config/nextest.toml`). The job `test` passes only when all of it passed. The ignored tests of cordelia-node ("out of reach", in two shards) and coverage run on a push to main, each night and by hand, not on a pull request; when one fails, the run on main fails.
+A pull request's gate (`ci.yml`) is fmt, clippy, the doc tests, and every other test that `cargo test --all` runs: built once, and run by cargo nextest in eight shards at once (`.config/nextest.toml`). The job `test` passes only when all of it passed. Beside them, the ignored tests of cordelia-node run in two shards of their own, and the job `out of reach` passes only when both passed; a merge waits for `test` and `out of reach`. Coverage runs on a push to main, each night and by hand, not on a pull request; when it fails, the run on main fails.
 
-The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" jobs run them on main. A few tests need the binary of the version before, alpha.19 (`CORDELIA_TEST_BINARY_BEFORE`); without it they pass without running, except in CI. TESTING.md has the rest.
+The real-process tests are `crates/cordelia-node/tests/*_e2e.rs`, with `scale.rs` and `threat_model.rs`; each starts its own nodes and relay on localhost. `CORDELIA_E2E_KEEP=1` keeps the nodes' directories. Long tests there are `#[ignore]`d, and CI's "out of reach" jobs run them. A few tests need the binary of the version before, alpha.19 (`CORDELIA_TEST_BINARY_BEFORE`); without it they pass without running, except in CI. TESTING.md has the rest.
 
 ## Public text
 

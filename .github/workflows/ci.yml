@@ -2,12 +2,12 @@ name: CI
 
 # A pull request's gate: fmt and clippy, the doc tests, and every test
 # that `cargo test --all` runs, built once and run by cargo nextest in
-# shards at once. The job `test` passes only when all of it passed.
+# shards at once; the job `test` passes only when all of it passed. Beside
+# them, from the same build, the ignored tests of cordelia-node in shards
+# of their own; the job `out of reach` passes only when they all passed.
 #
-# On a push to main, each night and when run by hand, two more run, which
-# do not gate a pull request: the ignored tests of cordelia-node ("out of
-# reach"), in shards too, and coverage. When one of them fails, the run
-# on main fails.
+# On a push to main, each night and when run by hand, coverage runs too.
+# It does not gate a pull request; when it fails, the run on main fails.
 on:
   push:
     branches: [main]
@@ -228,17 +228,17 @@ jobs:
 
   # The real-process tests that wait out a relay's five minutes out of
   # reach, or a dial's wait growing to its cap (decision 2026-10-19 §11):
-  # each is ignored in `cargo test --all`, so that the gate is not made
-  # longer, and is run here, on main, in two shards. They are the ignored
-  # tests of cordelia-node's test files, and only those: the other
-  # crates' ignored tests are timed for a release build, or are no part of
-  # this. Each runs whatever another fails. The scale test's ignored tests
-  # return at once here: its stages and its small runs run only where
-  # their variables are set (scale.yml runs the small runs).
-  out-of-reach:
+  # each is ignored in `cargo test --all`, so that the shards above are
+  # not made longer, and is run here, on every pull request, in two shards
+  # beside them. They are the ignored tests of cordelia-node's test files,
+  # and only those: the other crates' ignored tests are timed for a
+  # release build, or are no part of this. Each runs whatever another
+  # fails. The scale test's ignored tests return at once here: its stages
+  # and its small runs run only where their variables are set (scale.yml
+  # runs the small runs).
+  out-of-reach-shards:
     name: out of reach, shard ${{ matrix.shard }} of ${{ strategy.job-total }}
     needs: build
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     # About twice the longest of these tests (14 minutes): a test that
     # waits for ever fails the job in this time.
@@ -285,6 +285,24 @@ jobs:
           name: junit-out-of-reach-${{ matrix.shard }}
           path: target/nextest/ci-out-of-reach/junit.xml
           if-no-files-found: ignore
+
+  # The check that a merge into main needs as well (decision 2026-10-19
+  # §11): it passes only when both shards above passed. It runs when one
+  # of them failed too, and fails then, but not when the run was
+  # cancelled.
+  out-of-reach:
+    name: out of reach
+    needs: out-of-reach-shards
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Both shards passed
+        env:
+          SHARDS: ${{ needs.out-of-reach-shards.result }}
+        run: |
+          echo "out of reach: $SHARDS"
+          [ "$SHARDS" = success ]
 
   coverage:
     if: github.event_name != 'pull_request'

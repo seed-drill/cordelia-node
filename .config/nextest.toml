@@ -34,9 +34,10 @@ slow-timeout = { period = "60s", terminate-after = 15 }
 [profile.ci.junit]
 path = "junit.xml"
 
-# The ignored tests of cordelia-node, which CI's "out of reach" jobs run
-# on main: some wait out a relay's five minutes out of reach, and the
-# longest takes about 14 minutes in CI. One that has run for 30 is stopped.
+# The ignored tests of cordelia-node, which CI's "out of reach" shards run
+# on every pull request: some wait out a relay's five minutes out of
+# reach, and the longest takes about 14 minutes in CI. One that has run
+# for 30 is stopped.
 [profile.ci-out-of-reach]
 fail-fast = false
 retries = 0

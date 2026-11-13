@@ -60,8 +60,12 @@ A pull request's gate (`.github/workflows/ci.yml`) is:
 - every other test that `cargo test --all` runs, built once into an
   archive (`cargo nextest archive`) and run by `cargo nextest run` in
   eight shards at once;
-- the job `test`, which passes only when all of the above passed: the
-  check that a merge waits for.
+- the job `test`, which passes only when all of the above passed;
+- beside them, from the same archive, the ignored tests of cordelia-node
+  (below) in two shards, and the job `out of reach`, which passes only
+  when both passed.
+
+A merge into main waits for `test` and `out of reach`.
 
 nextest runs each test in a process of its own, as many at once as the
 machine has threads. Each shard runs one part: the tests are dealt out in
@@ -70,10 +74,8 @@ slice:k/8`). The profile `ci` in `.config/nextest.toml` runs every test
 whatever fails, runs none again, and stops a test that has run for 15
 minutes.
 
-On a push to main, each night and when run by hand, two more run: the
-ignored tests of cordelia-node (the jobs "out of reach", in two shards,
-profile `ci-out-of-reach`), and coverage. They do not gate a pull
-request. When one fails, the run on main fails.
+On a push to main, each night and when run by hand, coverage runs too.
+It does not gate a pull request; when it fails, the run on main fails.
 
 To run the tests as CI does (install nextest once, with
 `cargo install cargo-nextest --locked`):
@@ -103,8 +105,8 @@ and log), and prints where.
 wait growing to its cap (decision 2026-10-19 §11), are marked `#[ignore]`
 with the reason, so that `cargo test --all` does not take longer. The CI
 jobs "out of reach" in `ci.yml` run the ignored tests of cordelia-node's
-test files, and no other crate's, on a push to main, each night and when
-run by hand, in two shards: not on a pull request. The
+test files, and no other crate's, on every pull request, in two shards
+beside the others (profile `ci-out-of-reach`). The
 scale test's ignored tests (`scale.rs`, decision 2026-10-22) are among
 them and return at once there: its run of a stage does nothing unless
 `CORDELIA_SCALE_STAGE` is set, and its small runs (§6, tests 4 and 5)
