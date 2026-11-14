@@ -155,8 +155,15 @@ fn the_shared_commands_say_what_this_record_says() {
             &[&own, "<a name of their choosing>", &relay_words, &words]
         )
     );
-    // Said at the yes, and not after it (issue #338).
-    assert!(!lines.join("\n").contains("prove"), "{lines:?}");
+    // Said at the yes, and not after it (issue #338). Word by word: a
+    // channel's four words can hold "improve" or "approve".
+    assert!(
+        !lines
+            .join("\n")
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .any(|word| word.starts_with("prove")),
+        "{lines:?}"
+    );
     // §5.4: nobody else wrote there yet, so nothing more is said.
     assert_eq!(lines.len(), 4, "{lines:?}");
 
