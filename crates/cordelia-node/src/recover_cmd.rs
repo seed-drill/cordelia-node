@@ -4358,8 +4358,13 @@ mod tests {
             )),
             "{all}"
         );
-        // What is no key is not shown.
-        assert!(!all.contains("odd"), "{all}");
+        // What is no key is not shown. Word by word: a key's words can hold
+        // "goddess" or "toddler".
+        assert!(
+            !all.split(|c: char| !c.is_ascii_alphabetic())
+                .any(|word| word == "odd"),
+            "{all}"
+        );
 
         // A look that could not read the new channels took nothing, and
         // says so, with the command that brings in what the relays hold.
