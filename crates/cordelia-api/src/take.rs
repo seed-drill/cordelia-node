@@ -342,7 +342,7 @@ fn taken_as_its_own(
         {
             let link = statement.link()?;
             held_rows::keep_holder(conn, link.number, &link.hash, &entry.author)?;
-            crate::person::close_if_not_clear(conn)?;
+            crate::person::close_if_not_clear(conn, now)?;
         }
         return Ok(Some(Taken::Refused(NotTaken::SignerDoesNotCount)));
     }
@@ -413,7 +413,7 @@ fn taken_as_its_own(
     // reader that seals nothing is not closed: what it reads is what it
     // shows.
     if taker == Taker::Device && matches!(taken.0, Some(Record::Seen(_))) {
-        crate::person::close_if_not_clear(conn)?;
+        crate::person::close_if_not_clear(conn, now)?;
     }
     // A record that was taken can let a key add: the one it adds, where
     // a device of the statement signed it. (A record that is not counted

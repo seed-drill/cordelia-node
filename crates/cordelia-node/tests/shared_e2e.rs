@@ -3090,3 +3090,157 @@ fn after_a_removal_each_device_makes_a_shared_channel_anew_once() {
         "{refused}"
     );
 }
+
+/// How many rows of `channel` the table of shared channels of `node`'s
+/// database holds: none where it holds no seed of it.
+fn seeds_held(node: &Node, channel: &[u8; 32]) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(
+        node.data_dir().join("cordelia.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db.query_row(
+        "SELECT COUNT(*) FROM shared_channels WHERE channel = ?1",
+        [&channel[..]],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+/// A channel made after a removal is clean on each device that follows
+/// the change it was made under (decision 2026-10-24 (removal), rule 25,
+/// amended 13 November): Alice's laptop, desktop and tablet; the desktop
+/// removes the tablet. The laptop, on that change, makes "notes" with
+/// `shared new`. The desktop holds it and sends there with no reset, its
+/// status names no channel a removed device holds, and the tablet's
+/// database holds no seed of it.
+#[test]
+fn a_channel_made_after_a_removal_is_clean_on_each_device_of_its_change() {
+    let relay = relay_started();
+    let laptop = device_started_with_its_relays_key("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let desktop = device_started_with_its_relays_key("desktop", &relay);
+    let tablet = device_started_with_its_relays_key("tablet", &relay);
+    let all = [&relay, &laptop, &desktop, &tablet];
+    for (device, label) in [(&desktop, "desktop"), (&tablet, "tablet")] {
+        adds(&laptop, device, label);
+        has_applied(device, 1, &all);
+        sync_on(device);
+    }
+    let mut at = removes_from_an_added(&desktop, &key_of(&tablet), &words);
+    at.says("The change is made (change 2)");
+    at.says("The wait has ended.");
+    drop(at);
+    let after = [&relay, &laptop, &desktop];
+    has_applied(&laptop, 2, &after);
+
+    makes(&laptop, "notes", &[]);
+    holds_in_the_end(&after, &desktop, "notes");
+    let notes = id_filed(&desktop, "notes").unwrap();
+    // One subscription of the agent's, in the person's lists, holds on
+    // each device whose folder maps it.
+    for device in [&desktop, &laptop] {
+        let dir = maps_folder(device, "repo", AGENT);
+        if device.name == "desktop" {
+            subscribes(device, &dir, "notes");
+        }
+        assert_eq!(
+            send_comes_to(&after, device, &dir, "notes", "after the removal"),
+            None,
+            "{}",
+            device.name
+        );
+    }
+    let status = status_json(&desktop);
+    assert_eq!(
+        status["shared"]["removed_device_holds"],
+        json!([]),
+        "{status}"
+    );
+    assert_eq!(seeds_held(&tablet, &notes), 0);
+}
+
+/// A channel made by a device that had not read the removal is not clean
+/// on the person's devices, and the removed device's database holds no
+/// seed of it (decision 2026-10-24 (removal), rule 25, amended 13
+/// November): Alice's laptop, desktop, phone and tablet. The phone is
+/// stopped, and the desktop removes the tablet. The relay is then stopped,
+/// and the phone, started with no relay to reach, makes "late" under
+/// change 1, so it writes no entry `made/`. Once the relay is back, the
+/// phone applies the removal and carries its list. The desktop and the
+/// phone hold "late" not clean, and send nothing there.
+#[test]
+fn a_channel_made_by_a_device_that_had_not_read_the_removal_is_not_clean() {
+    let mut relay = relay_started();
+    let laptop = device_started_with_its_relays_key("laptop", &relay);
+    let words = makes_a_phrase(&laptop, "laptop");
+    sync_on(&laptop);
+    let desktop = device_started_with_its_relays_key("desktop", &relay);
+    let mut phone = device_started_with_its_relays_key("phone", &relay);
+    let tablet = device_started_with_its_relays_key("tablet", &relay);
+    let all = [&relay, &laptop, &desktop, &phone, &tablet];
+    for (device, label) in [
+        (&desktop, "desktop"),
+        (&phone, "phone"),
+        (&tablet, "tablet"),
+    ] {
+        adds(&laptop, device, label);
+        has_applied(device, 1, &all);
+        sync_on(device);
+    }
+    phone.stop();
+    let mut at = desktop.at_terminal(&["remove-device", &key_of(&tablet)]);
+    at.says("Type `list` to list this machine").types("list");
+    at.says("Type `stays` or `removed`").types("stays");
+    at.says("Make this change?")
+        .says("Type yes to go on")
+        .types("yes");
+    at.says(ASKS_THE_PHRASE).types(&words);
+    at.says("The change is made (change 2)");
+    drop(at);
+    let after = [&relay, &laptop, &desktop];
+    has_applied(&laptop, 2, &after);
+    wait_for("the tablet is removed", &[&relay, &tablet], 90, || {
+        (person_of(&tablet)["state"] == "removed").then_some(())
+    });
+
+    relay.stop();
+    phone.start();
+    wait_for("phone healthy", &[&phone], 30, || healthy(&phone));
+    assert_eq!(
+        person_of(&phone)["change"],
+        1,
+        "it has not read the removal"
+    );
+    // A card names only a relay the node has said it is set up with,
+    // which its pass says just after a start.
+    wait_for("the phone makes \"late\"", &[&phone], 60, || {
+        let mut at = phone.at_terminal(&["shared", "new", "late"]);
+        let asks = ["This makes \"late\" at ", "None of your relays is set up"];
+        if at.says_one_of(&asks) == 1 {
+            return None;
+        }
+        at.says("Type yes to go on").types("yes");
+        at.done().contains("Made \"late\": channel ").then_some(())
+    });
+    let late = id_filed(&phone, "late").unwrap();
+    relay.start();
+    let after = [&relay, &laptop, &desktop, &phone];
+    wait_for("relay healthy again", &after, 30, || healthy(&relay));
+    has_applied(&phone, 2, &after);
+    holds_in_the_end(&after, &desktop, "late");
+    let not_clean = "\"late\" has not been reset on this device since you removed a device, \
+                     so this device sends nothing there until you reset it";
+    for device in [&desktop, &phone] {
+        let dir = maps_folder(device, "repo", AGENT);
+        if device.name == "desktop" {
+            subscribes(device, &dir, "late");
+        }
+        let refused = send_comes_to(&after, device, &dir, "late", "not clean")
+            .unwrap_or_else(|| panic!("{} sent in a channel not clean", device.name));
+        assert!(refused.contains(not_clean), "{}: {refused}", device.name);
+    }
+    assert_eq!(seeds_held(&tablet, &late), 0);
+}

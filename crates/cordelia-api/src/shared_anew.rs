@@ -542,7 +542,25 @@ pub(crate) fn removal_applied(
             st(rows::not_clean(conn, &row.channel, now, false))?;
         }
     }
+    // What it kept of the channels it first held goes: the test of a
+    // channel made clears no mark set now (decision 2026-10-24 (removal),
+    // rule 25, amended 13 November).
+    crate::shared::forget_first_held(conn)?;
     note_removal(conn, removed, now)
+}
+
+/// This device's change stops being clear, at `now`, where it moves or
+/// closes because a key it knows to be removed holds its secret (decision
+/// 2026-10-24 (removal), rules 3 and 25, amended 13 November): every shared
+/// channel it holds is not clean, as at a removal, since that key reads the
+/// lists of the change. A mark kept already stays as it is.
+pub(crate) fn change_not_clear(conn: &Connection, now: i64) -> Result<(), PersonError> {
+    for row in st(kept::channels(conn))? {
+        if matches!(row.state, State::Held | State::NotInForce) {
+            st(rows::not_clean_where_clean(conn, &row.channel, now))?;
+        }
+    }
+    Ok(())
 }
 
 /// The latest removal or recovery that marked channels not clean: when,
@@ -988,6 +1006,10 @@ pub(crate) fn recovered(conn: &Connection, gone: &[[u8; 32]], now: i64) -> Resul
             st(rows::not_clean(conn, &row.channel, now, true))?;
         }
     }
+    // What it kept of the channels it first held goes: the test of a
+    // channel made clears no mark set now (decision 2026-10-24 (removal),
+    // rule 25, amended 13 November).
+    crate::shared::forget_first_held(conn)?;
     note_removal(conn, gone, now)
 }
 

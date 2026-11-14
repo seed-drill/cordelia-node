@@ -87,7 +87,7 @@ use zeroize::{Zeroize, Zeroizing};
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
     MAX_CHANGE_HEADS, MAX_COUNTED_DEVICES, MAX_NOT_COUNTED_RECORDS, PERSONAL_ADDED_PREFIX,
-    PERSONAL_APPLIED_PREFIX, PERSONAL_APPLIED_SENT, PERSONAL_REACHED_PREFIX,
+    PERSONAL_APPLIED_PREFIX, PERSONAL_APPLIED_SENT, PERSONAL_MADE_PREFIX, PERSONAL_REACHED_PREFIX,
     RECOVERY_MAX_LEFT_SECRETS,
 };
 use cordelia_core::revision::{band, lifted};
@@ -1703,6 +1703,11 @@ fn move_or_close(
     now: i64,
 ) -> Result<Shown, PersonError> {
     let held = held(conn)?.ok_or(PersonError::FollowsNoPhrase)?;
+    // Its change is not clear: a removed key reads the lists of that
+    // change, so every shared channel it holds is not clean, whether it
+    // moves or closes (decision 2026-10-24 (removal), rule 25, amended 13
+    // November).
+    crate::shared_anew::change_not_clear(conn, now)?;
     if MOVES_HELD_BACK.get() {
         close(conn)?;
         return Ok(Shown::Closed);
@@ -2093,13 +2098,15 @@ fn close(conn: &Connection) -> Result<(), PersonError> {
 /// change refused at `cordelia accept`. Both commit at once, closed; the
 /// move of rule 9 waits for the sync cycle's turn (rule 5), and the node
 /// makes it at its next pass ([`move_to_a_clear_change`]). Says whether it
-/// closed.
-pub(crate) fn close_if_not_clear(conn: &Connection) -> Result<bool, PersonError> {
+/// closed. Every shared channel it holds is then not clean, from `now`
+/// (decision 2026-10-24 (removal), rule 25, amended 13 November).
+pub(crate) fn close_if_not_clear(conn: &Connection, now: i64) -> Result<bool, PersonError> {
     let applied = held_rows::person(conn)?.is_some_and(|person| person.state == State::Applied);
     if !applied || follows_a_clear_change(conn)? {
         return Ok(false);
     }
     close(conn)?;
+    crate::shared_anew::change_not_clear(conn, now)?;
     Ok(true)
 }
 
@@ -2146,7 +2153,7 @@ pub fn know_what_is_shown(
             return Ok(false);
         }
         know_removed_if_signed(conn, identity, statement, Some(&entry.content), now)?;
-        close_if_not_clear(conn)
+        close_if_not_clear(conn, now)
     })
 }
 
@@ -3479,13 +3486,16 @@ fn carried_entry_at(
 /// Whether an entry of this device's own in the personal channel is
 /// carried: it is neither a record of an addition, nor a word that a
 /// statement is applied, nor its carried word or that word's delete
-/// (decision 2026-10-19 §4, rule 4). The next statement's own list is
-/// what stands, and the device writes its own words under the next
-/// statement.
+/// (decision 2026-10-19 §4, rule 4), nor the entry that it made a shared
+/// channel under the change it leaves (decision 2026-10-24 (removal), rule
+/// 25, amended 13 November), which ends at the next change. The next
+/// statement's own list is what stands, and the device writes its own
+/// words under the next statement.
 fn is_its_word_to_carry(version: &Version) -> bool {
     !version.name.starts_with(PERSONAL_ADDED_PREFIX)
         && !version.name.starts_with(PERSONAL_APPLIED_PREFIX)
         && !version.name.starts_with(PERSONAL_REACHED_PREFIX)
+        && !version.name.starts_with(PERSONAL_MADE_PREFIX)
 }
 
 /// The device writes, in the personal channel of the generation it has
