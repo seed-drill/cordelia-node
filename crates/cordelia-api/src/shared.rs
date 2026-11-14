@@ -514,7 +514,7 @@ fn follow_the_lists(conn: &Connection, own: &[u8; 32], now: i64) -> Result<(), P
         ),
         None => (false, None),
     };
-    let kept_before = first_held_kept(conn)?;
+    let kept_before = first_held_kept(conn, now)?;
     let mut first_held = kept_before.clone();
     for (act, _) in &holds.filings {
         let filing = &act.item;
@@ -705,7 +705,7 @@ pub(crate) fn write_made(
     };
     let entry = Entry::seal(&personal, identity, rev, &inside)?.check()?;
     entries::store(conn, &entry, now)?;
-    let mut first_held = first_held_kept(conn)?;
+    let mut first_held = first_held_kept(conn, now)?;
     first_held.retain(|kept| kept.channel != hex::encode(channel));
     first_held.push(FirstHeld::of(channel, &link, true));
     keep_first_held(conn, &first_held)
@@ -784,10 +784,29 @@ impl FirstHeld {
     }
 }
 
-fn first_held_kept(conn: &Connection) -> Result<Vec<FirstHeld>, PersonError> {
-    Ok(meta::get(conn, meta::SHARED_FIRST_HELD)?
-        .and_then(|kept| serde_json::from_str(&kept).ok())
-        .unwrap_or_default())
+/// What is kept of the channels first held after a removal. Where it
+/// cannot be read, a channel held clean would lose its record, and so its
+/// mark once the filing in force of it is no longer one made: so every
+/// channel this device holds is marked not clean, as a removal does, and
+/// what was kept goes (decision 2026-10-24 (removal), rule 25, amended 13
+/// November).
+fn first_held_kept(conn: &Connection, now: i64) -> Result<Vec<FirstHeld>, PersonError> {
+    let Some(kept) = meta::get(conn, meta::SHARED_FIRST_HELD)? else {
+        return Ok(Vec::new());
+    };
+    match serde_json::from_str(&kept) {
+        Ok(kept) => Ok(kept),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "the record of the shared channels first held after a removal \
+                 cannot be read: every channel held is marked not clean"
+            );
+            crate::shared_anew::change_not_clear(conn, now)?;
+            meta::remove(conn, meta::SHARED_FIRST_HELD)?;
+            Ok(Vec::new())
+        }
+    }
 }
 
 fn keep_first_held(conn: &Connection, kept: &[FirstHeld]) -> Result<(), PersonError> {

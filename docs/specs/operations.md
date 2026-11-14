@@ -592,9 +592,10 @@ System channels (prefixed `__`) are hidden by default. Use `--all` to include th
 > `--json` gives the same for tools: `storage_max_bytes`, and under
 > `entries` `storage_used_bytes` and `storage_max_bytes` with
 > `channels_held`, `entries_stored` and `content_bytes_stored`. The room of
-> the older kind is gone with it, and so is the `storage_used_bytes` at the
-> top of `--json`, which counted that room (decision 2026-11-10 (older
-> kind), rule 3).
+> the older kind is gone with it (decision 2026-11-10 (older kind), rule 3).
+> The `storage_used_bytes` at the top of `--json`, which counted that room,
+> was gone in alpha.20, and is back from alpha.21 as the same figure as
+> under `entries`, for the tools that read it there.
 
 ```
 $ cordelia stats
