@@ -3657,6 +3657,9 @@ fn cmd_stats(config_path: &str, json: bool) -> anyhow::Result<()> {
             },
         });
         if let Some(held) = &of_entries {
+            // At the top too, for the tools that read it there before the
+            // older kind went: the same as under `entries`.
+            out["storage_used_bytes"] = serde_json::json!(held.used);
             out["entries"] = serde_json::json!({
                 "storage_used_bytes": held.used,
                 "storage_max_bytes": cap,

@@ -983,6 +983,12 @@ async fn a_relay_near_its_cap_takes_no_new_channel_and_drops_nothing() {
         }),
         "{stats}"
     );
+    // At the top too, the same, for the tools that read it there.
+    assert_eq!(
+        stats["storage_used_bytes"],
+        serde_json::json!(3 * SMALL),
+        "{stats}"
+    );
     // And it counts its entries as a device does, and its channels as
     // those it holds (decision 2026-11-10 (older kind), rule 3).
     assert_eq!(
