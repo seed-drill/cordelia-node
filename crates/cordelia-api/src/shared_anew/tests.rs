@@ -4497,6 +4497,31 @@ fn the_maker_marks_a_channel_it_made_once_its_filing_is_no_longer_made() {
     assert!(!writes_there(&s[0].conn, &s[0].identity, &laptop).unwrap());
 }
 
+/// A record of the channels first held that cannot be read marks every
+/// channel held not clean, as a removal does, so a channel held clean does
+/// not lose its mark to come (rule 25, amended 13 November): the laptop
+/// makes "notes" after the removal and holds it clean; its record is then
+/// spoilt, and at its next read of the lists "notes" is not clean there.
+#[test]
+fn an_unreadable_record_of_the_channels_first_held_marks_them_not_clean() {
+    let mut s = bob(4);
+    let now = the_desktop_removed_the_tablet_with_the_phone_off(&mut s);
+    let notes = made_new(&s, 0, "notes", now);
+    crate::lists::follow(&s[0].conn, &s[0].identity, now).unwrap();
+    out(&s, 0, now);
+    assert!(!is_not_clean(&s[0].conn, &notes.id).unwrap(), "made here");
+    cordelia_storage::meta::set(&s[0].conn, cordelia_storage::meta::SHARED_FIRST_HELD, "[{")
+        .unwrap();
+    crate::lists::follow(&s[0].conn, &s[0].identity, now + 1).unwrap();
+    assert!(is_not_clean(&s[0].conn, &notes.id).unwrap(), "unreadable");
+    let laptop = row(&s, 0, &notes);
+    assert!(!writes_there(&s[0].conn, &s[0].identity, &laptop).unwrap());
+    assert_eq!(
+        cordelia_storage::meta::get(&s[0].conn, cordelia_storage::meta::SHARED_FIRST_HELD).unwrap(),
+        None
+    );
+}
+
 /// An act of the removed key's taken inside the removal's margin counts
 /// for nothing, and the channel it filed, held later by a rename from a
 /// device that took the act earlier, is not clean (rule 25, amended 13
