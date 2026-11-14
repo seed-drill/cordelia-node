@@ -955,9 +955,10 @@ pub fn running(f: &mut Facts, live: &serde_json::Value) {
 /// channels the person has not made anew, with since when; **and each line
 /// of `repositories` that is amber,** the joining record's ambers, by the
 /// person's ruling of 6 November (decision 2026-11-06 (joining), rule 6).
-/// Nothing else of the object is read: nothing else a shared channel
-/// holds, waits for or is refused sets a level, appears among the holds,
-/// or changes the line.
+/// Nothing else of the object is read here: nothing else a shared channel
+/// holds, waits for or is refused sets a level or appears among the
+/// holds. The line's count of messages unread by a person is read apart
+/// ([`unread_shared_says`]) and is in no fact.
 pub fn shared(devices: &mut Devices, shared: &serde_json::Value, now: i64) {
     devices.repository_ambers = shared["repositories"]
         .as_array()
@@ -1202,6 +1203,45 @@ fn of_its_folders(f: &Facts) -> (State, String) {
 /// The mark of amber: the line's, and that of each amber line the plain
 /// status says of a repository followed.
 pub const AMBER_MARK: &str = "◆";
+
+/// The mark of messages that wait for a person in shared channels.
+pub const UNREAD_MARK: &str = "✉";
+
+/// What the line adds of the shared channels: the messages that wait for
+/// a person to read them, from `unread_by_a_person` of each of the
+/// status's `shared.channels` (the person's ruling of 13 November, which
+/// overturns decision 2026-10-09 §8, C13, and decision 2026-10-10 §9,
+/// property 16, for these alone). One channel is named; more are counted.
+/// `None` where nothing waits. It sets no level, is no hold, and is not
+/// in `summary`: only `--line` shows it ([`with_unread`]).
+pub fn unread_shared_says(shared: &serde_json::Value) -> Option<String> {
+    let waiting: Vec<(&str, u64)> = shared["channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|channel| {
+            let n = channel["unread_by_a_person"].as_u64()?;
+            (n > 0).then_some((channel["name"].as_str()?, n))
+        })
+        .collect();
+    let total: u64 = waiting.iter().map(|(_, n)| n).sum();
+    match waiting.as_slice() {
+        [] => None,
+        [(name, n)] => Some(format!("{UNREAD_MARK} {n} in {name}")),
+        more => Some(format!(
+            "{UNREAD_MARK} {total} in {} shared channels",
+            more.len()
+        )),
+    }
+}
+
+/// The line's summary, with what waits unread in shared channels after it.
+pub fn with_unread(summary: &str, unread: Option<&str>) -> String {
+    match unread {
+        Some(unread) => format!("{summary} · {unread}"),
+        None => summary.to_string(),
+    }
+}
 
 /// One line for a status bar: a mark and the summary, coloured unless
 /// `color` is false. Empty when there is nothing to show.
@@ -3629,16 +3669,18 @@ mod tests {
         })
     }
 
-    /// Nothing shared holds a level or changes the line but two facts
-    /// (decision 2026-10-10 §9, property 16, §13 item 16, as the person
-    /// ruled on 6 November for the ambers of decision 2026-11-06
-    /// (joining), rule 6): with every field of the `shared` object at its
+    /// Nothing shared holds a level but two facts, and the line adds only
+    /// what waits unread (decision 2026-10-10 §9, property 16, §13 item
+    /// 16, as the person ruled on 6 November for the ambers of decision
+    /// 2026-11-06 (joining), rule 6, and on 13 November for messages
+    /// unread by a person): with every field of the `shared` object at its
     /// worst, no removed device, and no repository's line amber, the facts,
-    /// `holds`, `derive`, the line and the bar are as without it, for a
-    /// device that is synced, one that waits, one with no relay, and one
-    /// with sync off.
+    /// `holds`, `derive`, the summary and the bar are as without it, and
+    /// the line is as without it but for the count after it, for a device
+    /// that is synced, one that waits, one with no relay, and one with
+    /// sync off.
     #[test]
-    fn nothing_shared_holds_a_level_or_changes_the_line() {
+    fn nothing_shared_holds_a_level_and_the_line_adds_only_what_waits_unread() {
         let now = 2_000_000_000;
         let worst = shared_at_its_worst(serde_json::json!([]));
         for edit in [
@@ -3657,13 +3699,68 @@ mod tests {
                     super::shared(&mut f.devices, shared, now);
                 }
                 let shown = shown(&f);
-                let line = line(shown.state, shown.level, &shown.summary, false);
+                // As `cordelia status --line` makes it.
+                let unread = shared.and_then(unread_shared_says);
+                let summary = with_unread(&shown.summary, unread.as_deref());
+                let line = line(shown.state, shown.level, &summary, false);
                 let bar = bar(shown.state, shown.level, &shown.summary, &[]);
                 (format!("{f:?}"), derive(&f), holds(&f), shown, line, bar)
             };
-            assert_eq!(seen(Some(&worst)), seen(None));
-            assert_eq!(seen(Some(&serde_json::Value::Null)), seen(None));
+            let (facts, state, holds, shown, line, bar) = seen(Some(&worst));
+            let without = seen(None);
+            assert_eq!(
+                (&facts, &state, &holds, &shown, &bar),
+                (&without.0, &without.1, &without.2, &without.3, &without.5)
+            );
+            assert_eq!(
+                line,
+                format!("{} · ✉ 16000 in 16 shared channels", without.4)
+            );
+            assert_eq!(seen(Some(&serde_json::Value::Null)), without);
         }
+    }
+
+    /// What waits for a person in shared channels is said after the
+    /// summary, whatever the level (the person's ruling of 13 November):
+    /// one channel by its name, more by a count; a channel with nothing
+    /// unread, or without a name or a count, adds nothing.
+    #[test]
+    fn the_line_says_what_waits_unread_in_shared_channels() {
+        let of = |channels: serde_json::Value| {
+            unread_shared_says(&serde_json::json!({ "channels": channels }))
+        };
+        let channel =
+            |name: &str, n: u64| serde_json::json!({ "name": name, "unread_by_a_person": n });
+        assert_eq!(unread_shared_says(&serde_json::Value::Null), None);
+        assert_eq!(of(serde_json::json!([])), None);
+        assert_eq!(of(serde_json::json!([channel("owner/repo", 0)])), None);
+        assert_eq!(
+            of(serde_json::json!([{ "unread_by_a_person": 2 }, { "name": "x" }])),
+            None
+        );
+        assert_eq!(
+            of(serde_json::json!([
+                channel("owner/repo", 2),
+                channel("other", 0)
+            ]))
+            .as_deref(),
+            Some("✉ 2 in owner/repo")
+        );
+        assert_eq!(
+            of(serde_json::json!([
+                channel("owner/repo", 1),
+                channel("other", 3)
+            ]))
+            .as_deref(),
+            Some("✉ 4 in 2 shared channels")
+        );
+        let says = with_unread("memory synced", Some("✉ 1 in owner/repo"));
+        assert_eq!(says, "memory synced · ✉ 1 in owner/repo");
+        assert_eq!(with_unread("memory synced", None), "memory synced");
+        assert_eq!(
+            line(State::Synced, Some(Level::Red), &says, false),
+            "▲ memory synced · ✉ 1 in owner/repo"
+        );
     }
 
     /// Each amber line of a repository this device follows is a hold of its

@@ -1,7 +1,7 @@
 # Decision: messages between your own agents
 
 **Date**: 2026-10-09
-**Status**: Built. It adds to [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) and replaces nothing in it.
+**Status**: Built. It adds to [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) and replaces nothing in it. C13 is overturned in part by the person's ruling of 13 November, for messages in shared channels unread by a person (§8).
 **Cited as**: code comments cite the sections of this record ("decision 2026-10-09 §2.2"), and the numbered properties ("§1, property 4"). The numbers do not change.
 
 Words used throughout:
@@ -634,7 +634,9 @@ And two things beside the level:
 
 So `level`, `summary`, `holds`, the line (`indicator::line`), the bar (`indicator::bar`), `state` and what `cordelia devices` says of each relay are the same with a thousand unread messages, or a messages channel that a relay refuses, as with none. `--line` and `--waybar` say nothing of messages. What waits or was refused for messages is said in the `messages` object and by `log`. (One exception since: pairs held for their person set an amber hold, last of every hold, decision 2026-10-25, rule 4.)
 
-**Why not on the line.** The line says how sync stands, and shows the gravest thing that holds. A message is not a state of sync, and a person is not to be told that something is wrong because an agent wrote to another. A panel that wants a count reads it from `--json`.
+**Overturned in part by %s** (cordelia-node#352): `cordelia status --line` adds, after the summary, the messages in shared channels that wait for a person to read them: `● memory synced · ✉ 2 in owner/repo` for one channel, `✉ 4 in 2 shared channels` for more (`indicator::unread_shared_says`, from `unread_by_a_person` of each of the status's `shared.channels`). It sets no level, is no hold, and changes no `summary`, `holds`, `state` or bar. The person is told while not typing that something waits; the agent is told by `msg summary` at its next prompt.
+
+**Why not on the line.** The line says how sync stands, and shows the gravest thing that holds. A message is not a state of sync, and a person is not to be told that something is wrong because an agent wrote to another. A panel that wants a count reads it from `--json`. **Why a count of shared messages is on it after all** (the person's ruling of 13 November): another person's agent writes to be read by a person, and the line is the one place a person looks while not typing. A count after the summary says that something waits, not that something is wrong, so the level stays as it was.
 
 ## 9. Removal, renewal, recovery and the upgrade
 
