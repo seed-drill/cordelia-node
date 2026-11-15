@@ -1820,6 +1820,11 @@ fn cmd_status(
 
     if line {
         let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+        let unread = status
+            .live
+            .as_ref()
+            .and_then(|live| indicator::unread_shared_says(&live["shared"]));
+        let summary = indicator::with_unread(&summary, unread.as_deref());
         let text = indicator::line(state, level, &summary, color);
         if !text.is_empty() {
             println!("{text}");

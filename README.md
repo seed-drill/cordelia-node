@@ -189,7 +189,9 @@ the rest. For Claude Code's status line, add this to
 It shows `● memory synced`, `◐ memory sending 3` or `○ memory offline`. Red
 (`▲`) is for what you should act on now, as in `▲ memory: 1 conflict`.
 Amber (`◆`) is for what you should know, as in `◆ memory: 1 device added,
-not yet cleared`.
+not yet cleared`. Messages that wait for you in a shared channel are counted
+after it, as in `● memory synced · ✉ 2 in owner/repo`; read them with
+`cordelia msg log`.
 
 - **On [Omarchy](https://omarchy.org):** the
   [Cordelia panel](https://github.com/seed-drill/omarchy-cordelia) puts an
