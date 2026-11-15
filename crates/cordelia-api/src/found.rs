@@ -2018,17 +2018,20 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pid_file = tmp.path().join("pid");
         // TERM ignored, and a child that holds git's output open after git
-        // itself has ended.
+        // itself has ended. Git waits until the child has written its pid,
+        // so that a slow machine cannot kill the child before it does.
         let mut git = script(
             tmp.path(),
-            "trap '' TERM\nsh -c 'trap \"\" TERM; echo $$ > \"$PID_FILE\"; exec sleep 30' &\n\
+            "trap '' TERM\nsh -c 'trap \"\" TERM; echo $$ > \"$PID_FILE.tmp\"; \
+             mv \"$PID_FILE.tmp\" \"$PID_FILE\"; exec sleep 30' &\n\
+             while [ ! -s \"$PID_FILE\" ]; do sleep 0.01; done\n\
              echo started",
         );
         git.env("PID_FILE", &pid_file);
         let began = Instant::now();
         let ran = git_run_by(
             &mut git,
-            began + Duration::from_secs(1),
+            began + Duration::from_secs(3),
             bounds(64, 64, 300),
         );
         assert!(matches!(ran, GitRan::Late));
