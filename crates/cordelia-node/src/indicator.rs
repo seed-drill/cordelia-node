@@ -1209,7 +1209,7 @@ pub const UNREAD_MARK: &str = "✉";
 
 /// What the line adds of the shared channels: the messages that wait for
 /// a person to read them, from `unread_by_a_person` of each of the
-/// status's `shared.channels` (the person's ruling of 13 November, which
+/// status's `shared.channels` (the person's ruling of 15 November, which
 /// overturns decision 2026-10-09 §8, C13, and decision 2026-10-10 §9,
 /// property 16, for these alone). One channel is named; more are counted.
 /// `None` where nothing waits. It sets no level, is no hold, and is not
@@ -3672,7 +3672,7 @@ mod tests {
     /// Nothing shared holds a level but two facts, and the line adds only
     /// what waits unread (decision 2026-10-10 §9, property 16, §13 item
     /// 16, as the person ruled on 6 November for the ambers of decision
-    /// 2026-11-06 (joining), rule 6, and on 13 November for messages
+    /// 2026-11-06 (joining), rule 6, and on 15 November for messages
     /// unread by a person): with every field of the `shared` object at its
     /// worst, no removed device, and no repository's line amber, the facts,
     /// `holds`, `derive`, the summary and the bar are as without it, and
@@ -3721,7 +3721,7 @@ mod tests {
     }
 
     /// What waits for a person in shared channels is said after the
-    /// summary, whatever the level (the person's ruling of 13 November):
+    /// summary, whatever the level (the person's ruling of 15 November):
     /// one channel by its name, more by a count; a channel with nothing
     /// unread, or without a name or a count, adds nothing.
     #[test]
