@@ -45,10 +45,6 @@ use crate::marks::{HeldList, PersonList, may_write};
 use crate::person::{Counting, PersonError, in_one, who_counts};
 use crate::sender::Refused;
 
-/// The safe side where a list may have gone back (rule 2): a bound at or
-/// below it is kept.
-const USUAL: u8 = AGENT_MESSAGE_PAIR_UNREAD_MAX as u8;
-
 /// The usual hold of this device, as the node set it from `[messages]
 /// hold` when it started ([`set_usual`]): 0 where it has not.
 static USUAL_HOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -326,8 +322,8 @@ fn list_written(
 /// that list again so fewer than three times in a row, as
 /// [`HeldList::write`] writes again: the device then drops those of its
 /// own bounds set before this start that allow more than the usual hold
-/// (`any`, or a number above 10), which may be ones its later life ended,
-/// and keeps a 10 or a lower number, the safe side either way; and it
+/// (`any`, or a number above it), which may be ones its later life ended,
+/// and keeps the usual or a lower number, the safe side either way; and it
 /// writes its list above that revision.
 pub(crate) fn answered_another(
     conn: &Connection,
@@ -352,9 +348,9 @@ pub(crate) fn answered_another(
 }
 
 /// Whether `row` allows more to wait than the usual hold: `any`, or a
-/// number above 10 (decision 2026-10-25, rule 2).
+/// number above it (decision 2026-10-25, rule 2).
 fn allows_more_than_usual(row: &BoundRow) -> bool {
-    row.bound.is_none_or(|bound| bound > USUAL)
+    row.bound.is_none_or(|bound| u64::from(bound) > usual())
 }
 
 /// The reader took `list`, the list of bounds of the device whose key is

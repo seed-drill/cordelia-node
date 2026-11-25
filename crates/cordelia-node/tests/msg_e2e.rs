@@ -3846,8 +3846,10 @@ fn a_bound_set_on_the_desktop_holds_on_both() {
         assert!(!said.status.success(), "{}", out(&said));
         (err(&said) == format!("{}\n", held_at("work", "notes", 20, 10))).then_some(())
     });
-    // The pair, held at 10, is said.
+    // No bound is said now, as 10 is the usual hold here; the pair, held
+    // at 10, is.
     let status = two.laptop.cli(&["status"]);
+    assert!(!status.contains("  Messages:  between "), "{status}");
     assert!(
         status.contains("agents wait for you to read their messages; run cordelia msg log"),
         "{status}"

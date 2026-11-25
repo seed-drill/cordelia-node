@@ -25,7 +25,7 @@
 //! marker; anywhere else, and with `-v`, inside `read`'s frame.
 //!
 //! **`allow` is for a person too** ([`allow`]): only at a terminal, it
-//! sets a bound for a pair in place of the usual hold of ten, after a yes
+//! sets a bound for a pair in place of the usual hold, after a yes
 //! (decision 2026-10-25, rule 2). A pseudo-terminal passes that test, and
 //! the node's route takes it from whoever holds the token: the hold relies
 //! on agents keeping to "stop here" (rule 5).
@@ -2295,8 +2295,8 @@ pub struct AllowAsked {
 /// first that applies refusing (decision 2026-10-25, rule 2, refusals 1 to
 /// 3): two names, or one and `--all`, then a number from 1 to 64 or `any`;
 /// and `--for` as `--since` takes a while, from a minute to 7 days, or 8
-/// hours where none is given. A 10 is the usual hold: a `--for` given
-/// with it is not used, and not read.
+/// hours where none is given. A 10 is a bound as any other (the owner's
+/// ruling of 24 November 2026).
 pub fn allow_asked(args: &AllowArgs) -> Result<AllowAsked, String> {
     use cordelia_core::protocol::{
         AGENT_MESSAGE_PAIR_BOUND_MAX_SECS, AGENT_MESSAGE_PAIR_BOUND_MIN_SECS,
@@ -2325,9 +2325,6 @@ pub fn allow_asked(args: &AllowArgs) -> Result<AllowAsked, String> {
     };
     let for_secs = match &args.for_time {
         None => AGENT_MESSAGE_PAIR_BOUND_SECS,
-        // A 10 is the usual hold, which takes no `--for`: one given is not
-        // used, and not read.
-        Some(_) if bound == Some(10) => AGENT_MESSAGE_PAIR_BOUND_SECS,
         Some(time) => {
             let secs = time
                 .char_indices()
@@ -2545,7 +2542,8 @@ pub fn status_bound_lines(messages: &Value, now: i64) -> Vec<String> {
         let Some(until) = until.filter(|until| *until > now) else {
             continue;
         };
-        if bound["bound"].as_u64() == Some(10) {
+        // A bound at the usual hold says nothing more than the usual.
+        if bound["bound"].as_u64().is_some() && bound["bound"] == messages["hold"] {
             continue;
         }
         let pair = pair_said(bound);
@@ -4916,15 +4914,13 @@ mod tests {
                 for_secs: 3_600,
             })
         );
-        // A 10 with --for is the usual hold: the node sets it for 7 days,
-        // and the time given is not used, nor read.
-        for time in ["1h", "8d", "0m", "soon"] {
-            assert_eq!(
-                asked(&["notes", "work", "10"], false, Some(time)).map(|a| a.bound),
-                Ok(Some(10)),
-                "{time}"
-            );
-        }
+        // A 10 is a bound as any other, and its --for is read (the owner's
+        // ruling of 24 November 2026).
+        assert_eq!(
+            asked(&["notes", "work", "10"], false, Some("1h")).map(|a| a.for_secs),
+            Ok(3_600)
+        );
+        assert!(asked(&["notes", "work", "10"], false, Some("8d")).is_err());
         let ten = json!({ "a": "notes", "b": "work", "bound": 10, "waiting": 3,
                           "until": 1_800_000_000 + 3_600, "in_force": null, "set": false,
                           "usual": 10 });

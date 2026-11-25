@@ -115,7 +115,7 @@ cordelia msg allow <a> --all (<n> | any) [--for <time>]
 
 - `<n>` is 1 to 64 (`AGENT_MESSAGE_RING`, one lap of a device's ring: above it, a bound stops no loop between two agents of one device, and `any` says no hold plainly). `any` is no hold.
 - `--for` takes what `--since` takes (30m, 8h, 2d), from 1 minute to 7 days (`AGENT_MESSAGE_PAIR_BOUND_MAX_SECS`). Where it is not given, 8 hours (`AGENT_MESSAGE_PAIR_BOUND_SECS`).
-- **10 is the usual hold:** `allow <a> <b> 10` goes back to it now. It takes no `--for`: one given is not used.
+- **A 10 is a bound as any other** (amended 24 November 2026): it takes a `--for` as any number does.
 - Each name must be one that the personal channel lists, as for `send --to`.
 - In `cordelia msg --help` its line begins "For a person at a terminal:".
 
@@ -129,7 +129,7 @@ For `<k>` of 1, "1 message waits for you to read it."; for 0, "no message waits 
 
 `<now>` is one of:
 
-- "Sending stops at 10, the usual hold."
+- "Sending stops at `<usual>`, the usual hold."
 - "Sending stops at `<m>` until `<when>`, as you set on `<device>`."
 - "Only the hourly limits stop sending until `<when>`, as you set on `<device>`."
 
@@ -172,7 +172,7 @@ After a yes: "Done. `<Pair>`, sending stops at `<n>` until `<when>`. Your other 
 
 **Tests.**
 
-- Units (`msg_cmd.rs`): `allow_is_refused_away_from_a_terminal` (input a pipe; output a pipe), and asks the node nothing; `allow_takes_a_number_any_and_a_time` (0, 65, `none`, `0m` and `8d` refused; 10 with `--for` is the usual hold); every line above, word for word, `--all`'s among them.
+- Units (`msg_cmd.rs`): `allow_is_refused_away_from_a_terminal` (input a pipe; output a pipe), and asks the node nothing; `allow_takes_a_number_any_and_a_time` (0, 65, `none`, `0m` and `8d` refused; 10 with `--for` takes it, as any number (amended 24 November 2026)); every line above, word for word, `--all`'s among them.
 - Units (`messages.rs`): `the_look_says_the_count_and_the_bound_in_force`; `the_allow_route_refuses_what_the_command_refuses` (a bound of 0 or 65, a `for_secs` of 59 or 604,801, a name no device syncs); `allow_is_refused_before_the_first_fetch_and_with_sync_off`; `a_full_list_of_bounds_refuses_a_new_pair_and_takes_one_it_holds`; `a_bound_is_listed_and_taken_by_another_device`; `a_list_of_bounds_that_is_not_one_is_no_list`, one case for each check above, and that it drops that key's bounds, where a form it does not know keeps them; `a_restored_store_takes_its_own_later_bounds`; `a_restored_store_that_reaches_its_later_list_late_keeps_both_lives_last_acts` (the review's two cases: a relay that answers another, and one that answers that it holds a later list).
 - Real processes (`msg_e2e.rs`): `a_bound_set_on_the_desktop_holds_on_both`. Two agents, X on the laptop and Y on the desktop, answer each other until the pair is held at 10 on both. At the desktop's terminal (`AtTerminal`), `cordelia msg allow X Y 20 --for 1h`, and yes. Once the laptop holds the list, they answer each other again until the pair counts 20 on both devices (each sends five more, so neither folder nears its 20 an hour), and the next send is refused with `pair_held` and rule 4's line naming 20. `cordelia status` on the laptop says rule 4's line, with "you set it on "desktop"". Then `cordelia msg allow X Y 10` on the laptop, and both hold at 10 again. And `allow_into_a_pipe_sets_nothing`: with its output a pipe, nothing is set and the pair stays held.
 
@@ -219,7 +219,7 @@ For `<k>` of 1: "1 message between `<from>` and `<to>` waits for your user to re
 
 `<n>` is the bound in force (rule 3), and `<k>` the count, which can be above it where a bound was lowered or messages came from another device. The node's refusal carries both, as `bound` and `waiting`. The line does not name `cordelia msg allow`: that is for you, and not for an agent.
 
-**To you**, in `cordelia status`, under `Node:` after `Devices:`, one line for each pair whose bound in force is not the usual hold (a listed 10 is the usual hold):
+**To you**, in `cordelia status`, under `Node:` after `Devices:`, one line for each pair whose bound in force is not the usual hold (a bound at the usual hold is not said):
 
 > `  Messages:  <pair>, sending stops at <n> until <when> (you set it on <device>)`
 
@@ -231,7 +231,7 @@ For `<k>` of 1: "1 message between `<from>` and `<to>` waits for your user to re
 
 **What is stored, and what travels:** nothing more; it is worked out from rules 1 to 3. **Beside the version before:** the command and the node of one version only work together (the record of 2026-10-04, 10.1, rule 6), and a device of the version before says its own line with "Ten".
 
-**Tests.** Units: `msg_cmd.rs`, `the_held_line_names_the_bound_and_the_count` (10 of 10, 12 of 5, 1 of 1, and the line for every agent, each word for word); `main.rs`, `the_status_says_each_bound_in_force` (a number, `any`, every agent, this device and a label; nothing for the usual hold, a listed 10, or one that has ended); `messages.rs`, `the_status_object_carries_the_bounds`. Real processes: rule 2's test asserts the refusal's line and the status's line.
+**Tests.** Units: `msg_cmd.rs`, `the_held_line_names_the_bound_and_the_count` (10 of 10, 12 of 5, 1 of 1, and the line for every agent, each word for word); `main.rs`, `the_status_says_each_bound_in_force` (a number, `any`, every agent, this device and a label; nothing for the usual hold, a bound at it, or one that has ended); `messages.rs`, `the_status_object_carries_the_bounds`. Real processes: rule 2's test asserts the refusal's line and the status's line.
 
 ### Rule 5. A terminal is the only sign of a person
 
@@ -278,7 +278,7 @@ Each in `cordelia-core/src/protocol.rs`, with its reason in `docs/specs/paramete
 
 **Existing constants with a new use,** whose reasons gain a sentence:
 
-- `AGENT_MESSAGE_PAIR_UNREAD_MAX` (10): the usual hold, the bound of every pair until a person sets another, and again when it ends (rule 3).
+- `AGENT_MESSAGE_PAIR_HOLD_DEFAULT` (50), or `[messages] hold`: the usual hold (amended 24 November 2026), and `AGENT_MESSAGE_PAIR_UNREAD_MAX` (10) where the node has not read its configuration: the bound of every pair until a person sets another, and again when it ends (rule 3).
 - `AGENT_MESSAGE_RING` (64): the highest bound a person can set. With the two lists of rules 1 and 2, a device has 67 slots: 64 × 67 × 3,072 = 13,172,736 bytes, under a channel's 16 MiB. The check at `protocol.rs:2405-2409` counts `AGENT_MESSAGE_RING + 3`.
 - `AGENT_MESSAGE_READ_MARKS_MAX` (120): the IDs in a person's list, and the rows of messages not held kept for each key.
 - `AGENT_MESSAGE_KEPT_DAYS` (30): how long such a row is kept.
