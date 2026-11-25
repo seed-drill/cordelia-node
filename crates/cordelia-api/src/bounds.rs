@@ -30,8 +30,7 @@ use rusqlite::Connection;
 
 use cordelia_core::CordeliaError;
 use cordelia_core::protocol::{
-    AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS, AGENT_MESSAGE_PAIR_BOUND_MAX_SECS,
-    AGENT_MESSAGE_PAIR_UNREAD_MAX,
+    AGENT_MESSAGE_PAIR_BOUND_LISTED_SECS, AGENT_MESSAGE_PAIR_UNREAD_MAX,
 };
 use cordelia_crypto::identity::NodeIdentity;
 use cordelia_crypto::message::{PairBound, PairBounds};
@@ -46,8 +45,26 @@ use crate::marks::{HeldList, PersonList, may_write};
 use crate::person::{Counting, PersonError, in_one, who_counts};
 use crate::sender::Refused;
 
-/// The usual hold, as a bound: what a listed 10 is (rule 3.2).
-const USUAL: u8 = AGENT_MESSAGE_PAIR_UNREAD_MAX as u8;
+/// The usual hold of this device, as the node set it from `[messages]
+/// hold` when it started ([`set_usual`]): 0 where it has not.
+static USUAL_HOLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The node sets its usual hold from its configuration when it starts
+/// (the owner's ruling of 24 November 2026).
+pub fn set_usual(hold: u8) {
+    USUAL_HOLD.store(u64::from(hold), std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The usual hold: the count at which sending between two agents stops
+/// where no bound a person set holds, for the person's own agents and for
+/// shared channels alike. AGENT_MESSAGE_PAIR_UNREAD_MAX where the node has
+/// not set it, as in a test of the library.
+pub fn usual() -> u64 {
+    match USUAL_HOLD.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => AGENT_MESSAGE_PAIR_UNREAD_MAX as u64,
+        hold => hold,
+    }
+}
 
 /// The bound in force for a pair on this device (decision 2026-10-25,
 /// rule 3.2).
@@ -69,7 +86,7 @@ impl InForce {
     /// only the hourly limits stop it.
     pub fn stops_at(&self) -> Option<u64> {
         match self {
-            Self::Usual => Some(AGENT_MESSAGE_PAIR_UNREAD_MAX as u64),
+            Self::Usual => Some(usual()),
             Self::Set { bound, .. } => bound.map(u64::from),
         }
     }
@@ -129,7 +146,7 @@ pub fn in_force_of(
 ) -> InForce {
     match deciding(rows, own, counting, pair) {
         None => InForce::Usual,
-        Some(row) if row.bound == Some(USUAL) || now >= ends_at(row) => InForce::Usual,
+        Some(row) if now >= ends_at(row) => InForce::Usual,
         Some(row) => InForce::Set {
             bound: row.bound,
             until: ends_at(row),
@@ -305,8 +322,8 @@ fn list_written(
 /// that list again so fewer than three times in a row, as
 /// [`HeldList::write`] writes again: the device then drops those of its
 /// own bounds set before this start that allow more than the usual hold
-/// (`any`, or a number above 10), which may be ones its later life ended,
-/// and keeps a 10 or a lower number, the safe side either way; and it
+/// (`any`, or a number above it), which may be ones its later life ended,
+/// and keeps the usual or a lower number, the safe side either way; and it
 /// writes its list above that revision.
 pub(crate) fn answered_another(
     conn: &Connection,
@@ -331,9 +348,9 @@ pub(crate) fn answered_another(
 }
 
 /// Whether `row` allows more to wait than the usual hold: `any`, or a
-/// number above 10 (decision 2026-10-25, rule 2).
+/// number above it (decision 2026-10-25, rule 2).
 fn allows_more_than_usual(row: &BoundRow) -> bool {
-    row.bound.is_none_or(|bound| bound > USUAL)
+    row.bound.is_none_or(|bound| u64::from(bound) > usual())
 }
 
 /// The reader took `list`, the list of bounds of the device whose key is
@@ -467,12 +484,10 @@ pub struct Allow {
 }
 
 impl Allow {
-    /// The `for` that is set: 604,800 for a 10 (rule 3.3).
+    /// The `for` that is set (rule 3.3): a bound is its number, a 10 as
+    /// any other (the owner's ruling of 24 November 2026).
     fn for_set(&self) -> u32 {
-        match self.bound {
-            Some(USUAL) => AGENT_MESSAGE_PAIR_BOUND_MAX_SECS,
-            _ => self.for_secs,
-        }
+        self.for_secs
     }
 }
 
@@ -830,12 +845,22 @@ mod tests {
             let ten = listed(&s, 0)[0].clone();
             assert_eq!(ten.set, any + 1, "behind {behind}");
             assert_eq!(ten.at, (t + 2 - behind) as u64);
-            assert_eq!(ten.for_secs, AGENT_MESSAGE_PAIR_BOUND_MAX_SECS);
+            assert_eq!(ten.for_secs, 3600);
             hears(&s, 0, 1, t + 3 + 9 * MINUTE);
             assert_eq!(stops_on(&s, 0, t + 3 - behind), Some(10));
             assert_eq!(stops_on(&s, 1, t + 3 + 9 * MINUTE), Some(10));
-            // A listed 10 is the usual hold.
-            assert_eq!(in_force_on(&s, 1, t + 3 + 9 * MINUTE), InForce::Usual);
+            // A listed 10 is a bound of 10, as any number is (the owner's
+            // ruling of 24 November 2026), while it runs.
+            assert!(
+                behind > 0
+                    || matches!(
+                        in_force_on(&s, 1, t + 3 + 9 * MINUTE),
+                        InForce::Set {
+                            bound: Some(10),
+                            ..
+                        }
+                    )
+            );
         }
     }
 

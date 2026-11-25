@@ -1,7 +1,7 @@
 # Decision: messages between your own agents
 
 **Date**: 2026-10-09
-**Status**: Built. It adds to [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) and replaces nothing in it. C13 is overturned in part by the person's ruling of 15 November, for messages in shared channels unread by a person (§8).
+**Status**: Built. It adds to [`2026-10-04-a-persons-devices.md`](2026-10-04-a-persons-devices.md) and replaces nothing in it. C13 is overturned in part by the person's ruling of 15 November, for messages in shared channels unread by a person, and by that of 24 November for the person's own agents' messages too (§8): the line counts them, `✉ 3 from your agents`, or `✉ 5 to read` with shared ones, and sets no level.
 **Cited as**: code comments cite the sections of this record ("decision 2026-10-09 §2.2"), and the numbered properties ("§1, property 4"). The numbers do not change.
 
 Words used throughout:

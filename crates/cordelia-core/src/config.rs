@@ -174,6 +174,22 @@ pub struct MessagesConfig {
     /// configuration is refused.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answer_wait_ms: Option<u64>,
+    /// How many messages between two agents that no person has read stop
+    /// this device sending between them, where `cordelia msg allow` sets
+    /// no other bound: AGENT_MESSAGE_PAIR_HOLD_DEFAULT where it is not
+    /// set. From 1 to AGENT_MESSAGE_RING; outside, the configuration is
+    /// refused. It holds for the person's own agents and for shared
+    /// channels alike.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold: Option<u8>,
+}
+
+impl MessagesConfig {
+    /// The usual hold of this device (`[messages] hold`).
+    pub fn hold(&self) -> u8 {
+        self.hold
+            .unwrap_or(protocol::AGENT_MESSAGE_PAIR_HOLD_DEFAULT as u8)
+    }
 }
 
 /// The most `[messages] answer_wait_ms` may be, and what `msg read` and
@@ -198,6 +214,14 @@ impl MessagesConfig {
                 MESSAGES_ANSWER_WAIT_MAX_MS,
             ),
         ];
+        if let Some(hold) = self.hold
+            && !(1..=protocol::AGENT_MESSAGE_RING).contains(&usize::from(hold))
+        {
+            return Err(CordeliaError::Config(format!(
+                "[messages] hold is {hold}: it may be from 1 to {}",
+                protocol::AGENT_MESSAGE_RING
+            )));
+        }
         for (key, wait, most) in waits {
             if let Some(wait) = wait
                 && !(1..=most).contains(&wait)
@@ -396,6 +420,7 @@ impl Default for MessagesConfig {
             per_folder_per_hour: protocol::AGENT_MESSAGES_PER_FOLDER_PER_HOUR as u32,
             git_wait_ms: None,
             answer_wait_ms: None,
+            hold: None,
         }
     }
 }
@@ -653,6 +678,22 @@ http_port = 8080
         ] {
             let refused = at(git, answer).unwrap_err();
             assert!(refused.to_string().contains(key), "{refused}");
+        }
+        // The usual hold: 50 where it is not set, from 1 to 64 (the owner's
+        // ruling of 24 November 2026).
+        let hold = |toml: &str| {
+            std::fs::write(&path, toml).unwrap();
+            Config::load(&path).map(|c| c.messages.hold())
+        };
+        assert_eq!(hold("").unwrap(), 50);
+        assert_eq!(hold("[messages]\nhold = 1\n").unwrap(), 1);
+        assert_eq!(hold("[messages]\nhold = 64\n").unwrap(), 64);
+        for bad in [0, 65] {
+            let refused = hold(&format!("[messages]\nhold = {bad}\n")).unwrap_err();
+            assert!(
+                refused.to_string().contains(&format!("hold is {bad}")),
+                "{refused}"
+            );
         }
         // And it is written out with the rest.
         let written = toml::to_string_pretty(&Config::default()).unwrap();

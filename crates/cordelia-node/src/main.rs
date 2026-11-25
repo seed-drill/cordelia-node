@@ -639,14 +639,13 @@ enum MsgCommand {
     /// For a person at a terminal: how many messages may wait unread
     /// between two agents
     ///
-    /// Sending between two agents of yours stops when 10 of their
-    /// messages wait for you to read them with `cordelia msg log`. Give
-    /// another number for a while, from 1 to 64, or any: then only the
-    /// hourly limits stop them. 10 goes back to the usual hold now. It
-    /// holds on every device of yours, and the latest you set decides.
-    /// `cordelia status` says each one. With --all it is for one agent's
-    /// messages to every agent. A device of yours on an older version
-    /// holds every pair at 10, and does not hear of this.
+    /// Sending between two agents of yours stops when as many of their
+    /// messages as the usual hold wait for you to read them with
+    /// `cordelia msg log`: 50, or `[messages] hold` in the configuration.
+    /// Give another number for a while, from 1 to 64, or any: then only
+    /// the hourly limits stop them. It holds on every device of yours, and
+    /// the latest you set decides. `cordelia status` says each one. With
+    /// --all it is for one agent's messages to every agent.
     ///
     /// cordelia msg allow notes work 20 --for 2h
     #[command(
@@ -1820,10 +1819,7 @@ fn cmd_status(
 
     if line {
         let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-        let unread = status
-            .live
-            .as_ref()
-            .and_then(|live| indicator::unread_shared_says(&live["shared"]));
+        let unread = status.live.as_ref().and_then(indicator::unread_says);
         let summary = indicator::with_unread(&summary, unread.as_deref());
         let text = indicator::line(state, level, &summary, color);
         if !text.is_empty() {
@@ -2793,6 +2789,7 @@ fn cmd_start(config_path: &str) -> anyhow::Result<()> {
     state
         .own_channels
         .set_per_folder_per_hour(config.messages.per_folder_per_hour as usize);
+    cordelia_api::bounds::set_usual(config.messages.hold());
 
     // A node whose database is from a later version, or from before
     // alpha.19, is held up for as long as it runs, and touches nothing. A
@@ -10129,7 +10126,7 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(
-            allow.contains("A device of yours on an older version holds every pair at 10, and"),
+            allow.contains("as many of their messages as the usual hold wait for you"),
             "{allow}"
         );
         assert!(
@@ -10243,7 +10240,7 @@ mod tests {
     /// usual hold, under `Node:` after `Devices:`, one line for each pair
     /// (decision 2026-10-25, rule 4): a number and any, a pair of two names
     /// and of every agent, set on this device and on another by its label;
-    /// nothing for the usual hold, for a listed 10, or for one that has
+    /// nothing for the usual hold, for a bound at it, or for one that has
     /// ended.
     #[test]
     fn the_status_says_each_bound_in_force() {
@@ -10254,7 +10251,7 @@ mod tests {
                 .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
         };
         let laptop = serde_json::json!({ "label": "laptop", "fingerprint": "a b c d" });
-        let messages = serde_json::json!({ "bounds": [
+        let messages = serde_json::json!({ "hold": 10, "bounds": [
             { "a": "notes", "b": "work", "bound": 20, "until": at(now + 3_600),
               "set_on": "this" },
             { "a": "plans", "b": null, "bound": null, "until": at(now + 3 * 86_400),

@@ -1235,6 +1235,28 @@ pub fn unread_shared_says(shared: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// What the line adds of every message that waits for a person: those of
+/// the person's own agents (`messages.unread_by_a_person` of the status)
+/// and those of shared channels ([`unread_shared_says`]), by the owner's
+/// rulings of 15 and 24 November 2026. Only the person's own: "✉ 3 from
+/// your agents"; only shared channels: as [`unread_shared_says`] says;
+/// both: "✉ 5 to read". `None` where nothing waits. It sets no level.
+pub fn unread_says(live: &serde_json::Value) -> Option<String> {
+    let own = live["messages"]["unread_by_a_person"].as_u64().unwrap_or(0);
+    let shared_total: u64 = live["shared"]["channels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|channel| channel["name"].is_string())
+        .filter_map(|channel| channel["unread_by_a_person"].as_u64())
+        .sum();
+    match (own, unread_shared_says(&live["shared"])) {
+        (0, shared) => shared,
+        (own, None) => Some(format!("{UNREAD_MARK} {own} from your agents")),
+        (own, Some(_)) => Some(format!("{UNREAD_MARK} {} to read", own + shared_total)),
+    }
+}
+
 /// The line's summary, with what waits unread in shared channels after it.
 pub fn with_unread(summary: &str, unread: Option<&str>) -> String {
     match unread {
@@ -3724,6 +3746,33 @@ mod tests {
     /// summary, whatever the level (the person's ruling of 15 November):
     /// one channel by its name, more by a count; a channel with nothing
     /// unread, or without a name or a count, adds nothing.
+    /// The own agents' messages are counted too (the owner's ruling of 24
+    /// November 2026), as "from your agents" alone, or with shared ones as
+    /// one count.
+    #[test]
+    fn the_line_counts_what_waits_for_a_person_of_the_own_agents_too() {
+        let live = |own: u64, channels: serde_json::Value| {
+            serde_json::json!({ "messages": { "unread_by_a_person": own },
+                                "shared": { "channels": channels } })
+        };
+        let channel =
+            |name: &str, n: u64| serde_json::json!({ "name": name, "unread_by_a_person": n });
+        assert_eq!(unread_says(&serde_json::Value::Null), None);
+        assert_eq!(unread_says(&live(0, serde_json::json!([]))), None);
+        assert_eq!(
+            unread_says(&live(3, serde_json::json!([]))).as_deref(),
+            Some("✉ 3 from your agents")
+        );
+        assert_eq!(
+            unread_says(&live(0, serde_json::json!([channel("owner/repo", 2)]))).as_deref(),
+            Some("✉ 2 in owner/repo")
+        );
+        assert_eq!(
+            unread_says(&live(3, serde_json::json!([channel("owner/repo", 2)]))).as_deref(),
+            Some("✉ 5 to read")
+        );
+    }
+
     #[test]
     fn the_line_says_what_waits_unread_in_shared_channels() {
         let of = |channels: serde_json::Value| {

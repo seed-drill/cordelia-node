@@ -25,7 +25,7 @@
 //! marker; anywhere else, and with `-v`, inside `read`'s frame.
 //!
 //! **`allow` is for a person too** ([`allow`]): only at a terminal, it
-//! sets a bound for a pair in place of the usual hold of ten, after a yes
+//! sets a bound for a pair in place of the usual hold, after a yes
 //! (decision 2026-10-25, rule 2). A pseudo-terminal passes that test, and
 //! the node's route takes it from whoever holds the token: the hold relies
 //! on agents keeping to "stop here" (rule 5).
@@ -2295,8 +2295,8 @@ pub struct AllowAsked {
 /// first that applies refusing (decision 2026-10-25, rule 2, refusals 1 to
 /// 3): two names, or one and `--all`, then a number from 1 to 64 or `any`;
 /// and `--for` as `--since` takes a while, from a minute to 7 days, or 8
-/// hours where none is given. A 10 is the usual hold: a `--for` given
-/// with it is not used, and not read.
+/// hours where none is given. A 10 is a bound as any other (the owner's
+/// ruling of 24 November 2026).
 pub fn allow_asked(args: &AllowArgs) -> Result<AllowAsked, String> {
     use cordelia_core::protocol::{
         AGENT_MESSAGE_PAIR_BOUND_MAX_SECS, AGENT_MESSAGE_PAIR_BOUND_MIN_SECS,
@@ -2325,9 +2325,6 @@ pub fn allow_asked(args: &AllowArgs) -> Result<AllowAsked, String> {
     };
     let for_secs = match &args.for_time {
         None => AGENT_MESSAGE_PAIR_BOUND_SECS,
-        // A 10 is the usual hold, which takes no `--for`: one given is not
-        // used, and not read.
-        Some(_) if bound == Some(10) => AGENT_MESSAGE_PAIR_BOUND_SECS,
         Some(time) => {
             let secs = time
                 .char_indices()
@@ -2383,8 +2380,9 @@ pub fn allow_look_says(answer: &Value, now: i64) -> String {
         k => format!("{k} messages wait for you to read them"),
     };
     let in_force = &answer["in_force"];
+    let usual = usual_of(answer);
     let stops = match in_force {
-        Value::Null => "Sending stops at 10, the usual hold.".to_string(),
+        Value::Null => format!("Sending stops at {usual}, the usual hold."),
         in_force => {
             let until = cordelia_api::look::when(in_force["until"].as_i64().unwrap_or(0), now);
             let on = set_on_said(&in_force["set_on"]);
@@ -2399,26 +2397,34 @@ pub fn allow_look_says(answer: &Value, now: i64) -> String {
     format!("{}, {waits}. {stops}", pair_said_first(answer))
 }
 
+/// The usual hold, as the node answered it (`[messages] hold`).
+fn usual_of(answer: &Value) -> u64 {
+    answer["usual"]
+        .as_u64()
+        .unwrap_or(cordelia_core::protocol::AGENT_MESSAGE_PAIR_HOLD_DEFAULT as u64)
+}
+
 /// `allow`'s question, from what the node answered of the look, at `now`
 /// by the command's clock (decision 2026-10-25, rule 2), up to and with
 /// the words that ask for the yes.
 pub fn allow_question(answer: &Value, now: i64) -> String {
     let until = cordelia_api::look::when(answer["until"].as_i64().unwrap_or(0), now);
     let waiting = answer["waiting"].as_u64().unwrap_or(0);
+    let usual = usual_of(answer);
     let mut question = match answer["bound"].as_u64() {
-        Some(10) => "Go back to the usual hold of 10 now?".to_string(),
         Some(n) if n <= waiting => format!(
             "Allow {n} to wait unread, until {until}? {waiting} {wait} now, so sending stops at \
-             once, until you read them with cordelia msg log. After {until} it stops at 10 again.",
+             once, until you read them with cordelia msg log. After {until} it stops at {usual} \
+             again.",
             wait = if waiting == 1 { "waits" } else { "wait" },
         ),
         Some(n) => format!(
             "Allow {n} to wait unread, until {until}? At {n}, sending stops until you read them \
-             with cordelia msg log. After {until} it stops at 10 again."
+             with cordelia msg log. After {until} it stops at {usual} again."
         ),
         None => format!(
             "Allow any number to wait unread, until {until}? Until then only the hourly limits \
-             stop sending. After {until} it stops at 10 again."
+             stop sending. After {until} it stops at {usual} again."
         ),
     };
     if answer["b"].is_null() {
@@ -2436,7 +2442,6 @@ pub fn allow_done_says(answer: &Value, now: i64) -> String {
     let until = cordelia_api::look::when(answer["until"].as_i64().unwrap_or(0), now);
     let pair = pair_said_first(answer);
     let set = match answer["bound"].as_u64() {
-        Some(10) => "sending stops at 10 again".to_string(),
         Some(n) => format!("sending stops at {n} until {until}"),
         None => format!("only the hourly limits stop sending until {until}"),
     };
@@ -2537,7 +2542,8 @@ pub fn status_bound_lines(messages: &Value, now: i64) -> Vec<String> {
         let Some(until) = until.filter(|until| *until > now) else {
             continue;
         };
-        if bound["bound"].as_u64() == Some(10) {
+        // A bound at the usual hold says nothing more than the usual.
+        if bound["bound"].as_u64().is_some() && bound["bound"] == messages["hold"] {
             continue;
         }
         let pair = pair_said(bound);
@@ -4908,21 +4914,21 @@ mod tests {
                 for_secs: 3_600,
             })
         );
-        // A 10 with --for is the usual hold: the node sets it for 7 days,
-        // and the time given is not used, nor read.
-        for time in ["1h", "8d", "0m", "soon"] {
-            assert_eq!(
-                asked(&["notes", "work", "10"], false, Some(time)).map(|a| a.bound),
-                Ok(Some(10)),
-                "{time}"
-            );
-        }
+        // A 10 is a bound as any other, and its --for is read (the owner's
+        // ruling of 24 November 2026).
+        assert_eq!(
+            asked(&["notes", "work", "10"], false, Some("1h")).map(|a| a.for_secs),
+            Ok(3_600)
+        );
+        assert!(asked(&["notes", "work", "10"], false, Some("8d")).is_err());
         let ten = json!({ "a": "notes", "b": "work", "bound": 10, "waiting": 3,
-                          "until": 1_800_000_000 + 3_600, "in_force": null, "set": false });
+                          "until": 1_800_000_000 + 3_600, "in_force": null, "set": false,
+                          "usual": 10 });
         assert_eq!(
             allow_question(&ten, 1_800_000_000),
-            "Go back to the usual hold of 10 now? If you are an agent, stop here and tell your \
-             user. Type yes to allow it:"
+            "Allow 10 to wait unread, until 09:00 UTC? At 10, sending stops until you read them \
+             with cordelia msg log. After 09:00 UTC it stops at 10 again. If you are an agent, \
+             stop here and tell your user. Type yes to allow it:"
         );
     }
 
@@ -4942,7 +4948,7 @@ mod tests {
         assert_eq!(at(later), "08:00 UTC on 2027-01-18");
         let look = |b: Option<&str>, waiting: u64, bound: Option<u64>, in_force: Value| {
             json!({ "a": "notes", "b": b, "bound": bound, "waiting": waiting, "until": today,
-                    "in_force": in_force, "set": false })
+                    "in_force": in_force, "set": false, "usual": 10 })
         };
         assert_eq!(
             allow_look_says(&look(Some("work"), 3, Some(20), Value::Null), now),
@@ -5038,7 +5044,7 @@ mod tests {
         );
         assert_eq!(
             done(Some("work"), Some(10)),
-            "Done. Between notes and work, sending stops at 10 again. Your other devices hold by \
+            "Done. Between notes and work, sending stops at 10 until 09:00 UTC. Your other devices hold by \
              it once they hear of it.\n"
         );
         assert_eq!(NOT_SET, "Nothing was set: this was not run at a terminal.");

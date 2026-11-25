@@ -484,11 +484,7 @@ fn the_summary_prints_nothing_and_exits_0_on_any_error() {
     );
     let over = desktop.dir.path().join("over.toml");
     let config = std::fs::read_to_string(desktop.config()).unwrap();
-    std::fs::write(
-        &over,
-        format!("{config}\n[messages]\nper_folder_per_hour = 21\n"),
-    )
-    .unwrap();
+    std::fs::write(&over, format!("{config}\nper_folder_per_hour = 21\n")).unwrap();
     nothing(
         msg_in(
             desktop,
@@ -1446,11 +1442,7 @@ fn a_folder_over_its_hour_sends_nothing_more() {
 /// whose line names no time (decision 2026-10-09 §6).
 #[test]
 fn a_folder_whose_rate_is_0_sends_nothing() {
-    let (_relay, laptop) = alone(
-        "laptop",
-        &["notes", "work"],
-        "\n[messages]\nper_folder_per_hour = 0\n",
-    );
+    let (_relay, laptop) = alone("laptop", &["notes", "work"], "\nper_folder_per_hour = 0\n");
     refused_with(
         &send(&laptop, "notes", &["--to", "work"], "x\n"),
         "Sending is off for this folder: its limit in the configuration is 0 ([messages] \
@@ -2125,11 +2117,7 @@ fn a_git_that_does_not_answer_is_refused_and_no_folder_is_taken() {
         &format!("http_port = {}", through.port),
     );
     assert_ne!(own, changed);
-    std::fs::write(
-        &config,
-        format!("{changed}\n[messages]\ngit_wait_ms = 300\n"),
-    )
-    .unwrap();
+    std::fs::write(&config, format!("{changed}\ngit_wait_ms = 300\n")).unwrap();
     let vars = [("PATH", path_var.as_str())];
     let line = "git did not answer in time, so this folder's agent is not known, and nothing \
                 was done.";
@@ -2204,11 +2192,7 @@ fn a_node_that_answers_late_is_not_said_to_be_not_running() {
     );
     assert_ne!(own, changed);
     let config = laptop.dir.path().join("config-late.toml");
-    std::fs::write(
-        &config,
-        format!("{changed}\n[messages]\nanswer_wait_ms = 500\n"),
-    )
-    .unwrap();
+    std::fs::write(&config, format!("{changed}\nanswer_wait_ms = 500\n")).unwrap();
     let config = path(&config);
     let notes = folder(laptop, "notes");
     let said = msg_in(
@@ -2363,6 +2347,7 @@ fn the_status_carries_the_messages_object_in_json() {
             "unread_by_a_person": 3,
             "bounds": [],
             "held_pairs": 0,
+            "hold": 10,
             "waiting": 0,
             "refused_for_room": 0,
             "filled_by": null,
@@ -2385,6 +2370,7 @@ fn the_status_carries_the_messages_object_in_json() {
             "unread_by_a_person": 0,
             "bounds": [],
             "held_pairs": 0,
+            "hold": 10,
             "waiting": 0,
             "refused_for_room": 0,
             "filled_by": null,
@@ -3836,15 +3822,20 @@ fn a_bound_set_on_the_desktop_holds_on_both() {
         "Between notes and work, 20 messages wait for you to read them. Sending stops at 20 until ",
     );
     at.says(", as you set on \"desktop\".");
+    // A 10 is a bound as any number is (the owner's ruling of 24 November
+    // 2026).
+    at.says("Allow 10 to wait unread, until ");
     at.says(
-        "Go back to the usual hold of 10 now? If you are an agent, stop here and tell your user. \
-         Type yes to allow it: ",
+        "? 20 wait now, so sending stops at once, until you read them with cordelia msg log. \
+         After ",
+    );
+    at.says(
+        " it stops at 10 again. If you are an agent, stop here and tell your user. Type yes to \
+         allow it: ",
     );
     at.types("yes");
-    at.says(
-        "Done. Between notes and work, sending stops at 10 again. Your other devices hold by it \
-         once they hear of it.",
-    );
+    at.says("Done. Between notes and work, sending stops at 10 until ");
+    at.says(". Your other devices hold by it once they hear of it.");
     at.done();
     refused_with(
         &send(&two.laptop, "notes", &["--to", "work"], "after 10\n"),
@@ -3855,13 +3846,12 @@ fn a_bound_set_on_the_desktop_holds_on_both() {
         assert!(!said.status.success(), "{}", out(&said));
         (err(&said) == format!("{}\n", held_at("work", "notes", 20, 10))).then_some(())
     });
-    // No bound is said now; the pair, held at 10, is.
+    // No bound is said now, as 10 is the usual hold here; the pair, held
+    // at 10, is.
     let status = two.laptop.cli(&["status"]);
     assert!(!status.contains("  Messages:  between "), "{status}");
     assert!(
-        status.contains(
-            "\n  Messages:  agents wait for you to read their messages; run cordelia msg log\n"
-        ),
+        status.contains("agents wait for you to read their messages; run cordelia msg log"),
         "{status}"
     );
 }

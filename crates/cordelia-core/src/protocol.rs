@@ -2314,6 +2314,13 @@ pub const AGENT_MESSAGES_PER_DEVICE_PER_HOUR: usize = 60;
 /// 2026-10-25, rule 3).
 pub const AGENT_MESSAGE_PAIR_UNREAD_MAX: usize = 10;
 
+/// The usual hold where `[messages] hold` is not set (the owner's ruling
+/// of 24 November 2026): how many messages between two agents that no
+/// person has read stop a device sending between them. A node that has
+/// not read its configuration, as a test's, holds at
+/// AGENT_MESSAGE_PAIR_UNREAD_MAX.
+pub const AGENT_MESSAGE_PAIR_HOLD_DEFAULT: usize = 50;
+
 /// How many lines of new messages `cordelia msg summary` prints, and how
 /// many IDs its count line lists (decision 2026-10-09 §4.1).
 pub const AGENT_MESSAGE_SUMMARY_LINES: usize = 5;
@@ -2431,6 +2438,7 @@ const _: () = assert!(
 // The highest bound fits in its byte; a `for` in its four.
 const _: () = assert!(AGENT_MESSAGE_RING <= u8::MAX as usize);
 const _: () = assert!(AGENT_MESSAGE_PAIR_UNREAD_MAX <= AGENT_MESSAGE_RING);
+const _: () = assert!(AGENT_MESSAGE_PAIR_HOLD_DEFAULT <= AGENT_MESSAGE_RING);
 const _: () = assert!(AGENT_MESSAGE_PAIR_BOUND_MIN_SECS < AGENT_MESSAGE_PAIR_BOUND_SECS);
 const _: () = assert!(AGENT_MESSAGE_PAIR_BOUND_SECS <= AGENT_MESSAGE_PAIR_BOUND_MAX_SECS);
 // An honest device's hour of messages is within one lap of its ring.

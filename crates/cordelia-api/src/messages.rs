@@ -1194,6 +1194,7 @@ impl Counts {
             "unread_by_a_person": self.unread_by_a_person,
             "bounds": bounds,
             "held_pairs": self.held_pairs,
+            "hold": crate::bounds::usual(),
             "waiting": self.waiting,
             "refused_for_room": self.refused_for_room,
             "filled_by": filled_by,
@@ -1993,6 +1994,7 @@ impl AllowSaid {
             "until": self.allowed.until,
             "in_force": in_force,
             "set": self.allowed.set,
+            "usual": crate::bounds::usual(),
         })
     }
 }
@@ -4780,10 +4782,12 @@ mod tests {
             "held_back",
             "overwritten",
             "no_place",
+            "hold",
         ] {
             assert!(answered.get(key).is_some(), "{key}");
         }
-        assert_eq!(answered.as_object().unwrap().len(), 10);
+        assert_eq!(answered.as_object().unwrap().len(), 11);
+        assert_eq!(answered["hold"], crate::bounds::usual());
         // A message refused whose 30 days are up waits no more, and is
         // refused of those that wait no more, until the hourly task.
         conn.execute(
@@ -6170,8 +6174,9 @@ mod tests {
 
     /// The status object carries each bound in force that is not the usual
     /// hold (decision 2026-10-25, rule 4): `a`, `b` (null for every agent),
-    /// `bound` (null for any), `until` in RFC 3339 and `set_on`; nothing
-    /// for a listed 10, or for one that has ended.
+    /// `bound` (null for any), `until` in RFC 3339 and `set_on`; a listed
+    /// 10 as any number (the owner's ruling of 24 November 2026); nothing
+    /// for one that has ended.
     #[test]
     fn the_status_object_carries_the_bounds() {
         let s = devices(2);
@@ -6194,7 +6199,11 @@ mod tests {
         takes(&s, 1, &bounds_list_of(&s, 0).unwrap(), now + 1);
         let said = counts_on(&s, 1, now + 1).answered();
         let bounds = said["bounds"].as_array().unwrap();
-        assert_eq!(bounds.len(), 2, "{said}");
+        assert_eq!(bounds.len(), 3, "{said}");
+        assert_eq!(bounds[0]["b"], "plans");
+        assert_eq!(bounds[0]["bound"], 10);
+        assert_eq!(bounds[0]["set_on"], "this");
+        let bounds = &bounds[1..];
         assert_eq!(
             bounds[0],
             json!({ "a": "notes", "b": "work", "bound": 20,
