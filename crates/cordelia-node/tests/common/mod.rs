@@ -1023,6 +1023,9 @@ bind_address = "127.0.0.1"
 
 [logging]
 level = "debug"
+
+[messages]
+hold = 10
 "#,
         data = dir.path().join("data").display(),
     );

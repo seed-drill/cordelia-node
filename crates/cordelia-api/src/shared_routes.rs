@@ -1283,8 +1283,7 @@ fn log_in(
             let mut holds = Vec::new();
             for (channel, agent) in seen::in_force(conn)? {
                 if channel == row.channel
-                    && seen::held(conn, identity, &row, &agent, now)?
-                        >= cordelia_core::protocol::AGENT_MESSAGE_PAIR_UNREAD_MAX as u64
+                    && seen::held(conn, identity, &row, &agent, now)? >= crate::bounds::usual()
                 {
                     holds.push(agent);
                 }

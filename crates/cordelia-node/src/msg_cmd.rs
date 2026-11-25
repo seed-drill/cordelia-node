@@ -2383,8 +2383,9 @@ pub fn allow_look_says(answer: &Value, now: i64) -> String {
         k => format!("{k} messages wait for you to read them"),
     };
     let in_force = &answer["in_force"];
+    let usual = usual_of(answer);
     let stops = match in_force {
-        Value::Null => "Sending stops at 10, the usual hold.".to_string(),
+        Value::Null => format!("Sending stops at {usual}, the usual hold."),
         in_force => {
             let until = cordelia_api::look::when(in_force["until"].as_i64().unwrap_or(0), now);
             let on = set_on_said(&in_force["set_on"]);
@@ -2399,26 +2400,34 @@ pub fn allow_look_says(answer: &Value, now: i64) -> String {
     format!("{}, {waits}. {stops}", pair_said_first(answer))
 }
 
+/// The usual hold, as the node answered it (`[messages] hold`).
+fn usual_of(answer: &Value) -> u64 {
+    answer["usual"]
+        .as_u64()
+        .unwrap_or(cordelia_core::protocol::AGENT_MESSAGE_PAIR_HOLD_DEFAULT as u64)
+}
+
 /// `allow`'s question, from what the node answered of the look, at `now`
 /// by the command's clock (decision 2026-10-25, rule 2), up to and with
 /// the words that ask for the yes.
 pub fn allow_question(answer: &Value, now: i64) -> String {
     let until = cordelia_api::look::when(answer["until"].as_i64().unwrap_or(0), now);
     let waiting = answer["waiting"].as_u64().unwrap_or(0);
+    let usual = usual_of(answer);
     let mut question = match answer["bound"].as_u64() {
-        Some(10) => "Go back to the usual hold of 10 now?".to_string(),
         Some(n) if n <= waiting => format!(
             "Allow {n} to wait unread, until {until}? {waiting} {wait} now, so sending stops at \
-             once, until you read them with cordelia msg log. After {until} it stops at 10 again.",
+             once, until you read them with cordelia msg log. After {until} it stops at {usual} \
+             again.",
             wait = if waiting == 1 { "waits" } else { "wait" },
         ),
         Some(n) => format!(
             "Allow {n} to wait unread, until {until}? At {n}, sending stops until you read them \
-             with cordelia msg log. After {until} it stops at 10 again."
+             with cordelia msg log. After {until} it stops at {usual} again."
         ),
         None => format!(
             "Allow any number to wait unread, until {until}? Until then only the hourly limits \
-             stop sending. After {until} it stops at 10 again."
+             stop sending. After {until} it stops at {usual} again."
         ),
     };
     if answer["b"].is_null() {
@@ -2436,7 +2445,6 @@ pub fn allow_done_says(answer: &Value, now: i64) -> String {
     let until = cordelia_api::look::when(answer["until"].as_i64().unwrap_or(0), now);
     let pair = pair_said_first(answer);
     let set = match answer["bound"].as_u64() {
-        Some(10) => "sending stops at 10 again".to_string(),
         Some(n) => format!("sending stops at {n} until {until}"),
         None => format!("only the hourly limits stop sending until {until}"),
     };
@@ -4918,11 +4926,13 @@ mod tests {
             );
         }
         let ten = json!({ "a": "notes", "b": "work", "bound": 10, "waiting": 3,
-                          "until": 1_800_000_000 + 3_600, "in_force": null, "set": false });
+                          "until": 1_800_000_000 + 3_600, "in_force": null, "set": false,
+                          "usual": 10 });
         assert_eq!(
             allow_question(&ten, 1_800_000_000),
-            "Go back to the usual hold of 10 now? If you are an agent, stop here and tell your \
-             user. Type yes to allow it:"
+            "Allow 10 to wait unread, until 09:00 UTC? At 10, sending stops until you read them \
+             with cordelia msg log. After 09:00 UTC it stops at 10 again. If you are an agent, \
+             stop here and tell your user. Type yes to allow it:"
         );
     }
 
@@ -4942,7 +4952,7 @@ mod tests {
         assert_eq!(at(later), "08:00 UTC on 2027-01-18");
         let look = |b: Option<&str>, waiting: u64, bound: Option<u64>, in_force: Value| {
             json!({ "a": "notes", "b": b, "bound": bound, "waiting": waiting, "until": today,
-                    "in_force": in_force, "set": false })
+                    "in_force": in_force, "set": false, "usual": 10 })
         };
         assert_eq!(
             allow_look_says(&look(Some("work"), 3, Some(20), Value::Null), now),
@@ -5038,7 +5048,7 @@ mod tests {
         );
         assert_eq!(
             done(Some("work"), Some(10)),
-            "Done. Between notes and work, sending stops at 10 again. Your other devices hold by \
+            "Done. Between notes and work, sending stops at 10 until 09:00 UTC. Your other devices hold by \
              it once they hear of it.\n"
         );
         assert_eq!(NOT_SET, "Nothing was set: this was not run at a terminal.");

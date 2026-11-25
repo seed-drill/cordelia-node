@@ -22,8 +22,8 @@
 use rusqlite::Connection;
 
 use cordelia_core::protocol::{
-    AGENT_MESSAGE_PAIR_UNREAD_MAX, AGENT_MESSAGE_RING, AGENT_MESSAGE_SENDS_MAX,
-    AGENT_MESSAGES_PER_DEVICE_PER_HOUR, AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
+    AGENT_MESSAGE_RING, AGENT_MESSAGE_SENDS_MAX, AGENT_MESSAGES_PER_DEVICE_PER_HOUR,
+    AGENT_MESSAGES_PER_FOLDER_PER_HOUR,
 };
 use cordelia_crypto::derive;
 use cordelia_crypto::entry::{CheckedEntry, Entry};
@@ -262,9 +262,9 @@ pub(crate) fn sends(
             next_at,
         });
     }
-    // 12. The hold: the loop this agent is in, at 10.
+    // 12. The hold: the loop this agent is in, at the device's usual hold.
     let waiting = crate::shared_messages::held(conn, identity, &ring.row, &request.from, now)?;
-    if waiting >= AGENT_MESSAGE_PAIR_UNREAD_MAX as u64 {
+    if waiting >= crate::bounds::usual() {
         return refused(Refused::SharedHeld {
             from: request.from.clone(),
             waiting,

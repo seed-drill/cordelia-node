@@ -1,7 +1,7 @@
 # Decision: a person's hold on messages
 
 **Date**: 2026-10-25
-**Status**: Accepted, and built in `v0.2.0-alpha.17`; the pairs held, under the status (rule 4), in `v0.2.0-alpha.18`. It amends the record of 2026-10-09, `channels-api.md` and the threat model's T22 (section 5).
+**Status**: Accepted, and built in `v0.2.0-alpha.17`; the pairs held, under the status (rule 4), in `v0.2.0-alpha.18`. It amends the record of 2026-10-09, `channels-api.md` and the threat model's T22 (section 5). **Amended 24 November 2026** (the owner's ruling, "Kiss, no retro compat needed for alpha, so just set a value"): the usual hold is `[messages] hold`, 1 to 64, and 50 where it is not set (`AGENT_MESSAGE_PAIR_HOLD_DEFAULT`); a node that has not read its configuration, as in a test of the library, holds at 10. It holds for shared channels as for the person's own agents. A bound is its number, and a 10 is a bound as any other: there is no "go back" for 10. Where this record says 10 for the usual hold, read the device's usual hold. Its cost: `config.toml` is a file an agent's shell can change, so an agent that restarts the node can raise its usual hold, though never above 64, where only a person at a terminal raised a hold before (rule 5); a bound above that, or `any`, still takes a person at a terminal.
 **Cited as**: "decision 2026-10-25, rule 2", and "rule 3.6" for an item of a rule. The numbers do not change. A number that is not used stays unused.
 
 Words used throughout:
@@ -135,14 +135,13 @@ For `<k>` of 1, "1 message waits for you to read it."; for 0, "no message waits 
 
 `<question>` is one of:
 
-- "Allow `<n>` to wait unread, until `<when>`? At `<n>`, sending stops until you read them with cordelia msg log. After `<when>` it stops at 10 again."
-- where `<n>` is at or below `<k>`: "Allow `<n>` to wait unread, until `<when>`? `<k>` wait now, so sending stops at once, until you read them with cordelia msg log. After `<when>` it stops at 10 again." For `<k>` of 1: "... 1 waits now, so sending stops at once, ..."
-- for `any`: "Allow any number to wait unread, until `<when>`? Until then only the hourly limits stop sending. After `<when>` it stops at 10 again."
-- for 10: "Go back to the usual hold of 10 now?"
+- "Allow `<n>` to wait unread, until `<when>`? At `<n>`, sending stops until you read them with cordelia msg log. After `<when>` it stops at `<usual>` again."
+- where `<n>` is at or below `<k>`: "Allow `<n>` to wait unread, until `<when>`? `<k>` wait now, so sending stops at once, until you read them with cordelia msg log. After `<when>` it stops at `<usual>` again." For `<k>` of 1: "... 1 waits now, so sending stops at once, ..."
+- for `any`: "Allow any number to wait unread, until `<when>`? Until then only the hourly limits stop sending. After `<when>` it stops at `<usual>` again."
 
 With `--all`, the question ends with one sentence more: "`<a>` still sends nothing to every agent while a pair with `<a>` on one side is held." (§6 there refuses `--all` from `<a>` while any of its pairs is at its bound.)
 
-After a yes: "Done. `<Pair>`, sending stops at `<n>` until `<when>`. Your other devices hold by it once they hear of it." For `any`: "Done. `<Pair>`, only the hourly limits stop sending until `<when>`. Your other devices hold by it once they hear of it." For 10: "Done. `<Pair>`, sending stops at 10 again. Your other devices hold by it once they hear of it." Any other answer: "Nothing was set."
+After a yes: "Done. `<Pair>`, sending stops at `<n>` until `<when>`. Your other devices hold by it once they hear of it." For `any`: "Done. `<Pair>`, only the hourly limits stop sending until `<when>`. Your other devices hold by it once they hear of it." Any other answer: "Nothing was set."
 
 **Where its input or its output is not a terminal,** it says its first line, then, on standard error with status 1, "Nothing was set: this was not run at a terminal." It asks the node nothing.
 
